@@ -88,7 +88,7 @@ fn make_tools() -> Arc<InMemoryToolRegistry> {
         Arc::new(tools::file_edit::FileEditTool),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
-        Arc::new(tools::lsp::LspTool),
+        Arc::new(tools::lsp::LspTool::ephemeral()),
         Arc::new(tools::todo_write::TodoWriteTool),
         Arc::new(tools::tasks::TaskCreateTool),
         Arc::new(tools::tasks::TaskUpdateTool),

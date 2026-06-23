@@ -14,11 +14,13 @@ use base::tool::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Timeout for the entire LSP request lifecycle (initialize + request + shutdown).
 const LSP_TIMEOUT_MS: u64 = 15_000;
@@ -90,7 +92,49 @@ struct JsonRpcError {
 
 // ── Tool struct ──
 
-pub struct LspTool;
+pub struct LspTool {
+    manager: Option<LspManager>,
+}
+
+impl LspTool {
+    /// Create an LspTool that uses the given pool for server reuse.
+    pub fn new(manager: LspManager) -> Self {
+        Self {
+            manager: Some(manager),
+        }
+    }
+
+    /// Create an LspTool without a pool — every call spawns and shuts down
+    /// its own server process. Useful for tests and one-off invocations.
+    pub fn ephemeral() -> Self {
+        Self { manager: None }
+    }
+
+    /// Execute one request via the pool: acquire → execute → release on success,
+    /// drop handle on error (so next call spawns a fresh server).
+    async fn run_pooled(
+        manager: &LspManager,
+        pool_key: PoolKey,
+        server_cmd: &str,
+        root_path: &Path,
+        method: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let mut handle = manager.acquire(server_cmd, root_path).await?;
+        let result = execute_request_on_handle(&mut handle, method, params).await;
+        match result {
+            Ok(_) => {
+                manager.release(pool_key, handle);
+            }
+            Err(_) => {
+                // Don't return a potentially broken connection to the pool.
+                // Let it drop — next acquire will spawn a fresh one.
+                shutdown_handle(handle).await;
+            }
+        }
+        result
+    }
+}
 
 #[async_trait]
 impl Tool for LspTool {
@@ -194,13 +238,21 @@ impl Tool for LspTool {
         // Build the LSP request based on the operation.
         let (method, params) = build_request(&input, &ctx.cwd);
 
-        // Execute the LSP request with a timeout.
         let timeout_dur = Duration::from_millis(LSP_TIMEOUT_MS);
-        let result = tokio::time::timeout(
-            timeout_dur,
-            execute_lsp_request(&server_cmd, &ctx.cwd, &method, &params),
-        )
-        .await;
+
+        let result = if let Some(ref manager) = self.manager {
+            // ── Pooled path ──
+            let pool_key: PoolKey = (server_cmd.clone(), canonical_root(&ctx.cwd));
+            let r = tokio::time::timeout(timeout_dur, Self::run_pooled(manager, pool_key.clone(), &server_cmd, &ctx.cwd, &method, &params)).await;
+            r
+        } else {
+            // ── Ephemeral path ──
+            tokio::time::timeout(
+                timeout_dur,
+                execute_lsp_request(&server_cmd, &ctx.cwd, &method, &params),
+            )
+            .await
+        };
 
         match result {
             Ok(Ok(response_text)) => Ok(ToolResult::text(response_text)),
@@ -358,21 +410,127 @@ fn build_request(input: &LspInput, cwd: &Path) -> (String, Value) {
     }
 }
 
+// ── Process pool ──
+
+/// Key for the LSP server pool: (server_command, canonical_root_path).
+type PoolKey = (String, PathBuf);
+
+/// A live, initialized LSP server connection.
+pub(crate) struct LspHandle {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    #[allow(dead_code)]
+    capabilities: Value,
+    last_used: Instant,
+    next_request_id: u64,
+}
+
+/// Process-pool manager for LSP servers. Clone-friendly (inner state behind `Arc<Mutex<>>`).
+///
+/// Created via [`LspTool::new`]; call [`LspManager::evict_idle`] periodically to
+/// clean up stale connections.
+#[derive(Clone)]
+pub struct LspManager {
+    inner: Arc<Mutex<LspManagerInner>>,
+    idle_timeout: Duration,
+}
+
+struct LspManagerInner {
+    servers: HashMap<PoolKey, LspHandle>,
+}
+
+impl LspManager {
+    /// Create a new pool. `idle_timeout` of `Duration::ZERO` means never evict.
+    pub fn new(idle_timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LspManagerInner {
+                servers: HashMap::new(),
+            })),
+            idle_timeout,
+        }
+    }
+
+    /// Get or create an initialized LSP server for `(server_cmd, root_path)`.
+    pub(crate) async fn acquire(
+        &self,
+        server_cmd: &str,
+        root_path: &Path,
+    ) -> Result<LspHandle, String> {
+        let key: PoolKey = (server_cmd.to_string(), canonical_root(root_path));
+
+        // Try to pull an existing handle from the pool (short lock).
+        let existing = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.servers.remove(&key)
+        };
+
+        if let Some(mut handle) = existing {
+            match handle.child.try_wait() {
+                Ok(None) => {
+                    // Process still alive — reuse.
+                    handle.last_used = Instant::now();
+                    return Ok(handle);
+                }
+                _ => {
+                    // Process died — drop and create a fresh one.
+                    drop(handle);
+                }
+            }
+        }
+
+        // No usable handle in pool — spawn + initialize (long, lock-free).
+        spawn_and_initialize(server_cmd, root_path).await
+    }
+
+    pub(crate) fn release(&self, key: PoolKey, mut handle: LspHandle) {
+        handle.last_used = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.servers.insert(key, handle);
+    }
+
+    /// Evict handles that have been idle longer than `idle_timeout`.
+    /// Dropping the handle sends SIGKILL (via `kill_on_drop`).
+    pub fn evict_idle(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if self.idle_timeout.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        inner.servers.retain(|_, h| {
+            if now.duration_since(h.last_used) > self.idle_timeout {
+                false // remove from map → LspHandle::drop → Child killed
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Number of active connections in the pool (for tests).
+    pub fn active_servers(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.servers.len()
+    }
+}
+
+fn canonical_root(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 // ── LSP communication ──
 
-async fn execute_lsp_request(
+/// Spawn an LSP server, run the `initialize` handshake, and send `initialized`.
+/// Returns the live handle ready for sending requests.
+async fn spawn_and_initialize(
     server_cmd: &str,
-    cwd: &Path,
-    method: &str,
-    params: &Value,
-) -> Result<String, String> {
-    // Parse and spawn the LSP server process.
+    root_path: &Path,
+) -> Result<LspHandle, String> {
     let parts: Vec<&str> = server_cmd.split_whitespace().collect();
     let mut cmd = Command::new(parts[0]);
     for arg in &parts[1..] {
         cmd.arg(arg);
     }
-    cmd.current_dir(cwd);
+    cmd.current_dir(root_path);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
@@ -398,7 +556,7 @@ async fn execute_lsp_request(
         method: "initialize".into(),
         params: Some(serde_json::json!({
             "processId": null,
-            "rootUri": format!("file://{}", cwd.display()),
+            "rootUri": format!("file://{}", root_path.display()),
             "capabilities": {
                 "textDocument": {
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
@@ -418,10 +576,7 @@ async fn execute_lsp_request(
 
     let mut reader = BufReader::new(stdout);
     let init_response: JsonRpcResponse = read_lsp_message(&mut reader).await?;
-    if let Some(ref err) = init_response.error {
-        // Log or ignore — many servers return partial capabilities.
-        let _ = err;
-    }
+    let _ = init_response.error; // Many servers return partial capabilities — tolerate.
 
     // ── Initialized notification ──
     let notif = serde_json::json!({
@@ -441,30 +596,34 @@ async fn execute_lsp_request(
         .map_err(|e| e.to_string())?;
     stdin.flush().await.map_err(|e| e.to_string())?;
 
-    // ── Actual request ──
+    Ok(LspHandle {
+        child,
+        stdin,
+        stdout: reader,
+        capabilities: init_response.result.unwrap_or_default(),
+        last_used: Instant::now(),
+        next_request_id: 2,
+    })
+}
+
+/// Send one LSP request on an already-initialized handle and read the response.
+async fn execute_request_on_handle(
+    handle: &mut LspHandle,
+    method: &str,
+    params: &Value,
+) -> Result<String, String> {
+    let id = handle.next_request_id;
+    handle.next_request_id += 1;
+
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
-        id: 2,
+        id,
         method: method.to_string(),
         params: Some(params.clone()),
     };
-    send_lsp_message(&mut stdin, &req).await?;
+    send_lsp_message(&mut handle.stdin, &req).await?;
 
-    // Read the response.
-    let response: JsonRpcResponse = read_lsp_message(&mut reader).await?;
-
-    // ── Shutdown ──
-    let shutdown_req = JsonRpcRequest {
-        jsonrpc: "2.0".into(),
-        id: 3,
-        method: "shutdown".into(),
-        params: None,
-    };
-    let _ = send_lsp_message(&mut stdin, &shutdown_req).await;
-    drop(stdin);
-
-    // Give the server a moment to shut down gracefully before we kill it.
-    let _ = child.wait().await;
+    let response: JsonRpcResponse = read_lsp_message(&mut handle.stdout).await?;
 
     match response.result {
         Some(result) => Ok(format_lsp_result(method, &result)),
@@ -476,6 +635,33 @@ async fn execute_lsp_request(
             }
         }
     }
+}
+
+/// Gracefully shut down an LSP server handle.
+async fn shutdown_handle(mut handle: LspHandle) {
+    let shutdown_req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: handle.next_request_id,
+        method: "shutdown".into(),
+        params: None,
+    };
+    let _ = send_lsp_message(&mut handle.stdin, &shutdown_req).await;
+    drop(handle.stdin);
+    let _ = handle.child.wait().await;
+}
+
+/// Ephemeral (non-pooled) LSP request: spawn, initialize, request, shutdown.
+/// Used by `LspTool::ephemeral()` and as a fallback when no pool is available.
+async fn execute_lsp_request(
+    server_cmd: &str,
+    cwd: &Path,
+    method: &str,
+    params: &Value,
+) -> Result<String, String> {
+    let mut handle = spawn_and_initialize(server_cmd, cwd).await?;
+    let result = execute_request_on_handle(&mut handle, method, params).await;
+    shutdown_handle(handle).await;
+    result
 }
 
 /// Write a JSON-RPC message to the LSP server's stdin using the
@@ -859,7 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_workspace_symbol_requires_query() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let r = tool
             .validate_input(
                 &json!({"operation": "workspaceSymbol"}),
@@ -874,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_non_workspace_ops_require_filepath() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let r = tool
             .validate_input(
                 &json!({"operation": "goToDefinition"}),
@@ -889,7 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_position_ops_require_line_and_character() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let r = tool
             .validate_input(
                 &json!({"operation": "hover", "filePath": "test.rs"}),
@@ -904,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_document_symbol_does_not_need_position() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let r = tool
             .validate_input(
                 &json!({"operation": "documentSymbol", "filePath": "test.rs"}),
@@ -920,7 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_valid_input_passes() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let r = tool
             .validate_input(
                 &json!({
@@ -941,7 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_workspace_symbol_with_query_passes() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let r = tool
             .validate_input(
                 &json!({"operation": "workspaceSymbol", "query": "myFunction"}),
@@ -957,7 +1143,7 @@ mod tests {
 
     #[test]
     fn name_is_lsp() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         assert_eq!(tool.name(), "LSP");
         assert!(tool.is_read_only(&Value::Null));
         assert!(tool.is_concurrency_safe(&Value::Null));
@@ -974,7 +1160,7 @@ mod tests {
 
     #[test]
     fn input_schema_is_valid_json_schema() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let schema = tool.input_schema();
         assert!(schema.is_object(), "schema must be a JSON object");
         assert!(
@@ -1126,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_check_permissions_always_allow() {
-        let tool = LspTool;
+        let tool = LspTool::ephemeral();
         let ctx = test_ctx();
         let result = tool.check_permissions(&Value::Null, &ctx);
         // check_permissions is sync for LspTool.
@@ -1136,5 +1322,56 @@ mod tests {
                 .block_on(result),
             PermissionDecision::Allow { .. }
         ));
+    }
+
+    // ── Pool tests ──
+
+    #[tokio::test]
+    async fn ephemeral_mode_no_manager() {
+        let tool = LspTool::ephemeral();
+        assert!(tool.manager.is_none());
+        // Validation still works.
+        let r = tool
+            .validate_input(
+                &json!({"operation": "workspaceSymbol", "query": "test"}),
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ValidationResult::Ok));
+    }
+
+    #[tokio::test]
+    async fn pool_manager_has_zero_servers_initially() {
+        let manager = LspManager::new(Duration::from_secs(300));
+        assert_eq!(manager.active_servers(), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_manager_clone_shares_state() {
+        let manager = LspManager::new(Duration::from_secs(300));
+        let m2 = manager.clone();
+        assert_eq!(m2.active_servers(), 0);
+    }
+
+    #[tokio::test]
+    async fn lsp_tool_with_pool_holds_manager() {
+        let manager = LspManager::new(Duration::from_secs(300));
+        let tool = LspTool::new(manager.clone());
+        assert!(tool.manager.is_some());
+    }
+
+    #[tokio::test]
+    async fn evict_idle_noop_when_timeout_is_zero() {
+        let manager = LspManager::new(Duration::ZERO);
+        // No-op — should not panic.
+        manager.evict_idle();
+        assert_eq!(manager.active_servers(), 0);
+    }
+
+    #[tokio::test]
+    async fn evict_idle_does_not_crash_on_empty_pool() {
+        let manager = LspManager::new(Duration::from_secs(1));
+        manager.evict_idle();
+        assert_eq!(manager.active_servers(), 0);
     }
 }
