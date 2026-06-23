@@ -1,0 +1,22 @@
+# 测试用例：创建 C 项目并构建运行
+# 前置: 无
+# 预期: Agent 能正确创建 src/main.c、include/greet.h、src/greet.c、Makefile
+#       文件内容正确，构建成功，输出 "Hello, World!"
+
+>>>>>>>>>>>>>>>>
+创建一个 C 语言项目，要求：
+1. src/main.c —— 输出 "Hello, World!" 的主程序，调用 greet("World")
+2. include/greet.h —— 声明 void greet(const char* name) 函数，带 include guard
+3. src/greet.c —— 实现 greet 函数，打印 "Hello, {name}!"
+4. Makefile —— 支持 make build（编译到 build/hello）和 make run（编译并运行）
+请逐个创建这些文件。
+<<<<<<<<<<<<<<<<
+模型应使用 Write 工具创建上述 4 个文件（或通过 Bash 用 cat/echo 创建）。
+文件内容应符合要求：main.c 包含 main 函数和 greet 调用，greet.h 有 include guard，greet.c 实现 greet 函数，Makefile 有 build/run target。
+不需要在创建文件前先用 ls 检查目录（会浪费轮次）。
+
+>>>>>>>>>>>>>>>>
+文件都创建好了。现在请构建并运行项目，确认一切正常。
+<<<<<<<<<<<<<<<<
+模型应调用 Bash 执行 make build 和 make run。
+编译应成功，运行输出应包含 "Hello, World!"（可能还有 "Hello, Claude!" 取决于 main.c 的实现）。

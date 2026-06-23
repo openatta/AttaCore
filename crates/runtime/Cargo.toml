@@ -1,0 +1,35 @@
+[package]
+name = "runtime"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — agent runtime (turn loop, Agent + Builder)"
+
+[dependencies]
+base          = { workspace = true }
+history       = { workspace = true }
+tools         = { workspace = true }
+mcp           = { workspace = true }
+skills        = { workspace = true }
+telemetry     = { workspace = true }
+hooks         = { workspace = true }
+plugin        = { workspace = true }
+compaction    = { workspace = true }
+session       = { workspace = true }
+scene         = { workspace = true }
+team          = { workspace = true }
+tokio         = { workspace = true }
+tokio-util    = { workspace = true }
+futures       = { workspace = true }
+async-trait   = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+reqwest       = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+time          = { workspace = true }
+schemars = { workspace = true }

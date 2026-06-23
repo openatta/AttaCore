@@ -1,0 +1,44 @@
+[package]
+name = "base"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — foundation types, traits, and context"
+
+[dependencies]
+tokio         = { workspace = true }
+tokio-util    = { workspace = true }
+futures       = { workspace = true }
+async-trait   = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+schemars      = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+time          = { workspace = true }
+sha2          = { workspace = true }
+hex           = { workspace = true }
+regex         = { workspace = true }
+base64        = { workspace = true }
+bs58          = { workspace = true }
+toml          = { workspace = true }
+walkdir       = { workspace = true }
+ignore        = { workspace = true }
+url           = { workspace = true }
+serde_yaml    = "0.9"
+
+[features]
+default = []
+# Enable multi-agent team coordination mode
+team-mode = []
+# Enable plugin marketplace (remote registry + dependency resolution)
+plugin-marketplace = []
+# Enable experimental agent routing (model selection by task type)
+experimental-agent = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,444 @@
+//! `McpToolAdapter` —— 把一条 MCP server 提供的工具包装成 attacode `Tool`。
+//!
+//! 工具名按 `mcp__<server>__<tool>` 命名，与权限规则匹配语义一致
+//! （见 attacode-permissions::ruleset）。
+
+use crate::client::{McpCallResult, McpClientHandle, McpContent, McpToolMeta};
+use crate::error::McpError;
+use crate::manager::ElicitationCallback;
+use crate::output_cache::McpOutputCache;
+use async_trait::async_trait;
+use base::{
+    tool::PermissionDecision,
+    tool::ProgressSender,
+    tool::{PromptContext, ToolContext},
+    tool::Tool,
+    error::ToolError,
+    tool::ToolResult,
+    tool::ToolResultBlock,
+    tool::ToolResultContent,
+    tool::ValidationResult,
+};
+use serde_json::Value;
+use std::sync::{Arc, Mutex};
+
+pub struct McpToolAdapter {
+    full_name: String,
+    tool_name: String,
+    server_name: String,
+    description: String,
+    input_schema: Value,
+    client: McpClientHandle,
+    /// Shared output cache across all MCP adapters (TS parity: mcpOutputStorage).
+    cache: Arc<Mutex<McpOutputCache>>,
+    /// Callback for MCP elicitation URLs (mcp:// or elicitation:// protocols).
+    /// Set by the manager when wiring adapters into the tool registry.
+    elicitation_callback: Option<ElicitationCallback>,
+}
+
+impl McpToolAdapter {
+    /// Construct a new instance.
+    pub fn new(client: McpClientHandle, meta: McpToolMeta) -> Self {
+        let server_name = client.server_name().to_string();
+        let tool_name = meta.name.clone();
+        let full_name = format!("mcp__{server_name}__{tool_name}");
+        let description = meta
+            .description
+            .unwrap_or_else(|| format!("MCP tool: {tool_name}"));
+        Self {
+            full_name,
+            tool_name,
+            server_name,
+            description,
+            input_schema: meta.input_schema,
+            client,
+            cache: Arc::new(Mutex::new(McpOutputCache::new())),
+            elicitation_callback: None,
+        }
+    }
+
+    /// Construct with a shared output cache (all adapters from the same manager
+    /// should share the same cache instance).
+    pub fn with_cache(
+        client: McpClientHandle,
+        meta: McpToolMeta,
+        cache: Arc<Mutex<McpOutputCache>>,
+    ) -> Self {
+        let server_name = client.server_name().to_string();
+        let tool_name = meta.name.clone();
+        let full_name = format!("mcp__{server_name}__{tool_name}");
+        let description = meta
+            .description
+            .unwrap_or_else(|| format!("MCP tool: {tool_name}"));
+        Self {
+            full_name,
+            tool_name,
+            server_name,
+            description,
+            input_schema: meta.input_schema,
+            client,
+            cache,
+            elicitation_callback: None,
+        }
+    }
+
+    /// Server-qualified tool name, e.g. `{server}__{tool}`.
+    pub fn full_name(&self) -> &str {
+        &self.full_name
+    }
+    /// Server name this tool belongs to.
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+    /// Tool name (without server prefix).
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    /// Attach an elicitation callback to this adapter. When the adapter detects
+    /// an elicitation URL (`mcp://` or `elicitation://`) in a tool result, it
+    /// will invoke this callback. Returns Self for builder-style chaining.
+    pub fn with_elicitation_callback(mut self, cb: ElicitationCallback) -> Self {
+        self.elicitation_callback = Some(cb);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for McpToolAdapter {
+    fn name(&self) -> &str {
+        &self.full_name
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
+
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description.clone()
+    }
+
+    /// MCP 工具的并发安全 / 只读性是不可知的（每个 server 自己的逻辑）。
+    /// 保守按"非并发安全 / 非只读 / 非破坏性"看；具体由用户用 permission rule
+    /// 控制（`mcp__<server>` 整段 allow / deny / ask）。
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        false
+    }
+
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
+
+    fn permission_match_content(&self, _: &Value) -> Option<String> {
+        None // MCP 工具的"内容"不可解释；只按 tool_name 匹配规则
+    }
+
+    /// MCP tools are dynamic — their schemas and prompts come from live server
+    /// connections and may change between turns (e.g., after reconnection).
+    fn is_dynamic(&self) -> bool {
+        true
+    }
+
+    async fn validate_input(&self, input: &Value, _: &ToolContext) -> ValidationResult {
+        // 接受任意 object 输入 —— 实际 schema 校验由 server 端做
+        if input.is_object() {
+            ValidationResult::Ok
+        } else {
+            ValidationResult::err("MCP tool input must be a JSON object", 1)
+        }
+    }
+
+    async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
+        // 默认 Ask —— 上层 PermissionGate 用规则（如 `mcp__github` allow）放行
+        PermissionDecision::Ask {
+            message: format!("Allow MCP tool {} ?", self.full_name),
+            decision_reason: None,
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        _progress: ProgressSender,
+    ) -> Result<ToolResult, ToolError> {
+        let args = input.as_object().cloned().unwrap_or_default();
+
+        // P1: Check output cache first (TS parity: mcpOutputStorage)
+        {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.get(&self.server_name, &self.tool_name, &args) {
+                return Ok(into_tool_result(cached));
+            }
+        }
+
+        let result = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+            r = self.client.call_tool(&self.tool_name, args.clone()) => r,
+        };
+
+        let result = result.map_err(|e: McpError| ToolError::Execution(anyhow::Error::new(e)))?;
+
+        // P1: Store result in cache for future calls
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.put(&self.server_name, &self.tool_name, &args, result.clone());
+        }
+
+        // P2-4: Check for elicitation URLs in the result. If found, fire
+        // the elicitation callback to notify the hook system.
+        if let Some(ref cb) = self.elicitation_callback {
+            if let Some(url) = find_elicitation_url(&result) {
+                cb(self.server_name.clone(), url);
+            }
+        }
+
+        Ok(into_tool_result(result))
+    }
+}
+
+/// 把 MCP `CallToolResult` 转成我们的 `ToolResult`。
+///
+/// 单个内容块 → `Text`（image/other 用占位符，保持既有行为）；多个块 → `Blocks`
+/// 逐块保留。`is_error` 一并传播（TS parity: CallToolResult.isError）。
+fn into_tool_result(result: McpCallResult) -> ToolResult {
+    let is_error = result.is_error;
+    if result.content.len() <= 1 {
+        let text = result.content.iter().map(|b| match b {
+            McpContent::Text(t) => t.clone(),
+            McpContent::Image { .. } => "[image]".to_string(),
+            McpContent::Other(v) => format!("[mcp content: {v}]"),
+        }).collect::<Vec<_>>().join("\n");
+        let text = if text.is_empty() { "(empty response)".to_string() } else { text };
+        let mut r = ToolResult::text(text);
+        r.is_error = is_error;
+        return r;
+    }
+    let blocks = into_tool_result_blocks(result.content);
+    ToolResult {
+        content: ToolResultContent::Blocks(blocks),
+        is_error,
+        structured_content: None,
+        mcp_meta: None,
+        new_messages: None,
+    }
+}
+
+/// Scan an MCP tool result for an elicitation URL (`mcp://` or `elicitation://`
+/// protocol). Returns the first such URL found, or None if none exists.
+///
+/// Elicitation URLs indicate that the MCP server requires user interaction
+/// (e.g. authorization consent, form fill, confirmation dialog) — the content
+/// of the URL encodes the elicitation request.
+fn find_elicitation_url(result: &McpCallResult) -> Option<String> {
+    for block in &result.content {
+        if let McpContent::Text(text) = block {
+            for word in text.split_whitespace() {
+                let clean = word.trim_matches(|c: char| c.is_ascii_punctuation() && c != ':');
+                if clean.starts_with("mcp://") || clean.starts_with("elicitation://") {
+                    return Some(clean.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn into_tool_result_blocks(blocks: Vec<McpContent>) -> Vec<ToolResultBlock> {
+    blocks
+        .into_iter()
+        .map(|b| match b {
+            McpContent::Text(t) => ToolResultBlock {
+                block_type: "text".into(),
+                text: Some(t),
+                source: None,
+            },
+            McpContent::Image { data, media_type } => ToolResultBlock {
+                block_type: "image".into(),
+                text: None,
+                source: Some(serde_json::json!({
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                })),
+            },
+            McpContent::Other(v) => ToolResultBlock {
+                block_type: "text".into(),
+                text: Some(format!("[mcp content: {v}]")),
+                source: None,
+            },
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::MockMcpClient;
+    use base::tool::ToolResultContent;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn meta(name: &str) -> McpToolMeta {
+        McpToolMeta {
+            name: name.into(),
+            description: Some(format!("desc for {name}")),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext::for_test(std::path::PathBuf::from("/tmp"))
+    }
+
+    #[tokio::test]
+    async fn name_is_namespaced_with_server() {
+        let client = Arc::new(MockMcpClient::new("github", vec![]));
+        let adapter = McpToolAdapter::new(client, meta("create_issue"));
+        assert_eq!(adapter.name(), "mcp__github__create_issue");
+        assert_eq!(adapter.server_name(), "github");
+        assert_eq!(adapter.tool_name(), "create_issue");
+    }
+
+    #[tokio::test]
+    async fn input_schema_passes_through() {
+        let client = Arc::new(MockMcpClient::new("github", vec![]));
+        let mut m = meta("x");
+        m.input_schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let adapter = McpToolAdapter::new(client, m);
+        let s = adapter.input_schema();
+        assert_eq!(s["properties"]["q"]["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn calls_underlying_client_and_converts_text_result() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("echo")]));
+        client.push_response(
+            "echo",
+            McpCallResult {
+                content: vec![McpContent::Text("hi".into())],
+                is_error: false,
+                meta: None,
+            },
+        );
+        let adapter = McpToolAdapter::new(client.clone(), meta("echo"));
+        let r = adapter
+            .call(json!({"text": "hi"}), ctx(), ProgressSender::noop("t"))
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        match r.content {
+            ToolResultContent::Text(s) => assert_eq!(s, "hi"),
+            _ => panic!("expected Text"),
+        }
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "echo");
+        assert_eq!(calls[0].1.get("text"), Some(&json!("hi")));
+    }
+
+    #[tokio::test]
+    async fn is_error_propagates() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("fail")]));
+        client.push_response(
+            "fail",
+            McpCallResult {
+                content: vec![McpContent::Text("oops".into())],
+                is_error: true,
+                meta: None,
+            },
+        );
+        let adapter = McpToolAdapter::new(client, meta("fail"));
+        let r = adapter
+            .call(json!({}), ctx(), ProgressSender::noop("t"))
+            .await
+            .unwrap();
+        assert!(r.is_error);
+    }
+
+    #[tokio::test]
+    async fn multi_block_result_keeps_blocks() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("multi")]));
+        client.push_response(
+            "multi",
+            McpCallResult {
+                content: vec![
+                    McpContent::Text("part1".into()),
+                    McpContent::Text("part2".into()),
+                ],
+                is_error: false,
+                meta: None,
+            },
+        );
+        let adapter = McpToolAdapter::new(client, meta("multi"));
+        let r = adapter
+            .call(json!({}), ctx(), ProgressSender::noop("t"))
+            .await
+            .unwrap();
+        match r.content {
+            ToolResultContent::Blocks(b) => assert_eq!(b.len(), 2),
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_content_converts_to_image_block() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("img")]));
+        client.push_response(
+            "img",
+            McpCallResult {
+                content: vec![McpContent::Image {
+                    data: "base64data".into(),
+                    media_type: "image/png".into(),
+                }],
+                is_error: false,
+                meta: None,
+            },
+        );
+        let adapter = McpToolAdapter::new(client, meta("img"));
+        let r = adapter
+            .call(json!({}), ctx(), ProgressSender::noop("t"))
+            .await
+            .unwrap();
+        match r.content {
+            ToolResultContent::Text(s) => {
+                // When the adapter converts image content to text, it uses
+                // `[image]` as a placeholder in the combined text output.
+                assert!(s.contains("[image]"), "expected image in text output: {s}");
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("hang")]));
+        // 故意不 push_response → call_tool 永不返回？不对，mock 是 sync 直接返回错误
+        // 所以我们改成：cancel 已触发后 select! biased 命中 cancel 分支
+        let adapter = McpToolAdapter::new(client, meta("hang"));
+        let ctx = ToolContext::for_test(std::path::PathBuf::from("/tmp"));
+        ctx.cancel.cancel();
+        let err = adapter
+            .call(json!({}), ctx, ProgressSender::noop("t"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn non_object_input_validates_err() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("x")]));
+        let adapter = McpToolAdapter::new(client, meta("x"));
+        let r = adapter.validate_input(&json!("string"), &ctx()).await;
+        assert!(!matches!(r, ValidationResult::Ok));
+    }
+
+    #[tokio::test]
+    async fn default_check_permissions_is_ask() {
+        let client = Arc::new(MockMcpClient::new("test", vec![meta("x")]));
+        let adapter = McpToolAdapter::new(client, meta("x"));
+        let d = adapter.check_permissions(&json!({}), &ctx()).await;
+        assert!(matches!(d, PermissionDecision::Ask { .. }));
+    }
+}

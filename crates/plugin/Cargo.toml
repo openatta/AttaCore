@@ -1,0 +1,24 @@
+[package]
+name = "plugin"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — plugin manifest loader"
+
+[dependencies]
+base          = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+toml          = { workspace = true }
+async-trait   = { workspace = true }
+reqwest       = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+hooks         = { workspace = true }
+mcp           = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

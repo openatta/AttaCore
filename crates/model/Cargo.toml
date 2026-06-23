@@ -1,0 +1,30 @@
+[package]
+name = "model"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — LLM backend adapter (Anthropic API)"
+
+[dependencies]
+base          = { workspace = true }
+tokio         = { workspace = true }
+tokio-util    = { workspace = true }
+futures       = { workspace = true }
+async-trait   = { workspace = true }
+reqwest       = { workspace = true }
+eventsource-stream = { workspace = true }
+async-stream  = { workspace = true }
+bytes         = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+tiktoken-rs   = { workspace = true }
+url           = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

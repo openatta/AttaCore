@@ -1,0 +1,39 @@
+[package]
+name = "telemetry"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — telemetry, usage stats, VCR, perf"
+
+[dependencies]
+base          = { workspace = true }
+tokio         = { workspace = true }
+tokio-util    = { workspace = true }
+reqwest       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+time          = { workspace = true }
+url           = { workspace = true }
+async-trait   = { workspace = true }
+futures       = { workspace = true }
+sha2          = { workspace = true }
+regex         = { workspace = true }
+hex           = { workspace = true }
+
+# Optional: OpenTelemetry OTLP export (gated by "otel" feature)
+opentelemetry      = { version = "0.27", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk  = { version = "0.27", default-features = false, features = ["trace", "metrics", "rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "metrics", "grpc-tonic", "http-proto"], optional = true }
+tonic             = { version = "0.12", optional = true }
+
+[dev-dependencies]
+model       = { workspace = true }
+
+[features]
+default = []
+otel    = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tonic"]

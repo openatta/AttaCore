@@ -1,0 +1,46 @@
+[package]
+name = "daemon"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore daemon — JSON-RPC 2.0 over Unix socket / TCP, sample application"
+
+[[bin]]
+name = "attacored"
+path = "src/main.rs"
+
+[dependencies]
+base          = { workspace = true }
+runtime       = { workspace = true }
+model         = { workspace = true }
+mcp           = { workspace = true }
+permissions   = { workspace = true }
+scene         = { workspace = true }
+history       = { workspace = true }
+session       = { workspace = true }
+tokio         = { workspace = true, features = ["full"] }
+tokio-util    = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait   = { workspace = true }
+clap          = { version = "4", features = ["derive"] }
+reqwest       = { workspace = true }
+time          = { workspace = true }
+futures       = { workspace = true }
+telemetry     = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tools = { workspace = true }
+skills = { workspace = true }
+compaction = { workspace = true }
+url = { workspace = true }

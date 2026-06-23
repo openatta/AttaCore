@@ -1,0 +1,20 @@
+[package]
+name = "session"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — in-memory session state management"
+
+[dependencies]
+base          = { workspace = true }
+history       = { workspace = true }
+tokio         = { workspace = true }
+time          = { workspace = true }
+
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

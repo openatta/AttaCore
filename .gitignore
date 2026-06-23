@@ -1,0 +1,23 @@
+# Rust build output
+target/
+
+# Reference source copies
+3rds/
+
+# Backup files
+*.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local

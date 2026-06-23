@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/model",
+    "crates/auth",
+    "crates/hooks",
+    "crates/plugin",
+    "crates/telemetry",
+    "crates/history",
+    "crates/permissions",
+    "crates/mcp",
+    "crates/tools",
+    "crates/skills",
+    "crates/runtime",
+    "crates/compaction",
+    "crates/session",
+    "crates/scene",
+    "crates/team",
+    "crates/task",
+    "daemon",
+    "tests/runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+publish = false
+authors = ["AttaCore contributors"]
+repository = "https://github.com/openatta/AttaCore"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+eventsource-stream = "0.2"
+bytes = "1"
+url = "2"
+
+# WebSocket
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+# Serialize
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+unicode-normalization = "0.1"
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Common
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+glob = "0.3"
+globset = "0.4"
+html2text = "0.6"
+which = "7"
+similar = "2"
+base64 = "0.22"
+ignore = "0.4"
+walkdir = "2"
+tiktoken-rs = "0.6"
+toml = "0.8"
+bs58 = "0.5"
+async-stream = "0.3"
+
+# MCP
+rmcp = { version = "1.6", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+
+# Dev
+tempfile = "3"
+notify = "6"
+
+# Internal crate dependencies
+base     = { path = "crates/core" }
+model    = { path = "crates/model" }
+auth     = { path = "crates/auth" }
+hooks    = { path = "crates/hooks" }
+plugin   = { path = "crates/plugin" }
+telemetry = { path = "crates/telemetry" }
+history  = { path = "crates/history" }
+permissions = { path = "crates/permissions" }
+mcp      = { path = "crates/mcp" }
+tools    = { path = "crates/tools" }
+skills   = { path = "crates/skills" }
+runtime    = { path = "crates/runtime" }
+compaction = { path = "crates/compaction" }
+session    = { path = "crates/session" }
+scene      = { path = "crates/scene" }
+team       = { path = "crates/team" }
+task       = { path = "crates/task" }
+daemon     = { path = "daemon" }
