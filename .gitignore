@@ -18,6 +18,9 @@ target/
 .DS_Store
 Thumbs.db
 
+# Test output (generated, not committed)
+tests/output/
+
 # Environment
 .env
 .env.local
