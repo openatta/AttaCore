@@ -1,115 +1,263 @@
 # AttaCore
 
-AI agent 编排引擎 — 一个 Rust workspace，提供构建 AI 编程助手和智能代理运行时的全套基础设施。
+> **AI Agent Orchestration Engine** — a Rust workspace delivering production-grade infrastructure for building AI coding assistants and intelligent agent runtimes.
 
-## 设计目标
+[**中文版本**](docs/README.zh.md)
 
-AttaCore 不是一个面向终端用户的 AI 助手，而是**面向开发者的 agent 引擎**。它提供了与 Claude Code 行为对齐的工具系统、会话管理、权限控制、上下文压缩等能力，让上层应用（IDE 插件、桌面 GUI、CLI 工具、服务端）可以快速构建自己的 AI agent 产品。
+---
 
-核心原则：
+AttaCore is **not** an end-user AI assistant. It is a **developer-facing agent engine** — the same class of infrastructure that powers Claude Code. It provides a behavior-aligned tool system, session management, permission control, context compaction, multi-agent coordination, MCP protocol support, and more. Build your own IDE plugin, desktop GUI, CLI tool, or server-side agent product on top of it.
 
-- **库优先**：所有能力通过 Rust crate 暴露，daemon 仅是参考应用
-- **trait 注入**：Model、Permission、Scene 等核心行为通过 trait 由应用层控制
-- **工具对齐**：内置 30+ 工具，行为与 Claude Code TS 参考实现对齐
-- **安全可控**：三级权限模型（允许/询问/禁止），沙盒执行，路径安全校验
+## Why AttaCore
 
-## 架构概览
-
-```
-┌──────────────────────────────────────────────────────┐
-│  你的应用（IDE 插件 / CLI / 桌面 GUI / 服务端）       │
-│                                                      │
-│  Daemon 模式：JSON-RPC 2.0 over Unix Socket / TCP     │
-│  库模式：    Rust API，直接构造 Agent 对象              │
-└──────────┬───────────────────────────────────────────┘
-           │
-┌──────────▼───────────────────────────────────────────┐
-│  L4  runtime — Agent turn loop, Builder, streaming    │
-├──────────────────────────────────────────────────────┤
-│  L3  tools / skills / scene / task / team             │
-│      30+内置工具 · skill 加载 · 多场景 · 多agent协作   │
-├──────────────────────────────────────────────────────┤
-│  L2  model / history / permissions / mcp / compaction │
-│      模型适配 · 会话持久化 · 权限校验 · MCP协议       │
-├──────────────────────────────────────────────────────┤
-│  L1  core — trait 定义 · 基础类型 · ID 体系            │
-├──────────────────────────────────────────────────────┤
-│  L0  auth / hooks / plugin / telemetry                │
-└──────────────────────────────────────────────────────┘
-```
-
-## 功能
-
-### 工具系统（30+ 内置工具）
-
-| 类别 | 工具 |
+| Concern | What You Get |
 |---|---|
-| 文件操作 | Read, Write, Edit, Glob, Grep |
-| 命令执行 | Bash（含安全校验、沙盒） |
-| Web | WebFetch, WebSearch |
-| 任务管理 | TaskCreate, TaskList, TaskGet, TaskUpdate, TaskStop |
-| 计划模式 | EnterPlanMode, ExitPlanMode |
-| 定时任务 | CronCreate, CronDelete, CronList |
-| 编辑器 | LSP（go-to-def, find-refs, hover）, NotebookEdit |
-| 通知 | PushNotification, Monitor, ScheduleWakeup |
-| 协作 | Skill（skill 调用）, Agent（子 agent 派生） |
-| MCP | 全量 MCP 协议支持（stdio / SSE / Streamable HTTP） |
+| **Behavior Fidelity** | 30+ tools aligned with Claude Code's TypeScript reference implementation — every function, every edge case, every compression strategy annotated with `TS parity:` source traces |
+| **Context Is Hard** | Multi-strategy compaction (snip → micro-compact → collapse → LLM summarize), reactive triggers, circuit breakers, cache-aware edit generation — the system that keeps 200k+ token conversations coherent |
+| **Concurrency** | v2 streaming tool executor pipelines safe-parallel tools while the model is still generating tokens — GPU-pipeline thinking applied to LLM tool calls |
+| **Safety** | Three-tier permission model (allow/ask/deny), glob-based rule engine, Unicode-normalized path safety, sandboxed execution, LLM-assisted classification |
+| **Multi-Agent** | First-class team coordination: Coordinator, Mailbox, shared memory, remote agent spawning — compose agents like microservices |
+| **Observability** | 40+ structured telemetry events, OpenTelemetry export, VCR record/replay for deterministic testing, cost tracking |
+| **Embeddable** | Library mode (Rust API) or Daemon mode (JSON-RPC 2.0 over Unix socket / TCP) — same engine, your choice of integration surface |
 
-### 会话管理
+## Architecture
 
-- 多 session 并发，独立上下文隔离
-- JSONL 持久化，支持跨进程恢复
-- 上下文自动压缩（compaction），避免 token 溢出
-- Session 自动命名（Chat 场景）
+AttaCore is a 5-layer, strictly-layered Rust workspace. Dependencies only flow upward — each layer builds on the one below it. No cycles. No shortcuts.
 
-### 权限系统
+```
+                          ┌──────────────────────────┐
+                          │     Your Application      │
+                          │  IDE · CLI · GUI · Server │
+                          └──────────┬───────────────┘
+                                     │
+                          ┌──────────▼───────────────┐
+                          │  L4  runtime             │
+                          │  Agent loop · Builder    │
+                          │  Streaming · Dispatch    │
+                          │  Commands (/help, …)     │
+                          ├──────────────────────────┤
+                          │  L3  tools · skills      │
+                          │  scene · team · task     │
+                          │  30+ built-in tools      │
+                          │  Skill system · MCP      │
+                          ├──────────────────────────┤
+                          │  L2  model · history     │
+                          │  permissions · mcp       │
+                          │  compaction · session    │
+                          ├──────────────────────────┤
+                          │  L1  core                │
+                          │  traits · types · ID     │
+                          │  EngineConfig · Context  │
+                          ├──────────────────────────┤
+                          │  L0  auth · hooks        │
+                          │  plugin · telemetry      │
+                          └──────────────────────────┘
+```
 
-- 三态权限：Permit / Deny / AskUser
-- 路径安全校验（禁止操作关键系统目录）
-- Yolo 模式（自动批准）
-- LLM 辅助分类
+### The Layers
 
-### 遥测与调试
+**L0 — Cross-Cutting Services** (zero internal deps)
+`auth` (OAuth 2.0 PKCE), `hooks` (lifecycle callbacks — 11 event types, command/prompt/HTTP/agent hooks), `plugin` (marketplace + dependency resolution + version cache), `telemetry` (40+ structured events, OpenTelemetry export, VCR record/replay).
 
-- OpenTelemetry 集成
-- VCR 录制/回放（集成测试零成本回归）
-- 性能指标采集
-- 成本追踪
+**L1 — Foundation** (`core` / `base` crate)
+Shared types and traits for the entire system: `Model` (LLM backend abstraction), `AgentScene` (agent behavior), `Permission` (tool authorization), `Tool` (unified tool interface v7). Plus `Id` (BASE58 UUIDv4), `EngineConfig`, `SessionState`, `FrozenContext`, `ToolContext`, and the message/content block types.
 
-### 团队协作
+**L2 — Infrastructure**
+`model` — Anthropic Messages API adapter with streaming, tokenization, VCR wrapper, fallback routing. `history` — JSONL persistence with path sanitization and transcript chunking. `permissions` — glob-based rule engine with allow/deny/ask matching, path safety (Unicode NFC/NFD normalization), YOLO mode, LLM classifier. `mcp` — full MCP client: stdio / SSE / Streamable HTTP transports, tool adaptation, OAuth bearer tokens. `compaction` — multi-strategy context compression with reactive triggers and circuit breakers. `session` — in-memory session state and auto-naming.
 
-- 子 Agent 派生与管理
-- Agent 间消息传递（mailbox）
-- 共享团队记忆
+**L3 — Domain Logic**
+`tools` — 30+ built-in tools (Bash, Read, Write, Edit, Glob, Grep, LSP, WebFetch, WebSearch, CronCreate, TaskCreate, Skill, Agent, NotebookEdit, Monitor, PushNotification, …). `skills` — filesystem skill resolver + loader + watcher. `scene` — built-in scenes: Coding, Chat, Demo. `team` — multi-agent coordination: Coordinator, TeamTool, Mailbox, RemoteAgent. `task` — background task lifecycle: running, cron, store, delete.
 
-## 使用方式
+**L4 — Runtime**
+`agent` — core Agent struct and Builder pattern. `turn` — the turn loop (~2200 lines), all orchestration logic. `streaming` — v2 streaming tool executor (pipeline safe-parallel tools during model generation). `dispatch` — `FuturesUnordered` + `Semaphore` controlled concurrent tool dispatch with sibling abort. `commands` — slash command routing (/help, /skills, /clear, /compact, /cost, + custom).
 
-AttaCore 提供两种接入模式：
+## Core Capabilities
 
-### Daemon 模式（JSON-RPC 2.0）
+### Tool System (30+ tools, Claude Code behavior-aligned)
 
-适合 IDE 插件、多进程架构。启动独立进程，通过 Unix Socket 或 TCP 通信。
+| Category | Tools |
+|---|---|
+| **Filesystem** | `Read`, `Write`, `Edit`, `Glob`, `Grep` |
+| **Shell** | `Bash` (sandboxed, path-safe, timeout-controlled) |
+| **Web** | `WebFetch`, `WebSearch` |
+| **Task** | `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskStop` |
+| **Planning** | `EnterPlanMode`, `ExitPlanMode` |
+| **Scheduling** | `CronCreate`, `CronDelete`, `CronList` |
+| **Editor** | `LSP` (9 operations: go-to-def, find-refs, hover, document-symbol, workspace-symbol, go-to-impl, call-hierarchy, incoming/outgoing-calls), `NotebookEdit` |
+| **Notification** | `PushNotification`, `Monitor`, `ScheduleWakeup` |
+| **Collaboration** | `Skill` (skill invocation), `Agent` (sub-agent spawning) |
+| **Protocol** | Full MCP support (stdio / SSE / Streamable HTTP) |
+
+Every tool implements the unified `Tool` trait — consistent error handling, permission gating, and telemetry instrumentation.
+
+### Context Compaction
+
+The hardest problem in LLM agents, solved in production:
+
+```
+Budget Warning (80%) → Reactive Trigger → Micro-Compact (cache-aware)
+     ↓                                         ↓
+  Circuit Breaker ← Collapse (full) ← LLM Summarize (cost-aware)
+                                           ↓
+                                   Post-Compact Recovery
+                        (re-inject files, skills, plan state, task summaries)
+```
+
+- **Micro-compact**: removes stale tool results while preserving prompt cache
+- **Collapse**: merges consecutive user/assistant blocks
+- **LLM Summarize**: delegates to a cheaper model for aggressive compression
+- **Reactive**: predicts budget exhaustion from token velocity, triggers preemptively
+- **Circuit breaker**: detects compression loops, falls back to safe defaults
+- **Cache-aware edits**: generates `cache_edits` to avoid Anthropic prompt cache invalidation
+
+### Permission & Safety
+
+```
+RuleSet { allow: [Glob], ask: [Glob], deny: [Glob] }
+        ↓
+Path Safety (Unicode NFC/NFD normalization, system directory blocklist)
+        ↓
+LLM Classifier (optional: delegate ambiguous cases to a fast model)
+        ↓
+YOLO Mode (auto-approve for CI/automation)
+```
+
+Three-tier decisions: **Permit** / **AskUser** / **Deny**. Rules match by glob pattern with directory-aware semantics. Path safety normalizes Unicode to prevent homograph attacks and blocks writes to system directories.
+
+### Multi-Agent Team
+
+Spawn sub-agents as naturally as calling a function:
+
+```
+Coordinator → [Agent A] [Agent B] [Agent C]
+     ↕            ↕         ↕         ↕
+  Mailbox  ← messages →  Mailbox  ←→  Mailbox
+     ↕
+  Shared Memory (file-based, wikilink cross-references)
+```
+
+- **Agent spawning**: `Agent` tool with type selection, worktree isolation, background execution
+- **Mailbox**: typed message passing between agents
+- **Shared memory**: file-based persistent knowledge with YAML frontmatter, `[[wikilink]]` cross-references, staleness scoring, LLM-based extraction and relevance selection
+- **Coordinator**: task decomposition and result synthesis
+
+### MCP Integration
+
+Full Model Context Protocol support across all three transports:
+
+| Transport | Status |
+|---|---|
+| **stdio** | subprocess lifecycle, auto-restart |
+| **SSE** | long-lived HTTP streaming |
+| **Streamable HTTP** | stateless request/response |
+
+MCP tools are adapted to the native `Tool` trait and injected into the system prompt. MCP servers can also register as skills for user invocation. OAuth 2.0 bearer token exchange supported.
+
+### Telemetry & VCR
+
+40+ structured event types covering the full agent lifecycle: turn start/complete, tool execution, API errors, permission decisions, compaction operations, memory snapshots, MCP connect/disconnect, session lifecycle, startup timing, model routing, hook execution, slash command usage.
+
+**VCR mode**: wrap any `Model` with `VcrModel` to record LLM interactions to JSONL, then replay deterministically — zero API cost for integration tests, perfectly reproducible runs.
+
+## Crate Map
+
+| Layer | Crate | Responsibility | Key Exports |
+|---|---|---|---|
+| L0 | `auth` | OAuth 2.0 PKCE client | `OAuth2Client`, `TokenStore`, `PkceVerifier` |
+| L0 | `hooks` | Lifecycle hook runner | `HookRunner`, `HookConfig`, `HookEvent` (11 types) |
+| L0 | `plugin` | Plugin marketplace + resolution | `Plugin`, `PluginManifest`, `DependencyResolver` |
+| L0 | `telemetry` | Telemetry + VCR | `TelemetryHandle`, `TelemetryEvent` (40+), `VcrModel`, `FileRecorder` |
+| L1 | `core` (base) | Shared types, traits, ID | `Model`, `AgentScene`, `Permission`, `Tool`, `Id`, `EngineConfig`, `FrozenContext` |
+| L2 | `model` | Anthropic API adapter | `AnthropicModel`, `AnthropicClient`, `ModelEvent`, `Usage` |
+| L2 | `history` | JSONL session persistence | `HistoryStore`, `TranscriptEntry` |
+| L2 | `permissions` | Permission engine | `RuleSet`, `Gate`, `LLMClassifier`, `PathSafety` |
+| L2 | `mcp` | MCP protocol client | `McpManager`, `McpClient`, `ToolAdapter`, `OutputCache` |
+| L2 | `compaction` | Context compression | `Compactor`, `DefaultCompactor`, reactive/cached/time-based strategies |
+| L2 | `session` | In-memory session state | `SessionManager`, `SessionSummary` |
+| L3 | `tools` | 30+ built-in tools | `BashTool`, `FileReadTool`, `FileWriteTool`, `LspTool`, `WebFetchTool`, … |
+| L3 | `skills` | Skill loader + manager | `SkillManager`, `SkillWatcher`, `McpBuilder` |
+| L3 | `scene` | Built-in agent scenes | `CodingScene`, `ChatScene`, `DemoScene` |
+| L3 | `team` | Multi-agent coordination | `Coordinator`, `TeamTool`, `Mailbox`, `RemoteAgent` |
+| L3 | `task` | Background task lifecycle | `TaskManager`, `TaskStore`, `RunningTask`, `CronTask` |
+| L4 | `runtime` | Agent runtime + turn loop | `Agent`, `Builder`, `TurnOutcome`, `StreamResult`, `CommandRegistry` |
+| — | `daemon` | JSON-RPC 2.0 server | `DaemonServer`, `SessionPool` (LRU + idle eviction) |
+| — | `test-runner` | .test scenario runner | API runner, CLI runner, LLM comparator, reporter |
+
+## Quick Start
+
+### Prerequisites
+
+- **Rust** 1.80+
+- **Anthropic API Key** (or compatible endpoint)
+
+### Build & Test
 
 ```sh
-# 启动 daemon
+# Full workspace build
+cargo build --workspace
+
+# Run all tests
+cargo test --workspace
+
+# Single crate
+cargo test -p tools
+
+# Daemon tests
+cargo test -p daemon
+```
+
+### Run the Daemon
+
+```sh
+export ANTHROPIC_API_KEY=sk-...
+cargo run -p daemon
+# Listens on $HOME/.atta/code/daemon.sock
+# Writes discovery lock file → clients auto-discover
+```
+
+### Run Integration Tests
+
+```sh
+# Prerequisite: .deepseek file at repo root with API key
+# API mode (direct Agent construction)
+./tests/run_api.sh 000.c_project
+
+# CLI mode (daemon → JSON-RPC)
+./tests/run_cli.sh 000.c_project
+```
+
+## Usage Modes
+
+### Daemon Mode (JSON-RPC 2.0)
+
+For IDE plugins, multi-process architectures, remote clients. The engine runs as a standalone process communicating over Unix domain sockets or TCP.
+
+```sh
+# Start the daemon
 export ANTHROPIC_API_KEY=sk-...
 cargo run -p daemon --release
 
-# 通过 socat 交互
-echo '{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"写一个hello world"},"id":1}' \
+# Send a turn via socat
+echo '{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"Write hello world in Rust"},"id":1}' \
   | socat - UNIX-CONNECT:$HOME/.atta/code/daemon.sock
 ```
 
-### 库模式（嵌入式 Rust API）
+Daemon features:
+- **Session pool** with configurable capacity, LRU eviction, and idle timeout
+- **Discovery** via PID lock file + Unix socket — clients find the daemon automatically
+- **Graceful shutdown** with in-flight turn completion
+- **TCP mode** with token-based authentication for remote access
 
-适合桌面应用、定制 CLI、服务端。直接操作 Agent 对象，完全控制。
+### Library Mode (Embedded Rust API)
+
+For desktop apps, custom CLIs, server-side agents. Direct control over every aspect of the engine.
 
 ```rust
 use runtime::agent::Builder;
 use scene::scene::coding::CodingScene;
 use model::adapter::AnthropicModel;
 
-// 构建 Agent，一个实例 = 一个 session
+// One Agent = one session
 let (mut agent, event_rx, input_tx) = Builder::new()
     .scene(Arc::new(CodingScene))
     .model(model)
@@ -117,11 +265,16 @@ let (mut agent, event_rx, input_tx) = Builder::new()
     .session_id(session_id)
     .build()?;
 
-// 后台运行事件循环
+// Run the event loop in background
 tokio::spawn(async move { agent.run(cancel).await });
 
-// 发送消息，接收流式事件
-input_tx.send(InputMessage::User { content: "...", attachments: vec![], turn_id })?;
+// Send messages, receive streaming events
+input_tx.send(InputMessage::User {
+    content: "Write a TCP echo server".into(),
+    attachments: vec![],
+    turn_id,
+})?;
+
 while let Some(event) = event_rx.recv().await {
     match event {
         AgentEvent::TextDelta { text, .. } => print!("{text}"),
@@ -131,104 +284,103 @@ while let Some(event) = event_rx.recv().await {
 }
 ```
 
-详细 API 参考见 [DEV_GUIDE.md](docs/DEV_GUIDE.md)。
+The `Builder` enforces compile-time required fields (`scene`, `model`, `settings`) and applies sensible defaults for everything else — `AllowAll` permissions, in-memory tool registry, default compactor, noop hooks.
 
-## Crate 地图
+### Customizing Behavior
 
-| 层级 | Crate | 用途 |
-|---|---|---|
-| L0 | auth, hooks, plugin, telemetry | 零依赖叶节点 |
-| L1 | core | 基础 trait、类型、ID 体系 |
-| L2 | model, history, permissions, mcp, compaction, session | 单依赖 core |
-| L3 | tools, skills, scene, task, team | 多依赖组合 |
-| L4 | runtime | Agent + turn loop，串联全部组件 |
+Inject your own implementations through traits:
 
-## 快速开始
-
-### 前置
-
-- Rust 1.80+
-- Anthropic API Key（或兼容的 API 端点）
-
-### 构建 & 测试
-
-```sh
-# 全量构建
-cargo build --workspace
-
-# 运行全部测试
-cargo test --workspace
-
-# 单 crate 测试
-cargo test -p tools
-
-# Daemon 测试
-cargo test -p daemon
+```rust
+Builder::new()
+    .scene(my_scene)              // impl AgentScene — controls system prompt, behavior
+    .model(my_model)              // impl Model — any LLM backend
+    .permission(my_permission)    // impl Permission — your authorization logic
+    .tool_registry(my_tools)      // impl ToolRegistry — custom tool set
+    .hook_runner(my_hooks)        // impl HookRunner — lifecycle callbacks
+    .compactor(my_compactor)      // impl Compactor — custom compaction strategy
+    .build()?;
 ```
 
-### 运行 Daemon
+## Configuration
 
-```sh
-export ANTHROPIC_API_KEY=sk-...
-cargo run -p daemon
-# 监听 $HOME/.atta/code/daemon.sock
-# 写入 discovery lock file → 客户端自动发现
-```
+### Settings Layers (lowest to highest priority)
 
-### 运行集成测试
-
-```sh
-# 前置：在仓库根目录配置 .deepseek（API key）
-# API 模式（直接构造 Agent）
-./tests/run_api.sh 000.c_project
-
-# CLI 模式（启动 daemon → JSON-RPC）
-./tests/run_cli.sh 000.c_project
-```
-
-## 配置
-
-### settings.json
-
-Daemon 模式支持分层配置（优先级从低到高）：
-
-1. 内置默认值
-2. `$HOME/.atta/code/settings.json`
-3. `<project>/.atta/code/settings.json`
-4. CLI 参数
+1. Built-in defaults
+2. `$HOME/.atta/code/settings.json` (or `.toml`)
+3. `<project>/.atta/code/settings.json` (or `.toml`)
+4. CLI arguments
 
 ```json
 {
   "model": "claude-sonnet-4-6",
   "max_tokens": 4096,
+  "permission": {
+    "mode": "default",
+    "default_mode": "require_user_permission",
+    "yolo": false
+  },
   "mcp_servers": {}
 }
 ```
 
-### 环境变量
+### Environment Variables
 
-| 变量 | 说明 |
+| Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | 必需。API 密钥 |
-| `ANTHROPIC_BASE_URL` | 可选。自定义 API 端点 |
-| `ATTACORE_DAEMON_TOKEN` | TCP 模式认证令牌 |
-| `ATTA_CONFIG_HOME` | 配置根目录（默认 `$HOME/.atta/code`） |
+| `ANTHROPIC_API_KEY` | **Required.** API key for the model provider |
+| `ANTHROPIC_BASE_URL` | Custom API endpoint (proxies, compatible providers) |
+| `ATTACORE_DAEMON_TOKEN` | TCP mode authentication token |
+| `ATTA_CONFIG_HOME` | Config root directory (default: `$HOME/.atta/code`) |
+| `ATTA_VCR_RECORD` | Record mode: `ATTA_VCR_RECORD=<scenario_name>` |
+| `ATTA_VCR_REPLAY` | Replay mode: `ATTA_VCR_REPLAY=<scenario_name>` |
 
-## ID 体系
+## ID System
 
-所有外部可见的 ID 均为 **BASE58(UUID v4)**，22 字符，URL-safe：
+All externally-visible identifiers are **BASE58(UUID v4)** — 22 characters, URL-safe:
 
 ```
-Ab12Cd34Ef56Gh78Ij90Kl  ← session_id / turn_id / agent_id
+Ab12Cd34Ef56Gh78Ij90Kl   ← session_id / turn_id / agent_id / tool_call_id
 ```
 
-唯一生成入口：`core::id::Id::new()`。不允许在外部直接生成 UUID 并自行编码。
+Single source of truth: `core::id::Id::new()`. Direct UUID generation and manual BASE58 encoding outside this entry point is forbidden. The `Id` type is a `#[sqlx(transparent)]` newtype over `[u8; 16]`, mapping to `TEXT` in both Postgres and SQLite.
 
-## 文档
+```rust
+use base::id::Id;
 
-- [DEV_GUIDE.md](docs/DEV_GUIDE.md) — Daemon 与库模式完整 API 参考
-- [Cargo.toml](Cargo.toml) — Workspace 依赖与 crate 关系
+let id = Id::new();            // Random allocation — the ONLY generation path
+let id = Id::parse(s)?;        // Validate and decode external input (checks 16-byte length)
+```
 
-## 许可
+## Design Principles
+
+1. **Library-first.** Every capability is exposed through Rust crates. The daemon is a reference application, not the product.
+2. **Trait injection.** `Model`, `Permission`, `AgentScene` — core behaviors are traits you implement. The engine owns no policy.
+3. **Tool alignment.** 30+ tools, behavior-verified against Claude Code's TypeScript implementation. Systematic `TS parity:` annotations throughout.
+4. **Safe by default.** Three-tier permission model, Unicode-normalized path safety, sandboxed execution — you opt into less safety, not more.
+5. **Observable everywhere.** 40+ structured telemetry events. VCR for deterministic replay. Cost tracking. OpenTelemetry export.
+
+## Project Structure
+
+```
+AttaCore/
+├── crates/           # 18 Rust crates (the engine)
+├── daemon/           # JSON-RPC 2.0 daemon (reference application)
+├── tests/            # Integration tests + test runner + fixtures
+├── docs/             # Documentation
+├── 3rds/             # Third-party dependencies / vendored code
+├── Cargo.toml        # Workspace root (22 members)
+└── README.md         # You are here
+```
+
+## Documentation
+
+| Document | Audience |
+|---|---|
+| [README.md](README.md) | **You are here** — project overview, architecture, quick start |
+| [README.zh.md](docs/README.zh.md) | 中文版本 — 同样的内容，面向中文开发者 |
+| [DEV_GUIDE.md](docs/DEV_GUIDE.md) | Full API reference for Daemon and Library modes |
+| [CLAUDE.md](CLAUDE.md) | Agent instructions — codebase conventions, design rules |
+
+## License
 
 Apache-2.0
