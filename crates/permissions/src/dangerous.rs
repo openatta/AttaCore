@@ -50,11 +50,37 @@ const DANGEROUS_TOOLS: &[&str] = &["Bash", "Write", "Edit", "FileWrite", "FileEd
 /// Bash subcommands whose broad allow (prefix wildcard) is risky. Not an
 /// exhaustive list — just the most obviously destructive ones.
 const DESTRUCTIVE_BASH_SUBCOMMANDS: &[&str] = &[
-    "rm", "dd", "mkfs", "chmod", "chown", "sudo",
-    "python", "python3", "node", "npm", "npx", "pip", "pip3",
-    "curl", "wget", "systemctl", "passwd", "usermod", "groupmod",
-    "fdisk", "parted", "mkswap", "swapon", "swapoff",
-    "mount", "umount", "insmod", "rmmod", "iwconfig", "ifconfig", "ip",
+    "rm",
+    "dd",
+    "mkfs",
+    "chmod",
+    "chown",
+    "sudo",
+    "python",
+    "python3",
+    "node",
+    "npm",
+    "npx",
+    "pip",
+    "pip3",
+    "curl",
+    "wget",
+    "systemctl",
+    "passwd",
+    "usermod",
+    "groupmod",
+    "fdisk",
+    "parted",
+    "mkswap",
+    "swapon",
+    "swapoff",
+    "mount",
+    "umount",
+    "insmod",
+    "rmmod",
+    "iwconfig",
+    "ifconfig",
+    "ip",
 ];
 
 /// Check a ruleset for dangerous rules.
@@ -167,9 +193,7 @@ fn is_destructive_bash_allow(rule: &PermissionRule) -> Option<String> {
             }
             "mount" | "umount" => "allows filesystem mount operations (mount:*)",
             "insmod" | "rmmod" => "allows kernel module management (insmod:*)",
-            "iwconfig" | "ifconfig" | "ip" => {
-                "allows network interface configuration (ip:*)"
-            }
+            "iwconfig" | "ifconfig" | "ip" => "allows network interface configuration (ip:*)",
             _ => "allows potentially destructive subcommands via prefix wildcard (:*)",
         };
         return Some(format!(

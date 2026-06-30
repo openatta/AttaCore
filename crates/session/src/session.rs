@@ -3,9 +3,9 @@
 //! Owns the active message buffer and turn counter. Persistence (JSONL append/load,
 //! session listing) is delegated to `history::store::HistoryStore`.
 
+use crate::session_memory::SessionMemory;
 use base::interface::model::ModelMessage;
 use base::session::SessionId;
-use crate::session_memory::SessionMemory;
 use history::store::HistoryStore;
 pub use history::store::SessionSummary;
 use std::sync::Arc;
@@ -84,9 +84,7 @@ impl SessionManager {
                 m.content
                     .iter()
                     .map(|b| match b {
-                        base::interface::model::ModelContentBlock::Text { text } => {
-                            text.len() / 4
-                        }
+                        base::interface::model::ModelContentBlock::Text { text } => text.len() / 4,
                         _ => 50,
                     })
                     .sum::<usize>()
@@ -124,12 +122,16 @@ impl SessionManager {
             Some(s) => s,
             None => return Ok(()),
         };
-        let _sid = SessionId::parse(&self.session_id).map_err(|e| SessionError::Id(e.to_string()))?;
+        let _sid =
+            SessionId::parse(&self.session_id).map_err(|e| SessionError::Id(e.to_string()))?;
         // Write each message as a LogEntry via the store's append.
         // In practice, the engine should use the store directly for incremental append;
         // this bulk-persist is a convenience for the session snapshot use case.
         // For now, persist metadata via the history store.
-        let _ = store.list_sessions().await.map_err(|e| SessionError::Store(e.to_string()))?;
+        let _ = store
+            .list_sessions()
+            .await
+            .map_err(|e| SessionError::Store(e.to_string()))?;
         Ok(())
     }
 
@@ -141,7 +143,10 @@ impl SessionManager {
             None => return Err(SessionError::NotFound(id.to_string())),
         };
         let sid = SessionId::parse(id).map_err(|e| SessionError::Id(e.to_string()))?;
-        let entries = store.load(sid).await.map_err(|e| SessionError::Store(e.to_string()))?;
+        let entries = store
+            .load(sid)
+            .await
+            .map_err(|e| SessionError::Store(e.to_string()))?;
         if entries.is_empty() {
             return Err(SessionError::NotFound(id.to_string()));
         }
@@ -154,7 +159,10 @@ impl SessionManager {
 
         // Extract parent_session_id from the Meta entry if present.
         for entry in &entries {
-            if let history::entry::LogEntry::Meta { parent_session_id, .. } = &entry.entry {
+            if let history::entry::LogEntry::Meta {
+                parent_session_id, ..
+            } = &entry.entry
+            {
                 self.parent_session_id = parent_session_id.clone();
                 break;
             }
@@ -226,7 +234,10 @@ impl SessionManager {
             Some(s) => s,
             None => return Ok(vec![]),
         };
-        let sids = store.list_sessions().await.map_err(|e| SessionError::Store(e.to_string()))?;
+        let sids = store
+            .list_sessions()
+            .await
+            .map_err(|e| SessionError::Store(e.to_string()))?;
         // For each session, load a summary — simplified for now
         let mut out = Vec::new();
         for sid in sids {
@@ -254,7 +265,10 @@ impl SessionManager {
             None => return Err(SessionError::NotFound(id.to_string())),
         };
         let sid = SessionId::parse(id).map_err(|e| SessionError::Id(e.to_string()))?;
-        store.delete(sid).await.map_err(|e| SessionError::Store(e.to_string()))
+        store
+            .delete(sid)
+            .await
+            .map_err(|e| SessionError::Store(e.to_string()))
     }
 }
 
@@ -271,14 +285,12 @@ pub enum SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base::interface::model::{ModelContentBlock, MessageRole};
+    use base::interface::model::{MessageRole, ModelContentBlock};
 
     fn make_text_msg(text: &str) -> ModelMessage {
         ModelMessage {
             role: MessageRole::User,
-            content: vec![ModelContentBlock::Text {
-                text: text.into(),
-            }],
+            content: vec![ModelContentBlock::Text { text: text.into() }],
         }
     }
 

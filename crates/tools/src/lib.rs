@@ -2,9 +2,9 @@
 
 pub mod aliases;
 pub mod ask_user;
-pub mod config;
 pub mod bash;
 pub mod cancel;
+pub mod config;
 pub mod cron;
 pub mod file_edit;
 pub mod file_read;
@@ -79,6 +79,10 @@ pub fn assemble_tool_pool_refs<'a>(
     pool.into_values().collect()
 }
 
-pub fn register_skill_tool(r: &base::tool::InMemoryToolRegistry, m: std::sync::Arc<skills::manager::SkillManager>, u: Vec<String>) {
+pub fn register_skill_tool(
+    r: &base::tool::InMemoryToolRegistry,
+    m: std::sync::Arc<skills::manager::SkillManager>,
+    u: Vec<String>,
+) {
     r.register(std::sync::Arc::new(crate::skill_tool::SkillTool::new(m, u)));
 }

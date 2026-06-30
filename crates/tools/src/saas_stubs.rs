@@ -7,7 +7,7 @@
 //!   Bash + slack-cli/curl/mail covers messaging; AgentTool with `remote=true`
 //!   covers remote-trigger; multi-agent orchestration now lives in
 //!   `agent::TeamCreateTool`.
-//! - `LspTool`: replaced by real `attacode_lsp::tools::LspToolReal` (D1 
+//! - `LspTool`: replaced by real `attacode_lsp::tools::LspToolReal` (D1
 //!   moved it from `attacode_tools::lsp` to `attacode_lsp::tools`).
 //! - `McpAuthTool`: real OAuth flow implementation. Starts a browser-based
 //!   PKCE flow and returns the authorization URL. Completion exchanges the
@@ -18,8 +18,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,7 +37,8 @@ fn not_in_scope(tool: &str, alt: &str) -> ToolResult {
         is_error: true,
         structured_content: Some(json!({"tool": tool, "scope": "out_of_scope"})),
         mcp_meta: None,
-        new_messages: Some(vec![])}
+        new_messages: Some(vec![]),
+    }
 }
 
 // ============ McpAuth ============
@@ -103,9 +106,8 @@ impl Tool for McpAuthTool {
         _ctx: ToolContext,
         _progress: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
-        let input: McpAuthInput = serde_json::from_value(input).map_err(|e| {
-            ToolError::InvalidInput(format!("Invalid McpAuth input: {e}"))
-        })?;
+        let input: McpAuthInput = serde_json::from_value(input)
+            .map_err(|e| ToolError::InvalidInput(format!("Invalid McpAuth input: {e}")))?;
 
         // Determine the action
         let action = input.action.as_deref().unwrap_or("start");
@@ -163,14 +165,12 @@ impl Tool for McpAuthTool {
                 // Check if the server has OAuth configured
                 if mcp::oauth::get_server_oauth_provider(&server_name).is_none() {
                     return Ok(ToolResult {
-                        content: base::tool::ToolResultContent::Text(
-                            format!(
-                                "MCP server '{server_name}' does not support OAuth \
+                        content: base::tool::ToolResultContent::Text(format!(
+                            "MCP server '{server_name}' does not support OAuth \
                                  authentication.\n\
                                  Use the Authorization header in settings.json for \
                                  static tokens."
-                            ),
-                        ),
+                        )),
                         is_error: false,
                         structured_content: None,
                         mcp_meta: None,
@@ -238,6 +238,7 @@ mod tests {
                     "expected config-related error, got: {s}"
                 );
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 }

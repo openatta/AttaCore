@@ -16,8 +16,8 @@ pub use self::frontmatter::split_frontmatter;
 pub use self::memory::{find_relevant_memories, maybe_migrate_claude_to_atta, MemoryFileEntry};
 pub use self::skill::{
     activate_conditional_skills, expand_skill_vars, load_session_skills,
-    load_session_skills_with_bundled, load_skill_from_path, SkillEntry, SkillSource,
-    try_expand_skill_command,
+    load_session_skills_with_bundled, load_skill_from_path, try_expand_skill_command, SkillEntry,
+    SkillSource,
 };
 
 use self::memory::{collect_memory, collect_memory_files_with, load_all_memory_files};
@@ -119,7 +119,11 @@ impl FrozenContext {
 
         // git 相关命令并发跑，每条独立超时
         let is_git = git::run_git_check(&cwd_clone).await;
-        let is_worktree = if is_git { git::is_worktree(&cwd_clone).await } else { false };
+        let is_worktree = if is_git {
+            git::is_worktree(&cwd_clone).await
+        } else {
+            false
+        };
 
         // 平台信息走 std + 环境变量，不阻塞
         let platform = std::env::consts::OS.to_string();
@@ -142,16 +146,13 @@ impl FrozenContext {
         };
 
         let (git_branch, git_main_branch, git_user_name, git_status, git_log) = if is_git {
-            let branch =
-                git::run_git_text(&cwd_clone, &["symbolic-ref", "--short", "HEAD"]).await;
+            let branch = git::run_git_text(&cwd_clone, &["symbolic-ref", "--short", "HEAD"]).await;
             let main = git::detect_main_branch(&cwd_clone).await;
             let user = git::run_git_text(&cwd_clone, &["config", "user.name"]).await;
-            let status = git::run_git_text(
-                &cwd_clone,
-                &["--no-optional-locks", "status", "--short"],
-            )
-            .await
-            .map(|s| truncate_chars(&s, MAX_GIT_STATUS_CHARS, "\n... (truncated)"));
+            let status =
+                git::run_git_text(&cwd_clone, &["--no-optional-locks", "status", "--short"])
+                    .await
+                    .map(|s| truncate_chars(&s, MAX_GIT_STATUS_CHARS, "\n... (truncated)"));
             let log = git::run_git_text(
                 &cwd_clone,
                 &["--no-optional-locks", "log", "--oneline", "-n", "5"],

@@ -60,7 +60,10 @@ pub trait HistoryStore: Send + Sync {
 
     /// List all child sessions whose `LogEntry::Meta` has `parent_session_id` matching
     /// the given value. Scans every session file; O(n) on the number of sessions.
-    async fn child_sessions(&self, parent_session_id: &str) -> Result<Vec<SessionId>, HistoryError> {
+    async fn child_sessions(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<SessionId>, HistoryError> {
         let all = self.list_sessions().await?;
         let mut out = Vec::new();
         for sid in all {
@@ -70,7 +73,11 @@ pub trait HistoryStore: Send + Sync {
                 Err(e) => return Err(e),
             };
             for entry in &entries {
-                if let LogEntry::Meta { parent_session_id: Some(pid), .. } = &entry.entry {
+                if let LogEntry::Meta {
+                    parent_session_id: Some(pid),
+                    ..
+                } = &entry.entry
+                {
                     if pid == parent_session_id {
                         out.push(entry.session_id);
                         break;
@@ -1024,14 +1031,12 @@ mod tests {
         let cwd_a = TempDir::new().unwrap();
         let cwd_b = TempDir::new().unwrap();
         let projects = TempDir::new().unwrap();
-        let store_a =
-            JsonlHistoryStore::with_root(cwd_a.path(), projects.path().to_path_buf())
-                .await
-                .unwrap();
-        let store_b =
-            JsonlHistoryStore::with_root(cwd_b.path(), projects.path().to_path_buf())
-                .await
-                .unwrap();
+        let store_a = JsonlHistoryStore::with_root(cwd_a.path(), projects.path().to_path_buf())
+            .await
+            .unwrap();
+        let store_b = JsonlHistoryStore::with_root(cwd_b.path(), projects.path().to_path_buf())
+            .await
+            .unwrap();
 
         let session_a = SessionId::new();
         store_a
@@ -1116,18 +1121,14 @@ mod tests {
             .unwrap();
         assert!(init_output.status.success());
 
-        let repo_store = JsonlHistoryStore::with_root(
-            repo_dir.path(),
-            shared_projects.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
-        let outside_store = JsonlHistoryStore::with_root(
-            outside_dir.path(),
-            shared_projects.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let repo_store =
+            JsonlHistoryStore::with_root(repo_dir.path(), shared_projects.path().to_path_buf())
+                .await
+                .unwrap();
+        let outside_store =
+            JsonlHistoryStore::with_root(outside_dir.path(), shared_projects.path().to_path_buf())
+                .await
+                .unwrap();
 
         // Create session in repo
         let session_in_repo = SessionId::new();
@@ -1280,14 +1281,12 @@ mod tests {
         let loaded = store.load(s).await.unwrap();
         assert_eq!(loaded.len(), 1);
         match &loaded[0].entry {
-            LogEntry::User { content } => {
-                match &content[0] {
-                    ContentBlock::Text { text, .. } => {
-                        assert_eq!(text, &big_text);
-                    }
-                    other => panic!("expected Text block, got {other:?}"),
+            LogEntry::User { content } => match &content[0] {
+                ContentBlock::Text { text, .. } => {
+                    assert_eq!(text, &big_text);
                 }
-            }
+                other => panic!("expected Text block, got {other:?}"),
+            },
             other => panic!("expected User, got {other:?}"),
         }
     }

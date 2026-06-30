@@ -55,6 +55,57 @@ fn strip_quotes(s: &str) -> &str {
 }
 
 /// Parse a YAML inline list value: `[a, b, c]` or bare `a, b, c`.
+/// Parse `hook_rules` from YAML frontmatter (raw string → structured rules).
+fn parse_hook_rules(raw: &str) -> Vec<super::skill::SkillHookRule> {
+    let parsed: serde_yaml::Value = match serde_yaml::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let seq = match parsed {
+        serde_yaml::Value::Sequence(s) => s,
+        _ => return vec![],
+    };
+    seq.iter()
+        .filter_map(|v| {
+            let id = v.get("id")?.as_str()?.to_string();
+            let description = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string());
+            let condition = v.get("condition")?;
+            let require = v.get("require")?;
+            Some(super::skill::SkillHookRule {
+                id,
+                description,
+                condition: super::skill::SkillHookCondition {
+                    changed_file_ext: condition
+                        .get("changed_file_ext")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                    changed_file_glob: condition
+                        .get("changed_file_glob")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                    command_contains: condition
+                        .get("command_contains")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                },
+                require: super::skill::SkillHookRequirement {
+                    command_executed: require
+                        .get("command_executed")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string()),
+                    command_executed_matches: require
+                        .get("command_executed_matches")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string()),
+                },
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn parse_yaml_list(raw: &str) -> Vec<String> {
     let s = raw.trim();
     if s.starts_with('[') && s.ends_with(']') {
@@ -127,16 +178,12 @@ pub fn parse_skill_file(
                 "model" => entry.model = Some(value.to_string()),
                 "context" => entry.context = Some(value.to_string()),
                 "disable_model_invocation" | "disableModelInvocation" => {
-                    entry.disable_model_invocation = matches!(
-                        value.to_lowercase().as_str(),
-                        "true" | "yes" | "1"
-                    );
+                    entry.disable_model_invocation =
+                        matches!(value.to_lowercase().as_str(), "true" | "yes" | "1");
                 }
                 "user_invocable" | "userInvocable" => {
-                    entry.user_invocable = !matches!(
-                        value.to_lowercase().as_str(),
-                        "false" | "no" | "0"
-                    );
+                    entry.user_invocable =
+                        !matches!(value.to_lowercase().as_str(), "false" | "no" | "0");
                 }
                 "paths" => {
                     entry.paths = Some(parse_yaml_list(value));
@@ -147,6 +194,9 @@ pub fn parse_skill_file(
                 }
                 "hooks" => {
                     entry.hooks = Some(parse_yaml_list(value));
+                }
+                "hook_rules" | "hookRules" => {
+                    entry.hook_rules = Some(parse_hook_rules(value));
                 }
                 _ => {}
             }

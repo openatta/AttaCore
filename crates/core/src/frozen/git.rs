@@ -64,7 +64,11 @@ pub(crate) async fn is_worktree(cwd: &Path) -> bool {
 /// Detect the main branch name. Tries `origin/HEAD` via symbolic-ref first,
 /// then falls back to checking `main` / `master` locally.
 pub(crate) async fn detect_main_branch(cwd: &Path) -> Option<String> {
-    if let Some(out) = run_git_text(cwd, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).await
+    if let Some(out) = run_git_text(
+        cwd,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .await
     {
         if let Some(name) = out.strip_prefix("origin/") {
             return Some(name.to_string());
@@ -75,7 +79,12 @@ pub(crate) async fn detect_main_branch(cwd: &Path) -> Option<String> {
     for &cand in &["main", "master"] {
         if run_git_text(
             cwd,
-            &["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")],
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{cand}"),
+            ],
         )
         .await
         .is_some()

@@ -60,8 +60,7 @@ pub enum CompactionLevel {
 
 /// State tracking for compaction across turns.
 /// TS parity: AutoCompactTrackingState in autoCompact.ts.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CompactionState {
     /// Number of consecutive compaction failures.
     pub consecutive_failures: usize,
@@ -70,7 +69,6 @@ pub struct CompactionState {
     /// Whether the circuit breaker is open (skip further compaction attempts).
     pub circuit_open: bool,
 }
-
 
 impl CompactionState {
     /// Record a successful compaction. Resets the failure counter and closes the circuit.
@@ -213,19 +211,22 @@ mod tests {
     #[test]
     fn calculate_thresholds_for_200k() {
         let (auto, warn, error, block) = calculate_thresholds(200_000);
-        assert_eq!(auto, 187_000);   // 200K - 13K
-        assert_eq!(warn, 167_000);   // auto - 20K
-        assert_eq!(error, 167_000);  // auto - 20K (same as warn)
-        assert_eq!(block, 197_000);  // 200K - 3K
+        assert_eq!(auto, 187_000); // 200K - 13K
+        assert_eq!(warn, 167_000); // auto - 20K
+        assert_eq!(error, 167_000); // auto - 20K (same as warn)
+        assert_eq!(block, 197_000); // 200K - 3K
     }
 
     #[test]
     fn compaction_level_escalates() {
         // Thresholds for 200K window: auto=187K, warn=167K, block=197K
-        assert_eq!(compaction_level(100_000, 200_000), CompactionLevel::Normal);   // < 167K
-        assert_eq!(compaction_level(170_000, 200_000), CompactionLevel::Warning);  // >= 167K, < 187K
-        assert_eq!(compaction_level(190_000, 200_000), CompactionLevel::Auto);     // >= 187K, < 197K
-        assert_eq!(compaction_level(197_001, 200_000), CompactionLevel::Blocking); // >= 197K
+        assert_eq!(compaction_level(100_000, 200_000), CompactionLevel::Normal); // < 167K
+        assert_eq!(compaction_level(170_000, 200_000), CompactionLevel::Warning); // >= 167K, < 187K
+        assert_eq!(compaction_level(190_000, 200_000), CompactionLevel::Auto); // >= 187K, < 197K
+        assert_eq!(
+            compaction_level(197_001, 200_000),
+            CompactionLevel::Blocking
+        ); // >= 197K
     }
 
     #[test]
@@ -255,7 +256,7 @@ mod tests {
         state.record_failure();
         state.record_failure();
         state.record_failure(); // circuit open
-        // Even though below threshold, circuit blocks
+                                // Even though below threshold, circuit blocks
         assert!(!should_compact_with_state(180_000, 200_000, None, &state));
     }
 }

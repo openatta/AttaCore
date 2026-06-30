@@ -1,10 +1,23 @@
-//! Coding scene — Claude Code parity.
+//! Coding scene — Claude Code parity + v2.0.0 task routing.
 //!
-//! System prompt content VERBATIM from `system_prompt.rs`.
+//! # v2.0.0 Architecture
+//!
+//! System prompt assembly now integrates:
+//! 1. **TaskRouter** — classifies user request into `CodingTaskKind`
+//! 2. **TaskProfile** — per-task model, tool, and verification policies
+//! 3. **PromptProfile** — task-specific system prompt fragments
+//!
+//! When `config.enable_task_routing` is true and a user message is present,
+//! the task-specific prompt fragment is injected as a dynamic section.
+//! Otherwise, the original CodingScene behavior is preserved.
+//!
 //! Section cache machinery, fingerprinting, and all render functions
-//! migrated directly. The only change: `SystemBlock` → `PromptBlock`,
-//! `CacheControl` → `CacheStrategy`.
+//! are preserved from the original implementation.
 
+use crate::coding::config::CodingSceneConfig;
+use crate::coding::context::ContextPackBuilder;
+use crate::coding::prompt::PromptProfile;
+use crate::coding::task::{CodingTaskKind, RuleBasedTaskRouter, TaskClassifier};
 use base::interface::prompt::{CacheStrategy, PromptBlock};
 use base::interface::scene::{
     AgentScene, ExecutionParams, ReminderContext, ScenePromptContext, TokenBudget,
@@ -13,7 +26,47 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
-pub struct CodingScene;
+/// CodingScene with v2.0.0 task routing.
+///
+/// Holds a `CodingSceneConfig` and `RuleBasedTaskRouter`.
+/// When task routing is enabled, the system prompt is augmented with
+/// task-specific instructions based on the classified task kind.
+pub struct CodingScene {
+    config: CodingSceneConfig,
+    task_router: RuleBasedTaskRouter,
+}
+
+impl CodingScene {
+    /// Create a new CodingScene with the given config.
+    pub fn new(config: CodingSceneConfig) -> Self {
+        Self {
+            config,
+            task_router: RuleBasedTaskRouter::new(),
+        }
+    }
+
+    /// Create with default config (backward compatible).
+    pub fn default_scene() -> Self {
+        Self::new(CodingSceneConfig::default())
+    }
+
+    /// Access the config (read-only).
+    pub fn config(&self) -> &CodingSceneConfig {
+        &self.config
+    }
+
+    /// Classify the current user message (if any) and return the task kind.
+    fn classify_current_task(&self, ctx: &ScenePromptContext) -> Option<CodingTaskKind> {
+        if !self.config.enable_task_routing {
+            return None;
+        }
+        let msg = ctx.user_message.as_deref()?;
+        if msg.trim().is_empty() {
+            return None;
+        }
+        self.task_router.classify(msg)
+    }
+}
 
 impl AgentScene for CodingScene {
     fn id(&self) -> &str {
@@ -23,12 +76,33 @@ impl AgentScene for CodingScene {
         "AttaCode Coding"
     }
     fn description(&self) -> &str {
-        "编程场景 — 对齐 Claude Code 的完整 Agent 行为"
+        "编程场景 — v2.0.0 task-routed Agent 行为"
     }
 
     fn build_system_prompt(&self, ctx: &ScenePromptContext) -> Vec<PromptBlock> {
-        // Build sections exactly as in the original system_prompt.rs
-        let sections = build_section_registry(ctx);
+        let mut sections = build_section_registry(ctx);
+
+        // ── v2.0.0: Task routing + ContextPack ──
+        if let Some(kind) = self.classify_current_task(ctx) {
+            let task_profile = self.config.resolve_task_profile(kind);
+            let prompt_profile = PromptProfile::builtin(kind);
+
+            // Build ContextPack from the ScenePromptContext (no tool calls needed —
+            // git status, branch, etc. are already in the context).
+            let user_msg = ctx.user_message.as_deref().unwrap_or("");
+            let context_pack = ContextPackBuilder::new(user_msg)
+                .task_kind(kind)
+                .git_status(ctx.git_status.as_deref().unwrap_or(""))
+                .error_from_message(user_msg)
+                .build();
+            let context_text = context_pack.render();
+
+            // Inject task profile + ContextPack as a combined dynamic section
+            let task_section_text = render_task_section(kind, &task_profile, &prompt_profile);
+            let combined = format!("{context_text}\n\n{task_section_text}");
+            sections.push(memoized_section("task_profile", 2, move || Some(combined)));
+        }
+
         let resolved = resolve_sections(sections);
         render_prompt_blocks(resolved)
     }
@@ -79,6 +153,74 @@ impl AgentScene for CodingScene {
             max_api_calls_per_turn: 200,
             max_agent_depth: 16,
         }
+    }
+
+    /// v2.0.0: Return the verification policy for the current task.
+    ///
+    /// This is called per-turn by the Agent. The policy is derived from
+    /// the TaskProfile associated with the classified task kind.
+    fn verification_policy(&self) -> Option<base::interface::scene::SceneVerificationPolicy> {
+        if !self.config.enable_verification_loop {
+            return None;
+        }
+        // Return a default enabled policy — the Agent will check task_profile
+        // for specific settings. For now, enable targeted tests.
+        Some(base::interface::scene::SceneVerificationPolicy {
+            required_level: 3, // TargetedTest
+            block_completion_on_failure: true,
+            allow_explain_if_unavailable: true,
+            max_repair_iterations: 3,
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// v2.0.0: Task section render function
+// ═══════════════════════════════════════════════════════════
+
+/// Render the task profile section for injection into the system prompt.
+fn render_task_section(
+    kind: CodingTaskKind,
+    task_profile: &crate::coding::prompt::TaskProfile,
+    prompt_profile: &PromptProfile,
+) -> String {
+    let kind_label = kind_label(kind);
+    let model_tier = task_profile.model_profile.as_deref().unwrap_or("default");
+
+    format!(
+        "\
+# Current Task: {kind_label}
+
+{system_rules}
+
+## Task Policy
+- Model tier: {model_tier}
+- Tool policy: {tool_policy}
+- Verification: {verification_policy}
+
+## Output Format
+{output_format}
+",
+        kind_label = kind_label,
+        system_rules = prompt_profile.system_rules,
+        model_tier = model_tier,
+        tool_policy = task_profile.tool_policy,
+        verification_policy = task_profile.verification_policy,
+        output_format = prompt_profile.output_format,
+    )
+}
+
+fn kind_label(kind: CodingTaskKind) -> &'static str {
+    match kind {
+        CodingTaskKind::Explain => "Explain",
+        CodingTaskKind::Search => "Search",
+        CodingTaskKind::Generate => "Generate",
+        CodingTaskKind::Modify => "Modify",
+        CodingTaskKind::Debug => "Debug",
+        CodingTaskKind::Review => "Review",
+        CodingTaskKind::Refactor => "Refactor",
+        CodingTaskKind::Document => "Document",
+        CodingTaskKind::Plan => "Plan",
     }
 }
 
@@ -235,25 +377,37 @@ fn build_section_registry<'a>(ctx: &'a ScenePromptContext) -> Vec<SystemPromptSe
     sections.push(static_section("identity", || identity_block(ctx)));
 
     // [2] system_info — static, tool permissions/hooks/compression behavior
-    sections.push(static_section("system_info", || SYSTEM_INFO_BLOCK.to_string()));
+    sections.push(static_section("system_info", || {
+        SYSTEM_INFO_BLOCK.to_string()
+    }));
 
     // [3a] style — static (TS parity: separate block for caching)
     sections.push(static_section("style", || STYLE_BLOCK.to_string()));
 
     // [3b] system_context — static
-    sections.push(static_section("system_context", || SYSTEM_CONTEXT_BLOCK.to_string()));
+    sections.push(static_section("system_context", || {
+        SYSTEM_CONTEXT_BLOCK.to_string()
+    }));
 
     // [3c] doing_tasks — static
-    sections.push(static_section("doing_tasks", || DOING_TASKS_BLOCK.to_string()));
+    sections.push(static_section("doing_tasks", || {
+        DOING_TASKS_BLOCK.to_string()
+    }));
 
     // [3d] parallelism — static
-    sections.push(static_section("parallelism", || PARALLELISM_BLOCK.to_string()));
+    sections.push(static_section("parallelism", || {
+        PARALLELISM_BLOCK.to_string()
+    }));
 
     // [3e] sub_agents — static
-    sections.push(static_section("sub_agents", || SUB_AGENTS_BLOCK.to_string()));
+    sections.push(static_section("sub_agents", || {
+        SUB_AGENTS_BLOCK.to_string()
+    }));
 
     // [3f] code_style — static
-    sections.push(static_section("code_style", || CODE_STYLE_BLOCK.to_string()));
+    sections.push(static_section("code_style", || {
+        CODE_STYLE_BLOCK.to_string()
+    }));
 
     // [4] actions — static
     sections.push(static_section("actions", || ACTIONS_BLOCK.to_string()));
@@ -286,8 +440,14 @@ fn build_section_registry<'a>(ctx: &'a ScenePromptContext) -> Vec<SystemPromptSe
     let git_status = ctx.git_status.clone().map(|s| s.into_owned());
     sections.push(memoized_section("env", env_key, move || {
         Some(render_env(
-            &cwd, &os, &shell, &date, &model_name,
-            is_git, git_branch.as_deref(), is_worktree,
+            &cwd,
+            &os,
+            &shell,
+            &date,
+            &model_name,
+            is_git,
+            git_branch.as_deref(),
+            is_worktree,
             git_status.as_deref(),
         ))
     }));
@@ -469,8 +629,14 @@ const TONE_STYLE_BLOCK: &str = "\
 
 #[allow(clippy::too_many_arguments)]
 fn render_env(
-    cwd: &str, os: &str, shell: &str, date: &str, model_name: &str,
-    is_git: bool, git_branch: Option<&str>, is_worktree: bool,
+    cwd: &str,
+    os: &str,
+    shell: &str,
+    date: &str,
+    model_name: &str,
+    is_git: bool,
+    git_branch: Option<&str>,
+    is_worktree: bool,
     git_status: Option<&str>,
 ) -> String {
     let model_desc = format!("You are powered by the model {model_name}.");
@@ -521,7 +687,11 @@ fn get_knowledge_cutoff(model_name: &str) -> Option<&'static str> {
         Some("August 2025")
     } else if lower.contains("claude-sonnet-4-5") {
         Some("June 2025")
-    } else if lower.contains("claude-opus-4-8") || lower.contains("claude-opus-4-7") || lower.contains("claude-opus-4-6") || lower.contains("claude-opus-4-5") {
+    } else if lower.contains("claude-opus-4-8")
+        || lower.contains("claude-opus-4-7")
+        || lower.contains("claude-opus-4-6")
+        || lower.contains("claude-opus-4-5")
+    {
         Some("May 2025")
     } else if lower.contains("claude-haiku-4-5") {
         Some("February 2025")
@@ -549,19 +719,25 @@ fn get_knowledge_cutoff(model_name: &str) -> Option<&'static str> {
 /// TS parity: enhanceSystemPromptWithEnvDetails() dynamic model listing.
 fn build_model_recommendations(model_name: &str) -> String {
     let lower = model_name.to_lowercase();
-    if lower.contains("claude-opus-4-8") || lower.contains("claude-sonnet-4-6") || lower.contains("claude-haiku-4-5") {
+    if lower.contains("claude-opus-4-8")
+        || lower.contains("claude-sonnet-4-6")
+        || lower.contains("claude-haiku-4-5")
+    {
         "The most recent Claude models are Fable 5 and the Claude 4.X family. \
          Model IDs — Fable 5: 'claude-fable-5', Opus 4.8: 'claude-opus-4-8', \
          Sonnet 4.6: 'claude-sonnet-4-6', Haiku 4.5: 'claude-haiku-4-5-20251001'. \
-         When building AI applications, default to the latest and most capable Claude models.".to_string()
+         When building AI applications, default to the latest and most capable Claude models."
+            .to_string()
     } else if lower.contains("claude-4") || lower.contains("claude-3-5") {
         "Newer Claude models are available: Opus 4.8, Sonnet 4.6, Haiku 4.5, and Fable 5. \
-         Consider upgrading for improved capabilities and performance.".to_string()
+         Consider upgrading for improved capabilities and performance."
+            .to_string()
     } else {
         // Generic — list available models dynamically
         "Available Claude models include Opus 4.8 (most capable), Sonnet 4.6 (balanced), \
          Haiku 4.5 (fastest), and Fable 5 (latest). When building AI applications, \
-         default to the latest and most capable Claude models.".to_string()
+         default to the latest and most capable Claude models."
+            .to_string()
     }
 }
 
@@ -693,12 +869,8 @@ fn render_session_guidance(available_tools: Option<&str>) -> String {
     let has_ask = available_tools
         .map(|t| t.contains("AskUserQuestion"))
         .unwrap_or(true);
-    let has_skill = available_tools
-        .map(|t| t.contains("Skill"))
-        .unwrap_or(true);
-    let has_agent = available_tools
-        .map(|t| t.contains("Agent"))
-        .unwrap_or(true);
+    let has_skill = available_tools.map(|t| t.contains("Skill")).unwrap_or(true);
+    let has_agent = available_tools.map(|t| t.contains("Agent")).unwrap_or(true);
 
     let mut items = vec![
         "If you need the user to run a shell command themselves, suggest they type `! <command>` in the prompt.",
@@ -783,17 +955,18 @@ mod tests {
             scratchpad_dir: None,
             output_style_content: None,
             available_tools: None,
+            user_message: None,
         }
     }
 
     #[test]
     fn coding_id() {
-        assert_eq!(CodingScene.id(), "coding");
+        assert_eq!(CodingScene::default_scene().id(), "coding");
     }
 
     #[test]
     fn prompt_contains_identity_and_behavior() {
-        let blocks = CodingScene.build_system_prompt(&ctx());
+        let blocks = CodingScene::default_scene().build_system_prompt(&ctx());
         let text: String = blocks
             .iter()
             .map(|b| &b.content)
@@ -808,7 +981,7 @@ mod tests {
 
     #[test]
     fn prompt_contains_env() {
-        let blocks = CodingScene.build_system_prompt(&ctx());
+        let blocks = CodingScene::default_scene().build_system_prompt(&ctx());
         let text: String = blocks
             .iter()
             .map(|b| &b.content)
@@ -821,7 +994,7 @@ mod tests {
 
     #[test]
     fn static_sections_have_global_cache() {
-        let blocks = CodingScene.build_system_prompt(&ctx());
+        let blocks = CodingScene::default_scene().build_system_prompt(&ctx());
         assert_eq!(blocks[0].cache_strategy, Some(CacheStrategy::Global));
     }
 
@@ -832,15 +1005,15 @@ mod tests {
             git_status: Some(Cow::Borrowed("On branch main")),
             memory_summary: None,
         };
-        let r = CodingScene.build_system_reminder(&rctx);
+        let r = CodingScene::default_scene().build_system_reminder(&rctx);
         assert!(r.contains("On branch main"));
         assert!(r.contains("system-reminder"));
     }
 
     #[test]
     fn section_cache_is_reusable() {
-        let b1 = CodingScene.build_system_prompt(&ctx());
-        let b2 = CodingScene.build_system_prompt(&ctx());
+        let b1 = CodingScene::default_scene().build_system_prompt(&ctx());
+        let b2 = CodingScene::default_scene().build_system_prompt(&ctx());
         assert_eq!(b1.len(), b2.len());
         for (a, b) in b1.iter().zip(b2.iter()) {
             assert_eq!(a.content, b.content);

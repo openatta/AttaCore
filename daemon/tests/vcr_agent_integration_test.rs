@@ -22,14 +22,14 @@
 //!   --test vcr_agent_integration_test -- test_vcr_agent_replay --nocapture
 //! ```
 
+use async_trait::async_trait;
 use base::id::Id;
 use base::interface::event::AgentEvent;
+use base::interface::model::ModelStream;
 use base::interface::model::{Model, StreamParams};
 use base::interface::settings::{PermissionMode, ThinkingMode, VcrConfig, VcrMode};
-use base::interface::model::ModelStream;
 use base::provider::ApiType;
 use base::tool::{InMemoryToolRegistry, Tool};
-use async_trait::async_trait;
 use model::adapter::AnthropicModel;
 use model::client::{AuthMode, HttpAnthropicClient};
 use runtime::agent::{Builder, InputMessage};
@@ -43,7 +43,10 @@ const SCENARIO: &str = "vcr_agent";
 
 fn vcr_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..").join("tests").join("fixtures").join("vcr")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("vcr")
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -56,18 +59,26 @@ fn load_deepseek_config() -> Option<(String, String, String)> {
     let (mut url, mut token, mut model) = (String::new(), String::new(), String::new());
     for line in content.lines() {
         let l = line.trim();
-        if let Some(v) = l.strip_prefix("export ANTHROPIC_BASE_URL=") { url = v.trim().into(); }
-        else if let Some(v) = l.strip_prefix("export ANTHROPIC_AUTH_TOKEN=") { token = v.trim().into(); }
-        else if let Some(v) = l.strip_prefix("export ANTHROPIC_MODEL=") { model = v.trim().into(); }
+        if let Some(v) = l.strip_prefix("export ANTHROPIC_BASE_URL=") {
+            url = v.trim().into();
+        } else if let Some(v) = l.strip_prefix("export ANTHROPIC_AUTH_TOKEN=") {
+            token = v.trim().into();
+        } else if let Some(v) = l.strip_prefix("export ANTHROPIC_MODEL=") {
+            model = v.trim().into();
+        }
     }
-    if url.is_empty() || token.is_empty() || model.is_empty() { return None; }
+    if url.is_empty() || token.is_empty() || model.is_empty() {
+        return None;
+    }
     Some((url, token, model))
 }
 
 fn build_model() -> Result<Arc<dyn Model>, String> {
-    let (mut url, token, _) = load_deepseek_config()
-        .ok_or_else(|| String::from("~/.deepseek not found"))?;
-    if !url.ends_with('/') { url.push('/'); }
+    let (mut url, token, _) =
+        load_deepseek_config().ok_or_else(|| String::from("~/.deepseek not found"))?;
+    if !url.ends_with('/') {
+        url.push('/');
+    }
     let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
     let c = HttpAnthropicClient::with_base(AuthMode::ApiKey(token), parsed)
         .map_err(|e| format!("client: {e}"))?
@@ -95,7 +106,9 @@ fn make_tools() -> Arc<InMemoryToolRegistry> {
         Arc::new(tools::task_output::TaskOutputTool),
         Arc::new(tools::task_stop::TaskStopTool),
     ];
-    for t in tools { reg.register(t); }
+    for t in tools {
+        reg.register(t);
+    }
     reg
 }
 
@@ -109,37 +122,62 @@ fn build_agent(
     mode: VcrMode,
     telemetry_path: Option<PathBuf>,
     frozen: Option<base::frozen::FrozenContext>,
-) -> Result<(runtime::agent::Agent, runtime::agent::EventReceiver, runtime::agent::InputSender), String> {
+) -> Result<
+    (
+        runtime::agent::Agent,
+        runtime::agent::EventReceiver,
+        runtime::agent::InputSender,
+    ),
+    String,
+> {
     let tmp = PathBuf::from("/tmp/atta_vcr_agent_test");
     let _ = std::fs::create_dir_all(&tmp);
 
     let vcr_model = Arc::new(VcrModel::new(
         model,
-        Some(VcrConfig { mode, scenario: scenario.into(), fallback_on_miss: true }),
+        Some(VcrConfig {
+            mode,
+            scenario: scenario.into(),
+            fallback_on_miss: true,
+        }),
         PathBuf::from("/tmp/atta_vcr_nonexistent"),
         vcr_dir(),
     ));
 
     let settings = Arc::new(base::interface::settings::Settings {
         model: base::interface::settings::ModelSettings {
-            api_type: ApiType::Anthropic, base_url: String::new(), auth_token: String::new(),
-            model_name: "deepseek-v4-pro[1m]".into(), max_tokens: 2000,
-            thinking_mode: ThinkingMode::Off, fallback_model: None,
+            api_type: ApiType::Anthropic,
+            base_url: String::new(),
+            auth_token: String::new(),
+            model_name: "deepseek-v4-pro[1m]".into(),
+            max_tokens: 2000,
+            thinking_mode: ThinkingMode::Off,
+            fallback_model: None,
         },
         paths: base::interface::settings::PathSettings {
-            user_data_dir: tmp.join("user"), local_data_dir: tmp.join("local"),
+            user_data_dir: tmp.join("user"),
+            local_data_dir: tmp.join("local"),
         },
-        execution: Default::default(), compaction: Default::default(), sandbox: Default::default(),
-        instruction_file: None, prompt_append: None, prompt_override: None,
-        vcr: None, telemetry_url: None, session_dir: None,
+        execution: Default::default(),
+        compaction: Default::default(),
+        sandbox: Default::default(),
+        instruction_file: None,
+        prompt_append: None,
+        prompt_override: None,
+        vcr: None,
+        telemetry_url: None,
+        session_dir: None,
         memory_enabled: false,
         permission_mode: PermissionMode::BypassPermissions,
-        permission_rules: vec![], hooks_config: None, mcp_servers: vec![],
-        language: None, feature_flags: Default::default(),
+        permission_rules: vec![],
+        hooks_config: None,
+        mcp_servers: vec![],
+        language: None,
+        feature_flags: Default::default(),
     });
 
     let mut builder = Builder::new()
-        .scene(Arc::new(scene::scene::coding::CodingScene))
+        .scene(Arc::new(scene::scene::coding::CodingScene::default_scene()))
         .model(vcr_model)
         .tools(make_tools())
         .settings(settings)
@@ -204,7 +242,10 @@ async fn run_one_turn(
         match event {
             AgentEvent::TextDelta { text: t, .. } => text.push_str(&t),
             AgentEvent::ToolUse { name, .. } => tool_uses.push(name),
-            AgentEvent::TurnComplete { .. } => { turn_complete = true; break; }
+            AgentEvent::TurnComplete { .. } => {
+                turn_complete = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -220,9 +261,13 @@ async fn run_one_turn(
 #[ignore = "需要真实 LLM API；用 ATTA_VCR_RECORD=vcr_agent 运行"]
 async fn test_vcr_agent_record() {
     if std::env::var("ATTA_VCR_RECORD").is_err() {
-        eprintln!("SKIP: set ATTA_VCR_RECORD={SCENARIO}"); return;
+        eprintln!("SKIP: set ATTA_VCR_RECORD={SCENARIO}");
+        return;
     }
-    if load_deepseek_config().is_none() { eprintln!("SKIP: ~/.deepseek not found"); return; }
+    if load_deepseek_config().is_none() {
+        eprintln!("SKIP: ~/.deepseek not found");
+        return;
+    }
 
     let real_model = build_model().expect("build model");
     let fixture_path = vcr_dir().join(format!("{SCENARIO}.jsonl"));
@@ -238,9 +283,13 @@ async fn test_vcr_agent_record() {
     let frozen = base::frozen::FrozenContext::collect(tmp_local).await;
 
     let (agent, event_rx, input_tx) = build_agent(
-        real_model, SCENARIO, VcrMode::Record,
-        Some(telemetry_path.clone()), Some(frozen),
-    ).expect("build agent");
+        real_model,
+        SCENARIO,
+        VcrMode::Record,
+        Some(telemetry_path.clone()),
+        Some(frozen),
+    )
+    .expect("build agent");
 
     let out = run_one_turn(agent, event_rx, input_tx, "\u{521b}\u{5efa}\u{4e00}\u{4e2a} C \u{8bed}\u{8a00}\u{9879}\u{76ee}\u{ff0c}\u{8981}\u{6c42}\u{ff1a}\n\
                   1. src/main.c \u{2014}\u{2014} \u{8f93}\u{51fa} \"Hello, World!\" \u{7684}\u{4e3b}\u{7a0b}\u{5e8f}\n\
@@ -258,7 +307,11 @@ async fn test_vcr_agent_record() {
     assert!(fixture_path.exists(), "fixture not written");
     assert!(telemetry_path.exists(), "telemetry not written");
 
-    let lines: Vec<_> = std::fs::read_to_string(&fixture_path).unwrap().lines().map(|s| s.to_string()).collect();
+    let lines: Vec<_> = std::fs::read_to_string(&fixture_path)
+        .unwrap()
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
     eprintln!("Recorded {} VCR entries", lines.len());
     assert!(!lines.is_empty());
 }
@@ -270,8 +323,17 @@ async fn test_vcr_agent_record() {
 struct PanicModel;
 #[async_trait]
 impl Model for PanicModel {
-    fn api_type(&self) -> ApiType { ApiType::Anthropic }
-    async fn stream(&self, _: Vec<base::interface::prompt::PromptBlock>, _: Vec<base::interface::model::ToolDef>, _: Vec<base::interface::model::ModelMessage>, _: StreamParams, _: CancellationToken) -> Result<ModelStream, base::interface::model::ModelError> {
+    fn api_type(&self) -> ApiType {
+        ApiType::Anthropic
+    }
+    async fn stream(
+        &self,
+        _: Vec<base::interface::prompt::PromptBlock>,
+        _: Vec<base::interface::model::ToolDef>,
+        _: Vec<base::interface::model::ModelMessage>,
+        _: StreamParams,
+        _: CancellationToken,
+    ) -> Result<ModelStream, base::interface::model::ModelError> {
         panic!("PanicModel::stream() called — VCR replay should intercept ALL calls");
     }
 }
@@ -285,11 +347,15 @@ impl Model for PanicModel {
 async fn test_vcr_agent_replay() {
     let fixture_path = vcr_dir().join(format!("{SCENARIO}.jsonl"));
     if !fixture_path.exists() {
-        eprintln!("SKIP: no fixture. Run record test first."); return;
+        eprintln!("SKIP: no fixture. Run record test first.");
+        return;
     }
 
     // replay 时遥测文件带时间戳，便于和录制遥测对比
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let telemetry_path = vcr_dir().join(format!("{SCENARIO}.telemetry.{ts}.md"));
 
     let mock_model: Arc<dyn Model> = Arc::new(PanicModel);
@@ -301,9 +367,13 @@ async fn test_vcr_agent_replay() {
     let frozen = base::frozen::FrozenContext::collect(tmp_local).await;
 
     let (agent, event_rx, input_tx) = build_agent(
-        mock_model, SCENARIO, VcrMode::Replay,
-        Some(telemetry_path.clone()), Some(frozen),
-    ).expect("build agent");
+        mock_model,
+        SCENARIO,
+        VcrMode::Replay,
+        Some(telemetry_path.clone()),
+        Some(frozen),
+    )
+    .expect("build agent");
 
     let out = run_one_turn(agent, event_rx, input_tx, "\u{521b}\u{5efa}\u{4e00}\u{4e2a} C \u{8bed}\u{8a00}\u{9879}\u{76ee}\u{ff0c}\u{8981}\u{6c42}\u{ff1a}\n\
                   1. src/main.c \u{2014}\u{2014} \u{8f93}\u{51fa} \"Hello, World!\" \u{7684}\u{4e3b}\u{7a0b}\u{5e8f}\n\

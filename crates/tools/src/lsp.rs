@@ -173,16 +173,10 @@ impl Tool for LspTool {
             Ok(p) => {
                 if p.operation == LspOperation::WorkspaceSymbol {
                     if p.query.as_ref().map_or(true, |q| q.trim().is_empty()) {
-                        return ValidationResult::err(
-                            "query is required for workspaceSymbol",
-                            1,
-                        );
+                        return ValidationResult::err("query is required for workspaceSymbol", 1);
                     }
                 } else if p.file_path.as_ref().map_or(true, |f| f.trim().is_empty()) {
-                    return ValidationResult::err(
-                        "filePath is required for this operation",
-                        2,
-                    );
+                    return ValidationResult::err("filePath is required for this operation", 2);
                 }
 
                 // Position-based operations need line and character.
@@ -243,7 +237,18 @@ impl Tool for LspTool {
         let result = if let Some(ref manager) = self.manager {
             // ── Pooled path ──
             let pool_key: PoolKey = (server_cmd.clone(), canonical_root(&ctx.cwd));
-            let r = tokio::time::timeout(timeout_dur, Self::run_pooled(manager, pool_key.clone(), &server_cmd, &ctx.cwd, &method, &params)).await;
+            let r = tokio::time::timeout(
+                timeout_dur,
+                Self::run_pooled(
+                    manager,
+                    pool_key.clone(),
+                    &server_cmd,
+                    &ctx.cwd,
+                    &method,
+                    &params,
+                ),
+            )
+            .await;
             r
         } else {
             // ── Ephemeral path ──
@@ -291,9 +296,7 @@ fn detect_language_server(file_path: &str) -> Option<String> {
         "java" => try_resolve(&["jdtls"]),
         "kt" | "kts" => try_resolve(&["kotlin-language-server"]),
         "swift" => try_resolve(&["sourcekit-lsp"]),
-        "c" | "h" | "cpp" | "hpp" | "cxx" | "hxx" | "cc" | "hh" => {
-            try_resolve(&["clangd"])
-        }
+        "c" | "h" | "cpp" | "hpp" | "cxx" | "hxx" | "cc" | "hh" => try_resolve(&["clangd"]),
         _ => None,
     }
 }
@@ -521,10 +524,7 @@ fn canonical_root(path: &Path) -> PathBuf {
 
 /// Spawn an LSP server, run the `initialize` handshake, and send `initialized`.
 /// Returns the live handle ready for sending requests.
-async fn spawn_and_initialize(
-    server_cmd: &str,
-    root_path: &Path,
-) -> Result<LspHandle, String> {
+async fn spawn_and_initialize(server_cmd: &str, root_path: &Path) -> Result<LspHandle, String> {
     let parts: Vec<&str> = server_cmd.split_whitespace().collect();
     let mut cmd = Command::new(parts[0]);
     for arg in &parts[1..] {
@@ -670,8 +670,7 @@ async fn send_lsp_message(
     stdin: &mut tokio::process::ChildStdin,
     msg: &impl Serialize,
 ) -> Result<(), String> {
-    let body =
-        serde_json::to_string(msg).map_err(|e| format!("Serialize error: {e}"))?;
+    let body = serde_json::to_string(msg).map_err(|e| format!("Serialize error: {e}"))?;
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     stdin
         .write_all(header.as_bytes())
@@ -734,8 +733,7 @@ fn format_lsp_result(method: &str, result: &Value) -> String {
         "textDocument/prepareCallHierarchy" => format_hierarchy_items(result, "call hierarchy"),
         "callHierarchy/incomingCalls" => format_call_hierarchy_calls(result, "incoming"),
         "callHierarchy/outgoingCalls" => format_call_hierarchy_calls(result, "outgoing"),
-        _ => serde_json::to_string_pretty(result)
-            .unwrap_or_else(|_| format!("{:?}", result)),
+        _ => serde_json::to_string_pretty(result).unwrap_or_else(|_| format!("{:?}", result)),
     }
 }
 
@@ -745,10 +743,7 @@ fn format_definition_result(result: &Value) -> String {
         if locations.is_empty() {
             return "No definition found.".to_string();
         }
-        let lines: Vec<String> = locations
-            .iter()
-            .filter_map(format_location)
-            .collect();
+        let lines: Vec<String> = locations.iter().filter_map(format_location).collect();
         format!("Found {} location(s):\n{}", lines.len(), lines.join("\n"))
     } else if result.is_object() {
         // Single location (Location object).
@@ -769,12 +764,14 @@ fn format_location(loc: &Value) -> Option<String> {
         .get("targetUri")
         .or_else(|| loc.get("uri"))
         .and_then(|v| v.as_str())?;
-    let range = loc
-        .get("targetRange")
-        .or_else(|| loc.get("range"))?;
+    let range = loc.get("targetRange").or_else(|| loc.get("range"))?;
     let path = uri.strip_prefix("file://").unwrap_or(uri);
     let start = range.get("start")?;
-    let line = start.get("line").and_then(|v| v.as_u64()).map(|l| l + 1).unwrap_or(0);
+    let line = start
+        .get("line")
+        .and_then(|v| v.as_u64())
+        .map(|l| l + 1)
+        .unwrap_or(0);
     let col = start
         .get("character")
         .and_then(|v| v.as_u64())
@@ -874,10 +871,7 @@ fn format_symbols(value: &Value, depth: usize) -> String {
                 if children.is_empty() {
                     format!("{}{} {} (line {})", indent, kind, name, line)
                 } else {
-                    format!(
-                        "{}{} {} (line {})\n{}",
-                        indent, kind, name, line, children
-                    )
+                    format!("{}{} {} (line {})\n{}", indent, kind, name, line, children)
                 }
             })
             .collect::<Vec<_>>()
@@ -947,7 +941,12 @@ fn format_hierarchy_items(result: &Value, label: &str) -> String {
             }
         })
         .collect();
-    format!("Found {} {} item(s):\n{}", lines.len(), label, lines.join("\n"))
+    format!(
+        "Found {} {} item(s):\n{}",
+        lines.len(),
+        label,
+        lines.join("\n")
+    )
 }
 
 fn format_call_hierarchy_calls(result: &Value, direction: &str) -> String {
@@ -967,10 +966,7 @@ fn format_call_hierarchy_calls(result: &Value, direction: &str) -> String {
             let uri = from["uri"].as_str()?;
             let path = uri.strip_prefix("file://").unwrap_or(uri);
             let range = from.get("selectionRange")?;
-            let line = range["start"]["line"]
-                .as_u64()
-                .map(|l| l + 1)
-                .unwrap_or(0);
+            let line = range["start"]["line"].as_u64().map(|l| l + 1).unwrap_or(0);
             // fromRanges shows the actual call sites.
             let from_ranges = entry
                 .get("fromRanges")
@@ -979,10 +975,7 @@ fn format_call_hierarchy_calls(result: &Value, direction: &str) -> String {
                     arr.iter()
                         .filter_map(|r| {
                             let start = r.get("start")?;
-                            let l = start["line"]
-                                .as_u64()
-                                .map(|x| x + 1)
-                                .unwrap_or(0);
+                            let l = start["line"].as_u64().map(|x| x + 1).unwrap_or(0);
                             Some(format!("(at line {})", l))
                         })
                         .collect::<Vec<_>>()
@@ -996,7 +989,12 @@ fn format_call_hierarchy_calls(result: &Value, direction: &str) -> String {
             Some(format!("  {} {} — {}:{}{}", kind, name, path, line, sites))
         })
         .collect();
-    format!("Found {} {} call(s):\n{}", lines.len(), direction, lines.join("\n"))
+    format!(
+        "Found {} {} call(s):\n{}",
+        lines.len(),
+        direction,
+        lines.join("\n")
+    )
 }
 
 /// Map LSP SymbolKind integer to a human-readable string.
@@ -1047,10 +1045,7 @@ mod tests {
     async fn validates_workspace_symbol_requires_query() {
         let tool = LspTool::ephemeral();
         let r = tool
-            .validate_input(
-                &json!({"operation": "workspaceSymbol"}),
-                &test_ctx(),
-            )
+            .validate_input(&json!({"operation": "workspaceSymbol"}), &test_ctx())
             .await;
         assert!(
             matches!(r, ValidationResult::Err(..)),
@@ -1062,10 +1057,7 @@ mod tests {
     async fn validates_non_workspace_ops_require_filepath() {
         let tool = LspTool::ephemeral();
         let r = tool
-            .validate_input(
-                &json!({"operation": "goToDefinition"}),
-                &test_ctx(),
-            )
+            .validate_input(&json!({"operation": "goToDefinition"}), &test_ctx())
             .await;
         assert!(
             matches!(r, ValidationResult::Err(..)),
@@ -1200,7 +1192,10 @@ mod tests {
             }
         });
         let result = format_location(&loc);
-        assert_eq!(result, Some("  /home/user/project/src/main.rs:43:9".to_string()));
+        assert_eq!(
+            result,
+            Some("  /home/user/project/src/main.rs:43:9".to_string())
+        );
     }
 
     #[test]
@@ -1217,7 +1212,10 @@ mod tests {
             }
         });
         let result = format_location(&loc);
-        assert_eq!(result, Some("  /home/user/project/src/lib.rs:11:1".to_string()));
+        assert_eq!(
+            result,
+            Some("  /home/user/project/src/lib.rs:11:1".to_string())
+        );
     }
 
     #[test]
@@ -1279,7 +1277,10 @@ mod tests {
             ]
         });
         let formatted = format_hover_result(&result);
-        assert_eq!(formatted, "```rust\nfn foo() -> i32\n```\n\nSome documentation text");
+        assert_eq!(
+            formatted,
+            "```rust\nfn foo() -> i32\n```\n\nSome documentation text"
+        );
     }
 
     #[test]
@@ -1317,9 +1318,7 @@ mod tests {
         let result = tool.check_permissions(&Value::Null, &ctx);
         // check_permissions is sync for LspTool.
         assert!(matches!(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(result),
+            tokio::runtime::Runtime::new().unwrap().block_on(result),
             PermissionDecision::Allow { .. }
         ));
     }

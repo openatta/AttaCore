@@ -114,28 +114,23 @@ pub fn start_otel(config: &RemoteConfig) -> Result<OtelExporter, OtelError> {
     let protocol = detect_protocol(&config.endpoint);
     let endpoint = config.endpoint.clone();
 
-    let resource = opentelemetry_sdk::Resource::new(vec![
-        KeyValue::new("service.name", "attacore"),
-    ]);
+    let resource =
+        opentelemetry_sdk::Resource::new(vec![KeyValue::new("service.name", "attacore")]);
 
     // ── Trace exporter ──────────────────────────────────────────────────
     let trace_exporter = match protocol {
-        OtelProtocol::Grpc => {
-            opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(&endpoint)
-                .with_timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| OtelError::InitFailed(e.to_string()))?
-        }
-        OtelProtocol::HttpProtobuf => {
-            opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_endpoint(&endpoint)
-                .with_timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| OtelError::InitFailed(e.to_string()))?
-        }
+        OtelProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint)
+            .with_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| OtelError::InitFailed(e.to_string()))?,
+        OtelProtocol::HttpProtobuf => opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(&endpoint)
+            .with_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| OtelError::InitFailed(e.to_string()))?,
     };
 
     let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
@@ -147,31 +142,29 @@ pub fn start_otel(config: &RemoteConfig) -> Result<OtelExporter, OtelError> {
 
     // ── Metric exporter ─────────────────────────────────────────────────
     let metric_exporter = match protocol {
-        OtelProtocol::Grpc => {
-            opentelemetry_otlp::MetricExporter::builder()
-                .with_tonic()
-                .with_endpoint(&endpoint)
-                .with_timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| OtelError::InitFailed(e.to_string()))?
-        }
-        OtelProtocol::HttpProtobuf => {
-            opentelemetry_otlp::MetricExporter::builder()
-                .with_http()
-                .with_endpoint(&endpoint)
-                .with_timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| OtelError::InitFailed(e.to_string()))?
-        }
+        OtelProtocol::Grpc => opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint)
+            .with_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| OtelError::InitFailed(e.to_string()))?,
+        OtelProtocol::HttpProtobuf => opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(&endpoint)
+            .with_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| OtelError::InitFailed(e.to_string()))?,
     };
 
     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_reader(opentelemetry_sdk::metrics::PeriodicReader::builder(
-            metric_exporter,
-            opentelemetry_sdk::runtime::Tokio,
+        .with_reader(
+            opentelemetry_sdk::metrics::PeriodicReader::builder(
+                metric_exporter,
+                opentelemetry_sdk::runtime::Tokio,
+            )
+            .with_interval(Duration::from_secs(60))
+            .build(),
         )
-        .with_interval(Duration::from_secs(60))
-        .build())
         .with_resource(resource)
         .build();
 
@@ -291,10 +284,7 @@ mod tests {
 
     #[test]
     fn detect_grpc_from_port_4317() {
-        assert_eq!(
-            detect_protocol("http://localhost:4317"),
-            OtelProtocol::Grpc
-        );
+        assert_eq!(detect_protocol("http://localhost:4317"), OtelProtocol::Grpc);
     }
 
     #[test]

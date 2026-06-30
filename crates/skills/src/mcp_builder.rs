@@ -101,10 +101,7 @@ above. Pass it as the arguments for the `{tool_name}` tool.
 
 /// Return the number of stored MCP skill bodies.
 pub fn mcp_skill_count() -> usize {
-    mcp_bodies()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .len()
+    mcp_bodies().read().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 #[cfg(test)]
@@ -137,10 +134,7 @@ mod tests {
         assert_eq!(entries[0].name, "mcp__web-search__search");
         assert_eq!(entries[0].description, "Search the web");
         assert!(entries[0].user_invocable);
-        assert_eq!(
-            entries[0].path.to_string_lossy(),
-            "(mcp:web-search:search)"
-        );
+        assert_eq!(entries[0].path.to_string_lossy(), "(mcp:web-search:search)");
 
         assert_eq!(entries[1].name, "mcp__web-search__fetch");
     }

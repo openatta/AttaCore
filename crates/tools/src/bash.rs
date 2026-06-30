@@ -14,7 +14,10 @@ pub use sandbox::{sandbox_status, SandboxMode};
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -56,7 +59,8 @@ pub struct BashInput {
     /// The model can poll with TaskOutput or check /proc for completion.
     #[serde(default)]
     #[serde(alias = "run_in_background")]
-    pub run_in_background: bool}
+    pub run_in_background: bool,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BashTool;
@@ -121,7 +125,8 @@ impl Tool for BashTool {
                 4,
             ),
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
 
     async fn check_permissions(&self, input: &Value, _: &ToolContext) -> PermissionDecision {
@@ -130,11 +135,13 @@ impl Tool for BashTool {
         // acceptEdits → allow if readonly, default → ask）。
         if self.is_read_only(input) {
             return PermissionDecision::Allow {
-                decision_reason: Some("read_only".into())};
+                decision_reason: Some("read_only".into()),
+            };
         }
         PermissionDecision::Ask {
             message: "Bash command requires confirmation".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -159,7 +166,8 @@ impl Tool for BashTool {
             cwd: &ctx.cwd,
             additional_writable: &writable,
             disable: ctx.dangerously_disable_sandbox,
-            policy: sandbox::SandboxPolicy::default()});
+            policy: sandbox::SandboxPolicy::default(),
+        });
         if wrapped.mode == SandboxMode::Unavailable {
             tracing::warn!(
                 platform = std::env::consts::OS,
@@ -191,16 +199,16 @@ impl Tool for BashTool {
 
         // 等待 + 超时 + cancel
         let wait_result = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => {
-                let _ = child.kill().await;
-                return Err(ToolError::Cancelled);
-            }
-            _ = tokio::time::sleep(timeout) => {
-                let _ = child.kill().await;
-                return Err(ToolError::Timeout(timeout));
-            }
-            r = child.wait() => r};
+        biased;
+        _ = ctx.cancel.cancelled() => {
+            let _ = child.kill().await;
+            return Err(ToolError::Cancelled);
+        }
+        _ = tokio::time::sleep(timeout) => {
+            let _ = child.kill().await;
+            return Err(ToolError::Timeout(timeout));
+        }
+        r = child.wait() => r};
         let status = wait_result.map_err(|e| ToolError::exec(e.to_string()))?;
 
         // exit code 130 (128 + SIGINT) = user pressed Ctrl-C during this tool.
@@ -260,7 +268,8 @@ async fn drain_stream<R: AsyncRead + Unpin + Send + 'static>(
                 let line_with_nl = format!("{line}\n");
                 progress.send(&line_with_nl);
             }
-            Err(_) => break}
+            Err(_) => break,
+        }
     }
     if buf.len() >= MAX_OUTPUT_BYTES {
         buf.push_str("\n[output truncated]\n");
@@ -271,7 +280,8 @@ async fn drain_stream<R: AsyncRead + Unpin + Send + 'static>(
 #[derive(Debug, Clone, Copy)]
 pub struct CmdClassification {
     pub read_only: bool,
-    pub destructive: bool}
+    pub destructive: bool,
+}
 
 /// 命令中不允许出现的字符 — `;` 链式、`&` 后台/AND、`>` `<` 重定向、
 /// `` ` `` 命令替换、`$` 变量展开/命令替换。
@@ -313,7 +323,8 @@ pub mod classify {
         if trimmed.is_empty() {
             return CmdClassification {
                 read_only: true,
-                destructive: false};
+                destructive: false,
+            };
         }
 
         // Does the command contain quoted strings? If so, don't split on
@@ -349,7 +360,8 @@ pub mod classify {
             }
             return CmdClassification {
                 read_only: all_read_only,
-                destructive: any_destructive};
+                destructive: any_destructive,
+            };
         }
 
         classify_single(trimmed)
@@ -422,7 +434,8 @@ pub mod classify {
         if trimmed.is_empty() {
             return CmdClassification {
                 read_only: true,
-                destructive: false};
+                destructive: false,
+            };
         }
 
         // 1. destructive 优先 — match against the first real command token.
@@ -433,7 +446,8 @@ pub mod classify {
                 if first == p {
                     return CmdClassification {
                         read_only: false,
-                        destructive: true};
+                        destructive: true,
+                    };
                 }
             }
         }
@@ -443,7 +457,8 @@ pub mod classify {
         if READ_ONLY_COMMANDS.contains(&first) {
             return CmdClassification {
                 read_only: true,
-                destructive: false};
+                destructive: false,
+            };
         }
         for &p in READ_ONLY_PREFIXES {
             if trimmed == p
@@ -451,14 +466,16 @@ pub mod classify {
             {
                 return CmdClassification {
                     read_only: true,
-                    destructive: false};
+                    destructive: false,
+                };
             }
         }
 
         // 未识别 → 走默认 ask 路径（不标 destructive，由 gate/mode 分派决定）
         CmdClassification {
             read_only: false,
-            destructive: false}
+            destructive: false,
+        }
     }
 
     /// True if read only.
@@ -517,7 +534,9 @@ pub mod classify {
                 if sep_len > 0 {
                     if i > start {
                         let seg = cmd[start..i].trim();
-                        if !seg.is_empty() { segments.push(seg); }
+                        if !seg.is_empty() {
+                            segments.push(seg);
+                        }
                     }
                     start = i + sep_len;
                     i = start;
@@ -528,7 +547,9 @@ pub mod classify {
         }
         if start < bytes.len() {
             let seg = cmd[start..].trim();
-            if !seg.is_empty() { segments.push(seg); }
+            if !seg.is_empty() {
+                segments.push(seg);
+            }
         }
         if segments.is_empty() && !cmd.trim().is_empty() {
             segments.push(cmd.trim());
@@ -560,7 +581,9 @@ pub mod classify {
             }
         }
         // sudo/doas with redirects
-        if (cmd.starts_with("sudo ") || cmd.starts_with("doas ")) && (cmd.contains('>') || cmd.contains("&&")) {
+        if (cmd.starts_with("sudo ") || cmd.starts_with("doas "))
+            && (cmd.contains('>') || cmd.contains("&&"))
+        {
             risks.push("sudo/doas with redirect or compound command".to_string());
         }
 
@@ -797,7 +820,8 @@ mod tests {
             ToolResultContent::Text(t) => {
                 assert!(t.contains("hello"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -820,7 +844,8 @@ mod tests {
                     "expected exit code marker: {t}"
                 );
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -840,7 +865,8 @@ mod tests {
                 assert!(t.contains("to-stdout"));
                 assert!(t.contains("to-stderr"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -864,7 +890,8 @@ mod tests {
                     "expected cwd in output: {t}"
                 );
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]

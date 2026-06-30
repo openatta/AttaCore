@@ -398,11 +398,17 @@ mod tests {
         assert!(d.is_user_settable(), "DontAsk is user-settable");
 
         // Validation: Bubble in settings is rejected.
-        let s = Settings { permission_mode: PermissionMode::Bubble, ..Settings::defaults_for("test") };
+        let s = Settings {
+            permission_mode: PermissionMode::Bubble,
+            ..Settings::defaults_for("test")
+        };
         assert!(s.validate().is_err());
 
         // Validation: Auto in settings is rejected.
-        let s = Settings { permission_mode: PermissionMode::Auto, ..Settings::defaults_for("test") };
+        let s = Settings {
+            permission_mode: PermissionMode::Auto,
+            ..Settings::defaults_for("test")
+        };
         assert!(s.validate().is_err());
     }
 }

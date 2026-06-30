@@ -92,11 +92,7 @@ impl RequestContext {
 
     /// Approximate total input token count for the request.
     pub fn estimated_input_tokens(&self) -> usize {
-        let system_tokens: usize = self
-            .system_blocks
-            .iter()
-            .map(|b| b.content.len() / 4)
-            .sum();
+        let system_tokens: usize = self.system_blocks.iter().map(|b| b.content.len() / 4).sum();
         let message_tokens: usize = self
             .messages
             .iter()
@@ -104,9 +100,7 @@ impl RequestContext {
                 m.content
                     .iter()
                     .map(|b| match b {
-                        base::interface::model::ModelContentBlock::Text { text } => {
-                            text.len() / 4
-                        }
+                        base::interface::model::ModelContentBlock::Text { text } => text.len() / 4,
                         _ => 50, // rough estimate for tool blocks
                     })
                     .sum::<usize>()

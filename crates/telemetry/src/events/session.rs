@@ -101,7 +101,8 @@ mod tests {
                 started_at_ms: 1000,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert!(v.get("event_id").is_some(), "missing event_id");
         assert!(v.get("timestamp_ms").is_some(), "missing timestamp_ms");
         assert_eq!(v["schema_version"], 1);
@@ -127,7 +128,8 @@ mod tests {
                 custom_commands: vec![],
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "config_loaded");
         assert_eq!(v["tool_count"], 42);
         assert_eq!(v["mcp_server_count"], 3);
@@ -150,7 +152,8 @@ mod tests {
                 first_api_call_ms: 100,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "startup_timing");
         assert_eq!(v["total_startup_ms"], 1500);
         assert_eq!(v["mcp_connect_ms"], 800);
@@ -170,7 +173,8 @@ mod tests {
                 exit_code: 0,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "shutdown_signal");
         assert_eq!(v["reason"], "user_quit");
         assert_eq!(v["total_turns"], 10);

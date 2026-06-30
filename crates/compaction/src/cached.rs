@@ -142,11 +142,7 @@ impl CachedMicroCompact {
     /// the server-side cached prefix without busting the cache.
     ///
     /// Returns a list of tool_use_ids whose results should be deleted via cache_edits.
-    pub fn build_cache_edits(
-        &self,
-        messages: &[ModelMessage],
-        keep_recent: usize,
-    ) -> Vec<String> {
+    pub fn build_cache_edits(&self, messages: &[ModelMessage], keep_recent: usize) -> Vec<String> {
         let mut tool_use_ids: Vec<String> = Vec::new();
         let mut result_count = 0usize;
 
@@ -156,10 +152,12 @@ impl CachedMicroCompact {
                 for block in &msg.content {
                     if let ModelContentBlock::ToolResult { tool_use_id, .. } = block {
                         result_count += 1;
-                        if result_count > keep_recent && !tool_use_id.is_empty()
-                            && !tool_use_ids.contains(tool_use_id) {
-                                tool_use_ids.push(tool_use_id.clone());
-                            }
+                        if result_count > keep_recent
+                            && !tool_use_id.is_empty()
+                            && !tool_use_ids.contains(tool_use_id)
+                        {
+                            tool_use_ids.push(tool_use_id.clone());
+                        }
                     }
                 }
             }

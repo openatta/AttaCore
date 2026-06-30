@@ -256,17 +256,27 @@ impl SessionState {
 
     /// Read-only access to the snapshot registry (for `/rewind` listing).
     pub fn file_snapshots_snapshot(&self) -> Vec<FileSnapshot> {
-        self.file_snapshots.lock().unwrap_or_else(|e| e.into_inner()).entries().to_vec()
+        self.file_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries()
+            .to_vec()
     }
 
     pub fn file_snapshot_turns(&self) -> Vec<u64> {
-        self.file_snapshots.lock().unwrap_or_else(|e| e.into_inner()).turns_with_snapshots()
+        self.file_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .turns_with_snapshots()
     }
 
     /// Restore a single snapshot by id. Returns the path that was restored.
     pub fn restore_snapshot(&self, id: u64) -> Result<PathBuf, std::io::Error> {
         let snap = {
-            let reg = self.file_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+            let reg = self
+                .file_snapshots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             reg.entry_by_id(id).cloned().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "snapshot not found")
             })?
@@ -288,7 +298,10 @@ impl SessionState {
     /// ends up at the older state, not the intermediate one.
     pub fn restore_to_turn(&self, target_turn: u64) -> Result<Vec<PathBuf>, std::io::Error> {
         let to_restore: Vec<FileSnapshot> = {
-            let reg = self.file_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+            let reg = self
+                .file_snapshots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             reg.entries_after(target_turn)
                 .into_iter()
                 .cloned()
@@ -333,14 +346,22 @@ impl SessionState {
     }
 
     pub fn drain_denials(&self) -> Vec<PermissionDenial> {
-        std::mem::take(&mut *self.permission_denials.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(
+            &mut *self
+                .permission_denials
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// P2: Check if any tool has been denied 3+ times in this session.
     /// Returns the tool name and count if the escalation threshold is met.
     /// TS parity: denialTracking.ts repeated-denial detection + rule suggestion.
     pub fn check_denial_escalation(&self) -> Option<(String, usize)> {
-        let denials = self.permission_denials.lock().unwrap_or_else(|e| e.into_inner());
+        let denials = self
+            .permission_denials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for d in denials.iter() {
             *counts.entry(d.tool_name.clone()).or_insert(0) += 1;
@@ -394,15 +415,16 @@ impl SessionState {
     /// TODO: Needs concrete RunningTaskData from `task` crate.
     /// Caller (in task crate) should handle this via the public fields.
     pub fn insert_running_task(&self, task_id: String, task: std::sync::Arc<RunningTask>) {
-        self.running_tasks
-            .lock()
-            .unwrap()
-            .insert(task_id, task);
+        self.running_tasks.lock().unwrap().insert(task_id, task);
     }
 
     /// 找一个 running task。返回 Arc 让 caller 读快照（output / status）。
     pub fn find_running_task(&self, task_id: &str) -> Option<std::sync::Arc<RunningTask>> {
-        self.running_tasks.lock().unwrap_or_else(|e| e.into_inner()).get(task_id).cloned()
+        self.running_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .cloned()
     }
 
     /// 列出所有 running tasks 的 (id, status) 快照。
@@ -411,14 +433,24 @@ impl SessionState {
             .lock()
             .unwrap()
             .iter()
-            .map(|(k, v)| (k.clone(), v.status.lock().unwrap_or_else(|e| e.into_inner()).clone()))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.status.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                )
+            })
             .collect()
     }
 
     /// 主动取消一个 running task；返回是否找到。caller 后续调用 find_running_task
     /// 看 status 应该会变成 Cancelled。
     pub fn cancel_running_task(&self, task_id: &str) -> bool {
-        if let Some(task) = self.running_tasks.lock().unwrap_or_else(|e| e.into_inner()).get(task_id) {
+        if let Some(task) = self
+            .running_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+        {
             task.cancel.cancel();
             true
         } else {
@@ -465,7 +497,10 @@ impl SessionState {
     }
 
     /// Inject a file-backed running task store for crash recovery (implements [`RunningTaskPersist`]).
-    pub fn with_running_task_store(mut self, store: std::sync::Arc<dyn RunningTaskPersist>) -> Self {
+    pub fn with_running_task_store(
+        mut self,
+        store: std::sync::Arc<dyn RunningTaskPersist>,
+    ) -> Self {
         self.running_task_store = Some(store);
         self
     }
@@ -512,18 +547,27 @@ impl SessionState {
 
     /// Builder：设初始权限模式（CLI 启动时从 settings/CLI 注入）。
     pub fn with_permission_mode(self, mode: PermissionMode) -> Self {
-        *self.permission_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+        *self
+            .permission_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mode;
         self
     }
 
     /// 读当前模式（PermissionMode 是 Copy，返回值就行）。
     pub fn permission_mode(&self) -> PermissionMode {
-        *self.permission_mode.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .permission_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// 切换模式（EnterPlanMode / ExitPlanMode / `/permissions` 命令）。
     pub fn set_permission_mode(&self, mode: PermissionMode) {
-        *self.permission_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+        *self
+            .permission_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mode;
     }
 
     /// 读取当前 todo 列表（克隆给调用方）
@@ -545,13 +589,19 @@ impl SessionState {
     /// Record that TodoWrite was called on the current turn. Called by engine
     /// when it processes TodoWrite tool results.
     pub fn record_todo_write_turn(&self, turn: u64) {
-        *self.last_todo_write_turn.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn);
+        *self
+            .last_todo_write_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(turn);
     }
 
     /// Returns the turn number since last TodoWrite, or None if never called
     /// or current_turn is not advanced enough to compute.
     pub fn turns_since_todo_write(&self) -> Option<u64> {
-        let guard = self.last_todo_write_turn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self
+            .last_todo_write_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let last = (*guard)?;
         let current = *self.current_turn.lock().unwrap_or_else(|e| e.into_inner());
         Some(current.saturating_sub(last))
@@ -560,7 +610,10 @@ impl SessionState {
     /// Read + update the verification nudge counter atomically. Returns the
     /// difference between current and last-nudged completed-task count.
     pub fn check_verification_nudge(&self, completed_count: u32) -> u32 {
-        let mut last = self.last_verification_nudge_count.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = self
+            .last_verification_nudge_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let delta = completed_count.saturating_sub(*last);
         if delta >= 3 {
             *last = completed_count;
@@ -580,7 +633,10 @@ impl SessionState {
 
     /// Read the current plan text, if any.
     pub fn plan_text(&self) -> Option<String> {
-        self.plan_text.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.plan_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Set the active plan slug (called by EnterPlanMode tool).
@@ -595,17 +651,26 @@ impl SessionState {
 
     /// Read the current plan slug, if any.
     pub fn plan_slug(&self) -> Option<String> {
-        self.plan_slug.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.plan_slug
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// **P (2026-05-17)**: 添加一个沙盒放写路径（项目级授权时调用）。
     pub fn add_sandbox_allow_write(&self, path: PathBuf) {
-        self.sandbox_allow_writes.lock().unwrap_or_else(|e| e.into_inner()).push(path);
+        self.sandbox_allow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path);
     }
 
     /// 读取所有沙盒放写路径。
     pub fn sandbox_allow_writes(&self) -> Vec<PathBuf> {
-        self.sandbox_allow_writes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.sandbox_allow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// **P (read-before-edit)**: 记录一次文件读取。`FileRead` 工具成功后调用。
@@ -617,12 +682,7 @@ impl SessionState {
 
     /// Record a file read with offset/limit for precise dedup.
     /// TS parity: `FileReadTool.ts:1032-1037` — stores offset + limit + mtime.
-    pub fn record_read_with_range(
-        &self,
-        path: &Path,
-        offset: Option<usize>,
-        limit: Option<usize>,
-    ) {
+    pub fn record_read_with_range(&self, path: &Path, offset: Option<usize>, limit: Option<usize>) {
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(mtime) = meta.modified() {
                 self.read_cache
@@ -636,8 +696,10 @@ impl SessionState {
                             limit,
                         },
                     );
-                *self.last_read_path.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(path.to_path_buf());
+                *self
+                    .last_read_path
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
             }
         }
     }
@@ -693,22 +755,26 @@ impl SessionState {
         };
         let cache = self.read_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.get(path).is_some_and(|entry| {
-            entry.mtime == current_mtime
-                && entry.offset == offset
-                && entry.limit == limit
+            entry.mtime == current_mtime && entry.offset == offset && entry.limit == limit
         })
     }
 
     /// **P (read dedup)**: 给定路径是否与最近一次读取的文件一致。
     /// 仅检查路径相等；mtime 一致性由调用方通过 `check_read_dedup` 保证。
     pub fn is_consecutive_read(&self, path: &Path) -> bool {
-        let last = self.last_read_path.lock().unwrap_or_else(|e| e.into_inner());
+        let last = self
+            .last_read_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         last.as_ref().is_some_and(|p| p == path)
     }
 
     /// 当前已激活的 deferred 工具名（克隆 set；调用方只读）。
     pub fn activated_tools(&self) -> HashSet<String> {
-        self.activated_tools.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.activated_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// ToolSearch 命中后调用：把工具加进 activated 集合。
@@ -717,7 +783,10 @@ impl SessionState {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut set = self.activated_tools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = self
+            .activated_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for name in names {
             set.insert(name);
         }

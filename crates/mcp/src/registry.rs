@@ -172,7 +172,11 @@ mod tests {
     fn list_returns_all_servers() {
         let registry = OfficialRegistry::new();
         let all = registry.list_official_servers();
-        assert!(all.len() >= 5, "expected at least 5 servers, got {}", all.len());
+        assert!(
+            all.len() >= 5,
+            "expected at least 5 servers, got {}",
+            all.len()
+        );
     }
 
     #[test]
@@ -234,13 +238,25 @@ mod tests {
         let registry = OfficialRegistry::new();
         for server in registry.list_official_servers() {
             assert!(!server.name.is_empty(), "server name is empty");
-            assert!(!server.description.is_empty(), "description for '{}' is empty", server.name);
+            assert!(
+                !server.description.is_empty(),
+                "description for '{}' is empty",
+                server.name
+            );
             match server.transport {
                 McpServerTransport::Stdio => {
-                    assert!(server.command.is_some(), "Stdio server '{}' has no command", server.name);
+                    assert!(
+                        server.command.is_some(),
+                        "Stdio server '{}' has no command",
+                        server.name
+                    );
                 }
                 McpServerTransport::StreamableHttp => {
-                    assert!(server.url.is_some(), "StreamableHttp server '{}' has no url", server.name);
+                    assert!(
+                        server.url.is_some(),
+                        "StreamableHttp server '{}' has no url",
+                        server.name
+                    );
                 }
             }
         }

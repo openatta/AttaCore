@@ -13,14 +13,8 @@
 use crate::client::{McpClientHandle, McpContent};
 use async_trait::async_trait;
 use base::{
-    tool::PermissionDecision,
-    tool::ProgressSender,
-    tool::PromptContext,
-    tool::Tool,
-    tool::ToolContext,
-    error::ToolError,
-    tool::ToolResult,
-    tool::ValidationResult,
+    error::ToolError, tool::PermissionDecision, tool::ProgressSender, tool::PromptContext,
+    tool::Tool, tool::ToolContext, tool::ToolResult, tool::ValidationResult,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;

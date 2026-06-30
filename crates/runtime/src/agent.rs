@@ -6,16 +6,18 @@ use base::interface::model::Model;
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::Settings;
+use base::provider::ProviderDef;
+use base::tool::InMemoryToolRegistry;
 use compaction::cached::CachedMicroCompact;
 use compaction::compact::{Compactor, DefaultCompactor};
 use hooks::HookRunner;
 use mcp::manager::McpManager;
-use telemetry::perf::PerfCollector;
+use model::router::ModelRouter;
 use session::session::SessionManager;
-use telemetry::{TelemetryHandle, TelemetryRecorder};
-use base::tool::InMemoryToolRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
+use telemetry::perf::PerfCollector;
+use telemetry::{TelemetryHandle, TelemetryRecorder};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing;
@@ -76,6 +78,18 @@ pub type EventReceiver = mpsc::UnboundedReceiver<AgentEvent>;
 pub struct Agent {
     pub(crate) scene: Arc<dyn AgentScene>,
     pub(crate) model: Arc<dyn Model>,
+    /// v2.0.0: Multi-provider model router — caches Model instances per provider.
+    /// When a task resolves to a specific provider, this router returns the
+    /// appropriate Model. Falls back to `model` when no provider match.
+    pub(crate) model_router: ModelRouter,
+    /// v2.0.0: Policy hook runner — enforces engineering rules before task completion.
+    pub(crate) policy_hooks: scene::coding::policy::PolicyHookRunner,
+    /// v2.0.0: Verification records for the current turn.
+    pub(crate) verification_records: Vec<scene::coding::verify::VerificationRecord>,
+    /// v2.0.0: Files changed in the current turn (for policy hook context).
+    pub(crate) changed_files_this_turn: Vec<String>,
+    /// v2.0.0: Commands executed in the current turn (for policy hook context).
+    pub(crate) executed_commands_this_turn: Vec<String>,
     pub(crate) tools: Arc<InMemoryToolRegistry>,
     pub(crate) settings: Arc<Settings>,
     pub(crate) permission: Arc<dyn Permission>,
@@ -186,13 +200,15 @@ impl Agent {
                     "Recovering orphaned permission from previous session"
                 );
                 self.has_handled_orphaned_permission = true;
-                let _ = self.process_turn(
-                    InputMessage::PermissionResponse {
-                        prompt_id: "orphaned".into(),
-                        decision,
-                    },
-                    cancel.clone(),
-                ).await;
+                let _ = self
+                    .process_turn(
+                        InputMessage::PermissionResponse {
+                            prompt_id: "orphaned".into(),
+                            decision,
+                        },
+                        cancel.clone(),
+                    )
+                    .await;
             }
         }
         self.has_handled_orphaned_permission = true;
@@ -256,7 +272,8 @@ impl Agent {
             // 2. Re-scan skills directories for newly added skills
             async move {
                 let count1 = skills.load_dir(&user_skills_dir, skills::manager::SkillSource::User);
-                let count2 = skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
+                let count2 =
+                    skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
                 (count1.ok(), count2.ok())
             },
             // 3. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
@@ -284,16 +301,12 @@ impl Agent {
     /// List persisted sessions. External interface (read-only, from HistoryStore).
     pub async fn list_sessions(
         &self,
-    ) -> Result<Vec<session::session::SessionSummary>, session::session::SessionError>
-    {
+    ) -> Result<Vec<session::session::SessionSummary>, session::session::SessionError> {
         self.session.list_sessions().await
     }
 
     /// Delete a persisted session from HistoryStore. External interface.
-    pub async fn delete_session(
-        &self,
-        id: &str,
-    ) -> Result<(), session::session::SessionError> {
+    pub async fn delete_session(&self, id: &str) -> Result<(), session::session::SessionError> {
         self.session.delete_session(id).await
     }
 
@@ -317,6 +330,18 @@ impl Agent {
         Arc::make_mut(&mut self.settings).model.model_name = model_name;
     }
 
+    /// v2.0.0: Resolve the active Model for the current turn.
+    ///
+    /// Checks the ModelRouter for the default anthropic provider first,
+    /// then falls back to `self.model`. This is called at model.stream() time.
+    pub(crate) fn resolve_active_model(&self, _effective_model: &str) -> Arc<dyn Model> {
+        // Try the default anthropic provider
+        if let Some(m) = self.model_router.get("anthropic") {
+            return m;
+        }
+        self.model.clone()
+    }
+
     /// Access telemetry recorder for external event recording.
     pub fn telemetry(&self) -> &dyn TelemetryRecorder {
         &self.telemetry_handle
@@ -330,6 +355,117 @@ impl Agent {
     /// Access the permission handler (read-only).
     pub fn permission(&self) -> &dyn Permission {
         &*self.permission
+    }
+
+    /// v2.0.0: Run policy hooks at a specific hook point.
+    ///
+    /// Builds a PolicyContext from the current turn state and evaluates
+    /// all registered hooks for the given point. Returns the first blocking
+    /// decision, or Allow.
+    pub fn run_policy_hooks(
+        &self,
+        point: scene::coding::policy::PolicyHookPoint,
+        tool_name: Option<&str>,
+        command: Option<&str>,
+    ) -> scene::coding::policy::HookDecision {
+        let ctx = scene::coding::policy::PolicyContext {
+            hook_point: Some(point),
+            changed_files: self.changed_files_this_turn.clone(),
+            executed_commands: self.executed_commands_this_turn.clone(),
+            has_verification: !self.verification_records.is_empty(),
+            verification_passed: self
+                .verification_records
+                .last()
+                .map(|r| r.passed)
+                .unwrap_or(false),
+            tool_name: tool_name.map(|s| s.to_string()),
+            tool_input: None,
+            command: command.map(|s| s.to_string()),
+        };
+        self.policy_hooks.evaluate(point, &ctx)
+    }
+
+    /// v2.0.0: Record a file change (for policy hook context).
+    pub fn record_file_change(&mut self, path: impl Into<String>) {
+        let p = path.into();
+        if !self.changed_files_this_turn.contains(&p) {
+            self.changed_files_this_turn.push(p);
+        }
+    }
+
+    /// v2.0.0: Record a command execution (for policy hook context).
+    pub fn record_command(&mut self, cmd: impl Into<String>) {
+        self.executed_commands_this_turn.push(cmd.into());
+    }
+
+    /// Reset per-turn tracking state.
+    pub fn reset_turn_state(&mut self) {
+        self.verification_records.clear();
+        self.changed_files_this_turn.clear();
+        self.executed_commands_this_turn.clear();
+    }
+
+    /// v2.0.0: Record a verification attempt result.
+    ///
+    /// Called after a verification command (e.g. `cargo test`) completes.
+    pub fn record_verification(
+        &mut self,
+        command: impl Into<String>,
+        exit_code: Option<i32>,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) {
+        let record =
+            scene::coding::verify::VerificationRecord::new(command, exit_code, stdout, stderr);
+        self.verification_records.push(record);
+    }
+
+    /// v2.0.0: Build the verification reminder text for the system reminder.
+    ///
+    /// If verification is required but not yet performed, returns a hint
+    /// that is injected into the `<system-reminder>` block before each turn.
+    pub fn build_verification_reminder(&self) -> Option<String> {
+        let policy = self.scene.verification_policy()?;
+        if !policy.is_enabled() {
+            return None;
+        }
+        if self.verification_records.is_empty() {
+            return Some(
+                "Verification is required for this task. After making changes, \
+                 run the relevant tests or build command and verify the output. \
+                 Do not claim completion without verification."
+                    .into(),
+            );
+        }
+        let last = self.verification_records.last()?;
+        if !last.passed && policy.block_completion_on_failure {
+            return Some(format!(
+                "Last verification FAILED: {}. You must fix the issue and verify again.",
+                last.failure_summary.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        // Passed — no reminder needed
+        None
+    }
+
+    /// v2.0.0: Check whether the scene requires verification and the
+    /// verification policy blocks completion.
+    pub fn check_verification_block(&self) -> Option<String> {
+        let policy = self.scene.verification_policy()?;
+        if !policy.is_enabled() {
+            return None;
+        }
+        if self.verification_records.is_empty() {
+            return Some("Verification is required for this task but was not performed.".into());
+        }
+        let last = self.verification_records.last()?;
+        if !last.passed && policy.block_completion_on_failure {
+            return Some(format!(
+                "Verification failed: {}. Fix the issue and verify again.",
+                last.failure_summary.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        None
     }
 
     /// Access the memory store (read-only).
@@ -450,7 +586,11 @@ impl Agent {
 
     /// Run hooks for a lifecycle event.
     /// Returns hook outputs that may block actions or inject text.
-    pub async fn run_hooks(&self, event: hooks::HookEvent, input: &hooks::HookInput) -> hooks::runner::HookRunResult {
+    pub async fn run_hooks(
+        &self,
+        event: hooks::HookEvent,
+        input: &hooks::HookInput,
+    ) -> hooks::runner::HookRunResult {
         self.hooks.run(event, input).await
     }
 
@@ -530,6 +670,9 @@ pub enum EngineError {
 pub struct Builder {
     scene: Option<Arc<dyn AgentScene>>,
     model: Option<Arc<dyn Model>>,
+    /// v2.0.0: Pre-configured model router. If not set, a default empty
+    /// ModelRouter is created (falls back to `model` for all calls).
+    model_router: Option<ModelRouter>,
     tools: Option<Arc<InMemoryToolRegistry>>,
     settings: Option<Arc<Settings>>,
     permission: Option<Arc<dyn Permission>>,
@@ -555,6 +698,7 @@ impl Builder {
         Self {
             scene: None,
             model: None,
+            model_router: None,
             tools: None,
             settings: None,
             permission: None,
@@ -579,6 +723,12 @@ impl Builder {
     }
     pub fn model(mut self, m: Arc<dyn Model>) -> Self {
         self.model = Some(m);
+        self
+    }
+    /// v2.0.0: Inject a pre-configured ModelRouter for multi-provider support.
+    /// If not set, an empty ModelRouter is created (falls back to `model`).
+    pub fn model_router(mut self, router: ModelRouter) -> Self {
+        self.model_router = Some(router);
         self
     }
     pub fn tools(mut self, t: Arc<InMemoryToolRegistry>) -> Self {
@@ -720,12 +870,10 @@ impl Builder {
             hooks.set_wake_receiver(rx);
         }
         // Telemetry: use pre-built handle if injected, else noop (events silently dropped).
-        let telemetry_handle = self
-            .telemetry_handle_override
-            .unwrap_or_else(|| {
-                let (tx, _rx) = tokio::sync::mpsc::channel(1);
-                TelemetryHandle::new(tx)
-            });
+        let telemetry_handle = self.telemetry_handle_override.unwrap_or_else(|| {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            TelemetryHandle::new(tx)
+        });
         // MCP: use pre-built manager if injected, else empty (no servers).
         let mcp = self.mcp_manager_override.unwrap_or_else(McpManager::empty);
         // Skill auto-loading: scan ~/.atta/code/skills/ and project/.atta/code/skills/
@@ -740,7 +888,10 @@ impl Builder {
                 skills::manager::SkillSource::Project,
             ),
         ];
-        let loaded_count: usize = skill_load_results.iter().filter_map(|r| r.as_ref().ok()).sum();
+        let loaded_count: usize = skill_load_results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .sum();
         // Register built-in (bundled) skills after disk skills.
         // Disk-loaded skills with the same name take priority — bundled is fallback.
         for bundled in skills::bundled::bundled_skills() {
@@ -752,7 +903,7 @@ impl Builder {
         // Build command registry from skill manager + built-in local commands
         let skill_mgr_arc = std::sync::Arc::new(skill_mgr);
         let command_registry = std::sync::Arc::new(
-            crate::commands::CommandRegistry::from_skill_manager(&skill_mgr_arc)
+            crate::commands::CommandRegistry::from_skill_manager(&skill_mgr_arc),
         );
         // Register SkillTool using the populated skill manager
         tools::register_skill_tool(&tools, Arc::clone(&skill_mgr_arc), scene.default_skills());
@@ -762,9 +913,15 @@ impl Builder {
         tools.register(std::sync::Arc::new(tools::task_output::TaskOutputTool));
         // Register MCP resource tools if clients are available
         if !mcp.clients().is_empty() {
-            tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(mcp.clients().to_vec())));
-            tools.register(std::sync::Arc::new(mcp::tools::ReadMcpResourceTool::new(mcp.clients().to_vec())));
-            tools.register(std::sync::Arc::new(mcp::tools::DispatchMcpTool::new(mcp.clients().to_vec())));
+            tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(
+                mcp.clients().to_vec(),
+            )));
+            tools.register(std::sync::Arc::new(mcp::tools::ReadMcpResourceTool::new(
+                mcp.clients().to_vec(),
+            )));
+            tools.register(std::sync::Arc::new(mcp::tools::DispatchMcpTool::new(
+                mcp.clients().to_vec(),
+            )));
         }
 
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -773,10 +930,38 @@ impl Builder {
         // Capture feature flags before settings is moved into the Agent struct
         let cached_mc_enabled = settings.feature_flags.cached_microcompact;
 
+        // v2.0.0: Build or default the ModelRouter, pre-warm from providers
+        let model_router = self.model_router.unwrap_or_default();
+        // Pre-warm: if the scene has provider config, create Model instances now
+        if let Some(anthropic) = ProviderDef::from_env_anthropic() {
+            model_router.get_or_create(&anthropic);
+        }
+        // v2.0.0: Build PolicyHookRunner with built-in hooks + skill-driven rules
+        let mut policy_hooks = scene::coding::policy::PolicyHookRunner::builtin();
+        // Collect hook_rules from all loaded skills and register SkillRequiredHook
+        let skill_rules: Vec<base::frozen::skill::SkillHookRule> = skill_mgr_arc
+            .list()
+            .iter()
+            .filter_map(|s| s.hook_rules.clone())
+            .flatten()
+            .collect();
+        if !skill_rules.is_empty() {
+            let rule_count = skill_rules.len();
+            policy_hooks.register(Box::new(scene::coding::policy::SkillRequiredHook::new(
+                skill_rules,
+            )));
+            tracing::info!(count = rule_count, "skill hook rules registered");
+        }
+
         Ok((
             Agent {
                 scene,
                 model,
+                model_router,
+                policy_hooks,
+                verification_records: Vec::new(),
+                changed_files_this_turn: Vec::new(),
+                executed_commands_this_turn: Vec::new(),
                 tools,
                 settings,
                 permission,
@@ -801,12 +986,10 @@ impl Builder {
                 permission_denial_count: 0,
                 compact_warning_issued: false,
                 time_based_mc_config: compaction::time_based_mc::TimeBasedMcConfig::default(),
-                cached_mc: CachedMicroCompact::new(
-                    compaction::cached::CachedMcConfig {
-                        enabled: cached_mc_enabled,
-                        ..Default::default()
-                    }
-                ),
+                cached_mc: CachedMicroCompact::new(compaction::cached::CachedMcConfig {
+                    enabled: cached_mc_enabled,
+                    ..Default::default()
+                }),
                 compaction_state: compaction::reactive::CompactionState::default(),
                 team_id: None,
                 orphaned_permission: None,
@@ -842,16 +1025,27 @@ mod tests {
         Settings {
             model: ModelSettings {
                 api_type: base::provider::ApiType::Anthropic,
-                base_url: String::new(), auth_token: String::new(),
-                model_name: "test".into(), max_tokens: 2000,
-                thinking_mode: ThinkingMode::Auto, fallback_model: None,
+                base_url: String::new(),
+                auth_token: String::new(),
+                model_name: "test".into(),
+                max_tokens: 2000,
+                thinking_mode: ThinkingMode::Auto,
+                fallback_model: None,
             },
-            paths: PathSettings { user_data_dir: "/tmp".into(), local_data_dir: "/tmp".into() },
+            paths: PathSettings {
+                user_data_dir: "/tmp".into(),
+                local_data_dir: "/tmp".into(),
+            },
             execution: ExecutionSettings::default(),
             compaction: CompactionConfig::default(),
             sandbox: SandboxConfig::default(),
-            instruction_file: None, prompt_append: None, prompt_override: None,
-            vcr: None, telemetry_url: None, session_dir: None, memory_enabled: true,
+            instruction_file: None,
+            prompt_append: None,
+            prompt_override: None,
+            vcr: None,
+            telemetry_url: None,
+            session_dir: None,
+            memory_enabled: true,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,

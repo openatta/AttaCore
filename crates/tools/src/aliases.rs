@@ -6,7 +6,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,14 +30,17 @@ const REPL_TIMEOUT_MS: u64 = 30_000;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BriefInput {
     /// Short message to surface to the user (1-2 sentences)
-    pub message: String}
+    pub message: String,
+}
 
 pub struct BriefTool;
 
 #[async_trait]
 impl Tool for BriefTool {
-    fn description(&self) -> &str { "Send a message to the user" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Send a message to the user"
+    }
+    fn name(&self) -> &str {
         "SendUserMessage"
     }
 
@@ -65,7 +71,8 @@ impl Tool for BriefTool {
                 ValidationResult::err("message must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()
@@ -81,14 +88,12 @@ impl Tool for BriefTool {
             effects.append_system_message("notice", &input.message);
         }
         Ok(ToolResult {
-            content: base::tool::ToolResultContent::Text(format!(
-                "Briefed: {}",
-                input.message
-            )),
+            content: base::tool::ToolResultContent::Text(format!("Briefed: {}", input.message)),
             is_error: false,
             structured_content: Some(json!({"message": input.message})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -101,14 +106,17 @@ impl Tool for BriefTool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskOutputInput {
-    pub task_id: String}
+    pub task_id: String,
+}
 
 pub struct TaskOutputTool;
 
 #[async_trait]
 impl Tool for TaskOutputTool {
-    fn description(&self) -> &str { "Get output from a running background task" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Get output from a running background task"
+    }
+    fn name(&self) -> &str {
         "TaskOutput"
     }
 
@@ -148,7 +156,8 @@ impl Tool for TaskOutputTool {
                 ValidationResult::err("task_id must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()
@@ -190,7 +199,8 @@ impl Tool for TaskOutputTool {
                         "output": output,
                         "background": true})),
                     mcp_meta: None,
-                    new_messages: Some(vec![])});
+                    new_messages: Some(vec![]),
+                });
             }
         }
 
@@ -202,7 +212,8 @@ impl Tool for TaskOutputTool {
             is_error: true,
             structured_content: None,
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -216,24 +227,29 @@ impl Tool for TaskOutputTool {
 pub struct ConfigInput {
     /// 字段名（点分路径），如 `permissions.default_mode`。None = 输出完整摘要
     #[serde(default)]
-    pub field: Option<String>}
+    pub field: Option<String>,
+}
 
 pub struct ConfigTool {
     /// 启动时 cli 把"effective config snapshot"传进来；in-memory 只读
-    snapshot: Arc<Value>}
+    snapshot: Arc<Value>,
+}
 
 impl ConfigTool {
     /// Construct a new instance.
     pub fn new(snapshot: Value) -> Self {
         Self {
-            snapshot: Arc::new(snapshot)}
+            snapshot: Arc::new(snapshot),
+        }
     }
 }
 
 #[async_trait]
 impl Tool for ConfigTool {
-    fn description(&self) -> &str { "View current configuration settings" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "View current configuration settings"
+    }
+    fn name(&self) -> &str {
         "Config"
     }
 
@@ -278,16 +294,19 @@ impl Tool for ConfigTool {
         let snapshot = self.snapshot.as_ref();
         let target = match &input.field {
             Some(path) => walk_dotted(snapshot, path),
-            None => Some(snapshot.clone())};
+            None => Some(snapshot.clone()),
+        };
         let body = match &target {
             Some(v) => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
-            None => format!("(no such field: {})", input.field.as_deref().unwrap_or("?"))};
+            None => format!("(no such field: {})", input.field.as_deref().unwrap_or("?")),
+        };
         Ok(ToolResult {
             content: base::tool::ToolResultContent::Text(body),
             is_error: false,
             structured_content: target.map(|v| json!({"field": input.field, "value": v})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -310,14 +329,17 @@ pub struct PowerShellInput {
     pub command: String,
     /// timeout in milliseconds (default 60s, max 600s)
     #[serde(default)]
-    pub timeout_ms: Option<u64>}
+    pub timeout_ms: Option<u64>,
+}
 
 pub struct PowerShellTool;
 
 #[async_trait]
 impl Tool for PowerShellTool {
-    fn description(&self) -> &str { "Run a PowerShell command" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Run a PowerShell command"
+    }
+    fn name(&self) -> &str {
         "PowerShell"
     }
 
@@ -368,12 +390,14 @@ impl Tool for PowerShellTool {
                 ValidationResult::err("command must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::Ask {
             message: "PowerShell command".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
     async fn call(
         &self,
@@ -382,8 +406,12 @@ impl Tool for PowerShellTool {
         _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: PowerShellInput = serde_json::from_value(input)?;
-        let timeout =
-            std::time::Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_POWERSHELL_TIMEOUT_MS).min(MAX_POWERSHELL_TIMEOUT_MS));
+        let timeout = std::time::Duration::from_millis(
+            input
+                .timeout_ms
+                .unwrap_or(DEFAULT_POWERSHELL_TIMEOUT_MS)
+                .min(MAX_POWERSHELL_TIMEOUT_MS),
+        );
 
         let program = pick_powershell().ok_or_else(|| {
             #[allow(clippy::useless_format)]
@@ -402,9 +430,7 @@ impl Tool for PowerShellTool {
         cmd.current_dir(&ctx.cwd);
         let out = tokio::time::timeout(timeout, cmd.output())
             .await
-            .map_err(|_| {
-                ToolError::exec(format!("{program} timed out after {timeout:?}"))
-            })?
+            .map_err(|_| ToolError::exec(format!("{program} timed out after {timeout:?}")))?
             .map_err(|e| ToolError::exec(format!("{program} spawn: {e}")))?;
         let stdout = truncate_output(&String::from_utf8_lossy(&out.stdout));
         let stderr = truncate_output(&String::from_utf8_lossy(&out.stderr));
@@ -420,7 +446,8 @@ impl Tool for PowerShellTool {
                 "program": program,
                 "exit_code": out.status.code()})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -473,7 +500,8 @@ fn truncate_output(s: &str) -> String {
 pub enum ReplLanguage {
     Python,
     Node,
-    Ruby}
+    Ruby,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReplInput {
@@ -481,14 +509,17 @@ pub struct ReplInput {
     /// Code to evaluate
     pub code: String,
     #[serde(default)]
-    pub timeout_ms: Option<u64>}
+    pub timeout_ms: Option<u64>,
+}
 
 pub struct ReplTool;
 
 #[async_trait]
 impl Tool for ReplTool {
-    fn description(&self) -> &str { "Evaluate a single expression in python/node/ruby" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Evaluate a single expression in python/node/ruby"
+    }
+    fn name(&self) -> &str {
         "REPL"
     }
 
@@ -526,12 +557,14 @@ impl Tool for ReplTool {
         match serde_json::from_value::<ReplInput>(input.clone()) {
             Ok(p) if p.code.trim().is_empty() => ValidationResult::err("code must not be empty", 1),
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::Ask {
             message: "REPL eval".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
     async fn call(
         &self,
@@ -540,12 +573,17 @@ impl Tool for ReplTool {
         _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: ReplInput = serde_json::from_value(input)?;
-        let timeout =
-            std::time::Duration::from_millis(input.timeout_ms.unwrap_or(REPL_TIMEOUT_MS).min(REPL_TIMEOUT_MS));
+        let timeout = std::time::Duration::from_millis(
+            input
+                .timeout_ms
+                .unwrap_or(REPL_TIMEOUT_MS)
+                .min(REPL_TIMEOUT_MS),
+        );
         let (program, args): (&str, Vec<&str>) = match input.language {
             ReplLanguage::Python => ("python3", vec!["-c", &input.code]),
             ReplLanguage::Node => ("node", vec!["-e", &input.code]),
-            ReplLanguage::Ruby => ("ruby", vec!["-e", &input.code])};
+            ReplLanguage::Ruby => ("ruby", vec!["-e", &input.code]),
+        };
         let mut cmd = tokio::process::Command::new(program);
         for a in &args {
             cmd.arg(a);
@@ -555,7 +593,7 @@ impl Tool for ReplTool {
             .await
             .map_err(|_| ToolError::exec(format!("REPL ({program}) timed out")))?
             .map_err(|e| {
-            #[allow(clippy::useless_format)]
+                #[allow(clippy::useless_format)]
                 ToolError::exec(format!(
                     "REPL spawn ({program}): {e}; ensure {program} is installed"
                 ))
@@ -574,10 +612,10 @@ impl Tool for ReplTool {
                 json!({"language": input.language, "exit_code": out.status.code()}),
             ),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -626,7 +664,8 @@ mod tests {
                 assert!(s.contains("test"));
                 assert!(s.contains("default_mode"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -645,7 +684,8 @@ mod tests {
             base::tool::ToolResultContent::Text(s) => {
                 assert!(s.contains("auto"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -662,7 +702,8 @@ mod tests {
             .unwrap();
         match r.content {
             base::tool::ToolResultContent::Text(s) => assert!(s.contains("no such")),
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     // ---- PowerShell ----
@@ -728,7 +769,8 @@ mod tests {
                 base::tool::ToolResultContent::Text(s) => {
                     assert!(s.contains("4"));
                 }
-                _ => panic!()}
+                _ => panic!(),
+            }
         }
     }
 
@@ -750,7 +792,8 @@ mod tests {
             base::tool::ToolResultContent::Text(s) => {
                 assert!(s.contains("no running background task"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -760,12 +803,23 @@ mod tests {
 
         struct TestTasks {
             #[allow(clippy::type_complexity)]
-            data: Mutex<std::collections::HashMap<String, (String, Vec<String>, base::context::RunningStatus)>>}
+            data: Mutex<
+                std::collections::HashMap<
+                    String,
+                    (String, Vec<String>, base::context::RunningStatus),
+                >,
+            >,
+        }
         impl RunningTasksCallback for TestTasks {
-            fn find(&self, task_id: &str) -> Option<(String, Vec<String>, base::context::RunningStatus)> {
+            fn find(
+                &self,
+                task_id: &str,
+            ) -> Option<(String, Vec<String>, base::context::RunningStatus)> {
                 self.data.lock().unwrap().get(task_id).cloned()
             }
-            fn cancel(&self, _task_id: &str) -> bool { false }
+            fn cancel(&self, _task_id: &str) -> bool {
+                false
+            }
         }
         impl std::fmt::Debug for TestTasks {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -776,8 +830,13 @@ mod tests {
         let tasks = Arc::new(TestTasks {
             data: Mutex::new(std::collections::HashMap::from([(
                 "task-1".into(),
-                ("hello world".into(), vec!["event1".into()], base::context::RunningStatus::Running),
-            )]))});
+                (
+                    "hello world".into(),
+                    vec!["event1".into()],
+                    base::context::RunningStatus::Running,
+                ),
+            )])),
+        });
 
         let mut c = ToolContext::for_test(PathBuf::from("/tmp"));
         c.running_tasks = Some(tasks as Arc<dyn RunningTasksCallback>);
@@ -793,7 +852,7 @@ mod tests {
                 assert!(s.contains("hello world"));
                 assert!(s.contains("event1"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
-
 }

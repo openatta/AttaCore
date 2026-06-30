@@ -66,7 +66,14 @@ pub fn apply_time_based_mc(
     }
 
     let compactable: &[&str] = &[
-        "Read", "Bash", "Grep", "Glob", "WebSearch", "WebFetch", "Edit", "Write",
+        "Read",
+        "Bash",
+        "Grep",
+        "Glob",
+        "WebSearch",
+        "WebFetch",
+        "Edit",
+        "Write",
     ];
 
     let mut result = TimeBasedMcResult::default();
@@ -84,7 +91,10 @@ pub fn apply_time_based_mc(
         }
 
         // Check if this message is old enough
-        let age = ages.get(&idx).map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        let age = ages
+            .get(&idx)
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
         if age < max_age {
             result.skipped += 1;
             continue;
@@ -142,7 +152,10 @@ mod tests {
     fn disabled_config_skips_all() {
         let config = TimeBasedMcConfig::disabled();
         let mut messages = vec![make_tool_use("Read"), make_tool_result("old data")];
-        let ages = vec![(0, Instant::now()), (1, Instant::now() - Duration::from_secs(3600))];
+        let ages = vec![
+            (0, Instant::now()),
+            (1, Instant::now() - Duration::from_secs(3600)),
+        ];
         let result = apply_time_based_mc(&mut messages, &config, &ages);
         assert_eq!(result.cleared, 0);
     }
@@ -176,10 +189,7 @@ mod tests {
             min_messages: 0,
             ..Default::default()
         };
-        let mut messages = vec![
-            make_tool_use("Read"),
-            make_tool_result("fresh result"),
-        ];
+        let mut messages = vec![make_tool_use("Read"), make_tool_result("fresh result")];
         let ages = vec![(0, Instant::now()), (1, Instant::now())];
         let result = apply_time_based_mc(&mut messages, &config, &ages);
         assert_eq!(result.cleared, 0);

@@ -5,8 +5,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,7 +34,8 @@ pub struct FileReadInput {
     /// Only applicable to PDF files.
     #[serde(default)]
     #[serde(alias = "pageRange")]
-    pub pages: Option<String>}
+    pub pages: Option<String>,
+}
 
 /// 单元 struct —— 工具实例无状态，复用同一份。
 #[derive(Debug, Default, Clone, Copy)]
@@ -98,7 +101,8 @@ impl Tool for FileReadTool {
                 }
                 ValidationResult::Ok
             }
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
 
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
@@ -115,7 +119,8 @@ impl Tool for FileReadTool {
 
         PermissionDecision::Ask {
             message: "Read outside the project requires confirmation".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -130,7 +135,10 @@ impl Tool for FileReadTool {
 
         // **P (read dedup)**: 文件未变化且相同范围时跳过重新读取。
         // TS parity: FileReadTool.ts:547-573 — checks offset + limit + mtime.
-        if ctx.session.check_read_dedup_with_range(&path, input.offset, input.limit) {
+        if ctx
+            .session
+            .check_read_dedup_with_range(&path, input.offset, input.limit)
+        {
             let msg = if ctx.session.is_consecutive_read(&path) {
                 "[file unchanged] Use the previous content."
             } else {
@@ -142,28 +150,30 @@ impl Tool for FileReadTool {
         // 全程包在 select! 里以 honor cancel
         let max_bytes = ctx.max_file_read_bytes.max(1024 * 1024); // at least 1MB
         let result = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-            r = read_file_to_text(
-                &path,
-                input.offset,
-                input.limit,
-                input.pages.as_deref(),
-                max_bytes as u64,
-                2000,  // default_read_lines
-                2000,  // max_line_chars
-            ) => r};
+        biased;
+        _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+        r = read_file_to_text(
+            &path,
+            input.offset,
+            input.limit,
+            input.pages.as_deref(),
+            max_bytes as u64,
+            2000,  // default_read_lines
+            2000,  // max_line_chars
+        ) => r};
 
         match result {
             Ok(text) => {
                 // **P (read-before-edit)**: 记录本次读取(含偏移范围)，供去重与 Edit/Write 做 staleness 检测。
-                ctx.session.record_read_with_range(&path, input.offset, input.limit);
+                ctx.session
+                    .record_read_with_range(&path, input.offset, input.limit);
                 Ok(ToolResult::text(text))
             }
-            Err(ToolError::Execution(e)) if e.to_string().contains("not found") => {
-                Ok(ToolResult::text(format!("(no such file) {path}", path = path.display())))
-            }
-            Err(e) => Err(e)}
+            Err(ToolError::Execution(e)) if e.to_string().contains("not found") => Ok(
+                ToolResult::text(format!("(no such file) {path}", path = path.display())),
+            ),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -189,9 +199,13 @@ async fn read_file_to_text(
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolError::exec(format!("file not found: {}", path.display())));
+            return Err(ToolError::exec(format!(
+                "file not found: {}",
+                path.display()
+            )));
         }
-        Err(e) => return Err(ToolError::exec(e.to_string()))};
+        Err(e) => return Err(ToolError::exec(e.to_string())),
+    };
 
     if metadata.is_dir() {
         return Err(ToolError::Validation(format!(
@@ -201,13 +215,17 @@ async fn read_file_to_text(
     }
 
     // T1.1: Multimedia detection — check extension before reading as text
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     // Image handling
-    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") {
+    if matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    ) {
         return read_image(path, &metadata, max_bytes).await;
     }
 
@@ -241,7 +259,8 @@ async fn read_file_to_text(
                     path.display()
                 ))
             }
-            _ => ToolError::exec(e.to_string())})?;
+            _ => ToolError::exec(e.to_string()),
+        })?;
 
     // Empty file warning (TS parity)
     if content.trim().is_empty() {
@@ -262,22 +281,33 @@ async fn read_file_to_text(
 // ── T1.1: Multimedia readers ──
 
 /// Read an image file and return base64-encoded content with MIME type info.
-async fn read_image(path: &Path, metadata: &std::fs::Metadata, max_bytes: u64) -> Result<String, ToolError> {
+async fn read_image(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+) -> Result<String, ToolError> {
     if metadata.len() > max_bytes {
         return Err(ToolError::Validation(format!(
             "image too large ({} bytes); cap is {} bytes",
-            metadata.len(), max_bytes
+            metadata.len(),
+            max_bytes
         )));
     }
-    let bytes = tokio::fs::read(path).await.map_err(|e| ToolError::exec(e.to_string()))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| ToolError::exec(e.to_string()))?;
     let mime = mime_from_ext(path);
     let b64 = base64_encode(&bytes);
     let dims = estimate_image_dimensions(&bytes);
-    let dims_str = dims.map(|(w, h)| format!("{w}x{h}")).unwrap_or_else(|| "unknown".to_string());
+    let dims_str = dims
+        .map(|(w, h)| format!("{w}x{h}"))
+        .unwrap_or_else(|| "unknown".to_string());
 
     Ok(format!(
         "[Image: {} — {} — {} {} bytes base64]\n{}\n\n[Image rendered above. {} bytes, {} pixels.]",
-        path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
         mime,
         bytes.len(),
         dims_str,
@@ -288,45 +318,66 @@ async fn read_image(path: &Path, metadata: &std::fs::Metadata, max_bytes: u64) -
 }
 
 /// Read a PDF file — returns basic text extraction via the `pdftotext` CLI tool.
-async fn read_pdf_text(path: &Path, metadata: &std::fs::Metadata, max_bytes: u64, pages: Option<&str>) -> Result<String, ToolError> {
+async fn read_pdf_text(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    pages: Option<&str>,
+) -> Result<String, ToolError> {
     if metadata.len() > max_bytes.max(50 * 1024 * 1024) {
         return Err(ToolError::Validation(format!(
             "PDF too large ({} bytes); cap is {} bytes",
-            metadata.len(), max_bytes.max(50 * 1024 * 1024)
+            metadata.len(),
+            max_bytes.max(50 * 1024 * 1024)
         )));
     }
     let page_range = pages.unwrap_or("1-20");
     // Try pdftotext first, then fall back to raw bytes
     let output = tokio::process::Command::new("pdftotext")
-        .arg("-f").arg(page_range.split('-').next().unwrap_or("1"))
-        .arg("-l").arg(page_range.split('-').nth(1).unwrap_or("20"))
+        .arg("-f")
+        .arg(page_range.split('-').next().unwrap_or("1"))
+        .arg("-l")
+        .arg(page_range.split('-').nth(1).unwrap_or("20"))
         .arg(path)
-        .arg("-")  // stdout
-        .output().await;
+        .arg("-") // stdout
+        .output()
+        .await;
 
     match output {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout).to_string();
             let truncated = if text.len() > max_bytes as usize {
-                format!("{}...\n[text truncated at {} bytes]", &text[..max_bytes as usize], max_bytes)
+                format!(
+                    "{}...\n[text truncated at {} bytes]",
+                    &text[..max_bytes as usize],
+                    max_bytes
+                )
             } else {
                 text
             };
             Ok(format!(
                 "[PDF: {} — {} bytes, pages {page_range}]\n\n{truncated}",
-                path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                path.file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default(),
                 metadata.len(),
             ))
         }
         _ => {
             // pdftotext not available — return raw binary header for inspection
-            let mut f = tokio::fs::File::open(path).await.map_err(|e| ToolError::exec(e.to_string()))?;
+            let mut f = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| ToolError::exec(e.to_string()))?;
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 1024.min(metadata.len() as usize)];
-            f.read_exact(&mut buf).await.map_err(|e| ToolError::exec(e.to_string()))?;
+            f.read_exact(&mut buf)
+                .await
+                .map_err(|e| ToolError::exec(e.to_string()))?;
             Ok(format!(
                 "[PDF: {} — {} bytes. Install pdftotext (poppler-utils) for text extraction.]",
-                path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                path.file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default(),
                 metadata.len(),
             ))
         }
@@ -341,23 +392,34 @@ async fn read_notebook(
     default_lines: usize,
     max_line_chars: usize,
 ) -> Result<String, ToolError> {
-    let content = tokio::fs::read_to_string(path).await.map_err(|e| ToolError::exec(e.to_string()))?;
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| ToolError::exec(e.to_string()))?;
     let notebook: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| ToolError::Validation(format!("invalid notebook JSON: {e}")))?;
 
-    let cells = notebook["cells"].as_array()
+    let cells = notebook["cells"]
+        .as_array()
         .ok_or_else(|| ToolError::Validation("notebook has no cells array".to_string()))?;
 
     let mut out = format!(
         "[Notebook: {} — {} cells]\n\n",
-        path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
         cells.len(),
     );
 
     for (i, cell) in cells.iter().enumerate() {
         let cell_type = cell["cell_type"].as_str().unwrap_or("unknown");
-        let source = cell["source"].as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(""))
+        let source = cell["source"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
             .or_else(|| cell["source"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
 
@@ -382,7 +444,10 @@ async fn read_notebook(
             }
         } else {
             // Markdown cell — strip to plain text
-            out.push_str(&format!("        {}\n", source.lines().next().unwrap_or("")));
+            out.push_str(&format!(
+                "        {}\n",
+                source.lines().next().unwrap_or("")
+            ));
         }
         out.push_str(&format!("</cell id=\"{i}\">\n\n"));
     }
@@ -403,13 +468,20 @@ async fn read_notebook(
 }
 
 fn mime_from_ext(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
-        _ => "application/octet-stream"}
+        _ => "application/octet-stream",
+    }
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -419,7 +491,9 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Crude image dimension estimation from PNG/JPEG/GIF headers.
 fn estimate_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 24 { return None; }
+    if bytes.len() < 24 {
+        return None;
+    }
     // PNG: width at offset 16, height at offset 20 (big-endian u32)
     if &bytes[1..4] == b"PNG" {
         let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
@@ -517,7 +591,8 @@ mod tests {
                 assert!(t.contains("\tline3"));
                 assert!(t.starts_with("     1\t"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -537,7 +612,8 @@ mod tests {
             .unwrap();
         match r.content {
             ToolResultContent::Text(t) => assert!(t.contains("\thi")),
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -558,7 +634,8 @@ mod tests {
             .unwrap();
         let txt = match r.content {
             ToolResultContent::Text(t) => t,
-            _ => panic!()};
+            _ => panic!(),
+        };
         // 应该看到 L3..L6，4 行
         assert!(txt.contains("\tL3"));
         assert!(txt.contains("\tL4"));
@@ -587,7 +664,8 @@ mod tests {
             .unwrap();
         let txt = match r.content {
             ToolResultContent::Text(t) => t,
-            _ => panic!()};
+            _ => panic!(),
+        };
         assert!(txt.contains("…[truncated]"));
         // 行号 + 制表符 + 前 2000 char + 标记 + 换行 ≈ 7 + 1 + 2000 + 12 + 1
         // 真实长度小于 5000
@@ -609,7 +687,8 @@ mod tests {
             .expect("not-found should be Ok with text marker");
         let text = match &result.content {
             base::tool::ToolResultContent::Text(s) => s.clone(),
-            _ => panic!("expected text content")};
+            _ => panic!("expected text content"),
+        };
         assert!(text.contains("no such file"), "got: {text}");
     }
 
@@ -738,7 +817,10 @@ mod tests {
             ToolResultContent::Text(t) => t,
             _ => panic!("expected text"),
         };
-        assert!(t1.contains("hello"), "first read should return content, got: {t1}");
+        assert!(
+            t1.contains("hello"),
+            "first read should return content, got: {t1}"
+        );
 
         // Second read — same file, unchanged -> dedup
         let r2 = tool
@@ -753,7 +835,10 @@ mod tests {
             ToolResultContent::Text(t) => t,
             _ => panic!("expected text"),
         };
-        assert!(t2.contains("file unchanged"), "dedup should trigger, got: {t2}");
+        assert!(
+            t2.contains("file unchanged"),
+            "dedup should trigger, got: {t2}"
+        );
     }
 
     #[tokio::test]
@@ -797,7 +882,10 @@ mod tests {
             ToolResultContent::Text(t) => t,
             _ => panic!("expected text"),
         };
-        assert!(t.contains("file unchanged"), "dedup should trigger, got: {t}");
+        assert!(
+            t.contains("file unchanged"),
+            "dedup should trigger, got: {t}"
+        );
         // Should use the longer "general" message, not the short "consecutive" one
         assert!(
             t.contains("since last read"),
@@ -839,7 +927,13 @@ mod tests {
             ToolResultContent::Text(t) => t,
             _ => panic!("expected text"),
         };
-        assert!(t.contains("v2"), "modified file should return new content, got: {t}");
-        assert!(!t.contains("file unchanged"), "modified file should not be dedup'd");
+        assert!(
+            t.contains("v2"),
+            "modified file should return new content, got: {t}"
+        );
+        assert!(
+            !t.contains("file unchanged"),
+            "modified file should not be dedup'd"
+        );
     }
 }

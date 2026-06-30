@@ -4,10 +4,7 @@
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SsrfError {
     #[error("SSRF guard: blocked request to private/reserved IP `{ip}` (url: `{url}`)")]
-    PrivateIp {
-        ip: std::net::IpAddr,
-        url: String,
-    },
+    PrivateIp { ip: std::net::IpAddr, url: String },
     #[error("SSRF guard: host `{host}` resolves to private IP `{ip}` (url: `{url}`)")]
     HostResolvesToPrivate {
         host: String,

@@ -9,6 +9,7 @@ description  = "AttaCore — agent runtime (turn loop, Agent + Builder)"
 
 [dependencies]
 base          = { workspace = true }
+model         = { workspace = true }
 history       = { workspace = true }
 tools         = { workspace = true }
 mcp           = { workspace = true }

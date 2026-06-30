@@ -61,8 +61,7 @@ fn plugin_mcp_tools() -> Plugin {
         plugin: PluginMeta {
             name: "plugin-mcp-tools".into(),
             version: "0.1.0".into(),
-            description:
-                "Bundles common MCP server configurations (filesystem, web search)".into(),
+            description: "Bundles common MCP server configurations (filesystem, web search)".into(),
             author: "AttaCore".into(),
             homepage: String::new(),
         },
@@ -112,7 +111,13 @@ mod tests {
     #[test]
     fn plugin_mcp_tools_has_mcp_servers() {
         let mcp_tools = plugin_mcp_tools();
-        assert_eq!(mcp_tools.manifest.mcp.servers[0], "mcp_configs/filesystem.json");
-        assert_eq!(mcp_tools.manifest.mcp.servers[1], "mcp_configs/websearch.json");
+        assert_eq!(
+            mcp_tools.manifest.mcp.servers[0],
+            "mcp_configs/filesystem.json"
+        );
+        assert_eq!(
+            mcp_tools.manifest.mcp.servers[1],
+            "mcp_configs/websearch.json"
+        );
     }
 }

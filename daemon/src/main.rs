@@ -14,16 +14,19 @@ use std::sync::Arc;
 
 use base::context::EngineConfig;
 use base::interface::permission::PermissionOutcome;
-use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
-use daemon::{config::*, write_lock_file, DaemonServer, SessionPool};
 use clap::Parser;
-use telemetry::perf::PerfCollector;
+use daemon::{config::*, write_lock_file, DaemonServer, SessionPool};
+use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
 use telemetry::events::StartupTimingPayload;
+use telemetry::perf::PerfCollector;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "AttaCore daemon: multi-session agent engine over JSON-RPC")]
+#[command(
+    version,
+    about = "AttaCore daemon: multi-session agent engine over JSON-RPC"
+)]
 struct Cli {
     /// Unix socket path (default: $HOME/.atta/code/daemon.sock)
     #[arg(long)]
@@ -128,7 +131,9 @@ async fn main() -> anyhow::Result<()> {
     let client: Arc<dyn AnthropicClient> = match std::env::var("ANTHROPIC_BASE_URL").ok() {
         Some(mut url) => {
             // Ensure trailing slash so Url::join appends instead of replacing
-            if !url.ends_with('/') { url.push('/'); }
+            if !url.ends_with('/') {
+                url.push('/');
+            }
             let base = reqwest::Url::parse(&url)
                 .map_err(|e| anyhow::anyhow!("invalid ANTHROPIC_BASE_URL: {e}"))?;
             Arc::new(HttpAnthropicClient::with_base(auth, base)?)
@@ -142,8 +147,8 @@ async fn main() -> anyhow::Result<()> {
     let local_dir = PathBuf::from(".").join(".atta").join("code");
 
     use base::interface::settings::{
-        CompactionConfig, ExecutionSettings, ModelSettings, PathSettings, SandboxConfig,
-        Settings, ThinkingMode,
+        CompactionConfig, ExecutionSettings, ModelSettings, PathSettings, SandboxConfig, Settings,
+        ThinkingMode,
     };
     let settings = Arc::new(Settings {
         model: ModelSettings {
@@ -188,7 +193,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Startup checkpoint: memory_loaded ──────────────────────────────
     let _memory_load_ms = perf.checkpoint("memory_loaded");
-    info!(elapsed_ms = _memory_load_ms, "startup: memory store initialised");
+    info!(
+        elapsed_ms = _memory_load_ms,
+        "startup: memory store initialised"
+    );
 
     // ── Engine config ──────────────────────────────────────────────────
     let mut engine_config = EngineConfig::defaults_for(&daemon_config.model);
@@ -199,30 +207,38 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Scenes ─────────────────────────────────────────────────────────
     let scene_coding: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
+        Arc::new(scene::scene::coding::CodingScene::default_scene());
     let scene_chat: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::chat::ChatScene);
 
-    let permission: Arc<dyn base::interface::permission::Permission> =
-        Arc::new(AllowAllPermission);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
 
     // ── Startup checkpoint: skills_scanned ─────────────────────────────
     // (No skills scanning currently performed in the daemon — placeholder
     //  checkpoint for future integration.)
     let _skills_scan_ms = perf.checkpoint("skills_scanned");
-    info!(elapsed_ms = _skills_scan_ms, "startup: skills scanned (noop)");
+    info!(
+        elapsed_ms = _skills_scan_ms,
+        "startup: skills scanned (noop)"
+    );
 
     // ── Startup checkpoint: mcp_connected ──────────────────────────────
     // (No MCP servers are connected at startup in this minimal daemon —
     //  placeholder checkpoint for future integration.)
     let _mcp_connect_ms = perf.checkpoint("mcp_connected");
-    info!(elapsed_ms = _mcp_connect_ms, "startup: mcp connected (noop)");
+    info!(
+        elapsed_ms = _mcp_connect_ms,
+        "startup: mcp connected (noop)"
+    );
 
     // ── Startup checkpoint: tools_registered ───────────────────────────
     // (Tools are registered implicitly via the session engine. Placeholder
     //  checkpoint for explicit registration timing.)
     let _tools_reg_ms = perf.checkpoint("tools_registered");
-    info!(elapsed_ms = _tools_reg_ms, "startup: tools registered (noop)");
+    info!(
+        elapsed_ms = _tools_reg_ms,
+        "startup: tools registered (noop)"
+    );
 
     // ── Build SessionPool ──────────────────────────────────────────────
     let pool = Arc::new(SessionPool::new(
@@ -265,11 +281,7 @@ async fn main() -> anyhow::Result<()> {
         first_api_call_ms: 0,
     };
 
-    info!(
-        total_ms = total_startup_ms,
-        ?timing,
-        "startup complete"
-    );
+    info!(total_ms = total_startup_ms, ?timing, "startup complete");
 
     // If telemetry is available, emit the startup timing event.
     // (The daemon currently does not wire up the full telemetry pipeline

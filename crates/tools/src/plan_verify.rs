@@ -13,8 +13,9 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult, ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,15 +25,18 @@ pub struct VerifyPlanExecutionInput {
     /// Optional note about what aspect to verify (e.g. "check auth logic",
     /// "verify all planned files were created"). If empty, the full plan is checked.
     #[serde(default)]
-    pub focus: Option<String>}
+    pub focus: Option<String>,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VerifyPlanExecutionTool;
 
 #[async_trait]
 impl Tool for VerifyPlanExecutionTool {
-    fn description(&self) -> &str { "Verify that a plan implementation step was completed correctly" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Verify that a plan implementation step was completed correctly"
+    }
+    fn name(&self) -> &str {
         "VerifyPlanExecution"
     }
 
@@ -155,7 +159,7 @@ async fn run_git_diff(cwd: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::Mutex;
@@ -210,7 +214,8 @@ mod tests {
                     "report should include focus"
                 );
             }
-            _ => panic!("expected Text content")}
+            _ => panic!("expected Text content"),
+        }
     }
 
     #[tokio::test]
@@ -271,7 +276,7 @@ mod tests {
 
         // Set plan text via static store.
         crate::plan_mode::plan_state_for_test(
-            "Add hello world\nStep 1: modify main.rs".to_string()
+            "Add hello world\nStep 1: modify main.rs".to_string(),
         );
 
         // Create tool context with working dir = the temp git repo.
@@ -293,7 +298,8 @@ mod tests {
                 assert!(t.contains("println"), "report should contain git diff");
                 assert!(t.contains("main.rs"), "report should mention changed file");
             }
-            _ => panic!("expected Text content")}
+            _ => panic!("expected Text content"),
+        }
 
         // Cleanup env var.
         std::env::remove_var("ATTACODE_PLAN_STORE_DIR");

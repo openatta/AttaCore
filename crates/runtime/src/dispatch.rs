@@ -116,8 +116,8 @@ fn format_tool_content(r: &ToolResult) -> String {
 mod tests {
     use super::*;
     use base::tool::InMemoryToolRegistry;
-use tools::file_read::FileReadTool as ReadTool;
     use tokio::sync::mpsc;
+    use tools::file_read::FileReadTool as ReadTool;
 
     #[tokio::test]
     async fn dispatch_single_read() {

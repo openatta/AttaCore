@@ -88,7 +88,10 @@ where
         match event.map_err(|e| crate::turn::TurnError::Model(e.to_string()))? {
             ModelEvent::TextDelta { text } => {
                 pending_text.push_str(&text);
-                let _ = event_tx.send(AgentEvent::TextDelta { text, turn_id: turn_id.clone() });
+                let _ = event_tx.send(AgentEvent::TextDelta {
+                    text,
+                    turn_id: turn_id.clone(),
+                });
             }
             ModelEvent::ToolUse { id, name, input } => {
                 // P1: Dedup consecutive identical tool calls within a turn.
@@ -178,8 +181,13 @@ where
                                 batch_abort.cancel();
                             }
                             // Find tool name
-                            let tname = queued_tools.get(idx).map(|t| t.name.clone()).unwrap_or_default();
-                            push_result_to_session(session, event_tx, &turn_id, idx, &tid, &tname, &content, is_err);
+                            let tname = queued_tools
+                                .get(idx)
+                                .map(|t| t.name.clone())
+                                .unwrap_or_default();
+                            push_result_to_session(
+                                session, event_tx, &turn_id, idx, &tid, &tname, &content, is_err,
+                            );
                             // Inject new_messages after tool result
                             if let Some(msgs) = new_msgs {
                                 inject_new_messages(session, event_tx, &turn_id, &msgs);
@@ -193,7 +201,9 @@ where
                         Ok((t, msgs)) => (t.clone(), msgs.clone()),
                         Err(e) => (e.clone(), None),
                     };
-                    push_result_to_session(session, event_tx, &turn_id, tool_index, &id, &name, &content, is_err);
+                    push_result_to_session(
+                        session, event_tx, &turn_id, tool_index, &id, &name, &content, is_err,
+                    );
                     if let Some(msgs) = new_msgs {
                         inject_new_messages(session, event_tx, &turn_id, &msgs);
                     }
@@ -233,8 +243,13 @@ where
             Ok((t, msgs)) => (t.clone(), msgs.clone()),
             Err(e) => (e.clone(), None),
         };
-        let tname = queued_tools.get(idx).map(|t| t.name.clone()).unwrap_or_default();
-        push_result_to_session(session, event_tx, &turn_id, idx, &tid, &tname, &content, is_err);
+        let tname = queued_tools
+            .get(idx)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        push_result_to_session(
+            session, event_tx, &turn_id, idx, &tid, &tname, &content, is_err,
+        );
         if let Some(msgs) = new_msgs {
             inject_new_messages(session, event_tx, &turn_id, &msgs);
         }

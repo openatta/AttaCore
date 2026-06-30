@@ -8,16 +8,20 @@ use std::sync::Arc;
 
 use super::store::CronStore;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CronDeleteInput {
     /// Job ID returned by CronCreate.
-    pub id: String}
+    pub id: String,
+}
 
 pub struct CronDeleteTool {
-    store: Arc<CronStore>}
+    store: Arc<CronStore>,
+}
 
 impl CronDeleteTool {
     pub fn new(store: Arc<CronStore>) -> Self {
@@ -70,7 +74,8 @@ impl Tool for CronDeleteTool {
                 }
                 ValidationResult::Ok
             }
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -93,7 +98,8 @@ impl Tool for CronDeleteTool {
                 is_error: false,
                 structured_content: Some(json!({"id": input.id})),
                 mcp_meta: None,
-                new_messages: Some(vec![])})
+                new_messages: Some(vec![]),
+            })
         } else {
             Ok(ToolResult {
                 content: base::tool::ToolResultContent::Text(format!(
@@ -103,7 +109,8 @@ impl Tool for CronDeleteTool {
                 is_error: true,
                 structured_content: None,
                 mcp_meta: None,
-                new_messages: Some(vec![])})
+                new_messages: Some(vec![]),
+            })
         }
     }
 }

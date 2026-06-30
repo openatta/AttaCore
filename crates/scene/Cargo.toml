@@ -9,4 +9,5 @@ description  = "AttaCore — built-in agent scene implementations (coding, demo)
 
 [dependencies]
 base          = { workspace = true }
+serde_json    = { workspace = true }
 

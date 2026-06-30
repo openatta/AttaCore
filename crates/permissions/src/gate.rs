@@ -19,12 +19,10 @@ use crate::error::GateError;
 use crate::rule::format_rule_string;
 use crate::ruleset::{RuleHit, RuleSet};
 use async_trait::async_trait;
-use base::tool::ToolContext;
 use base::permission::PermissionRule;
-use base::permission::{
-    DecisionReason, PermissionDecision, PermissionMode,
-};
+use base::permission::{DecisionReason, PermissionDecision, PermissionMode};
 use base::tool::Tool;
+use base::tool::ToolContext;
 use serde_json::Value;
 use std::sync::{Arc, RwLock};
 
@@ -52,14 +50,10 @@ pub trait AutoClassifier: Send + Sync {
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum ClassifyDecision {
     /// classifier 判定为安全，应允许执行。
-    Allow {
-        reason: String,
-    },
+    Allow { reason: String },
     /// classifier 判定为危险（仅 LLM-based classifier 使用）。对应的
     /// `PermissionDecision::Deny` 将包含此 reason。
-    Deny {
-        reason: String,
-    },
+    Deny { reason: String },
     /// classifier 认为安全但建议改输入后执行（例如加 `--dry-run`）。
     /// Gate 将其映射为 `Allow` 并在 decision_reason 附带建议内容。
     AllowWithEdit {
@@ -100,13 +94,16 @@ impl PermissionGate {
 
     /// Record a permission denial for tracking.
     pub fn record_denial(&self) {
-        self.denial_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.total_denial_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.denial_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.total_denial_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record a success — resets the consecutive denial counter.
     pub fn record_success(&self) {
-        self.denial_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.denial_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Number of consecutive denials (reset on success).
@@ -116,7 +113,8 @@ impl PermissionGate {
 
     /// Total denials since gate creation.
     pub fn total_denials(&self) -> u64 {
-        self.total_denial_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.total_denial_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if the denial threshold has been exceeded (consecutive denials >= max).
@@ -170,9 +168,7 @@ impl PermissionGate {
         //    check always runs before mode dispatch.
         if let Some(ref c) = content {
             if is_path_bypass_immune(c) {
-                return format!(
-                    "Denied by path safety: \"{c}\" is in the bypass-immune deny list"
-                );
+                return format!("Denied by path safety: \"{c}\" is in the bypass-immune deny list");
             }
         }
 
@@ -181,17 +177,26 @@ impl PermissionGate {
         match rules.evaluate(tool_name, content.as_deref()) {
             RuleHit::Allow(rule) => {
                 let rule_str = format_rule_string(&rule);
-                let content_info = content.as_ref().map(|c| format!(" matches \"{c}\"")).unwrap_or_default();
+                let content_info = content
+                    .as_ref()
+                    .map(|c| format!(" matches \"{c}\""))
+                    .unwrap_or_default();
                 format!("Allowed by rule: {rule_str}{content_info}")
             }
             RuleHit::Deny(rule) => {
                 let rule_str = format_rule_string(&rule);
-                let content_info = content.as_ref().map(|c| format!(" matches \"{c}\"")).unwrap_or_default();
+                let content_info = content
+                    .as_ref()
+                    .map(|c| format!(" matches \"{c}\""))
+                    .unwrap_or_default();
                 format!("Denied by rule: {rule_str}{content_info}")
             }
             RuleHit::Ask(rule) => {
                 let rule_str = format_rule_string(&rule);
-                let content_info = content.as_ref().map(|c| format!(" matches \"{c}\"")).unwrap_or_default();
+                let content_info = content
+                    .as_ref()
+                    .map(|c| format!(" matches \"{c}\""))
+                    .unwrap_or_default();
                 format!("Rule matches: {rule_str} [ask]{content_info} — requires confirmation")
             }
             RuleHit::None => {
@@ -225,7 +230,8 @@ impl PermissionGate {
         ctx: &ToolContext,
     ) -> Result<PermissionDecision, GateError> {
         // 1. validateInput
-        if let base::tool::ValidationResult::Err(msg, code) = tool.validate_input(input, ctx).await {
+        if let base::tool::ValidationResult::Err(msg, code) = tool.validate_input(input, ctx).await
+        {
             return Err(GateError::InvalidInput { message: msg, code });
         }
 
@@ -237,7 +243,12 @@ impl PermissionGate {
                     decision_reason: Some(DecisionReason::Other("tool allowed".into())),
                 });
             }
-            base::tool::PermissionDecision::Deny { reason, .. } => return Ok(PermissionDecision::Deny { message: reason.unwrap_or_default(), decision_reason: DecisionReason::Other("tool denied".into()) }),
+            base::tool::PermissionDecision::Deny { reason, .. } => {
+                return Ok(PermissionDecision::Deny {
+                    message: reason.unwrap_or_default(),
+                    decision_reason: DecisionReason::Other("tool denied".into()),
+                })
+            }
             base::tool::PermissionDecision::Ask { .. } => {}
         }
 
@@ -400,10 +411,10 @@ impl PermissionGate {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use base::context::SessionState;
+    use base::error::ToolError;
     use base::permission::PermissionMode;
     use base::tool::Tool;
-    use base::error::ToolError;
-    use base::context::SessionState;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -453,7 +464,11 @@ mod tests {
         fn is_read_only(&self, _: &Value) -> bool {
             self.read_only
         }
-        async fn check_permissions(&self, _: &Value, _: &base::tool::ToolContext) -> base::tool::PermissionDecision {
+        async fn check_permissions(
+            &self,
+            _: &Value,
+            _: &base::tool::ToolContext,
+        ) -> base::tool::PermissionDecision {
             self.own_decision
                 .clone()
                 .unwrap_or(base::tool::PermissionDecision::ask("?"))
@@ -474,9 +489,7 @@ mod tests {
     fn ctx_with_mode(mode: PermissionMode) -> base::tool::ToolContext {
         let mut ctx = base::tool::ToolContext::for_test(PathBuf::from("/tmp"));
         ctx.permission_mode = mode;
-        ctx.session = Arc::new(
-            SessionState::new(PathBuf::from("/tmp")).with_permission_mode(mode),
-        );
+        ctx.session = Arc::new(SessionState::new(PathBuf::from("/tmp")).with_permission_mode(mode));
         ctx.tool_use_id = "test".into();
         ctx
     }
@@ -907,8 +920,7 @@ mod explain_tests {
     #[test]
     fn explain_allowed_by_rule_matches_content() {
         let gate = make_gate_with_rules(vec![(true, "Bash", "git status")]);
-        let explanation =
-            gate.explain_decision("Bash", &json!({"command": "git status"}));
+        let explanation = gate.explain_decision("Bash", &json!({"command": "git status"}));
         assert!(
             explanation.contains("Allowed by rule"),
             "expected Allowed by rule, got: {explanation}"
@@ -923,8 +935,7 @@ mod explain_tests {
     #[test]
     fn explain_allowed_by_prefix_rule() {
         let gate = make_gate_with_rules(vec![(true, "Bash", "git:*")]);
-        let explanation =
-            gate.explain_decision("Bash", &json!({"command": "git log"}));
+        let explanation = gate.explain_decision("Bash", &json!({"command": "git log"}));
         assert!(explanation.contains("Allowed by rule"));
         assert!(explanation.contains("Bash(git:*)"));
         assert!(explanation.contains("git log"));
@@ -945,8 +956,7 @@ mod explain_tests {
     #[test]
     fn explain_ask_no_matching_rule() {
         let gate = make_gate_with_rules(vec![(true, "Bash", "git:*")]);
-        let explanation =
-            gate.explain_decision("Read", &json!({"file_path": "/tmp/x"}));
+        let explanation = gate.explain_decision("Read", &json!({"file_path": "/tmp/x"}));
         assert!(
             explanation.contains("Ask: no matching rule found"),
             "expected Ask: no matching rule found, got: {explanation}"
@@ -957,8 +967,7 @@ mod explain_tests {
     #[test]
     fn explain_bypass_immune_path() {
         let gate = PermissionGate::empty();
-        let explanation =
-            gate.explain_decision("Read", &json!({"file_path": "/etc/passwd"}));
+        let explanation = gate.explain_decision("Read", &json!({"file_path": "/etc/passwd"}));
         assert!(
             explanation.contains("Denied by path safety"),
             "expected Denied by path safety, got: {explanation}"
@@ -975,8 +984,7 @@ mod explain_tests {
             rule_content: None,
         }];
         let gate = PermissionGate::new(RuleSet::new(rules));
-        let explanation =
-            gate.explain_decision("Bash", &json!({"command": "ls"}));
+        let explanation = gate.explain_decision("Bash", &json!({"command": "ls"}));
         assert!(
             explanation.contains("[ask]"),
             "expected [ask] marker, got: {explanation}"

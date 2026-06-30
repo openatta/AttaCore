@@ -4,12 +4,13 @@
 //! 其它（json / text / binary）按 utf-8 解码或标识 binary。
 //! 5 MB 上限、~50_000 char 上限、15s 超时。
 
+use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{SecondaryLlm,
-    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext,
-    ToolResult, ValidationResult};
-use crate::cancel::run_with_cancel;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, SecondaryLlm, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,7 +32,8 @@ pub struct WebFetchInput {
     /// Optional question / instruction about the page (recorded for context;
     /// model interprets the returned text itself).
     #[serde(default)]
-    pub prompt: Option<String>}
+    pub prompt: Option<String>,
+}
 
 /// **Q1 **: optional secondary-LLM extractor. When wired, after fetching
 /// the URL the tool calls the secondary LLM with `(prompt, content)` and
@@ -40,7 +42,8 @@ pub struct WebFetchInput {
 /// model overridden to `compact_model` (haiku-tier).
 #[derive(Default, Clone)]
 pub struct WebFetchTool {
-    secondary: Option<Arc<dyn SecondaryLlm>>}
+    secondary: Option<Arc<dyn SecondaryLlm>>,
+}
 
 impl WebFetchTool {
     /// Construct a new instance.
@@ -51,7 +54,8 @@ impl WebFetchTool {
     /// Builder: set secondary llm.
     pub fn with_secondary_llm(secondary: Arc<dyn SecondaryLlm>) -> Self {
         Self {
-            secondary: Some(secondary)}
+            secondary: Some(secondary),
+        }
     }
 }
 
@@ -102,7 +106,8 @@ impl Tool for WebFetchTool {
                 ValidationResult::err("url must start with http:// or https://", 2)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -110,7 +115,8 @@ impl Tool for WebFetchTool {
         // 之类的规则放行
         PermissionDecision::Ask {
             message: "WebFetch requires confirmation".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -141,7 +147,8 @@ impl Tool for WebFetchTool {
                             }
                         }
                     }
-                    _ => fallback_text(&text)};
+                    _ => fallback_text(&text),
+                };
                 let header = if input.prompt.is_some() {
                     let mode = if self.secondary.is_some() {
                         "extracted-by-haiku"
@@ -172,7 +179,8 @@ impl Tool for WebFetchTool {
                 )))
             }
             Err(FetchError::Timeout) => Err(ToolError::Timeout(TIMEOUT)),
-            Err(FetchError::Other(e)) => Err(ToolError::exec(e.to_string()))}
+            Err(FetchError::Other(e)) => Err(ToolError::exec(e.to_string())),
+        }
     }
 }
 
@@ -205,7 +213,8 @@ enum FetchError {
     #[error("redirect: {0}")]
     Redirect(String),
     #[error(transparent)]
-    Other(#[from] anyhow::Error)}
+    Other(#[from] anyhow::Error),
+}
 
 async fn fetch(url: &str) -> Result<(u16, String), FetchError> {
     let client = reqwest::Client::builder()
@@ -218,14 +227,13 @@ async fn fetch(url: &str) -> Result<(u16, String), FetchError> {
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) if e.is_timeout() => return Err(FetchError::Timeout),
-        Err(e) => return Err(FetchError::Other(anyhow::Error::new(e)))};
+        Err(e) => return Err(FetchError::Other(anyhow::Error::new(e))),
+    };
 
     let status = resp.status().as_u16();
     // Handle cross-host redirects by returning the Location to the model
     if (300..400).contains(&status) {
-        if let Some(location) = resp.headers().get("location")
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(location) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
             return Err(FetchError::Redirect(location.to_string()));
         }
     }
@@ -248,7 +256,8 @@ async fn fetch(url: &str) -> Result<(u16, String), FetchError> {
         .map_err(|e| FetchError::Other(anyhow::Error::new(e)))?;
     if body_bytes.len() as u64 > MAX_BYTES {
         return Err(FetchError::TooLarge {
-            size: body_bytes.len() as u64});
+            size: body_bytes.len() as u64,
+        });
     }
 
     if !(200..300).contains(&status) {
@@ -391,7 +400,8 @@ connection: close\r\n\
                 assert!(t.contains("Hello"));
                 assert!(t.contains("test page"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -432,6 +442,7 @@ not found";
                 assert!(t.contains("HTTP 404"));
                 assert!(t.contains("not found"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 }

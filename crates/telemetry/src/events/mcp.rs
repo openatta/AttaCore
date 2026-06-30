@@ -79,7 +79,8 @@ mod tests {
                 connect_duration_ms: 150,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "mcp_server_connected");
         assert_eq!(v["transport"], "stdio");
         assert_eq!(v["tool_count"], 8);
@@ -98,7 +99,8 @@ mod tests {
                 was_connected: true,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "mcp_server_disconnected");
         assert_eq!(v["reason"], "server_exit");
     }
@@ -117,7 +119,8 @@ mod tests {
                 error_message: None,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "mcp_tool_call");
         assert_eq!(v["server_name"], "filesystem");
         assert_eq!(v["success"], true);
@@ -137,12 +140,14 @@ mod tests {
                 transport: "stdio".into(),
             },
         );
-        let v = serde_json::to_value(event.clone()).expect("serialization of telemetry event should not fail");
+        let v = serde_json::to_value(event.clone())
+            .expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "mcp_connection_error");
         assert_eq!(v["error_kind"], "connection_refused");
 
         let redacted = event.redact(&RedactionPolicy::all());
-        let rv = serde_json::to_value(redacted).expect("serialization of telemetry event should not fail");
+        let rv = serde_json::to_value(redacted)
+            .expect("serialization of telemetry event should not fail");
         assert_eq!(rv["error_message"], "[REDACTED]");
     }
 }

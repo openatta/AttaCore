@@ -15,26 +15,21 @@
 //! allowed tool set, which `resolve_tools()` applies when spawning sub-agents.
 
 use crate::agent::{Builder, InputMessage};
+use anyhow::anyhow;
+use async_trait::async_trait;
+use base::context::EngineConfig;
 use base::interface::event::AgentEvent;
-use base::interface::model::{
-    MessageRole, Model, ModelContentBlock, ModelMessage,
-};
+use base::interface::model::{MessageRole, Model, ModelContentBlock, ModelMessage};
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::{
     ExecutionSettings, ModelSettings, PathSettings, PermissionMode, SandboxConfig, Settings,
     ThinkingMode,
 };
-use team::remote_agent::{
-    NoopRemoteTransport, RemoteAgentEvent, RemoteAgentRequest, RemoteAgentTransport,
-};
 use base::tool::InMemoryToolRegistry;
-use tools::worktree::create_worktree;
-use anyhow::anyhow;
-use async_trait::async_trait;
-use base::context::EngineConfig; use base::tool::ToolContext;
-use base::tool::ToolResultContent;
 use base::tool::ProgressSender;
+use base::tool::ToolContext;
+use base::tool::ToolResultContent;
 use futures::StreamExt;
 use history::store::HistoryStore;
 use schemars::JsonSchema;
@@ -42,6 +37,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
+use team::remote_agent::{
+    NoopRemoteTransport, RemoteAgentEvent, RemoteAgentRequest, RemoteAgentTransport,
+};
+use tools::worktree::create_worktree;
 
 // ═══════════════════════════════════════════════════════════
 // Agent type registry
@@ -343,8 +342,13 @@ fn bg_task_id() -> String {
     let chars: Vec<char> = "0123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
     let mut n = ts;
     let mut s = String::new();
-    while n > 0 { s.push(chars[(n % 36) as usize]); n /= 36; }
-    if s.is_empty() { s.push('0'); }
+    while n > 0 {
+        s.push(chars[(n % 36) as usize]);
+        n /= 36;
+    }
+    if s.is_empty() {
+        s.push('0');
+    }
     s
 }
 
@@ -421,11 +425,14 @@ impl AgentTool {
     /// to the full `fallback_tools` set.
     fn resolve_tools(&self, subagent_type: Option<&str>) -> Arc<InMemoryToolRegistry> {
         let allowed_names: Option<Vec<&str>> = match subagent_type {
-            Some("explore") => Some(vec![
-                "Read", "Grep", "Glob", "WebSearch", "WebFetch", "LSP",
-            ]),
+            Some("explore") => Some(vec!["Read", "Grep", "Glob", "WebSearch", "WebFetch", "LSP"]),
             Some("plan") => Some(vec![
-                "Read", "Grep", "Glob", "WebSearch", "WebFetch", "Write",
+                "Read",
+                "Grep",
+                "Glob",
+                "WebSearch",
+                "WebFetch",
+                "Write",
             ]),
             Some("general-purpose") | Some("claude") => None,
             Some("code-reviewer") => Some(vec!["Read", "Grep", "Glob", "LSP", "Bash"]),
@@ -458,9 +465,11 @@ impl AgentTool {
         Settings {
             model: ModelSettings {
                 api_type: base::provider::ApiType::Anthropic,
-                base_url: String::new(), auth_token: String::new(),
+                base_url: String::new(),
+                auth_token: String::new(),
                 model_name: model_name.unwrap_or(&c.model).to_string(),
-                max_tokens: c.max_tokens, thinking_mode: ThinkingMode::Auto,
+                max_tokens: c.max_tokens,
+                thinking_mode: ThinkingMode::Auto,
                 fallback_model: c.fallback_model.clone(),
             },
             paths: PathSettings {
@@ -472,8 +481,12 @@ impl AgentTool {
             execution: ExecutionSettings::default(),
             compaction: Default::default(),
             sandbox: SandboxConfig::default(),
-            instruction_file: None, prompt_append: None, prompt_override: None,
-            vcr: None, telemetry_url: None, session_dir: None,
+            instruction_file: None,
+            prompt_append: None,
+            prompt_override: None,
+            vcr: None,
+            telemetry_url: None,
+            session_dir: None,
             memory_enabled: true,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
@@ -511,7 +524,8 @@ impl AgentTool {
         cancel: tokio_util::sync::CancellationToken,
         perm: Arc<dyn Permission>,
     ) -> Result<String, base::error::ToolError> {
-        let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+        let scene: Arc<dyn AgentScene> =
+            Arc::new(scene::scene::coding::CodingScene::default_scene());
         let settings = Arc::new(self.sub_settings(None));
         let _ = &perm; // used below in Builder
 
@@ -532,7 +546,9 @@ impl AgentTool {
             let mut t = String::new();
             while let Some(ev) = event_rx.recv().await {
                 match &ev {
-                    AgentEvent::TextDelta { text, .. } => { t.push_str(text); }
+                    AgentEvent::TextDelta { text, .. } => {
+                        t.push_str(text);
+                    }
                     AgentEvent::TurnComplete { .. } => break,
                     _ => {}
                 }
@@ -541,7 +557,9 @@ impl AgentTool {
         });
 
         let _ = input_tx.send(InputMessage::User {
-            content: prompt.clone(), attachments: vec![], turn_id: turn_id.clone(),
+            content: prompt.clone(),
+            attachments: vec![],
+            turn_id: turn_id.clone(),
         });
         let outcome = agent.run_turn(prompt, turn_id, cancel).await;
         drop(input_tx);
@@ -554,7 +572,9 @@ impl AgentTool {
     }
 
     async fn launch_bg(
-        &self, input: &AgentInput, ctx: &ToolContext,
+        &self,
+        input: &AgentInput,
+        ctx: &ToolContext,
     ) -> Result<base::tool::ToolResult, base::error::ToolError> {
         let tid = bg_task_id();
         let task = ctx.session.register_running_task(tid.clone());
@@ -579,9 +599,7 @@ impl AgentTool {
         let _events_tx = ctx.events_tx.clone();
 
         tokio::spawn(async move {
-            let r = Self::run_sub_inner(
-                &inner, prompt, tools, cwd, outer_cancel,
-            ).await;
+            let r = Self::run_sub_inner(&inner, prompt, tools, cwd, outer_cancel).await;
             let mut s = tc.status.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(*s, base::context::RunningStatus::Running) {
                 *s = match &r {
@@ -590,7 +608,10 @@ impl AgentTool {
                 };
             }
             if let Ok(ref text) = r {
-                tc.output.lock().unwrap_or_else(|e| e.into_inner()).push_str(text);
+                tc.output
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_str(text);
             }
             session.persist_running_task(&tc);
             session.remove_running_task_persistence(&tid_c);
@@ -600,15 +621,20 @@ impl AgentTool {
 
     /// Static helper for background execution.
     async fn run_sub_inner(
-        inner: &Inner, prompt: String, tools: Arc<InMemoryToolRegistry>,
-        cwd: std::path::PathBuf, cancel: tokio_util::sync::CancellationToken,
+        inner: &Inner,
+        prompt: String,
+        tools: Arc<InMemoryToolRegistry>,
+        cwd: std::path::PathBuf,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<String, base::error::ToolError> {
-        let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+        let scene: Arc<dyn AgentScene> =
+            Arc::new(scene::scene::coding::CodingScene::default_scene());
         let perm: Arc<dyn Permission> = Arc::new(AlwaysPermit);
         let settings = Arc::new(Settings {
             model: ModelSettings {
                 api_type: base::provider::ApiType::Anthropic,
-                base_url: String::new(), auth_token: String::new(),
+                base_url: String::new(),
+                auth_token: String::new(),
                 model_name: inner.config.model.clone(),
                 max_tokens: inner.config.max_tokens,
                 thinking_mode: ThinkingMode::Auto,
@@ -623,8 +649,12 @@ impl AgentTool {
             execution: ExecutionSettings::default(),
             compaction: Default::default(),
             sandbox: SandboxConfig::default(),
-            instruction_file: None, prompt_append: None, prompt_override: None,
-            vcr: None, telemetry_url: None, session_dir: None,
+            instruction_file: None,
+            prompt_append: None,
+            prompt_override: None,
+            vcr: None,
+            telemetry_url: None,
+            session_dir: None,
             memory_enabled: true,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
@@ -637,7 +667,11 @@ impl AgentTool {
         let sid = uuid::Uuid::new_v4().to_string();
         let (mut agent, mut event_rx, input_tx) = Builder::new()
             .session_id(sid)
-            .scene(scene).model(inner.model.clone()).tools(tools).settings(settings).permission(perm)
+            .scene(scene)
+            .model(inner.model.clone())
+            .tools(tools)
+            .settings(settings)
+            .permission(perm)
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
 
@@ -646,7 +680,9 @@ impl AgentTool {
             let mut t = String::new();
             while let Some(ev) = event_rx.recv().await {
                 match &ev {
-                    AgentEvent::TextDelta { text, .. } => { t.push_str(text); }
+                    AgentEvent::TextDelta { text, .. } => {
+                        t.push_str(text);
+                    }
                     AgentEvent::TurnComplete { .. } => break,
                     _ => {}
                 }
@@ -655,7 +691,9 @@ impl AgentTool {
         });
 
         let _ = input_tx.send(InputMessage::User {
-            content: prompt.clone(), attachments: vec![], turn_id: turn_id.clone(),
+            content: prompt.clone(),
+            attachments: vec![],
+            turn_id: turn_id.clone(),
         });
         let outcome = agent.run_turn(prompt, turn_id, cancel).await;
         drop(input_tx);
@@ -741,7 +779,8 @@ impl AgentTool {
         });
 
         // 4. Build and run sub-agent with pre-loaded messages
-        let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+        let scene: Arc<dyn AgentScene> =
+            Arc::new(scene::scene::coding::CodingScene::default_scene());
         let settings = Arc::new(self.sub_settings(None));
         let perm: Arc<dyn Permission> = Arc::new(AlwaysPermit);
 
@@ -812,7 +851,11 @@ struct AlwaysPermit;
 #[async_trait]
 impl Permission for AlwaysPermit {
     async fn check(
-        &self, _tn: &str, _i: &Value, _c: &std::path::Path, _s: &str,
+        &self,
+        _tn: &str,
+        _i: &Value,
+        _c: &std::path::Path,
+        _s: &str,
     ) -> base::interface::permission::PermissionOutcome {
         base::interface::permission::PermissionOutcome::Permit
     }
@@ -824,9 +867,9 @@ fn convert_content_blocks(blocks: &[base::message::ContentBlock]) -> Vec<ModelCo
     blocks
         .iter()
         .filter_map(|block| match block {
-            base::message::ContentBlock::Text { text, .. } => Some(ModelContentBlock::Text {
-                text: text.clone(),
-            }),
+            base::message::ContentBlock::Text { text, .. } => {
+                Some(ModelContentBlock::Text { text: text.clone() })
+            }
             base::message::ContentBlock::ToolUse { id, name, input } => {
                 Some(ModelContentBlock::ToolUse {
                     id: id.clone(),
@@ -862,7 +905,10 @@ fn bg_result(task_id: &str, status: &str) -> base::tool::ToolResult {
         content: ToolResultContent::Text(format!(
             "background task spawned (task_id: {task_id}, status: {status})"
         )),
-        is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
+        is_error: false,
+        structured_content: None,
+        mcp_meta: None,
+        new_messages: None,
     }
 }
 
@@ -872,7 +918,9 @@ fn bg_result(task_id: &str, status: &str) -> base::tool::ToolResult {
 
 #[async_trait]
 impl base::tool::Tool for AgentTool {
-    fn name(&self) -> &str { "Agent" }
+    fn name(&self) -> &str {
+        "Agent"
+    }
     fn description(&self) -> &str {
         "Launch a sub-agent to handle complex, multi-step tasks independently"
     }
@@ -882,11 +930,18 @@ impl base::tool::Tool for AgentTool {
     async fn prompt(&self, _: &base::tool::PromptContext) -> String {
         include_str!("agent_tool.prompt.md").to_string()
     }
-    fn is_concurrency_safe(&self, _: &Value) -> bool { true }
-    fn is_read_only(&self, _: &Value) -> bool { false }
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
 
     async fn call(
-        &self, input: Value, ctx: ToolContext, _progress: ProgressSender,
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        _progress: ProgressSender,
     ) -> Result<base::tool::ToolResult, base::error::ToolError> {
         let inp: AgentInput = serde_json::from_value(input)
             .map_err(|e| base::error::ToolError::Validation(format!("{e}")))?;
@@ -894,26 +949,37 @@ impl base::tool::Tool for AgentTool {
         // Remote
         if inp.remote {
             let req = RemoteAgentRequest {
-                prompt: inp.prompt.clone(), allowed_tools: vec![],
+                prompt: inp.prompt.clone(),
+                allowed_tools: vec![],
                 worktree_slug: inp.worktree.clone(),
             };
-            let stream = self.remote.spawn(req)
-                .await.map_err(|e| base::error::ToolError::Execution(anyhow!("remote: {e}")))?;
+            let stream = self
+                .remote
+                .spawn(req)
+                .await
+                .map_err(|e| base::error::ToolError::Execution(anyhow!("remote: {e}")))?;
             tokio::pin!(stream);
             let mut text = String::new();
             while let Some(ev) = stream.next().await {
                 match ev {
                     Ok(RemoteAgentEvent::TextDelta(t)) => text.push_str(&t),
-                    Ok(RemoteAgentEvent::Final { output_text, .. }) => { text = output_text; break; }
-                    Ok(RemoteAgentEvent::Error(m)) =>
-                        return Err(base::error::ToolError::Execution(anyhow!("{m}"))),
+                    Ok(RemoteAgentEvent::Final { output_text, .. }) => {
+                        text = output_text;
+                        break;
+                    }
+                    Ok(RemoteAgentEvent::Error(m)) => {
+                        return Err(base::error::ToolError::Execution(anyhow!("{m}")))
+                    }
                     Err(e) => return Err(base::error::ToolError::Execution(anyhow!("{e}"))),
                     _ => {}
                 }
             }
             return Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(text),
-                is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
+                is_error: false,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
             });
         }
 
@@ -934,14 +1000,23 @@ impl base::tool::Tool for AgentTool {
         let prompt = build_prompt(&inp);
         let perm = self.permission_handler();
 
-        match self.run_sub(prompt, tools, cwd, ctx.cancel.child_token(), perm).await {
+        match self
+            .run_sub(prompt, tools, cwd, ctx.cancel.child_token(), perm)
+            .await
+        {
             Ok(text) => Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(text),
-                is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
+                is_error: false,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
             }),
             Err(e) => Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(format!("sub-agent error: {e}")),
-                is_error: true, structured_content: None, mcp_meta: None, new_messages: None,
+                is_error: true,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
             }),
         }
     }

@@ -5,8 +5,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,9 +35,13 @@ pub struct GlobInput {
     pub max_results: usize,
 }
 
-fn default_max_results() -> usize { DEFAULT_MAX_RESULTS }
+fn default_max_results() -> usize {
+    DEFAULT_MAX_RESULTS
+}
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GlobTool;
@@ -83,7 +89,8 @@ impl Tool for GlobTool {
         match parsed {
             Ok(p) if p.pattern.is_empty() => ValidationResult::err("pattern must not be empty", 1),
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -101,7 +108,8 @@ impl Tool for GlobTool {
         let max_results = input.max_results.max(1); // ensure at least 1
         let root = match &input.path {
             Some(p) => resolve_path(p, &ctx.cwd),
-            None => ctx.cwd.clone()};
+            None => ctx.cwd.clone(),
+        };
 
         // 解析 pattern；不合法直接 validation error。
         // `literal_separator=true` 让 `*` 不跨 `/`（shell 行为）；`**` 仍可跨。
@@ -155,11 +163,11 @@ impl Tool for GlobTool {
         );
 
         let result = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-            r = scan => match r {
-                Ok(inner) => inner?,
-                Err(e) => return Err(ToolError::exec(e.to_string()))}};
+        biased;
+        _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+        r = scan => match r {
+            Ok(inner) => inner?,
+            Err(e) => return Err(ToolError::exec(e.to_string()))}};
 
         let total = result.len();
         let mut paths = result;
@@ -232,7 +240,8 @@ mod tests {
             .unwrap();
         let txt = match r.content {
             ToolResultContent::Text(t) => t,
-            _ => panic!()};
+            _ => panic!(),
+        };
         assert!(txt.contains("a.rs"));
         assert!(txt.contains("b.rs"));
         assert!(!txt.contains("c.toml"));
@@ -254,7 +263,8 @@ mod tests {
             .unwrap();
         let txt = match r.content {
             ToolResultContent::Text(t) => t,
-            _ => panic!()};
+            _ => panic!(),
+        };
         assert!(txt.contains("a.rs"));
         assert!(txt.contains("b.rs"));
         assert!(txt.contains("lib.rs"));
@@ -279,7 +289,8 @@ mod tests {
             ToolResultContent::Text(t) => {
                 assert!(t.contains("(no matches)"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]

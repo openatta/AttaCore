@@ -36,18 +36,14 @@ impl AutoClassifier for YoloClassifier {
     ) -> ClassifyDecision {
         match tool_name {
             // ── Read-only operations: always allow ──
-            "Read" | "Grep" | "Glob" | "LSP" | "ListFiles" | "Search" => {
-                ClassifyDecision::Allow {
-                    reason: "yolo: read-only operation".into(),
-                }
-            }
+            "Read" | "Grep" | "Glob" | "LSP" | "ListFiles" | "Search" => ClassifyDecision::Allow {
+                reason: "yolo: read-only operation".into(),
+            },
 
             // ── Web access: always allow ──
-            "WebSearch" | "WebFetch" | "Fetch" | "Http" => {
-                ClassifyDecision::Allow {
-                    reason: "yolo: network fetch always allowed".into(),
-                }
-            }
+            "WebSearch" | "WebFetch" | "Fetch" | "Http" => ClassifyDecision::Allow {
+                reason: "yolo: network fetch always allowed".into(),
+            },
 
             // ── Bash: allow safe commands, defer destructive ones ──
             "Bash" | "PowerShell" | "Shell" => {
@@ -68,13 +64,41 @@ impl AutoClassifier for YoloClassifier {
 
                 // Safe command patterns
                 let safe_patterns = [
-                    "git ", "cargo ", "npm ", "yarn ", "pnpm ", "bun ",
-                    "ls", "cat ", "echo ", "head ", "tail ", "wc ",
-                    "pwd", "whoami", "uname", "date", "which ", "type ",
-                    "mkdir -p", "cp ", "mv ", "touch ", "chmod +x",
-                    "rustc", "python", "python3", "node ", "deno ",
-                    "make ", "cmake", "go ", "cargo test", "npm test",
-                    "docker ", "docker-compose",
+                    "git ",
+                    "cargo ",
+                    "npm ",
+                    "yarn ",
+                    "pnpm ",
+                    "bun ",
+                    "ls",
+                    "cat ",
+                    "echo ",
+                    "head ",
+                    "tail ",
+                    "wc ",
+                    "pwd",
+                    "whoami",
+                    "uname",
+                    "date",
+                    "which ",
+                    "type ",
+                    "mkdir -p",
+                    "cp ",
+                    "mv ",
+                    "touch ",
+                    "chmod +x",
+                    "rustc",
+                    "python",
+                    "python3",
+                    "node ",
+                    "deno ",
+                    "make ",
+                    "cmake",
+                    "go ",
+                    "cargo test",
+                    "npm test",
+                    "docker ",
+                    "docker-compose",
                 ];
                 if safe_patterns.iter().any(|p| trimmed.starts_with(p)) {
                     return ClassifyDecision::Allow {
@@ -84,11 +108,28 @@ impl AutoClassifier for YoloClassifier {
 
                 // Destructive patterns — defer to user
                 let destructive_patterns = [
-                    "rm ", "rmdir ", "dd ", "mkfs", "fdisk", "parted",
-                    "chmod 0", "chown ", "kill ", "pkill ", "sudo ",
-                    "passwd", "shutdown", "reboot", "init ",
-                    "> /dev/", "> /etc/", ":(){ :|:& };:", "wget ",
-                    "curl -", "curl --", "chattr",
+                    "rm ",
+                    "rmdir ",
+                    "dd ",
+                    "mkfs",
+                    "fdisk",
+                    "parted",
+                    "chmod 0",
+                    "chown ",
+                    "kill ",
+                    "pkill ",
+                    "sudo ",
+                    "passwd",
+                    "shutdown",
+                    "reboot",
+                    "init ",
+                    "> /dev/",
+                    "> /etc/",
+                    ":(){ :|:& };:",
+                    "wget ",
+                    "curl -",
+                    "curl --",
+                    "chattr",
                 ];
                 if destructive_patterns.iter().any(|p| trimmed.contains(p)) {
                     return ClassifyDecision::Defer;

@@ -3,6 +3,12 @@
 //! Supports Anthropic Messages API and OpenAI-compatible endpoints.
 //! Each provider can expose multiple API type interfaces.
 //! Fallback chain is strictly within a single provider.
+//!
+//! # v2.0.0: Two-level provider → profile system
+//!
+//! Level 1 — ProviderDef: "who serves the model" (API endpoint, auth, available models)
+//! Level 2 — ModelProfile (in scene crate): "what model + params for this task"
+//!   Profiles reference providers by name; $strong/$normal/$lite resolve to base profiles.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,7 +22,22 @@ pub enum ApiType {
     OpenAICompatible,
 }
 
+impl ApiType {
+    /// Guess the API type from a base URL.
+    pub fn from_base_url(url: &str) -> Self {
+        let lower = url.to_lowercase();
+        if lower.contains("anthropic") {
+            ApiType::Anthropic
+        } else {
+            ApiType::OpenAICompatible
+        }
+    }
+}
+
 /// A single provider definition with model slot configuration.
+///
+/// Level 1 of the two-level config: defines "who serves the model".
+/// Each provider has API endpoint(s), auth, and a list of supported model names.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderDef {
     /// Unique provider identifier (e.g. "anthropic", "deepseek")
@@ -27,6 +48,10 @@ pub struct ProviderDef {
     pub interfaces: HashMap<ApiType, String>,
     /// Auth token (one per provider)
     pub auth_token: Option<String>,
+    /// Supported model names (whitelist). Empty = no validation.
+    /// v2.0.0: used to validate ModelProfile.model references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     /// Model slot configuration
     pub model_config: ModelConfig,
 }
@@ -56,6 +81,23 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
 }
 
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            model: "claude-sonnet-4-6".into(),
+            opus_model: Some("claude-opus-4-8".into()),
+            sonnet_model: Some("claude-sonnet-4-6".into()),
+            haiku_model: Some("claude-haiku-4-5".into()),
+            subagent_model: None,
+            strong_model: None,
+            fallback_model: None,
+            classifier_model: None,
+            compact_model: None,
+            max_tokens: Some(4096),
+        }
+    }
+}
+
 /// Semantic slot identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelSlot {
@@ -83,12 +125,86 @@ pub struct ModelResolver {
     config: ModelConfig,
 }
 
+impl ProviderDef {
+    /// Build the built-in anthropic provider from environment variables.
+    /// Reads `ANTHROPIC_API_KEY` (required) and `ANTHROPIC_BASE_URL` (optional).
+    /// Returns None if no API key is set.
+    pub fn from_env_anthropic() -> Option<Self> {
+        let auth_token = std::env::var("ANTHROPIC_API_KEY").ok()?;
+        let base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".into());
+        Some(Self {
+            id: "anthropic".into(),
+            name: "Anthropic".into(),
+            interfaces: {
+                let mut m = HashMap::new();
+                m.insert(ApiType::Anthropic, base_url);
+                m
+            },
+            auth_token: Some(auth_token),
+            models: vec![
+                "claude-opus-4-8".into(),
+                "claude-sonnet-4-6".into(),
+                "claude-haiku-4-5".into(),
+                "claude-fable-5".into(),
+            ],
+            model_config: ModelConfig::default(),
+        })
+    }
+
+    /// Get the primary base URL (prefers Anthropic interface).
+    pub fn base_url(&self) -> Option<&str> {
+        self.interfaces
+            .get(&ApiType::Anthropic)
+            .or_else(|| self.interfaces.get(&ApiType::OpenAICompatible))
+            .map(|s| s.as_str())
+    }
+
+    /// Check if a model name is in the provider's supported models list.
+    /// Returns true if models is empty (no validation) or if the model is found.
+    pub fn supports_model(&self, model_name: &str) -> bool {
+        self.models.is_empty() || self.models.iter().any(|m| m == model_name)
+    }
+}
+
 impl ProviderRegistry {
     pub fn new(providers: Vec<ProviderDef>) -> Self {
         Self {
             providers,
             active_index: 0,
         }
+    }
+
+    /// v2.0.0: Create a registry seeded with the built-in anthropic provider from env.
+    /// Falls back to an empty registry if no credentials are available.
+    pub fn from_env() -> Self {
+        let mut providers = Vec::new();
+        if let Some(anthropic) = ProviderDef::from_env_anthropic() {
+            providers.push(anthropic);
+        }
+        Self {
+            providers,
+            active_index: 0,
+        }
+    }
+
+    /// v2.0.0: Register or replace a provider by id.
+    pub fn register(&mut self, def: ProviderDef) {
+        if let Some(idx) = self.providers.iter().position(|p| p.id == def.id) {
+            self.providers[idx] = def;
+        } else {
+            self.providers.push(def);
+        }
+    }
+
+    /// v2.0.0: Look up a provider by id.
+    pub fn find(&self, id: &str) -> Option<&ProviderDef> {
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// v2.0.0: Look up a provider by id (mutable).
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut ProviderDef> {
+        self.providers.iter_mut().find(|p| p.id == id)
     }
 
     pub fn activate(&mut self, provider_id: &str) -> Result<(), ProviderError> {
@@ -106,6 +222,11 @@ impl ProviderRegistry {
 
     pub fn active(&self) -> &ProviderDef {
         &self.providers[self.active_index]
+    }
+
+    /// v2.0.0: Iterate all registered providers.
+    pub fn iter(&self) -> impl Iterator<Item = &ProviderDef> {
+        self.providers.iter()
     }
 
     pub fn find_by_model(&self, model_name: &str) -> Option<&ProviderDef> {

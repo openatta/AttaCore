@@ -158,9 +158,7 @@ pub enum LogEntry {
     /// chars). Written when the serialized content exceeds 1024 bytes, to
     /// avoid bloating the conversation JSONL. Transparently hydrated back to
     /// the original variant by [`JsonlHistoryStore::load`].
-    PasteRef {
-        paste_id: String,
-    },
+    PasteRef { paste_id: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

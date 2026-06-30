@@ -15,8 +15,8 @@
 //! [第 2 轮预期输出描述]
 //! ```
 
-const SEP_IN: &str = ">>>>>>>>>>>>>>>>";   // 16 >
-const SEP_OUT: &str = "<<<<<<<<<<<<<<<<";  // 16 <
+const SEP_IN: &str = ">>>>>>>>>>>>>>>>"; // 16 >
+const SEP_OUT: &str = "<<<<<<<<<<<<<<<<"; // 16 <
 
 #[derive(Debug, Clone)]
 pub struct TestCase {
@@ -79,7 +79,11 @@ pub fn parse_test_script(content: &str, source_path: &str) -> anyhow::Result<Tes
         anyhow::bail!("no turns found in test script (missing >>>>>>>>>>>>>>>> markers)");
     }
 
-    Ok(TestCase { meta, source_path: source_path.to_string(), turns })
+    Ok(TestCase {
+        meta,
+        source_path: source_path.to_string(),
+        turns,
+    })
 }
 
 fn parse_turns(body: &str) -> anyhow::Result<Vec<Turn>> {
@@ -100,7 +104,11 @@ fn parse_turns(body: &str) -> anyhow::Result<Vec<Turn>> {
             None => (block.to_string(), String::new()),
         };
 
-        turns.push(Turn { index: i, input, expected });
+        turns.push(Turn {
+            index: i,
+            input,
+            expected,
+        });
     }
 
     Ok(turns)
@@ -125,7 +133,10 @@ Should create a file and report success.
         assert_eq!(tc.meta, "# Test case\nThis is a test.");
         assert_eq!(tc.turns.len(), 1);
         assert_eq!(tc.turns[0].input, "Hello, create a file.");
-        assert_eq!(tc.turns[0].expected, "Should create a file and report success.");
+        assert_eq!(
+            tc.turns[0].expected,
+            "Should create a file and report success."
+        );
     }
 
     #[test]

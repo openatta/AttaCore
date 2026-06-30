@@ -29,11 +29,10 @@ impl FileRecorder {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok(Self { file: Mutex::new(file) })
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
     }
 
     /// Check whether any events have been written.
@@ -47,10 +46,10 @@ impl TelemetryRecorder for FileRecorder {
         let mut f = self.file.lock().unwrap();
         let mut line = serde_json::to_string(&event).unwrap_or_default();
         line.push('\n');
-        f.write_all(line.as_bytes()).map_err(|_| {
-            crate::handle::TelemetryHandleError::ChannelFull
-        })?;
-        f.flush().map_err(|_| crate::handle::TelemetryHandleError::ChannelFull)?;
+        f.write_all(line.as_bytes())
+            .map_err(|_| crate::handle::TelemetryHandleError::ChannelFull)?;
+        f.flush()
+            .map_err(|_| crate::handle::TelemetryHandleError::ChannelFull)?;
         Ok(())
     }
 

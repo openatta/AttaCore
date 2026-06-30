@@ -79,7 +79,11 @@ impl McpOAuthStore {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".atta").join("code").join("mcp").join("oauth")
+        PathBuf::from(home)
+            .join(".atta")
+            .join("code")
+            .join("mcp")
+            .join("oauth")
     }
 
     /// Create a new OAuth token store using the default directory.
@@ -124,14 +128,20 @@ impl McpOAuthStore {
         let token = stored.access_token;
 
         // Populate in-memory cache for future lookups.
-        self.cache.lock().await.insert(provider.to_string(), token.clone());
+        self.cache
+            .lock()
+            .await
+            .insert(provider.to_string(), token.clone());
         Some(token)
     }
 
     /// Store a token for the given provider, persisting to disk.
     pub async fn set_token(&self, provider: &str, token: &str) {
         // Update in-memory cache.
-        self.cache.lock().await.insert(provider.to_string(), token.to_string());
+        self.cache
+            .lock()
+            .await
+            .insert(provider.to_string(), token.to_string());
 
         // Persist to disk.
         let path = self.token_path(provider);
@@ -242,9 +252,7 @@ fn pending_flow_lock() -> &'static tokio::sync::Mutex<Option<PendingFlow>> {
 /// Register the full set of MCP server configurations so tools can query
 /// them (e.g., to discover which servers support OAuth).
 /// Called once at startup by the CLI/daemon after loading settings.
-pub fn register_mcp_server_configs(
-    configs: HashMap<String, crate::config::McpServerConfig>,
-) {
+pub fn register_mcp_server_configs(configs: HashMap<String, crate::config::McpServerConfig>) {
     let _ = MCP_SERVER_CONFIGS.set(configs);
 }
 
@@ -255,8 +263,8 @@ pub fn register_oauth_providers(providers: HashMap<String, ProviderConfig>) {
 }
 
 /// Return a reference to the registered MCP server configs, if any.
-pub fn get_mcp_server_configs(
-) -> Option<&'static HashMap<String, crate::config::McpServerConfig>> {
+pub fn get_mcp_server_configs() -> Option<&'static HashMap<String, crate::config::McpServerConfig>>
+{
     MCP_SERVER_CONFIGS.get()
 }
 
@@ -301,18 +309,14 @@ pub async fn start_oauth_flow(server_name: &str) -> Result<String, String> {
         "No MCP server configurations loaded. Configure MCP servers in settings.json.".to_string()
     })?;
     let server_cfg = configs.get(server_name).ok_or_else(|| {
-        format!(
-            "Unknown MCP server: '{server_name}'. Check your MCP server configuration."
-        )
+        format!("Unknown MCP server: '{server_name}'. Check your MCP server configuration.")
     })?;
     let provider_name = server_cfg.oauth_provider().ok_or_else(|| {
-        format!(
-            "MCP server '{server_name}' does not support OAuth authentication"
-        )
+        format!("MCP server '{server_name}' does not support OAuth authentication")
     })?;
-    let providers = OAUTH_PROVIDER_CONFIGS.get().ok_or_else(|| {
-        "No OAuth provider configurations loaded".to_string()
-    })?;
+    let providers = OAUTH_PROVIDER_CONFIGS
+        .get()
+        .ok_or_else(|| "No OAuth provider configurations loaded".to_string())?;
     let provider_cfg = providers.get(provider_name).ok_or_else(|| {
         format!(
             "OAuth provider '{provider_name}' not found. \
@@ -325,9 +329,9 @@ pub async fn start_oauth_flow(server_name: &str) -> Result<String, String> {
     let verifier = pkce.verifier.clone();
 
     // Start a local callback listener on 127.0.0.1:<ephemeral>
-    let listener = CallbackListener::start().await.map_err(|e| {
-        format!("Failed to start OAuth callback listener: {e}")
-    })?;
+    let listener = CallbackListener::start()
+        .await
+        .map_err(|e| format!("Failed to start OAuth callback listener: {e}"))?;
     let redirect_uri = listener.redirect_uri().to_string();
 
     // Build the authorization URL
@@ -353,14 +357,11 @@ pub async fn start_oauth_flow(server_name: &str) -> Result<String, String> {
 /// If `code` is provided, uses it directly instead of waiting for the callback.
 /// The `timeout_secs` controls how long to wait for the browser callback
 /// (ignored if `code` is provided). Minimum timeout is 30 seconds.
-pub async fn complete_oauth_flow(
-    code: Option<&str>,
-    timeout_secs: u64,
-) -> Result<String, String> {
+pub async fn complete_oauth_flow(code: Option<&str>, timeout_secs: u64) -> Result<String, String> {
     let mut guard = pending_flow_lock().lock().await;
-    let pending = guard.take().ok_or_else(|| {
-        "No pending OAuth flow. Call start_oauth_flow first.".to_string()
-    })?;
+    let pending = guard
+        .take()
+        .ok_or_else(|| "No pending OAuth flow. Call start_oauth_flow first.".to_string())?;
 
     // Get the authorization code
     let auth_code = match code {
@@ -377,12 +378,12 @@ pub async fn complete_oauth_flow(
     };
 
     // Look up the provider config
-    let providers = OAUTH_PROVIDER_CONFIGS.get().ok_or_else(|| {
-        "OAuth provider configurations no longer available".to_string()
-    })?;
-    let provider_cfg = providers.get(&pending.provider).ok_or_else(|| {
-        format!("OAuth provider '{}' not found", pending.provider)
-    })?;
+    let providers = OAUTH_PROVIDER_CONFIGS
+        .get()
+        .ok_or_else(|| "OAuth provider configurations no longer available".to_string())?;
+    let provider_cfg = providers
+        .get(&pending.provider)
+        .ok_or_else(|| format!("OAuth provider '{}' not found", pending.provider))?;
 
     // Exchange the code for a token
     let client = OAuth2Client::new(provider_cfg);

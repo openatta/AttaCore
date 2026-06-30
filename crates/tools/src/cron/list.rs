@@ -6,11 +6,14 @@ use std::sync::Arc;
 
 use super::store::CronStore;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 
 pub struct CronListTool {
-    store: Arc<CronStore>}
+    store: Arc<CronStore>,
+}
 
 impl CronListTool {
     pub fn new(store: Arc<CronStore>) -> Self {
@@ -69,13 +72,12 @@ impl Tool for CronListTool {
         let jobs = self.store.list();
         if jobs.is_empty() {
             return Ok(ToolResult {
-                content: base::tool::ToolResultContent::Text(
-                    "No scheduled jobs.".into(),
-                ),
+                content: base::tool::ToolResultContent::Text("No scheduled jobs.".into()),
                 is_error: false,
                 structured_content: Some(json!({"jobs": []})),
                 mcp_meta: None,
-                new_messages: Some(vec![])});
+                new_messages: Some(vec![]),
+            });
         }
         let lines: Vec<String> = jobs
             .iter()
@@ -101,7 +103,8 @@ impl Tool for CronListTool {
             is_error: false,
             structured_content: Some(json!({"jobs": jobs})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -130,6 +133,7 @@ mod tests {
             base::tool::ToolResultContent::Text(s) => {
                 assert!(s.contains("No scheduled jobs"));
             }
-            _ => panic!("expected text")}
+            _ => panic!("expected text"),
+        }
     }
 }

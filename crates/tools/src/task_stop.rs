@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use base::context::RunningStatus;
 use base::error::ToolError;
 use base::tool::{
-    PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult,
-    ValidationResult,
+    PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult, ValidationResult,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -116,9 +115,7 @@ impl Tool for TaskStopTool {
                         new_messages: None,
                     })
                 } else {
-                    Ok(ToolResult::error_text(format!(
-                        "Failed to stop task: {id}"
-                    )))
+                    Ok(ToolResult::error_text(format!("Failed to stop task: {id}")))
                 }
             }
             Some((_, _, status)) => {
@@ -127,11 +124,9 @@ impl Tool for TaskStopTool {
                     "Task {id} is not running (status: {status:?})"
                 )))
             }
-            None => {
-                Ok(ToolResult::error_text(format!(
-                    "No task found with ID: {id}"
-                )))
-            }
+            None => Ok(ToolResult::error_text(format!(
+                "No task found with ID: {id}"
+            ))),
         }
     }
 }
@@ -178,9 +173,12 @@ mod tests {
     async fn requires_at_least_one_id() {
         let tool = TaskStopTool;
         let r = tool
-            .validate_input(&json!({}), &ctx_with_tasks(MockTasks {
-                tasks: std::collections::HashMap::new(),
-            }))
+            .validate_input(
+                &json!({}),
+                &ctx_with_tasks(MockTasks {
+                    tasks: std::collections::HashMap::new(),
+                }),
+            )
             .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
@@ -189,9 +187,12 @@ mod tests {
     async fn empty_task_id_is_rejected() {
         let tool = TaskStopTool;
         let r = tool
-            .validate_input(&json!({"task_id": ""}), &ctx_with_tasks(MockTasks {
-                tasks: std::collections::HashMap::new(),
-            }))
+            .validate_input(
+                &json!({"task_id": ""}),
+                &ctx_with_tasks(MockTasks {
+                    tasks: std::collections::HashMap::new(),
+                }),
+            )
             .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
@@ -200,9 +201,12 @@ mod tests {
     async fn shell_id_backward_compat() {
         let tool = TaskStopTool;
         let r = tool
-            .validate_input(&json!({"shell_id": "sh-abc123"}), &ctx_with_tasks(MockTasks {
-                tasks: std::collections::HashMap::new(),
-            }))
+            .validate_input(
+                &json!({"shell_id": "sh-abc123"}),
+                &ctx_with_tasks(MockTasks {
+                    tasks: std::collections::HashMap::new(),
+                }),
+            )
             .await;
         assert!(matches!(r, ValidationResult::Ok));
     }
@@ -212,16 +216,16 @@ mod tests {
         let mut tasks = std::collections::HashMap::new();
         tasks.insert(
             "ag-test".into(),
-            (
-                "ag-test".into(),
-                vec![],
-                RunningStatus::Running,
-            ),
+            ("ag-test".into(), vec![], RunningStatus::Running),
         );
         let ctx = ctx_with_tasks(MockTasks { tasks });
         let tool = TaskStopTool;
         let r = tool
-            .call(json!({"task_id": "ag-test"}), ctx, ProgressSender::noop("t"))
+            .call(
+                json!({"task_id": "ag-test"}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -240,7 +244,11 @@ mod tests {
         });
         let tool = TaskStopTool;
         let r = tool
-            .call(json!({"task_id": "nonexistent"}), ctx, ProgressSender::noop("t"))
+            .call(
+                json!({"task_id": "nonexistent"}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(r.is_error);
@@ -257,11 +265,7 @@ mod tests {
         let mut tasks = std::collections::HashMap::new();
         tasks.insert(
             "ag-completed".into(),
-            (
-                "ag-completed".into(),
-                vec![],
-                RunningStatus::Completed,
-            ),
+            ("ag-completed".into(), vec![], RunningStatus::Completed),
         );
         let ctx = ctx_with_tasks(MockTasks { tasks });
         let tool = TaskStopTool;

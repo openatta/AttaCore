@@ -29,7 +29,12 @@ struct EndpointState {
 
 impl EndpointState {
     fn new(url: String, api_key: String) -> Self {
-        Self { url, api_key, consecutive_failures: 0, cooldown_until: None }
+        Self {
+            url,
+            api_key,
+            consecutive_failures: 0,
+            cooldown_until: None,
+        }
     }
 
     /// Whether this endpoint is in cooldown and should be skipped for now.
@@ -66,7 +71,10 @@ impl EndpointState {
 /// 2. `config.remote.endpoint` (backward-compatible fallback)
 fn resolve_primary(config: &TelemetryConfig) -> Option<(String, String)> {
     if let Some(url) = &config.primary_endpoint {
-        Some((url.clone(), config.primary_api_key.clone().unwrap_or_default()))
+        Some((
+            url.clone(),
+            config.primary_api_key.clone().unwrap_or_default(),
+        ))
     } else if let Some(ref r) = config.remote {
         if !r.endpoint.is_empty() {
             Some((r.endpoint.clone(), r.telemetry_key.clone()))
@@ -84,7 +92,10 @@ fn resolve_primary(config: &TelemetryConfig) -> Option<(String, String)> {
 /// Returns `None` if not configured (backward-compatible).
 fn resolve_secondary(config: &TelemetryConfig) -> Option<(String, String)> {
     config.secondary_endpoint.as_ref().map(|url| {
-        (url.clone(), config.secondary_api_key.clone().unwrap_or_default())
+        (
+            url.clone(),
+            config.secondary_api_key.clone().unwrap_or_default(),
+        )
     })
 }
 
@@ -138,10 +149,7 @@ pub struct RemoteExporter {
 }
 
 impl RemoteExporter {
-    pub fn new(
-        config: TelemetryConfig,
-        rx: mpsc::Receiver<TelemetryEvent>,
-    ) -> Self {
+    pub fn new(config: TelemetryConfig, rx: mpsc::Receiver<TelemetryEvent>) -> Self {
         let policy = RedactionPolicy {
             redact_prompts: config.redact_prompts,
             redact_tool_content: config.redact_tool_content,
@@ -154,7 +162,13 @@ impl RemoteExporter {
         };
         let primary_ep = resolve_primary(&config).map(|(u, k)| EndpointState::new(u, k));
         let secondary_ep = resolve_secondary(&config).map(|(u, k)| EndpointState::new(u, k));
-        Self { config, rx, policy, primary_ep, secondary_ep }
+        Self {
+            config,
+            rx,
+            policy,
+            primary_ep,
+            secondary_ep,
+        }
     }
 
     /// Drive the export loop. Returns when the channel is closed (handle dropped).
@@ -288,23 +302,28 @@ impl RemoteExporter {
     /// Retry previously failed batches from disk on startup.
     /// Tries primary then secondary endpoint with failover.
     /// TS parity: `retryPreviousBatches()` in firstPartyEventLoggingExporter.ts.
-    pub async fn retry_previous_batches(
-        client: &reqwest::Client,
-        config: &TelemetryConfig,
-    ) {
-        let Some(remote) = config.remote.as_ref() else { return; };
-        let Some(dir) = remote.disk_fallback_dir.as_ref() else { return; };
+    pub async fn retry_previous_batches(client: &reqwest::Client, config: &TelemetryConfig) {
+        let Some(remote) = config.remote.as_ref() else {
+            return;
+        };
+        let Some(dir) = remote.disk_fallback_dir.as_ref() else {
+            return;
+        };
 
         let primary = resolve_primary(config);
         let secondary = resolve_secondary(config);
 
-        let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return; };
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            return;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(content) = tokio::fs::read_to_string(&path).await else { continue; };
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
 
             // Try primary
             let mut sent = false;

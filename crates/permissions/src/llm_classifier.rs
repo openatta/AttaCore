@@ -23,9 +23,9 @@ use futures::stream::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 // ── Constants ──
@@ -298,9 +298,7 @@ impl AutoClassifier for LlmClassifier {
 
         let user_msg = ModelMessage {
             role: MessageRole::User,
-            content: vec![ModelContentBlock::Text {
-                text: user_prompt,
-            }],
+            content: vec![ModelContentBlock::Text { text: user_prompt }],
         };
 
         let params = StreamParams {
@@ -368,7 +366,9 @@ impl AutoClassifier for LlmClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base::interface::model::{Model, ModelError, ModelEvent, ModelMessage, StreamParams, ToolDef};
+    use base::interface::model::{
+        Model, ModelError, ModelEvent, ModelMessage, StreamParams, ToolDef,
+    };
     use base::interface::prompt::PromptBlock;
     use futures::stream;
     use serde_json::json;
@@ -424,7 +424,13 @@ mod tests {
     #[tokio::test]
     async fn classify_allow() {
         let c = make_classifier(r#"{"decision":"ALLOW","reason":"safe git operation"}"#);
-        let decision = c.classify("Bash", "Run shell commands", &json!({"command": "git status"})).await;
+        let decision = c
+            .classify(
+                "Bash",
+                "Run shell commands",
+                &json!({"command": "git status"}),
+            )
+            .await;
         match decision {
             ClassifyDecision::Allow { reason } => assert!(reason.contains("safe git operation")),
             other => panic!("expected Allow, got {other:?}"),
@@ -434,7 +440,13 @@ mod tests {
     #[tokio::test]
     async fn classify_deny() {
         let c = make_classifier(r#"{"decision":"DENY","reason":"destructive command"}"#);
-        let decision = c.classify("Bash", "Run shell commands", &json!({"command": "rm -rf /"})).await;
+        let decision = c
+            .classify(
+                "Bash",
+                "Run shell commands",
+                &json!({"command": "rm -rf /"}),
+            )
+            .await;
         match decision {
             ClassifyDecision::Deny { reason } => assert!(reason.contains("destructive")),
             other => panic!("expected Deny, got {other:?}"),
@@ -446,9 +458,18 @@ mod tests {
         let c = make_classifier(
             r#"{"decision":"ALLOW_WITH_EDIT","reason":"safe with dry-run","suggested_edits":"add --dry-run flag"}"#,
         );
-        let decision = c.classify("Bash", "Run shell commands", &json!({"command": "rm -rf build/"})).await;
+        let decision = c
+            .classify(
+                "Bash",
+                "Run shell commands",
+                &json!({"command": "rm -rf build/"}),
+            )
+            .await;
         match decision {
-            ClassifyDecision::AllowWithEdit { reason, suggested_edits } => {
+            ClassifyDecision::AllowWithEdit {
+                reason,
+                suggested_edits,
+            } => {
                 assert!(reason.contains("dry-run"));
                 assert!(suggested_edits.contains("--dry-run"));
             }
@@ -459,14 +480,26 @@ mod tests {
     #[tokio::test]
     async fn classify_defer() {
         let c = make_classifier(r#"{"decision":"DEFER","reason":"uncertain"}"#);
-        let decision = c.classify("Bash", "Run shell commands", &json!({"command": "some weird command"})).await;
+        let decision = c
+            .classify(
+                "Bash",
+                "Run shell commands",
+                &json!({"command": "some weird command"}),
+            )
+            .await;
         assert!(matches!(decision, ClassifyDecision::Defer));
     }
 
     #[tokio::test]
     async fn malformed_json_falls_to_defer() {
         let c = make_classifier("this is not valid JSON at all");
-        let decision = c.classify("Bash", "Run shell commands", &json!({"command": "echo hello"})).await;
+        let decision = c
+            .classify(
+                "Bash",
+                "Run shell commands",
+                &json!({"command": "echo hello"}),
+            )
+            .await;
         assert!(matches!(decision, ClassifyDecision::Defer));
     }
 
@@ -476,7 +509,13 @@ mod tests {
             response: r#"{"decision":"ALLOW","reason":"should not be called"}"#.to_string(),
         });
         let c = LlmClassifier::new(model, "test-model").with_enabled(false);
-        let decision = c.classify("Bash", "Run shell commands", &json!({"command": "git status"})).await;
+        let decision = c
+            .classify(
+                "Bash",
+                "Run shell commands",
+                &json!({"command": "git status"}),
+            )
+            .await;
         assert!(matches!(decision, ClassifyDecision::Defer));
     }
 
@@ -559,12 +598,18 @@ mod tests {
     #[test]
     fn parse_unknown_decision_falls_to_defer() {
         let v = json!({"decision": "MAYBE", "reason": "unknown"});
-        assert!(matches!(LlmClassifier::parse_decision(&v), ClassifyDecision::Defer));
+        assert!(matches!(
+            LlmClassifier::parse_decision(&v),
+            ClassifyDecision::Defer
+        ));
     }
 
     #[test]
     fn parse_missing_decision_falls_to_defer() {
         let v = json!({"reason": "no decision field"});
-        assert!(matches!(LlmClassifier::parse_decision(&v), ClassifyDecision::Defer));
+        assert!(matches!(
+            LlmClassifier::parse_decision(&v),
+            ClassifyDecision::Defer
+        ));
     }
 }

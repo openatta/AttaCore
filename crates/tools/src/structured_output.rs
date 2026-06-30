@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -10,7 +12,8 @@ use serde_json::{json, Value};
 pub struct StructuredOutputInput {
     /// Any data to return as structured output. All properties are echoed back.
     #[serde(flatten)]
-    pub payload: Value}
+    pub payload: Value,
+}
 
 pub struct StructuredOutputTool;
 
@@ -65,6 +68,7 @@ impl Tool for StructuredOutputTool {
             is_error: false,
             structured_content: Some(json!({"structured_output": input})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }

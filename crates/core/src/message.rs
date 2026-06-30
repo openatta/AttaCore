@@ -122,9 +122,7 @@ impl ToolResultContent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CacheEdit {
-    DeleteToolResult {
-        tool_use_id: String,
-    },
+    DeleteToolResult { tool_use_id: String },
 }
 
 /// 模型停止原因。Anthropic API 取值。

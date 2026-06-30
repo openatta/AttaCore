@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, PromptContext, Tool, ToolContext, ToolResult, ValidationResult};
-
-
-
+use base::tool::{
+    PermissionDecision, PromptContext, Tool, ToolContext, ToolResult, ValidationResult,
+};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -79,9 +78,7 @@ impl Tool for TeamDeleteTool {
         _: base::tool::ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult {
-            content: base::tool::ToolResultContent::Text(
-                "Team context cleaned up.".into(),
-            ),
+            content: base::tool::ToolResultContent::Text("Team context cleaned up.".into()),
             is_error: false,
             structured_content: None,
             mcp_meta: None,

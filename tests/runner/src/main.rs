@@ -83,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let scenario = args.scenario.clone().unwrap_or_else(|| {
-        args.case.file_stem()
+        args.case
+            .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| {
                 // Extract numeric prefix: "000.c_project" → "000"
@@ -99,7 +100,16 @@ async fn main() -> anyhow::Result<()> {
 
     match args.mode.as_str() {
         "api" | "agent" => {
-            run_api_mode(&args, &case, vcr_mode, &scenario, &vcr_dir, &report_dir, &config_path).await?;
+            run_api_mode(
+                &args,
+                &case,
+                vcr_mode,
+                &scenario,
+                &vcr_dir,
+                &report_dir,
+                &config_path,
+            )
+            .await?;
         }
         "cli" | "daemon" => {
             run_cli_mode(&args, &case, &scenario, &report_dir).await?;
@@ -144,10 +154,21 @@ async fn run_api_mode(
     Ok(())
 }
 
-async fn run_cli_mode(args: &Args, case: &script::TestCase, scenario: &str, report_dir: &PathBuf) -> anyhow::Result<()> {
+async fn run_cli_mode(
+    args: &Args,
+    case: &script::TestCase,
+    scenario: &str,
+    report_dir: &PathBuf,
+) -> anyhow::Result<()> {
     let config_path = shellexpand::tilde(&args.config).to_string();
-    let vcr_mode: Option<String> = std::env::var("ATTA_VCR_RECORD").ok().map(|_| "record".into())
-        .or_else(|| std::env::var("ATTA_VCR_REPLAY").ok().map(|_| "replay".into()));
+    let vcr_mode: Option<String> = std::env::var("ATTA_VCR_RECORD")
+        .ok()
+        .map(|_| "record".into())
+        .or_else(|| {
+            std::env::var("ATTA_VCR_REPLAY")
+                .ok()
+                .map(|_| "replay".into())
+        });
     let output_dir = args.out_dir.join(scenario).join("cli");
     let _ = std::fs::create_dir_all(&output_dir);
     let config = cli_runner::CliRunnerConfig {
@@ -185,16 +206,35 @@ async fn run_comparison(
                     verdict: comparator::Verdict::Fail,
                     reasoning: format!("比对失败: {e}"),
                 });
-            eprintln!("Turn {}: {:?} — {}", i, cmp.verdict, cmp.reasoning.chars().take(100).collect::<String>());
+            eprintln!(
+                "Turn {}: {:?} — {}",
+                i,
+                cmp.verdict,
+                cmp.reasoning.chars().take(100).collect::<String>()
+            );
             comparisons.push(cmp);
         }
     }
     reporter::write_reports(case, &comparisons, report_dir)?;
-    let passed = comparisons.iter().filter(|c| c.verdict == comparator::Verdict::Pass).count();
-    let failed = comparisons.iter().filter(|c| c.verdict == comparator::Verdict::Fail).count();
+    let passed = comparisons
+        .iter()
+        .filter(|c| c.verdict == comparator::Verdict::Pass)
+        .count();
+    let failed = comparisons
+        .iter()
+        .filter(|c| c.verdict == comparator::Verdict::Fail)
+        .count();
     eprintln!("\n=== Comparison Complete ===");
-    eprintln!("  {} passed, {} failed, {}/{} total", passed, failed, comparisons.len(), case.turns.len());
-    if failed > 0 { std::process::exit(1); }
+    eprintln!(
+        "  {} passed, {} failed, {}/{} total",
+        passed,
+        failed,
+        comparisons.len(),
+        case.turns.len()
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -203,27 +243,42 @@ fn load_config(path: &str) -> anyhow::Result<(String, String, String)> {
     let (mut url, mut token, mut model) = (String::new(), String::new(), String::new());
     for line in content.lines() {
         let l = line.trim();
-        if let Some(v) = l.strip_prefix("export ANTHROPIC_BASE_URL=") { url = v.trim().into(); }
-        else if let Some(v) = l.strip_prefix("export ANTHROPIC_AUTH_TOKEN=") { token = v.trim().into(); }
-        else if let Some(v) = l.strip_prefix("export ANTHROPIC_MODEL=") { model = v.trim().into(); }
+        if let Some(v) = l.strip_prefix("export ANTHROPIC_BASE_URL=") {
+            url = v.trim().into();
+        } else if let Some(v) = l.strip_prefix("export ANTHROPIC_AUTH_TOKEN=") {
+            token = v.trim().into();
+        } else if let Some(v) = l.strip_prefix("export ANTHROPIC_MODEL=") {
+            model = v.trim().into();
+        }
     }
     anyhow::ensure!(!url.is_empty(), "ANTHROPIC_BASE_URL not found in config");
-    anyhow::ensure!(!token.is_empty(), "ANTHROPIC_AUTH_TOKEN not found in config");
+    anyhow::ensure!(
+        !token.is_empty(),
+        "ANTHROPIC_AUTH_TOKEN not found in config"
+    );
     Ok((url, token, model))
 }
 
-fn build_model(config: &(String, String, String)) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
+fn build_model(
+    config: &(String, String, String),
+) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
     let (url, token, _) = config;
     let mut url = url.clone();
-    if !url.ends_with('/') { url.push('/'); }
+    if !url.ends_with('/') {
+        url.push('/');
+    }
     let c = model::client::HttpAnthropicClient::with_base(
         model::client::AuthMode::ApiKey(token.clone()),
         url::Url::parse(&url)?,
     )?
     .with_backoff(vec![100, 200, 500]);
-    Ok(std::sync::Arc::new(model::adapter::AnthropicModel::new(std::sync::Arc::new(c))))
+    Ok(std::sync::Arc::new(model::adapter::AnthropicModel::new(
+        std::sync::Arc::new(c),
+    )))
 }
 
-fn build_compare_model(config: &(String, String, String)) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
+fn build_compare_model(
+    config: &(String, String, String),
+) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
     build_model(config)
 }

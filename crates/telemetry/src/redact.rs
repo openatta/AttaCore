@@ -9,13 +9,13 @@ use std::sync::LazyLock;
 // ── Compiled regex patterns (lazy, one-time initialisation) ─────────────────
 
 /// Match common email addresses.
-static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap()
-});
+static EMAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
 
 /// Match IPv4 addresses.
 static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b").unwrap()
+    Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
+        .unwrap()
 });
 
 /// Match IPv6 addresses (simplified — covers most common forms).
@@ -29,11 +29,12 @@ static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// which is acceptable for telemetry redaction.
 static IPV6_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|",   // full
-        r"\b(?:[0-9a-fA-F]{1,4}:){1,7}:|",                    // trailing ::
+        r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|", // full
+        r"\b(?:[0-9a-fA-F]{1,4}:){1,7}:|",                // trailing ::
         r"\b(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}\b|", // partial hex
-        r"::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b",   // ::1 and other :: forms
-    )).unwrap()
+        r"::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b", // ::1 and other :: forms
+    ))
+    .unwrap()
 });
 
 /// Match paths containing home directory-like segments: `/Users/name` or `/home/name`.
@@ -44,38 +45,81 @@ static HOME_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
 // ── Known sensitive env-var names (lowercased for comparison) ────────────────
 
 const SENSITIVE_ENV_NAMES: &[&str] = &[
-    "api_key", "api_secret", "api_token",
-    "access_key", "secret_key", "secret_access_key",
-    "token", "auth_token", "bearer", "bearer_token",
-    "password", "passwd", "pwd", "secret", "secrets",
-    "private_key", "private", "ssh_key",
-    "signing_key", "signing_secret",
-    "consumer_key", "consumer_secret",
-    "client_secret", "client_id",
-    "app_secret", "app_token",
-    "session_token", "csrf_token",
-    "authorization", "x-api-key",
-    "pat", "github_token", "gitlab_token",
-    "db_password", "database_url",
-    "redis_url", "connection_string",
-    "jwt", "jwt_secret", "jwt_key",
-    "encryption_key", "master_key",
-    "slack_token", "slack_secret",
-    "webhook_secret", "webhook_token",
-    "npm_token", "pypi_token",
-    "docker_token", "kube_config",
-    "terraform_token", "vault_token",
-    "mfa_secret", "otp_secret", "totp_secret",
-    "refresh_token", "id_token",
-    "proxy_password", "proxy_auth",
-    "cloudflare_api_key", "aws_secret",
-    "gcp_secret", "azure_secret",
+    "api_key",
+    "api_secret",
+    "api_token",
+    "access_key",
+    "secret_key",
+    "secret_access_key",
+    "token",
+    "auth_token",
+    "bearer",
+    "bearer_token",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "secrets",
+    "private_key",
+    "private",
+    "ssh_key",
+    "signing_key",
+    "signing_secret",
+    "consumer_key",
+    "consumer_secret",
+    "client_secret",
+    "client_id",
+    "app_secret",
+    "app_token",
+    "session_token",
+    "csrf_token",
+    "authorization",
+    "x-api-key",
+    "pat",
+    "github_token",
+    "gitlab_token",
+    "db_password",
+    "database_url",
+    "redis_url",
+    "connection_string",
+    "jwt",
+    "jwt_secret",
+    "jwt_key",
+    "encryption_key",
+    "master_key",
+    "slack_token",
+    "slack_secret",
+    "webhook_secret",
+    "webhook_token",
+    "npm_token",
+    "pypi_token",
+    "docker_token",
+    "kube_config",
+    "terraform_token",
+    "vault_token",
+    "mfa_secret",
+    "otp_secret",
+    "totp_secret",
+    "refresh_token",
+    "id_token",
+    "proxy_password",
+    "proxy_auth",
+    "cloudflare_api_key",
+    "aws_secret",
+    "gcp_secret",
+    "azure_secret",
 ];
 
 /// Sensitive env-var name suffix patterns (e.g., `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`).
 const SENSITIVE_ENV_SUFFIXES: &[&str] = &[
-    "_key", "_token", "_secret", "_password", "_passwd",
-    "_auth", "_credential", "_cert",
+    "_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_auth",
+    "_credential",
+    "_cert",
 ];
 
 // ── RedactionPolicy ─────────────────────────────────────────────────────────
@@ -163,7 +207,9 @@ impl RedactionPolicy {
         let mut result = input.to_string();
 
         if self.redact_emails {
-            result = EMAIL_RE.replace_all(&result, "[REDACTED_EMAIL]").to_string();
+            result = EMAIL_RE
+                .replace_all(&result, "[REDACTED_EMAIL]")
+                .to_string();
         }
 
         if self.redact_ip_addresses {
@@ -288,7 +334,7 @@ pub fn sanitize_path(path: &str) -> String {
     let bytes = path.as_bytes();
     if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
         let prefix = &bytes[0..2]; // e.g. "C:"
-        let rest = &bytes[3..];    // skip "C:\"
+        let rest = &bytes[3..]; // skip "C:\"
         if rest.len() >= 6
             && (rest[0..6].eq_ignore_ascii_case(b"Users\\")
                 || rest[0..6].eq_ignore_ascii_case(b"Users/"))
@@ -318,14 +364,20 @@ mod tests {
 
     #[test]
     fn redact_email_simple() {
-        let policy = RedactionPolicy { redact_emails: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_emails: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("contact alice@example.com for info");
         assert_eq!(result, "contact [REDACTED_EMAIL] for info");
     }
 
     #[test]
     fn redact_email_multiple() {
-        let policy = RedactionPolicy { redact_emails: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_emails: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("alice@a.com, bob@b.org, charlie@c.net");
         assert_eq!(
             result,
@@ -335,7 +387,10 @@ mod tests {
 
     #[test]
     fn redact_email_with_plus() {
-        let policy = RedactionPolicy { redact_emails: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_emails: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("email: alice+tag@example.co.uk");
         assert_eq!(result, "email: [REDACTED_EMAIL]");
     }
@@ -351,28 +406,40 @@ mod tests {
 
     #[test]
     fn redact_ipv4() {
-        let policy = RedactionPolicy { redact_ip_addresses: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_ip_addresses: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("connect from 192.168.1.1:8080");
         assert_eq!(result, "connect from [REDACTED_IP]:8080");
     }
 
     #[test]
     fn redact_ipv4_loopback() {
-        let policy = RedactionPolicy { redact_ip_addresses: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_ip_addresses: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("localhost is 127.0.0.1");
         assert_eq!(result, "localhost is [REDACTED_IP]");
     }
 
     #[test]
     fn redact_ipv6_loopback() {
-        let policy = RedactionPolicy { redact_ip_addresses: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_ip_addresses: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("ipv6: ::1");
         assert_eq!(result, "ipv6: [REDACTED_IP]");
     }
 
     #[test]
     fn redact_ipv6_full() {
-        let policy = RedactionPolicy { redact_ip_addresses: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_ip_addresses: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("ipv6: 2001:0db8:85a3:0000:0000:8a2e:0370:7334");
         assert!(result.contains("[REDACTED_IP]"));
     }
@@ -388,14 +455,20 @@ mod tests {
 
     #[test]
     fn redact_users_path_unix() {
-        let policy = RedactionPolicy { redact_paths: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_paths: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("config at /Users/xbits/project/file.rs");
         assert_eq!(result, "config at [REDACTED_PATH]/project/file.rs");
     }
 
     #[test]
     fn redact_home_path_unix() {
-        let policy = RedactionPolicy { redact_paths: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_paths: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("stored at /home/alice/.config");
         assert_eq!(result, "stored at [REDACTED_PATH]/.config");
     }
@@ -411,28 +484,40 @@ mod tests {
 
     #[test]
     fn redact_env_var_api_key() {
-        let policy = RedactionPolicy { redact_env_vars: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_env_vars: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("OPENAI_API_KEY=sk-1234567890abcdef");
         assert_eq!(result, "OPENAI_API_KEY=[REDACTED_ENV]");
     }
 
     #[test]
     fn redact_env_var_password() {
-        let policy = RedactionPolicy { redact_env_vars: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_env_vars: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("DB_PASSWORD=hunter2");
         assert_eq!(result, "DB_PASSWORD=[REDACTED_ENV]");
     }
 
     #[test]
     fn redact_env_var_simple_token() {
-        let policy = RedactionPolicy { redact_env_vars: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_env_vars: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("TOKEN=abc123");
         assert_eq!(result, "TOKEN=[REDACTED_ENV]");
     }
 
     #[test]
     fn redact_env_var_multi_line() {
-        let policy = RedactionPolicy { redact_env_vars: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_env_vars: true,
+            ..RedactionPolicy::none()
+        };
         let input = "DB_HOST=localhost\nDB_PASSWORD=secret123\nDB_NAME=test";
         let result = policy.apply(input);
         assert!(result.contains("DB_HOST=localhost"));
@@ -449,7 +534,10 @@ mod tests {
 
     #[test]
     fn non_sensitive_env_var_left_alone() {
-        let policy = RedactionPolicy { redact_env_vars: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_env_vars: true,
+            ..RedactionPolicy::none()
+        };
         let result = policy.apply("MY_VAR=hello");
         assert_eq!(result, "MY_VAR=hello");
     }
@@ -466,7 +554,10 @@ mod tests {
         };
         let input = "user@example.com from 10.0.0.1 at /Users/me/file";
         let result = policy.apply(input);
-        assert_eq!(result, "[REDACTED_EMAIL] from [REDACTED_IP] at [REDACTED_PATH]/file");
+        assert_eq!(
+            result,
+            "[REDACTED_EMAIL] from [REDACTED_IP] at [REDACTED_PATH]/file"
+        );
     }
 
     #[test]
@@ -536,7 +627,10 @@ mod tests {
 
     #[test]
     fn content_redation_true_when_prompts_enabled() {
-        let policy = RedactionPolicy { redact_prompts: true, ..RedactionPolicy::none() };
+        let policy = RedactionPolicy {
+            redact_prompts: true,
+            ..RedactionPolicy::none()
+        };
         assert!(policy.has_content_redaction());
     }
 

@@ -5,7 +5,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,14 +22,16 @@ pub struct AskUserQuestionInput {
     pub header: Option<String>,
     /// Multiple-choice options. If empty, free-form text answer.
     #[serde(default)]
-    pub options: Vec<AskUserOption>}
+    pub options: Vec<AskUserOption>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AskUserOption {
     /// Short key (1-5 chars; what the user types)
     pub key: String,
     /// Human-readable label
-    pub label: String}
+    pub label: String,
+}
 
 pub struct AskUserQuestionTool;
 
@@ -66,7 +71,8 @@ impl Tool for AskUserQuestionTool {
                 ValidationResult::err("option key must not be empty", 2)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()

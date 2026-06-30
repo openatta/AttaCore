@@ -41,16 +41,21 @@ pub fn group_by_api_round(messages: &[ModelMessage]) -> Vec<ApiRound> {
 
     for (i, msg) in messages.iter().enumerate() {
         let is_user_text = msg.role == MessageRole::User
-            && msg.content.first().is_some_and(|b| matches!(b, ModelContentBlock::Text { .. }));
+            && msg
+                .content
+                .first()
+                .is_some_and(|b| matches!(b, ModelContentBlock::Text { .. }));
         let is_tool_result = msg.role == MessageRole::User
-            && msg.content.first().is_some_and(|b| matches!(b, ModelContentBlock::ToolResult { .. }));
+            && msg
+                .content
+                .first()
+                .is_some_and(|b| matches!(b, ModelContentBlock::ToolResult { .. }));
         let is_assistant = msg.role == MessageRole::Assistant;
 
         // New round starts on:
         // - User text (fresh user input)
         // - Assistant after tool results (next API call in loop)
-        let is_round_start = is_user_text
-            || (is_assistant && prev_was_tool_result);
+        let is_round_start = is_user_text || (is_assistant && prev_was_tool_result);
 
         if is_round_start && !current.is_empty() {
             rounds.push(finish_round(&current, start_idx));

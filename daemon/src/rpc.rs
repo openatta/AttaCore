@@ -91,14 +91,14 @@ pub struct SessionOptions {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct VcrOptions {
-    pub mode: String,      // "record" | "replay"
+    pub mode: String, // "record" | "replay"
     pub scenario: String,
-    pub dir: String,       // absolute path to VCR fixture directory
+    pub dir: String, // absolute path to VCR fixture directory
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TelemetryOptions {
-    pub output: String,    // absolute path to telemetry output file
+    pub output: String, // absolute path to telemetry output file
 }
 
 /// Streaming frame sent during long-running operations (e.g. session.run_turn).
@@ -157,7 +157,11 @@ mod tests {
 
     #[test]
     fn stream_frame_format() {
-        let f = StreamFrame::event("sess-1", "turn-1", serde_json::json!({"kind": "text", "data": "hi"}));
+        let f = StreamFrame::event(
+            "sess-1",
+            "turn-1",
+            serde_json::json!({"kind": "text", "data": "hi"}),
+        );
         let s = serde_json::to_string(&f).unwrap();
         assert!(s.contains(r#""method":"session.event""#));
         assert!(s.contains(r#""session_id":"sess-1""#));

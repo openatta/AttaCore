@@ -375,11 +375,16 @@ async fn spawn_service(
     config: &McpServerConfig,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpError> {
     match config {
-        McpServerConfig::Stdio { command, args, env, .. } => {
+        McpServerConfig::Stdio {
+            command, args, env, ..
+        } => {
             // TS parity: expandEnvVarsInString — expand $VAR/${VAR}/${VAR:-default}/$$
             // in command/args/env values before spawning.
             let command = crate::config::expand_env_vars(command);
-            let args: Vec<String> = args.iter().map(|a| crate::config::expand_env_vars(a)).collect();
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| crate::config::expand_env_vars(a))
+                .collect();
             let env: std::collections::HashMap<String, String> = env
                 .iter()
                 .map(|(k, v)| (k.clone(), crate::config::expand_env_vars(v)))
@@ -551,7 +556,6 @@ async fn resolve_oauth_bearer(provider_name: &str) -> Result<String, anyhow::Err
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-
 /// 启发式判断：错误是不是 transport / connectivity 类（值得重连）vs
 /// 真正的 RPC / schema / business 错（不该重连）。
 ///
@@ -625,9 +629,8 @@ fn rmcp_content_to_ours(c: &rmcp::model::Annotated<rmcp::model::RawContent>) -> 
 // ── WebSocket transport ──
 
 /// Type alias for the tokio_tungstenite WebSocket stream (with optional TLS).
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Concrete error type for the WebSocket transport.
 ///
@@ -650,7 +653,8 @@ enum WsTransportError {
 /// The write half is behind `Arc<Mutex<…>>` so that `send()` can return a
 /// `'static + Send` future per the `Transport` trait contract.
 struct WebSocketTransport {
-    write: Arc<Mutex<futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>>,
+    write:
+        Arc<Mutex<futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>>,
     read: futures::stream::SplitStream<WsStream>,
 }
 
@@ -666,17 +670,15 @@ impl rmcp::transport::Transport<rmcp::RoleClient> for WebSocketTransport {
         Box::pin(async move {
             let msg = tokio_tungstenite::tungstenite::Message::text(json?);
             let mut guard = write.lock().await;
-            futures::SinkExt::send(&mut *guard, msg)
-                .await?;
+            futures::SinkExt::send(&mut *guard, msg).await?;
             Ok(())
         })
     }
 
     fn receive(
         &mut self,
-    ) -> impl std::future::Future<
-        Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleClient>>,
-    > + Send {
+    ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleClient>>>
+           + Send {
         let read = &mut self.read;
         Box::pin(async move {
             loop {
@@ -707,9 +709,7 @@ impl rmcp::transport::Transport<rmcp::RoleClient> for WebSocketTransport {
         })
     }
 
-    fn close(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let write = self.write.clone();
         Box::pin(async move {
             let mut guard = write.lock().await;
@@ -730,14 +730,13 @@ async fn try_ws_connect(
     _headers: &std::collections::HashMap<String, String>,
 ) -> Result<WebSocketTransport, anyhow::Error> {
     // Validate the URL first for a better error message
-    url::Url::parse(url)
-        .map_err(|e| anyhow::anyhow!("Invalid WebSocket URL '{url}': {e}"))?;
+    url::Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid WebSocket URL '{url}': {e}"))?;
 
     // Pass &str directly — url::Url does not implement tokio_tungstenite's
     // IntoClientRequest trait, but &str does.
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
-        anyhow::anyhow!("WebSocket connection to '{url}' failed: {e}")
-    })?;
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|e| anyhow::anyhow!("WebSocket connection to '{url}' failed: {e}"))?;
 
     let (write, read) = ws_stream.split();
     Ok(WebSocketTransport {
@@ -783,11 +782,9 @@ async fn spawn_websocket_service(
                 url = %url,
                 "Connected to MCP server via WebSocket transport"
             );
-            return ().serve(transport).await.map_err(|e| {
-                McpError::ConnectFailed {
-                    name: server_name.into(),
-                    source: anyhow::anyhow!("{e}"),
-                }
+            return ().serve(transport).await.map_err(|e| McpError::ConnectFailed {
+                name: server_name.into(),
+                source: anyhow::anyhow!("{e}"),
             });
         }
         Err(e) => {

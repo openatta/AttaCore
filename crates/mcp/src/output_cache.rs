@@ -41,14 +41,12 @@ struct PersistentEntry {
 
 /// An in-memory cache for MCP tool call results with optional file persistence.
 /// TS parity: mcpOutputStorage.ts.
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct McpOutputCache {
     entries: HashMap<String, CacheEntry>,
     /// Path to the persistence file. None disables persistence.
     persist_path: Option<PathBuf>,
 }
-
 
 impl McpOutputCache {
     pub fn new() -> Self {
@@ -77,9 +75,15 @@ impl McpOutputCache {
 
     /// Load cached entries from disk.
     fn load_from_disk(&mut self) {
-        let Some(ref path) = self.persist_path else { return };
-        let Ok(data) = std::fs::read_to_string(path) else { return };
-        let Ok(entries): Result<Vec<PersistentEntry>, _> = serde_json::from_str(&data) else { return };
+        let Some(ref path) = self.persist_path else {
+            return;
+        };
+        let Ok(data) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(entries): Result<Vec<PersistentEntry>, _> = serde_json::from_str(&data) else {
+            return;
+        };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -108,10 +112,15 @@ impl McpOutputCache {
 
     /// Persist current entries to disk.
     fn save_to_disk(&self) {
-        let Some(ref path) = self.persist_path else { return };
+        let Some(ref path) = self.persist_path else {
+            return;
+        };
         let mut entries: Vec<PersistentEntry> = Vec::with_capacity(self.entries.len());
         for (key, entry) in &self.entries {
-            let text = entry.result.content.iter()
+            let text = entry
+                .result
+                .content
+                .iter()
                 .filter_map(|c| match c {
                     crate::client::McpContent::Text(t) => Some(t.clone()),
                     _ => None,
@@ -121,7 +130,10 @@ impl McpOutputCache {
             // Extract server and tool from key format: mcp_cache_<hash>_<server>_<tool>
             let parts: Vec<&str> = key.rsplitn(3, '_').collect();
             let (server, tool) = if parts.len() >= 2 {
-                (parts.get(1).copied().unwrap_or(""), parts.first().copied().unwrap_or(""))
+                (
+                    parts.get(1).copied().unwrap_or(""),
+                    parts.first().copied().unwrap_or(""),
+                )
             } else {
                 ("", "")
             };
@@ -129,9 +141,15 @@ impl McpOutputCache {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
-                .saturating_sub(CACHE_TTL.as_secs().saturating_sub(
-                    entry.created_at.elapsed().as_secs().min(CACHE_TTL.as_secs()),
-                ));
+                .saturating_sub(
+                    CACHE_TTL.as_secs().saturating_sub(
+                        entry
+                            .created_at
+                            .elapsed()
+                            .as_secs()
+                            .min(CACHE_TTL.as_secs()),
+                    ),
+                );
             entries.push(PersistentEntry {
                 key: key.clone(),
                 server: server.to_string(),

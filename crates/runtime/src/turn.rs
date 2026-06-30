@@ -7,7 +7,7 @@ use crate::agent::{Agent, EngineCommand, InputMessage};
 use base::interface::event::AgentEvent;
 use base::interface::memory::{DurableMemory, MemoryStore, MemoryType};
 use base::interface::model::{
-    MessageRole, ModelContentBlock, ModelMessage, ModelStream, ToolDef, Usage,
+    MessageRole, Model, ModelContentBlock, ModelMessage, ModelStream, ToolDef, Usage,
 };
 use base::interface::prompt::{assemble_prompt, PromptBlock};
 use base::interface::scene::ScenePromptContext;
@@ -87,14 +87,12 @@ impl Agent {
                 // Parse directives like "+500k", "spend 2M tokens", "use 1B tokens"
                 // from the user message, set the budget on Agent state, and strip
                 // the directive before passing content to the turn loop.
-                let processed_content = if let Some(target) = parse_token_budget_directive(&content) {
+                let processed_content = if let Some(target) = parse_token_budget_directive(&content)
+                {
                     self.output_token_target = Some(target);
                     self.accumulated_output_tokens = 0;
                     self.token_budget_continuation_count = 0;
-                    tracing::info!(
-                        target,
-                        "Token budget directive parsed — set output target"
-                    );
+                    tracing::info!(target, "Token budget directive parsed — set output target");
                     strip_token_budget_directive(&content)
                 } else {
                     content
@@ -155,6 +153,8 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<TurnOutcome, TurnError> {
         let _timer = self.perf.start_timer("turn", "total");
+        // v2.0.0: Reset per-turn tracking state
+        self.reset_turn_state();
         let mut api_calls: u32 = 0;
         let mut tool_calls: u32 = 0;
         let mut structured_output_calls: u32 = 0;
@@ -223,6 +223,12 @@ impl Agent {
                     ));
                 }
             }
+            // v2.0.0: Inject verification reminder if needed
+            if let Some(ver_reminder) = self.build_verification_reminder() {
+                reminder.push_str(&format!(
+                    "\n<system-reminder>\n{ver_reminder}\n</system-reminder>"
+                ));
+            }
             if !reminder.is_empty() {
                 self.session.push_message(ModelMessage {
                     role: MessageRole::User,
@@ -235,9 +241,11 @@ impl Agent {
         // TS parity: startRelevantMemoryPrefetch in query.ts (fires Sonnet call, collects after tools).
         let mut prefetch_handle: Option<tokio::task::JoinHandle<Vec<String>>> = {
             let store = self.memory_store.clone();
-            let model = self.model.clone();
+            let model = self.resolve_active_model(&self.settings.model.model_name);
             let query = content.clone();
-            let already_surfaced: HashSet<String> = self.frozen.as_ref()
+            let already_surfaced: HashSet<String> = self
+                .frozen
+                .as_ref()
                 .map(|f| f.already_surfaced.clone())
                 .unwrap_or_default();
             let recent_tools = self.tools.names();
@@ -251,7 +259,8 @@ impl Agent {
                     &already_surfaced,
                     &recent_tools,
                     &model_name,
-                ).await
+                )
+                .await
             }))
         };
         let prefetch_started_at: std::time::Instant = std::time::Instant::now();
@@ -290,9 +299,13 @@ impl Agent {
         };
 
         // Push user message (memory injection deferred until after tool execution).
+        // v2.0.0: clone content for the session message; the original is
+        // used later for task routing in build_prompt_for_turn.
         self.session.push_message(ModelMessage {
             role: MessageRole::User,
-            content: vec![ModelContentBlock::Text { text: content }],
+            content: vec![ModelContentBlock::Text {
+                text: content.clone(),
+            }],
         });
 
         let mut had_tool_uses_this_turn = false;
@@ -321,12 +334,12 @@ impl Agent {
             self.compact_if_needed().await;
 
             // 2. Build prompt, tool defs, and clone messages for the model call
-            let (prompt_blocks, tool_defs, messages) = self.build_prompt_for_turn();
+            let (prompt_blocks, tool_defs, messages) = self.build_prompt_for_turn(Some(&content));
 
-            // 3. Call model
+            // 3. Call model — v2.0.0: route through ModelRouter for task-specific providers
             api_calls += 1;
-            let stream_result = self
-                .model
+            let active_model: Arc<dyn Model> = self.resolve_active_model(&effective_model);
+            let stream_result = active_model
                 .stream(
                     prompt_blocks.clone(),
                     tool_defs.clone(),
@@ -363,14 +376,18 @@ impl Agent {
                     let threshold = self.scene.token_budget().compact_threshold.max(50000);
                     let keep = self.scene.token_budget().compact_keep_recent.min(5);
                     let messages_before = self.session.messages.len();
-                    if let Ok((compacted, _result)) = self
-                        .compactor
-                        .compact(messages, threshold, keep)
-                        .await
+                    if let Ok((compacted, _result)) =
+                        self.compactor.compact(messages, threshold, keep).await
                     {
                         if compacted.len() < messages_before {
                             self.session.messages = compacted;
-                            let fb_ctx = build_prompt_context(&self.settings, &self.session, self.frozen.as_ref(), None, None);
+                            let fb_ctx = build_prompt_context(
+                                &self.settings,
+                                &self.session,
+                                self.frozen.as_ref(),
+                                None,
+                                None,
+                            );
                             let fb_prompt = assemble_prompt(
                                 self.scene.as_ref(),
                                 &self.settings,
@@ -448,9 +465,7 @@ impl Agent {
                         turn_id: tid.clone(),
                         cancel: cancel_for_exec.clone(),
                     };
-                    async move {
-                        execute_tool_with_telemetry(&exec_ctx, &name, input).await
-                    }
+                    async move { execute_tool_with_telemetry(&exec_ctx, &name, input).await }
                 },
                 move |name: &str, input: &serde_json::Value| {
                     tools_for_safety
@@ -502,9 +517,13 @@ impl Agent {
                 };
                 let relevant: Vec<base::interface::memory::DurableMemory> = {
                     let all = self.memory_store.load_all();
-                    let surfaced: &std::collections::HashSet<String> =
-                        self.frozen.as_ref().map(|f| &f.already_surfaced).unwrap_or(&EMPTY);
-                    prefetch_names.iter()
+                    let surfaced: &std::collections::HashSet<String> = self
+                        .frozen
+                        .as_ref()
+                        .map(|f| &f.already_surfaced)
+                        .unwrap_or(&EMPTY);
+                    prefetch_names
+                        .iter()
                         .filter_map(|name| all.iter().find(|m| &m.name == name).cloned())
                         .filter(|m| !surfaced.contains(&m.name))
                         .collect()
@@ -542,8 +561,11 @@ Relevant memories for this query:
 ",
                         );
                         for m in relevant.iter().take(5) {
-                            mem_text.push_str(&format!("- **{}**: {}
-", m.name, m.description));
+                            mem_text.push_str(&format!(
+                                "- **{}**: {}
+",
+                                m.name, m.description
+                            ));
                         }
                         mem_text.push_str(
                             "
@@ -564,7 +586,10 @@ Use these memories to inform your response.
                 structured_output_calls = so_calls_this_turn;
             }
             if structured_output_calls >= MAX_STRUCTURED_OUTPUT_RETRIES {
-                tracing::warn!(structured_output_calls, "structured output retry limit exceeded");
+                tracing::warn!(
+                    structured_output_calls,
+                    "structured output retry limit exceeded"
+                );
                 self.last_had_tool_uses = had_tool_uses_this_turn;
                 return Ok(TurnOutcome {
                     stop_reason: "max_structured_output_retries".into(),
@@ -587,13 +612,19 @@ Use these memories to inform your response.
                         self.last_had_tool_uses = had_tool_uses_this_turn;
                         return Ok(TurnOutcome {
                             stop_reason: "budget_exceeded".into(),
-                            api_calls, tool_calls, usage: Usage::default(),
+                            api_calls,
+                            tool_calls,
+                            usage: Usage::default(),
                         });
                     }
                     if total_cost_usd >= budget * 0.9 {
                         // TS parity: checkTokenBudget "continue" mode in query.ts:1308.
                         // Inject a reminder so the model wraps up before hitting the hard cap.
-                        tracing::warn!(total_cost_usd, budget, "approaching USD budget limit; injecting continue reminder");
+                        tracing::warn!(
+                            total_cost_usd,
+                            budget,
+                            "approaching USD budget limit; injecting continue reminder"
+                        );
                         self.session.push_message(ModelMessage {
                             role: MessageRole::User,
                             content: vec![ModelContentBlock::Text {
@@ -612,11 +643,7 @@ Use these memories to inform your response.
                     // Time-bounded wait: if discovery hasn't completed after
                     // tool execution, skip it this turn (it'll run next turn).
                     if let Ok(Ok((_discovered, new_names))) =
-                        tokio::time::timeout(
-                            std::time::Duration::from_millis(500),
-                            handle,
-                        )
-                        .await
+                        tokio::time::timeout(std::time::Duration::from_millis(500), handle).await
                     {
                         if !new_names.is_empty() {
                             let skills_text = format!(
@@ -640,18 +667,14 @@ Use these memories to inform your response.
                 // files accessed by Read/Write/Edit tool operations this turn.
                 // TS parity: conditional skills activation from skill frontmatter.
                 {
-                    let file_paths = Self::extract_tool_file_paths(
-                        self.session.messages(),
-                    );
+                    let file_paths = Self::extract_tool_file_paths(self.session.messages());
                     if !file_paths.is_empty() {
                         let activated = self
                             .skills
                             .activate_conditional_skills_for_paths(&file_paths);
                         if !activated.is_empty() {
-                            let names: Vec<&str> = activated
-                                .iter()
-                                .map(|s| s.name.as_str())
-                                .collect();
+                            let names: Vec<&str> =
+                                activated.iter().map(|s| s.name.as_str()).collect();
                             let skills_text = format!(
                                 "<system-reminder>\nConditional skills activated for \
                                  current context: {}. Use /<skill-name> to invoke.\n\
@@ -660,9 +683,7 @@ Use these memories to inform your response.
                             );
                             self.session.push_message(ModelMessage {
                                 role: MessageRole::User,
-                                content: vec![ModelContentBlock::Text {
-                                    text: skills_text,
-                                }],
+                                content: vec![ModelContentBlock::Text { text: skills_text }],
                             });
                             for s in &activated {
                                 if !self.invoked_skills.contains(&s.name) {
@@ -731,38 +752,57 @@ Use these memories to inform your response.
                     session_id: self.session.session_id.to_string(),
                     cwd: self.settings.paths.local_data_dir.display().to_string(),
                     permission_mode: "default".into(),
-                    tool_name: None, tool_input: None, tool_use_id: None,
-                    tool_result: None, is_error: None, user_prompt: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_use_id: None,
+                    tool_result: None,
+                    is_error: None,
+                    user_prompt: None,
                 };
-                let hook_result = self.hooks.run(hooks::HookEvent::Stop, &stop_hook_input).await;
+                let hook_result = self
+                    .hooks
+                    .run(hooks::HookEvent::Stop, &stop_hook_input)
+                    .await;
                 if hook_result.discontinued() {
                     tracing::info!("Stop hook discontinued the turn");
                     let tid = self.current_turn_id.clone();
-                    let _ = self.telemetry_handle.record(
-                        telemetry::TelemetryEvent::turn_complete(
-                            &self.session.session_id, self.session.turn_count,
+                    let _ = self
+                        .telemetry_handle
+                        .record(telemetry::TelemetryEvent::turn_complete(
+                            &self.session.session_id,
+                            self.session.turn_count,
                             Some(tid.clone()),
                             telemetry::TurnCompletePayload {
                                 turn_no: self.session.turn_count,
                                 turn_id: Some(tid),
                                 stop_reason: "stopped_by_hook".into(),
-                                api_calls, tool_calls,
+                                api_calls,
+                                tool_calls,
                                 permission_denials: self.permission_denial_count,
-                                last_tool_name: None, last_tool_was_error: false,
+                                last_tool_name: None,
+                                last_tool_was_error: false,
                                 turn_duration_ms: start.elapsed().as_millis() as u64,
                             },
                         ));
                     self.last_had_tool_uses = had_tool_uses_this_turn;
                     return Ok(TurnOutcome {
                         stop_reason: "stopped_by_hook".into(),
-                        api_calls, tool_calls, usage,
+                        api_calls,
+                        tool_calls,
+                        usage,
                     });
                 }
                 // Teammate lifecycle hooks (TS parity: TaskCompleted + TeammateIdle
                 // in stopHooks.ts:335-453). Only run if agent is part of a team.
                 if self.team_id.is_some() {
-                    let _ = self.hooks.run(hooks::HookEvent::TaskCompleted, &stop_hook_input).await;
-                    let _ = self.hooks.run(hooks::HookEvent::TeammateIdle, &stop_hook_input).await;
+                    let _ = self
+                        .hooks
+                        .run(hooks::HookEvent::TaskCompleted, &stop_hook_input)
+                        .await;
+                    let _ = self
+                        .hooks
+                        .run(hooks::HookEvent::TeammateIdle, &stop_hook_input)
+                        .await;
                 }
             }
 
@@ -892,6 +932,50 @@ or project context that should survive across sessions.
                 tracing::warn!(error = %e, "failed to persist session");
             }
             self.last_had_tool_uses = had_tool_uses_this_turn;
+
+            // ── v2.0.0: Policy hook + verification check before turn complete ──
+            let hook_decision = self.run_policy_hooks(
+                scene::coding::policy::PolicyHookPoint::BeforeTaskComplete,
+                None,
+                None,
+            );
+            if hook_decision.is_blocked() {
+                let block_msg = match &hook_decision {
+                    scene::coding::policy::HookDecision::Deny { reason } => reason.clone(),
+                    scene::coding::policy::HookDecision::RequireUserApproval { reason } => {
+                        reason.clone()
+                    }
+                    scene::coding::policy::HookDecision::RequireRemediation { message, .. } => {
+                        message.clone()
+                    }
+                    _ => String::new(),
+                };
+                let _ = self.event_tx.send(AgentEvent::TextDelta {
+                    text: format!("\n[PolicyHook blocked completion: {block_msg}]\n"),
+                    turn_id: self.current_turn_id.clone(),
+                });
+                return Ok(TurnOutcome {
+                    stop_reason: "blocked_by_policy_hook".into(),
+                    api_calls,
+                    tool_calls,
+                    usage,
+                });
+            }
+
+            // Check verification requirement
+            if let Some(block_reason) = self.check_verification_block() {
+                let _ = self.event_tx.send(AgentEvent::TextDelta {
+                    text: format!("\n[Verification required: {block_reason}]\n"),
+                    turn_id: self.current_turn_id.clone(),
+                });
+                return Ok(TurnOutcome {
+                    stop_reason: "blocked_by_verification".into(),
+                    api_calls,
+                    tool_calls,
+                    usage,
+                });
+            }
+
             return Ok(TurnOutcome {
                 stop_reason,
                 api_calls,
@@ -1052,7 +1136,8 @@ or project context that should survive across sessions.
             let context_limit = self.scene.token_budget().compact_threshold;
             if context_limit > 0 {
                 let current = self.session.token_count();
-                let velocity = compaction::reactive::estimate_token_velocity(&self.session.messages);
+                let velocity =
+                    compaction::reactive::estimate_token_velocity(&self.session.messages);
                 // Check circuit breaker before attempting compaction
                 if self.compaction_state.circuit_open {
                     tracing::warn!(
@@ -1060,7 +1145,10 @@ or project context that should survive across sessions.
                         "compaction circuit breaker open — skipping reactive compact"
                     );
                 } else if compaction::reactive::should_compact_with_state(
-                    current, context_limit, velocity, &self.compaction_state,
+                    current,
+                    context_limit,
+                    velocity,
+                    &self.compaction_state,
                 ) {
                     tracing::info!(
                         current_tokens = current,
@@ -1072,7 +1160,9 @@ or project context that should survive across sessions.
                         .micro_compact(self.session.messages().to_vec(), keep);
                     if compacted.len() < self.session.messages.len() {
                         self.session.messages = compacted;
-                        self.session.message_timestamps.truncate(self.session.messages.len());
+                        self.session
+                            .message_timestamps
+                            .truncate(self.session.messages.len());
                         self.compaction_state.record_success();
                         // P1-6: Run post-compact cleanup callbacks (cache clearing, etc.)
                         // TS parity: postCompactCleanup.ts
@@ -1113,23 +1203,32 @@ or project context that should survive across sessions.
         }
         if threshold > 0 && self.session.token_count() > threshold {
             // P1: Fire PreCompact hook (TS parity: executePreCompactHooks)
-            if self.hooks.has_hooks_for(hooks::config::HookEvent::PreCompact) {
-                let hook_result = self.hooks.run(
-                    hooks::config::HookEvent::PreCompact,
-                    &hooks::HookInput {
-                        hook_event_name: "PreCompact".into(),
-                        session_id: self.session.session_id.clone(),
-                        cwd: self.settings.paths.local_data_dir.display().to_string(),
-                        permission_mode: "default".into(),
-                        tool_input: Some(serde_json::json!({
-                            "messages_before": self.session.messages.len(),
-                            "token_count": self.session.token_count(),
-                            "threshold": threshold,
-                        })),
-                        tool_name: None, tool_use_id: None,
-                        tool_result: None, is_error: None, user_prompt: None,
-                    },
-                ).await;
+            if self
+                .hooks
+                .has_hooks_for(hooks::config::HookEvent::PreCompact)
+            {
+                let hook_result = self
+                    .hooks
+                    .run(
+                        hooks::config::HookEvent::PreCompact,
+                        &hooks::HookInput {
+                            hook_event_name: "PreCompact".into(),
+                            session_id: self.session.session_id.clone(),
+                            cwd: self.settings.paths.local_data_dir.display().to_string(),
+                            permission_mode: "default".into(),
+                            tool_input: Some(serde_json::json!({
+                                "messages_before": self.session.messages.len(),
+                                "token_count": self.session.token_count(),
+                                "threshold": threshold,
+                            })),
+                            tool_name: None,
+                            tool_use_id: None,
+                            tool_result: None,
+                            is_error: None,
+                            user_prompt: None,
+                        },
+                    )
+                    .await;
                 // P0-3: Respect hook decisions — discontinue or block compaction.
                 if hook_result.discontinued() {
                     tracing::info!("PreCompact hook discontinued — skipping compaction");
@@ -1174,7 +1273,11 @@ or project context that should survive across sessions.
                     self.session.message_timestamps.truncate(messages_after);
                     let (dropped_rounds, dropped_messages, estimated_tokens_saved) =
                         if let Some(ref proj) = result.projection {
-                            (Some(proj.dropped_rounds), Some(proj.dropped_messages), Some(proj.estimated_tokens_saved))
+                            (
+                                Some(proj.dropped_rounds),
+                                Some(proj.dropped_messages),
+                                Some(proj.estimated_tokens_saved),
+                            )
                         } else {
                             (None, None, None)
                         };
@@ -1210,25 +1313,34 @@ or project context that should survive across sessions.
                     }
 
                     // P1: Fire PostCompact hook (TS parity: executePostCompactHooks)
-                    if self.hooks.has_hooks_for(hooks::config::HookEvent::PostCompact) {
-                        let _ = self.hooks.run(
-                            hooks::config::HookEvent::PostCompact,
-                            &hooks::HookInput {
-                                hook_event_name: "PostCompact".into(),
-                                session_id: self.session.session_id.clone(),
-                                cwd: self.settings.paths.local_data_dir.display().to_string(),
-                                permission_mode: "default".into(),
-                                tool_input: Some(serde_json::json!({
-                                    "strategy": format!("{:?}", result.strategy),
-                                    "messages_before": messages_before,
-                                    "messages_after": messages_after,
-                                    "tokens_before": result.tokens_before,
-                                    "tokens_after": result.tokens_after,
-                                })),
-                                tool_name: None, tool_use_id: None,
-                                tool_result: None, is_error: None, user_prompt: None,
-                            },
-                        ).await;
+                    if self
+                        .hooks
+                        .has_hooks_for(hooks::config::HookEvent::PostCompact)
+                    {
+                        let _ = self
+                            .hooks
+                            .run(
+                                hooks::config::HookEvent::PostCompact,
+                                &hooks::HookInput {
+                                    hook_event_name: "PostCompact".into(),
+                                    session_id: self.session.session_id.clone(),
+                                    cwd: self.settings.paths.local_data_dir.display().to_string(),
+                                    permission_mode: "default".into(),
+                                    tool_input: Some(serde_json::json!({
+                                        "strategy": format!("{:?}", result.strategy),
+                                        "messages_before": messages_before,
+                                        "messages_after": messages_after,
+                                        "tokens_before": result.tokens_before,
+                                        "tokens_after": result.tokens_after,
+                                    })),
+                                    tool_name: None,
+                                    tool_use_id: None,
+                                    tool_result: None,
+                                    is_error: None,
+                                    user_prompt: None,
+                                },
+                            )
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -1261,7 +1373,8 @@ or project context that should survive across sessions.
     fn build_skills_text(&self) -> String {
         let skills = self.skills.list();
         // Filter out skills with disable_model_invocation: true
-        let llm_skills: Vec<_> = skills.iter()
+        let llm_skills: Vec<_> = skills
+            .iter()
             .filter(|s| !s.disable_model_invocation)
             .collect();
         if llm_skills.is_empty() {
@@ -1281,7 +1394,8 @@ or project context that should survive across sessions.
         const MAX_DESC_CHARS: usize = 250;
 
         let available_budget = budget_chars.saturating_sub(HEADER_CHARS);
-        let per_entry = (available_budget / llm_skills.len().max(1)).saturating_sub(PER_ENTRY_OVERHEAD);
+        let per_entry =
+            (available_budget / llm_skills.len().max(1)).saturating_sub(PER_ENTRY_OVERHEAD);
         let desc_cap = per_entry.min(MAX_DESC_CHARS);
 
         let mut text = String::from("## Available Skills\n\n");
@@ -1308,20 +1422,48 @@ or project context that should survive across sessions.
     }
 
     /// Build prompt blocks, tool definitions, and clone messages for the model call.
-    fn build_prompt_for_turn(&self) -> (Vec<PromptBlock>, Vec<ToolDef>, Vec<ModelMessage>) {
+    fn build_prompt_for_turn(
+        &self,
+        user_message: Option<&str>,
+    ) -> (Vec<PromptBlock>, Vec<ToolDef>, Vec<ModelMessage>) {
         let mcp_instructions = self.build_mcp_instructions();
-        let mcp_ref: Option<&str> = if mcp_instructions.is_empty() { None } else { Some(&mcp_instructions) };
+        let mcp_ref: Option<&str> = if mcp_instructions.is_empty() {
+            None
+        } else {
+            Some(&mcp_instructions)
+        };
         let skills_text = self.build_skills_text();
-        let skills_ref: Option<&str> = if skills_text.is_empty() { None } else { Some(&skills_text) };
+        let skills_ref: Option<&str> = if skills_text.is_empty() {
+            None
+        } else {
+            Some(&skills_text)
+        };
         // Build comma-separated tool names for dynamic session guidance
-        let tool_names: String = self.tools.list().iter()
+        let tool_names: String = self
+            .tools
+            .list()
+            .iter()
             .map(|t| t.name().to_string())
-            .chain(self.mcp.tool_adapters().iter().map(|t| t.name().to_string()))
+            .chain(
+                self.mcp
+                    .tool_adapters()
+                    .iter()
+                    .map(|t| t.name().to_string()),
+            )
             .collect::<Vec<_>>()
             .join(",");
-        let tools_ref: Option<Cow<'_, str>> = if tool_names.is_empty() { None } else { Some(Cow::Owned(tool_names)) };
-        let mut ctx = build_prompt_context(
-            &self.settings, &self.session, self.frozen.as_ref(), mcp_ref, skills_ref,
+        let tools_ref: Option<Cow<'_, str>> = if tool_names.is_empty() {
+            None
+        } else {
+            Some(Cow::Owned(tool_names))
+        };
+        let mut ctx = build_prompt_context_with_message(
+            &self.settings,
+            &self.session,
+            self.frozen.as_ref(),
+            mcp_ref,
+            skills_ref,
+            user_message,
         );
         ctx.available_tools = tools_ref;
         let prompt_blocks = assemble_prompt(
@@ -1329,8 +1471,8 @@ or project context that should survive across sessions.
             &self.settings,
             &self.memory_store,
             &ctx,
-            skills_ref,  // skills_text
-            mcp_ref,     // mcp_instructions
+            skills_ref, // skills_text
+            mcp_ref,    // mcp_instructions
         );
         let tool_defs = self.build_tool_defs();
         let messages = self.session.messages().to_vec();
@@ -1353,7 +1495,13 @@ or project context that should survive across sessions.
                 "model overloaded, switching to fallback"
             );
             *effective_model = fallback.clone();
-            let fb_ctx = build_prompt_context(&self.settings, &self.session, self.frozen.as_ref(), None, None);
+            let fb_ctx = build_prompt_context(
+                &self.settings,
+                &self.session,
+                self.frozen.as_ref(),
+                None,
+                None,
+            );
             let fb_prompt = assemble_prompt(
                 self.scene.as_ref(),
                 &self.settings,
@@ -1475,7 +1623,8 @@ async fn execute_tool_inner(
     name: &str,
     input: serde_json::Value,
 ) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
-    let tool = ctx.tools
+    let tool = ctx
+        .tools
         .get(name)
         .ok_or_else(|| format!("Tool not found: {name}"))?;
     let tool_ctx = ToolContext {
@@ -1500,10 +1649,13 @@ async fn execute_tool_inner(
         events_tx: None,
     };
     let tool_start = std::time::Instant::now();
-    let result = tool.call(input, tool_ctx, base::tool::ProgressSender::noop("")).await;
+    let result = tool
+        .call(input, tool_ctx, base::tool::ProgressSender::noop(""))
+        .await;
     let latency_ms = tool_start.elapsed().as_millis() as f64;
     let is_error = result.is_err();
-    let _ = ctx.telemetry_handle
+    let _ = ctx
+        .telemetry_handle
         .record(telemetry::TelemetryEvent::tool_execution(
             &ctx.session_id,
             ctx.turn_no,
@@ -1511,7 +1663,11 @@ async fn execute_tool_inner(
             telemetry::ToolExecutionPayload {
                 tool_name: name.to_string(),
                 tool_use_id: String::new(),
-                outcome: if is_error { telemetry::ToolOutcome::Failed } else { telemetry::ToolOutcome::Succeeded },
+                outcome: if is_error {
+                    telemetry::ToolOutcome::Failed
+                } else {
+                    telemetry::ToolOutcome::Succeeded
+                },
                 is_error,
                 error_message: None,
                 latency_ms: latency_ms as u64,
@@ -1538,6 +1694,25 @@ fn build_prompt_context<'a>(
     frozen: Option<&'a base::frozen::FrozenContext>,
     mcp_instructions: Option<&'a str>,
     skills_text: Option<&'a str>,
+) -> ScenePromptContext<'a> {
+    build_prompt_context_with_message(
+        settings,
+        _session,
+        frozen,
+        mcp_instructions,
+        skills_text,
+        None,
+    )
+}
+
+/// Build prompt context with optional user message for v2.0.0 task routing.
+fn build_prompt_context_with_message<'a>(
+    settings: &'a base::interface::settings::Settings,
+    _session: &'a session::session::SessionManager,
+    frozen: Option<&'a base::frozen::FrozenContext>,
+    mcp_instructions: Option<&'a str>,
+    skills_text: Option<&'a str>,
+    user_message: Option<&'a str>,
 ) -> ScenePromptContext<'a> {
     let (is_git, git_branch, is_worktree, git_status, memory_index, output_style) =
         if let Some(f) = frozen {
@@ -1567,9 +1742,15 @@ fn build_prompt_context<'a>(
         git_status: git_status.map(Cow::Owned),
         is_worktree,
         language: settings.language.clone().map(Cow::Owned),
-        scratchpad_dir: settings.paths.local_data_dir.join(".atta/scratchpad").to_str().map(|s| Cow::Owned(s.to_string())),
+        scratchpad_dir: settings
+            .paths
+            .local_data_dir
+            .join(".atta/scratchpad")
+            .to_str()
+            .map(|s| Cow::Owned(s.to_string())),
         output_style_content: output_style.map(Cow::Owned),
         available_tools: None, // populated by caller if needed
+        user_message: user_message.map(|s| Cow::Owned(s.to_string())),
     }
 }
 
@@ -1720,9 +1901,18 @@ fn extract_suffixed_number_from_end(s: &str) -> Option<u64> {
     let mut multiplier = 1u64;
     if end > 0 {
         match chars[end - 1] {
-            'k' | 'K' => { multiplier = 1_000; end -= 1; }
-            'm' | 'M' => { multiplier = 1_000_000; end -= 1; }
-            'b' | 'B' => { multiplier = 1_000_000_000; end -= 1; }
+            'k' | 'K' => {
+                multiplier = 1_000;
+                end -= 1;
+            }
+            'm' | 'M' => {
+                multiplier = 1_000_000;
+                end -= 1;
+            }
+            'b' | 'B' => {
+                multiplier = 1_000_000_000;
+                end -= 1;
+            }
             _ => {}
         }
     }
@@ -1863,7 +2053,9 @@ mod tests {
         // 90% of target → stop
         assert!(!should_continue_token_budget(90_000, 100_000, 0, 1_000, 0));
         // High continuation count alone does NOT stop (no hard cap; was 10).
-        assert!(should_continue_token_budget(10_000, 100_000, 20, 1_000, 1_000));
+        assert!(should_continue_token_budget(
+            10_000, 100_000, 20, 1_000, 1_000
+        ));
     }
 
     #[test]
@@ -1871,7 +2063,9 @@ mod tests {
         // ≥3 continuations, both deltas <500 → stop even below 90%
         assert!(!should_continue_token_budget(10_000, 100_000, 3, 400, 400));
         // ≥3 but large delta → continue
-        assert!(should_continue_token_budget(10_000, 100_000, 3, 1_000, 1_000));
+        assert!(should_continue_token_budget(
+            10_000, 100_000, 3, 1_000, 1_000
+        ));
         // <3 continuations, small deltas → still continue
         assert!(should_continue_token_budget(10_000, 100_000, 2, 400, 400));
     }
@@ -1880,7 +2074,10 @@ mod tests {
 
     #[test]
     fn parse_shorthand_500k() {
-        assert_eq!(parse_token_budget_directive("+500k do this task"), Some(500_000));
+        assert_eq!(
+            parse_token_budget_directive("+500k do this task"),
+            Some(500_000)
+        );
     }
 
     #[test]
@@ -1953,10 +2150,7 @@ mod tests {
 
     #[test]
     fn strip_no_directive() {
-        assert_eq!(
-            strip_token_budget_directive("hello world"),
-            "hello world"
-        );
+        assert_eq!(strip_token_budget_directive("hello world"), "hello world");
     }
 
     #[test]
@@ -2015,7 +2209,7 @@ mod tests {
             hooks_config: None,
             mcp_servers: Vec::new(),
             language: None,
-        feature_flags: Default::default(),
+            feature_flags: Default::default(),
             session_dir: None,
         };
         let session = session::session::SessionManager::in_memory(None);
@@ -2086,15 +2280,17 @@ For each memory, return a JSON object with:\n\
 Return only a JSON array of memories. If nothing is worth saving, return [].";
 
     use base::interface::settings::ThinkingMode;
-    let request_messages = vec![
-        ModelMessage {
-            role: MessageRole::User,
-            content: vec![
-                ModelContentBlock::Text { text: prompt.to_string() },
-                ModelContentBlock::Text { text: messages_text },
-            ],
-        },
-    ];
+    let request_messages = vec![ModelMessage {
+        role: MessageRole::User,
+        content: vec![
+            ModelContentBlock::Text {
+                text: prompt.to_string(),
+            },
+            ModelContentBlock::Text {
+                text: messages_text,
+            },
+        ],
+    }];
     let params = base::interface::model::StreamParams {
         model: "claude-haiku-4-5-20251001".into(),
         max_tokens: 2000,

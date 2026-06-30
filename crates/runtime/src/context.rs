@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use crate::agent::{Agent, EventReceiver};
-use base::tool::InMemoryToolRegistry;
 use base::context::EngineConfig;
+use base::tool::InMemoryToolRegistry;
 
 /// Bundles the agent Engine and shared config for turn execution.
 pub struct AgentContext {

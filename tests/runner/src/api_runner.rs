@@ -2,13 +2,13 @@
 //!
 //! 每轮: 发送用户消息 → 收集 AgentEvent → 记录输出 → 可选 LLM 比对。
 
+use base::frozen::FrozenContext;
 use base::id::Id;
 use base::interface::event::AgentEvent;
 use base::interface::model::{Model, StreamParams};
 use base::interface::settings::{PermissionMode, ThinkingMode, VcrConfig, VcrMode};
 use base::provider::ApiType;
 use base::tool::{InMemoryToolRegistry, Tool};
-use base::frozen::FrozenContext;
 use runtime::agent::{Builder, InputMessage};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +30,10 @@ pub struct TurnOutput {
     pub tool_uses: Vec<(String, serde_json::Value)>,
 }
 
-pub async fn run_test_case(config: AgentRunnerConfig, case: &TestCase) -> anyhow::Result<Vec<TurnOutput>> {
+pub async fn run_test_case(
+    config: AgentRunnerConfig,
+    case: &TestCase,
+) -> anyhow::Result<Vec<TurnOutput>> {
     let mut results = Vec::new();
 
     for turn in &case.turns {
@@ -45,39 +48,61 @@ pub async fn run_test_case(config: AgentRunnerConfig, case: &TestCase) -> anyhow
     Ok(results)
 }
 
-async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) -> anyhow::Result<TurnOutput> {
+async fn run_one_turn(
+    config: &AgentRunnerConfig,
+    turn: &crate::script::Turn,
+) -> anyhow::Result<TurnOutput> {
     let tmp = PathBuf::from("/tmp/atta_test_runner");
     let _ = std::fs::create_dir_all(&tmp);
 
     let vcr_model = Arc::new(VcrModel::new(
         config.model.clone(),
-        Some(VcrConfig { mode: config.vcr_mode, scenario: config.vcr_scenario.clone(), fallback_on_miss: true }),
+        Some(VcrConfig {
+            mode: config.vcr_mode,
+            scenario: config.vcr_scenario.clone(),
+            fallback_on_miss: true,
+        }),
         PathBuf::from("/tmp/atta_vcr_nonexistent"),
         config.vcr_dir.clone(),
     ));
 
     let settings = Arc::new(base::interface::settings::Settings {
         model: base::interface::settings::ModelSettings {
-            api_type: ApiType::Anthropic, base_url: String::new(), auth_token: String::new(),
-            model_name: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into()), max_tokens: 2000,
-            thinking_mode: ThinkingMode::Off, fallback_model: None,
+            api_type: ApiType::Anthropic,
+            base_url: String::new(),
+            auth_token: String::new(),
+            model_name: std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+            max_tokens: 2000,
+            thinking_mode: ThinkingMode::Off,
+            fallback_model: None,
         },
         paths: base::interface::settings::PathSettings {
-            user_data_dir: tmp.join("user"), local_data_dir: tmp.join("local"),
+            user_data_dir: tmp.join("user"),
+            local_data_dir: tmp.join("local"),
         },
-        execution: Default::default(), compaction: Default::default(), sandbox: Default::default(),
-        instruction_file: None, prompt_append: None, prompt_override: None,
-        vcr: None, telemetry_url: None, session_dir: None,
+        execution: Default::default(),
+        compaction: Default::default(),
+        sandbox: Default::default(),
+        instruction_file: None,
+        prompt_append: None,
+        prompt_override: None,
+        vcr: None,
+        telemetry_url: None,
+        session_dir: None,
         memory_enabled: false,
         permission_mode: PermissionMode::BypassPermissions,
-        permission_rules: vec![], hooks_config: None, mcp_servers: vec![],
-        language: None, feature_flags: Default::default(),
+        permission_rules: vec![],
+        hooks_config: None,
+        mcp_servers: vec![],
+        language: None,
+        feature_flags: Default::default(),
     });
 
     let tools_registry = make_tools();
 
     let mut builder = Builder::new()
-        .scene(Arc::new(scene::scene::coding::CodingScene))
+        .scene(Arc::new(scene::scene::coding::CodingScene::default_scene()))
         .model(vcr_model)
         .tools(tools_registry)
         .settings(settings)
@@ -98,7 +123,8 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
         builder = builder.telemetry_handle(telemetry::TelemetryHandle::new(tx));
     }
 
-    let (agent, mut event_rx, input_tx) = builder.build()
+    let (agent, mut event_rx, input_tx) = builder
+        .build()
         .map_err(|e| anyhow::anyhow!("build agent: {e}"))?;
 
     let cancel = CancellationToken::new();
@@ -143,6 +169,8 @@ fn make_tools() -> Arc<InMemoryToolRegistry> {
         Arc::new(tools::task_output::TaskOutputTool),
         Arc::new(tools::task_stop::TaskStopTool),
     ];
-    for t in tools { reg.register(t); }
+    for t in tools {
+        reg.register(t);
+    }
     reg
 }

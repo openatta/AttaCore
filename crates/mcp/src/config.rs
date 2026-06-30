@@ -159,9 +159,8 @@ pub fn expand_env_vars(input: &str) -> String {
         let mut j = start;
         while j < chars.len() {
             let ch = chars[j];
-            let valid = ch.is_ascii_alphabetic()
-                || ch == '_'
-                || (j > start && ch.is_ascii_alphanumeric());
+            let valid =
+                ch.is_ascii_alphabetic() || ch == '_' || (j > start && ch.is_ascii_alphanumeric());
             if !valid {
                 break;
             }
@@ -276,10 +275,7 @@ pub struct McpPolicy {
 /// Apply an enterprise policy to filter a server map.
 ///
 /// Deny overrides allow. An empty allowlist blocks all servers.
-pub fn apply_policy(
-    servers: &mut HashMap<String, McpServerConfig>,
-    policy: &McpPolicy,
-) {
+pub fn apply_policy(servers: &mut HashMap<String, McpServerConfig>, policy: &McpPolicy) {
     // 1. Apply deny list first (deny always overrides allow)
     if let Some(ref denied) = policy.denied_servers {
         servers.retain(|name, cfg| !denied.iter().any(|p| p.matches(name, cfg)));
@@ -434,7 +430,9 @@ fn load_scoped_servers_file(path: &Path, merged: &mut HashMap<String, McpServerC
 /// Expand environment variables in all string fields of an `McpServerConfig`.
 fn expand_env_vars_in_config(cfg: &mut McpServerConfig) {
     match cfg {
-        McpServerConfig::Stdio { command, args, env, .. } => {
+        McpServerConfig::Stdio {
+            command, args, env, ..
+        } => {
             *command = expand_env(command);
             for arg in args.iter_mut() {
                 *arg = expand_env(arg);
@@ -538,7 +536,9 @@ mod tests {
         });
         let cfg: McpServerConfig = serde_json::from_value(v).unwrap();
         match cfg {
-            McpServerConfig::Stdio { command, args, env, .. } => {
+            McpServerConfig::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "uvx");
                 assert_eq!(args.len(), 3);
                 assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
@@ -698,7 +698,10 @@ mod tests {
     fn mcppattern_name_exact_match() {
         let pattern = McpServerPattern::Name("my-server".into());
         let cfg = McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            scope: None,
         };
         assert!(pattern.matches("my-server", &cfg));
         assert!(!pattern.matches("other", &cfg));
@@ -708,7 +711,10 @@ mod tests {
     fn mcppattern_command_substring_match() {
         let pattern = McpServerPattern::Command("npx".into());
         let cfg = McpServerConfig::Stdio {
-            command: "/usr/local/bin/npx".into(), args: vec![], env: HashMap::new(), scope: None,
+            command: "/usr/local/bin/npx".into(),
+            args: vec![],
+            env: HashMap::new(),
+            scope: None,
         };
         assert!(pattern.matches("any-name", &cfg));
     }
@@ -753,7 +759,10 @@ mod tests {
     fn mcppattern_url_no_match_on_stdio() {
         let pattern = McpServerPattern::UrlPattern("https://*".into());
         let cfg = McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            scope: None,
         };
         assert!(!pattern.matches("any-name", &cfg));
     }
@@ -763,12 +772,24 @@ mod tests {
     #[test]
     fn apply_policy_no_restrictions_passes_all() {
         let mut servers = HashMap::new();
-        servers.insert("s1".into(), McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
-        servers.insert("s2".into(), McpServerConfig::Stdio {
-            command: "cat".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
+        servers.insert(
+            "s1".into(),
+            McpServerConfig::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
+        servers.insert(
+            "s2".into(),
+            McpServerConfig::Stdio {
+                command: "cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
         let policy = McpPolicy::default();
         apply_policy(&mut servers, &policy);
         assert_eq!(servers.len(), 2);
@@ -777,12 +798,24 @@ mod tests {
     #[test]
     fn apply_policy_deny_removes_matching() {
         let mut servers = HashMap::new();
-        servers.insert("blocked".into(), McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
-        servers.insert("allowed".into(), McpServerConfig::Stdio {
-            command: "cat".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
+        servers.insert(
+            "blocked".into(),
+            McpServerConfig::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
+        servers.insert(
+            "allowed".into(),
+            McpServerConfig::Stdio {
+                command: "cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
         let policy = McpPolicy {
             denied_servers: Some(vec![McpServerPattern::Name("blocked".into())]),
             ..McpPolicy::default()
@@ -795,9 +828,15 @@ mod tests {
     #[test]
     fn apply_policy_empty_allowlist_blocks_all() {
         let mut servers = HashMap::new();
-        servers.insert("s1".into(), McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
+        servers.insert(
+            "s1".into(),
+            McpServerConfig::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
         let policy = McpPolicy {
             allowed_servers: Some(vec![]),
             ..McpPolicy::default()
@@ -809,12 +848,24 @@ mod tests {
     #[test]
     fn apply_policy_allowlist_keeps_only_matching() {
         let mut servers = HashMap::new();
-        servers.insert("keep".into(), McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
-        servers.insert("remove".into(), McpServerConfig::Stdio {
-            command: "cat".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
+        servers.insert(
+            "keep".into(),
+            McpServerConfig::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
+        servers.insert(
+            "remove".into(),
+            McpServerConfig::Stdio {
+                command: "cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
         let policy = McpPolicy {
             allowed_servers: Some(vec![McpServerPattern::Name("keep".into())]),
             ..McpPolicy::default()
@@ -827,9 +878,15 @@ mod tests {
     #[test]
     fn apply_policy_deny_overrides_allow() {
         let mut servers = HashMap::new();
-        servers.insert("server".into(), McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
-        });
+        servers.insert(
+            "server".into(),
+            McpServerConfig::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                scope: None,
+            },
+        );
         let policy = McpPolicy {
             allowed_servers: Some(vec![McpServerPattern::Name("server".into())]),
             denied_servers: Some(vec![McpServerPattern::Name("server".into())]),
@@ -915,13 +972,17 @@ mod tests {
     fn load_scoped_servers_file_applies_env_expansion() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("servers.json");
-        std::fs::write(&path, r#"{
+        std::fs::write(
+            &path,
+            r#"{
             "my-server": {
                 "type": "stdio",
                 "command": "echo",
                 "args": ["${UNSET_TEST_VAR_123:-hello}"]
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let mut merged = HashMap::new();
         load_scoped_servers_file(&path, &mut merged);
         assert_eq!(merged.len(), 1);
@@ -938,23 +999,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // First file: lower priority
         let path1 = dir.path().join("servers.json");
-        std::fs::write(&path1, r#"{
+        std::fs::write(
+            &path1,
+            r#"{
             "same": {
                 "type": "stdio",
                 "command": "first"
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let mut merged = HashMap::new();
         load_scoped_servers_file(&path1, &mut merged);
 
         // Second file: higher priority should override
         let path2 = dir.path().join("local.json");
-        std::fs::write(&path2, r#"{
+        std::fs::write(
+            &path2,
+            r#"{
             "same": {
                 "type": "stdio",
                 "command": "second"
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         load_scoped_servers_file(&path2, &mut merged);
 
         assert_eq!(merged.len(), 1);
@@ -971,7 +1040,10 @@ mod tests {
     #[test]
     fn url_method_returns_correct_variants() {
         let stdio = McpServerConfig::Stdio {
-            command: "echo".into(), args: vec![], env: HashMap::new(), scope: None,
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            scope: None,
         };
         assert!(stdio.url().is_none());
 
@@ -984,12 +1056,15 @@ mod tests {
         assert_eq!(http.url(), Some("https://example.com"));
 
         let ws = McpServerConfig::WebSocket {
-            url: "ws://localhost".into(), headers: HashMap::new(), scope: None,
+            url: "ws://localhost".into(),
+            headers: HashMap::new(),
+            scope: None,
         };
         assert_eq!(ws.url(), Some("ws://localhost"));
 
         let inproc = McpServerConfig::InProcess {
-            name: "test".into(), scope: None,
+            name: "test".into(),
+            scope: None,
         };
         assert!(inproc.url().is_none());
     }

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use base::error::ToolError;
 use base::tool::Tool;
 use base::tool::{
-    PermissionDecision, ProgressSender, PromptContext, ToolContext, ToolResult,
-    ToolResultContent, ValidationResult,
+    PermissionDecision, ProgressSender, PromptContext, ToolContext, ToolResult, ToolResultContent,
+    ValidationResult,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -24,10 +24,16 @@ pub struct SleepTool;
 
 #[async_trait]
 impl Tool for SleepTool {
-    fn description(&self) -> &str { "Wait for a specified duration" }
-        fn name(&self) -> &str { "Sleep" }
+    fn description(&self) -> &str {
+        "Wait for a specified duration"
+    }
+    fn name(&self) -> &str {
+        "Sleep"
+    }
 
-    fn is_deferred(&self) -> bool { true }
+    fn is_deferred(&self) -> bool {
+        true
+    }
 
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(SleepInput)).expect("schema")
@@ -37,14 +43,19 @@ impl Tool for SleepTool {
         include_str!("prompts/coding/sleep.prompt.md").to_string()
     }
 
-    fn is_concurrency_safe(&self, _: &Value) -> bool { true }
-    fn is_read_only(&self, _: &Value) -> bool { true }
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        true
+    }
 
     async fn validate_input(&self, input: &Value, _: &ToolContext) -> ValidationResult {
         match serde_json::from_value::<SleepInput>(input.clone()) {
             Ok(p) if p.duration_ms == 0 => ValidationResult::err("duration_ms must be > 0", 1),
-            Ok(p) if p.duration_ms > MAX_SLEEP_MS =>
-                ValidationResult::err(format!("duration_ms exceeds {MAX_SLEEP_MS} ms cap"), 2),
+            Ok(p) if p.duration_ms > MAX_SLEEP_MS => {
+                ValidationResult::err(format!("duration_ms exceeds {MAX_SLEEP_MS} ms cap"), 2)
+            }
             Ok(_) => ValidationResult::Ok,
             Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
         }
@@ -92,14 +103,24 @@ mod tests {
     #[tokio::test]
     async fn validates_zero_duration() {
         let tool = SleepTool;
-        let r = tool.validate_input(&json!({"duration_ms": 0}), &ToolContext::for_test("/tmp".into())).await;
+        let r = tool
+            .validate_input(
+                &json!({"duration_ms": 0}),
+                &ToolContext::for_test("/tmp".into()),
+            )
+            .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
 
     #[tokio::test]
     async fn validates_over_cap() {
         let tool = SleepTool;
-        let r = tool.validate_input(&json!({"duration_ms": 999_999}), &ToolContext::for_test("/tmp".into())).await;
+        let r = tool
+            .validate_input(
+                &json!({"duration_ms": 999_999}),
+                &ToolContext::for_test("/tmp".into()),
+            )
+            .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
 
@@ -107,7 +128,14 @@ mod tests {
     async fn sleeps_short_duration() {
         let tool = SleepTool;
         let start = std::time::Instant::now();
-        let r = tool.call(json!({"duration_ms": 50}), ToolContext::for_test("/tmp".into()), ProgressSender::noop("t")).await.unwrap();
+        let r = tool
+            .call(
+                json!({"duration_ms": 50}),
+                ToolContext::for_test("/tmp".into()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed >= std::time::Duration::from_millis(45));
         assert!(elapsed < std::time::Duration::from_millis(500));
@@ -124,7 +152,10 @@ mod tests {
             cancel.cancel();
         });
         let start = std::time::Instant::now();
-        let r = tool.call(json!({"duration_ms": 5000}), ctx, ProgressSender::noop("t")).await.unwrap();
+        let r = tool
+            .call(json!({"duration_ms": 5000}), ctx, ProgressSender::noop("t"))
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_millis(1000));
         assert!(r.is_error);

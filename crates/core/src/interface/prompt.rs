@@ -211,6 +211,7 @@ mod tests {
             scratchpad_dir: None,
             output_style_content: None,
             available_tools: None,
+            user_message: None,
         };
 
         let blocks = assemble_prompt(&scene, &settings, &store, &ctx, None, None);
@@ -243,6 +244,7 @@ mod tests {
             scratchpad_dir: None,
             output_style_content: None,
             available_tools: None,
+            user_message: None,
         };
 
         let blocks = assemble_prompt(&scene, &settings, &store, &ctx, None, None);

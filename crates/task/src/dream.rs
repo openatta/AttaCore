@@ -246,7 +246,9 @@ mod tests {
 
         let file_path = dream.dream_file_path();
         if file_path.exists() {
-            let content = tokio::fs::read_to_string(&file_path).await.unwrap_or_default();
+            let content = tokio::fs::read_to_string(&file_path)
+                .await
+                .unwrap_or_default();
             // May contain CANCELLED if the write happened
             if !content.is_empty() {
                 assert!(content.contains("Initial Prompt") || content.contains("[CANCELLED]"));

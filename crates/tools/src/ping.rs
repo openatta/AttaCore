@@ -4,11 +4,13 @@
 //! 不下载响应体，仅验证可达性与响应速度。
 //! 超时 10s，重定向跟随但不计跳转时间差异。
 
+use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
-use crate::cancel::run_with_cancel;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,15 +25,18 @@ pub struct PingInput {
 
     /// Optional label for the model's reference (not sent to server).
     #[serde(default)]
-    pub label: Option<String>}
+    pub label: Option<String>,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PingTool;
 
 #[async_trait]
 impl Tool for PingTool {
-    fn description(&self) -> &str { "Check if a URL is reachable via HTTP HEAD request" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Check if a URL is reachable via HTTP HEAD request"
+    }
+    fn name(&self) -> &str {
         "Ping"
     }
 
@@ -70,13 +75,15 @@ impl Tool for PingTool {
                 ValidationResult::err("url must start with http:// or https://", 2)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::Ask {
             message: "Ping requires confirmation".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -115,7 +122,8 @@ impl Tool for PingTool {
                 "connection refused for {}: {e}",
                 input.url
             ))),
-            Err(e) => Err(ToolError::exec(format!("ping failed: {e}")))}
+            Err(e) => Err(ToolError::exec(format!("ping failed: {e}"))),
+        }
     }
 }
 
@@ -220,7 +228,8 @@ mod tests {
                 assert!(t.contains("HTTP 200"), "got: {t}");
                 assert!(t.contains("latency:"), "got: {t}");
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -246,6 +255,7 @@ mod tests {
             Ok(Ok(res)) => panic!(
                 "expected ToolError or outer timeout, got success: {:?}",
                 res
-            )}
+            ),
+        }
     }
 }

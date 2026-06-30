@@ -103,12 +103,10 @@ impl Tool for PushNotificationTool {
 
             match result {
                 Ok(output) if output.status.success() => {
-                    let suffix = if is_proactive {
-                        " (proactive)"
-                    } else {
-                        ""
-                    };
-                    Ok(ToolResult::text(format!("Notification sent: {msg}{suffix}")))
+                    let suffix = if is_proactive { " (proactive)" } else { "" };
+                    Ok(ToolResult::text(format!(
+                        "Notification sent: {msg}{suffix}"
+                    )))
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -129,11 +127,7 @@ impl Tool for PushNotificationTool {
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("[PushNotification] {msg}");
-            let suffix = if is_proactive {
-                " (proactive)"
-            } else {
-                ""
-            };
+            let suffix = if is_proactive { " (proactive)" } else { "" };
             Ok(ToolResult::text(format!(
                 "Notification logged to terminal: {msg}{suffix}"
             )))

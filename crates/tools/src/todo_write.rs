@@ -4,10 +4,12 @@
 //! 状态存储在 static OnceLock<Mutex<Vec<TodoItem>>> 中；用户用 `/tasks` slash 查看。
 
 use async_trait::async_trait;
-use base::error::ToolError;
-use base::tool::{PermissionDecision,
-    ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ValidationResult};
 use base::context::TodoStatus;
+use base::error::ToolError;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,12 +32,14 @@ pub struct TodoItem {
     pub content: String,
     pub status: TodoStatus,
     #[serde(default)]
-    pub active_form: String}
+    pub active_form: String,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoWriteInput {
     /// Full replacement set of todos; pass the complete list every call.
-    pub todos: Vec<TodoItem>}
+    pub todos: Vec<TodoItem>,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TodoWriteTool;
@@ -101,7 +105,8 @@ impl Tool for TodoWriteTool {
                 }
                 ValidationResult::Ok
             }
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -133,7 +138,8 @@ fn count_by_status(todos: &[TodoItem]) -> (usize, usize, usize) {
         match t.status {
             TodoStatus::Pending => pending += 1,
             TodoStatus::InProgress => in_progress += 1,
-            TodoStatus::Completed => completed += 1}
+            TodoStatus::Completed => completed += 1,
+        }
     }
     (pending, in_progress, completed)
 }
@@ -180,7 +186,8 @@ mod tests {
         *todo_store().lock().unwrap() = vec![TodoItem {
             content: "old".into(),
             status: TodoStatus::Pending,
-            active_form: "old".into()}];
+            active_form: "old".into(),
+        }];
         let tool = TodoWriteTool;
         tool.call(
             json!({"todos": [{"content": "new", "status": "pending", "active_form": "doing new"}]}),
@@ -199,7 +206,8 @@ mod tests {
         *todo_store().lock().unwrap() = vec![TodoItem {
             content: "x".into(),
             status: TodoStatus::Pending,
-            active_form: "x".into()}];
+            active_form: "x".into(),
+        }];
         let tool = TodoWriteTool;
         tool.call(json!({"todos": []}), ctx(), ProgressSender::noop("t"))
             .await
@@ -220,8 +228,9 @@ mod tests {
             )
             .await;
         match r {
-            ValidationResult::Err { .. } => {},
-            _ => panic!("expected validation error")}
+            ValidationResult::Err { .. } => {}
+            _ => panic!("expected validation error"),
+        }
     }
 
     #[tokio::test]
@@ -234,8 +243,9 @@ mod tests {
             )
             .await;
         match r {
-            ValidationResult::Err { .. } => {},
-            _ => panic!("expected validation error")}
+            ValidationResult::Err { .. } => {}
+            _ => panic!("expected validation error"),
+        }
     }
 
     #[tokio::test]
@@ -262,7 +272,8 @@ mod tests {
                 assert!(s.contains("1 in_progress"));
                 assert!(s.contains("2 pending"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 use crate::api_runner::TurnOutput;
 use crate::script::Turn;
-use base::interface::model::{Model, MessageRole, ModelContentBlock, ModelMessage, StreamParams, ModelEvent};
+use base::interface::model::{
+    MessageRole, Model, ModelContentBlock, ModelEvent, ModelMessage, StreamParams,
+};
 use base::interface::settings::ThinkingMode;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -64,11 +66,17 @@ pub async fn compare_output(
 判定:",
         user_input = turn.input,
         expected = turn.expected,
-        text = if actual.text.is_empty() { "(无文本输出)" } else { &actual.text },
+        text = if actual.text.is_empty() {
+            "(无文本输出)"
+        } else {
+            &actual.text
+        },
         tools = if actual.tool_uses.is_empty() {
             "(未调用工具)".to_string()
         } else {
-            actual.tool_uses.iter()
+            actual
+                .tool_uses
+                .iter()
                 .map(|(name, input)| format!("- {name}: {input}"))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -90,7 +98,9 @@ pub async fn compare_output(
     };
 
     let cancel = CancellationToken::new();
-    let mut stream = model.stream(vec![], vec![], messages, params, cancel).await?;
+    let mut stream = model
+        .stream(vec![], vec![], messages, params, cancel)
+        .await?;
     let mut text = String::new();
     while let Some(e) = stream.next().await {
         if let Ok(ModelEvent::TextDelta { text: t }) = e {

@@ -198,11 +198,7 @@ impl CodedError {
         }
     }
 
-    pub fn with_source(
-        code: ErrorCode,
-        message: impl Into<String>,
-        source: anyhow::Error,
-    ) -> Self {
+    pub fn with_source(code: ErrorCode, message: impl Into<String>, source: anyhow::Error) -> Self {
         Self {
             code,
             message: message.into(),
@@ -228,7 +224,9 @@ impl fmt::Display for CodedError {
 
 impl std::error::Error for CodedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|e| e.as_ref() as &dyn std::error::Error)
+        self.source
+            .as_ref()
+            .map(|e| e.as_ref() as &dyn std::error::Error)
     }
 }
 
@@ -293,7 +291,11 @@ mod tests {
             );
         }
         // ensure every variant is covered (count may grow as codes are added)
-        assert!(codes.len() >= 39, "expected at least 39 codes, got {}", codes.len());
+        assert!(
+            codes.len() >= 39,
+            "expected at least 39 codes, got {}",
+            codes.len()
+        );
     }
 
     #[test]

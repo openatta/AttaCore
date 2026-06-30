@@ -11,8 +11,8 @@ use base::interface::model::{
 };
 use base::interface::prompt::{CacheStrategy, PromptBlock};
 use base::interface::settings::ThinkingMode;
-use base::provider::ApiType;
 use base::message::{CacheEdit, ContentBlock, Role};
+use base::provider::ApiType;
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;

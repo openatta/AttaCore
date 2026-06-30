@@ -66,7 +66,12 @@ impl DependencyGraph {
     }
 
     /// Add a root plugin (the one the user wants to install).
-    pub fn add_root(&mut self, name: impl Into<String>, version: impl Into<String>, deps: Vec<DependencyConstraint>) {
+    pub fn add_root(
+        &mut self,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        deps: Vec<DependencyConstraint>,
+    ) {
         let name = name.into();
         self.nodes.insert(
             name.clone(),
@@ -79,7 +84,12 @@ impl DependencyGraph {
     }
 
     /// Add a dependency node.
-    pub fn add_dependency(&mut self, dep: DependencyConstraint, version: String, sub_deps: Vec<DependencyConstraint>) {
+    pub fn add_dependency(
+        &mut self,
+        dep: DependencyConstraint,
+        version: String,
+        sub_deps: Vec<DependencyConstraint>,
+    ) {
         self.nodes.insert(
             dep.name.clone(),
             DependencyNode {
@@ -100,10 +110,7 @@ impl DependencyGraph {
         for (name, node) in &self.nodes {
             in_degree.entry(name).or_insert(0);
             for dep in &node.deps {
-                adjacency
-                    .entry(&dep.name)
-                    .or_default()
-                    .push(name.as_str());
+                adjacency.entry(&dep.name).or_default().push(name.as_str());
                 *in_degree.entry(name.as_str()).or_insert(0) += 1;
             }
         }
@@ -124,7 +131,10 @@ impl DependencyGraph {
             if let Some(node) = self.nodes.get(name) {
                 install_order.push(ResolvedPlugin {
                     name: name.to_string(),
-                    version: node.resolved_version.clone().unwrap_or_else(|| "latest".into()),
+                    version: node
+                        .resolved_version
+                        .clone()
+                        .unwrap_or_else(|| "latest".into()),
                 });
             }
             if let Some(neighbors) = adjacency.get(name) {
@@ -181,11 +191,18 @@ mod tests {
 
         let resolved = graph.resolve().unwrap();
         assert!(resolved.cycles.is_empty());
-        let names: Vec<&str> = resolved.install_order.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = resolved
+            .install_order
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
         // lib should come before app
         let lib_idx = names.iter().position(|&n| n == "lib").unwrap();
         let app_idx = names.iter().position(|&n| n == "app").unwrap();
-        assert!(lib_idx < app_idx, "dependency must install before dependent");
+        assert!(
+            lib_idx < app_idx,
+            "dependency must install before dependent"
+        );
     }
 
     #[test]
@@ -199,7 +216,11 @@ mod tests {
     fn cycle_is_detected() {
         let mut graph = DependencyGraph::new();
         graph.add_root("a", "1.0", vec![DependencyConstraint::new("b")]);
-        graph.add_dependency(DependencyConstraint::new("b"), "1.0".into(), vec![DependencyConstraint::new("a")]);
+        graph.add_dependency(
+            DependencyConstraint::new("b"),
+            "1.0".into(),
+            vec![DependencyConstraint::new("a")],
+        );
 
         let resolved = graph.resolve().unwrap();
         assert!(!resolved.cycles.is_empty(), "cycle should be detected");

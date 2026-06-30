@@ -3,8 +3,8 @@
 //! These are `impl HookRunner` blocks extending the runner with execution logic.
 //! Separated from `mod.rs` to keep the struct definition and dispatch clean.
 
-use super::{HookOutcome, HookRunner};
 use super::ssrf::ssrf_check_url;
+use super::{HookOutcome, HookRunner};
 use crate::payload::{HookDecision, HookInput, HookResponse};
 use std::process::Stdio;
 use std::time::Duration;
@@ -191,13 +191,9 @@ impl HookRunner {
 fn parse_hook_response_lenient(s: &str) -> HookResponse {
     let trimmed = s.trim();
     let candidate = if let Some(rest) = trimmed.strip_prefix("```json") {
-        rest.trim_start_matches('\n')
-            .trim_end_matches("```")
-            .trim()
+        rest.trim_start_matches('\n').trim_end_matches("```").trim()
     } else if let Some(rest) = trimmed.strip_prefix("```") {
-        rest.trim_start_matches('\n')
-            .trim_end_matches("```")
-            .trim()
+        rest.trim_start_matches('\n').trim_end_matches("```").trim()
     } else {
         trimmed
     };

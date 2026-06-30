@@ -31,7 +31,11 @@ impl PluginCommands {
     }
 
     /// Install a plugin from the marketplace.
-    pub async fn install(&self, name: &str, version: Option<&str>) -> Result<PluginCommandResult, PluginError> {
+    pub async fn install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<PluginCommandResult, PluginError> {
         // 1. Check blocklist for known-malicious names (including confusable variants)
         if let Some(blocked) = crate::homograph::check_blocklist(name) {
             return Err(PluginError::Homograph(format!(
@@ -55,14 +59,14 @@ impl PluginCommands {
         let version = version.unwrap_or("latest");
 
         // Find the entry in the already-fetched index to avoid a second fetch
-        let entry = index.iter().find(|e| {
-            e.name == name
-                && (version == "latest"
-                    || version == "any"
-                    || e.version == version)
-        }).ok_or_else(|| {
-            PluginError::Schema(format!("plugin {name}@{version} not found in registry"))
-        })?;
+        let entry = index
+            .iter()
+            .find(|e| {
+                e.name == name && (version == "latest" || version == "any" || e.version == version)
+            })
+            .ok_or_else(|| {
+                PluginError::Schema(format!("plugin {name}@{version} not found in registry"))
+            })?;
 
         let source = PluginSource {
             download_url: entry.download_url.clone(),
@@ -85,8 +89,11 @@ impl PluginCommands {
         // Placeholder: mark as cached by creating the directory
         let dir = self.cache.version_dir(name, &source.version);
         self.cache.ensure_dirs()?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to create plugin dir: {e}"))))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            PluginError::Io(std::io::Error::other(format!(
+                "failed to create plugin dir: {e}"
+            )))
+        })?;
 
         Ok(PluginCommandResult {
             success: true,
@@ -101,7 +108,11 @@ impl PluginCommands {
     }
 
     /// Uninstall a plugin version.
-    pub async fn uninstall(&self, name: &str, version: Option<&str>) -> Result<PluginCommandResult, PluginError> {
+    pub async fn uninstall(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<PluginCommandResult, PluginError> {
         if let Some(version) = version {
             self.cache.remove_version(name, version)?;
             Ok(PluginCommandResult {
@@ -178,8 +189,11 @@ impl PluginCommands {
 
         // Install latest version
         let dir = self.cache.version_dir(name, &latest_version);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to create plugin dir: {e}"))))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            PluginError::Io(std::io::Error::other(format!(
+                "failed to create plugin dir: {e}"
+            )))
+        })?;
 
         Ok(PluginCommandResult {
             success: true,

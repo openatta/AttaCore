@@ -55,6 +55,8 @@ impl AgentScene for ChatScene {
 
     /// 用 3-5 个词概括对话主题。
     fn session_name_prompt(&self, first_message: &str) -> Option<String> {
-        Some(format!("用 3-5 个词概括以下对话的主题，只输出标题不要任何解释：\n{first_message}"))
+        Some(format!(
+            "用 3-5 个词概括以下对话的主题，只输出标题不要任何解释：\n{first_message}"
+        ))
     }
 }

@@ -421,15 +421,9 @@ impl HttpRemoteTransport {
                         format_args!("SSE connect: {e}"),
                     )
                 } else if e.is_timeout() {
-                    RemoteAgentError::timeout(
-                        &self.endpoint,
-                        format_args!("SSE connect: {e}"),
-                    )
+                    RemoteAgentError::timeout(&self.endpoint, format_args!("SSE connect: {e}"))
                 } else {
-                    RemoteAgentError::transport(
-                        &self.endpoint,
-                        format_args!("SSE connect: {e}"),
-                    )
+                    RemoteAgentError::transport(&self.endpoint, format_args!("SSE connect: {e}"))
                 }
             })?;
 
@@ -437,9 +431,7 @@ impl HttpRemoteTransport {
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(RemoteAgentError::rejected(
                 &self.endpoint,
-                format_args!(
-                    "SSE authentication failed (HTTP {status}). Check your auth token.",
-                ),
+                format_args!("SSE authentication failed (HTTP {status}). Check your auth token.",),
             ));
         }
         if !status.is_success() {
@@ -453,17 +445,15 @@ impl HttpRemoteTransport {
         let endpoint = self.endpoint.clone();
         let event_stream =
             eventsource_stream::EventStream::new(byte_stream).map(move |event| match event {
-                Ok(sse) => {
-                    serde_json::from_str::<RemoteAgentEvent>(&sse.data)
-                        .map(Ok)
-                        .unwrap_or_else(|e| {
-                            let preview: String = sse.data.chars().take(200).collect();
-                            Err(RemoteAgentError::transport(
-                                &endpoint,
-                                format_args!("SSE parse error: {e} (raw preview: {preview})"),
-                            ))
-                        })
-                }
+                Ok(sse) => serde_json::from_str::<RemoteAgentEvent>(&sse.data)
+                    .map(Ok)
+                    .unwrap_or_else(|e| {
+                        let preview: String = sse.data.chars().take(200).collect();
+                        Err(RemoteAgentError::transport(
+                            &endpoint,
+                            format_args!("SSE parse error: {e} (raw preview: {preview})"),
+                        ))
+                    }),
                 Err(e) => Err(RemoteAgentError::transport(
                     &endpoint,
                     format_args!("SSE stream error: {e}"),
@@ -542,20 +532,11 @@ impl HttpRemoteTransport {
             .await
             .map_err(|e| {
                 if e.is_connect() {
-                    RemoteAgentError::connection_refused(
-                        &self.endpoint,
-                        format_args!("{e}"),
-                    )
+                    RemoteAgentError::connection_refused(&self.endpoint, format_args!("{e}"))
                 } else if e.is_timeout() {
-                    RemoteAgentError::timeout(
-                        &self.endpoint,
-                        format_args!("{e}"),
-                    )
+                    RemoteAgentError::timeout(&self.endpoint, format_args!("{e}"))
                 } else {
-                    RemoteAgentError::transport(
-                        &self.endpoint,
-                        format_args!("HTTP request: {e}"),
-                    )
+                    RemoteAgentError::transport(&self.endpoint, format_args!("HTTP request: {e}"))
                 }
             })?;
 
@@ -564,9 +545,7 @@ impl HttpRemoteTransport {
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(RemoteAgentError::rejected(
                 &self.endpoint,
-                format_args!(
-                    "authentication failed (HTTP {status}). Check your auth token.",
-                ),
+                format_args!("authentication failed (HTTP {status}). Check your auth token.",),
             ));
         }
         if status.is_server_error() {
@@ -582,15 +561,9 @@ impl HttpRemoteTransport {
             ));
         }
 
-        let rpc: JsonRpcResponse<R> = response
-            .json()
-            .await
-            .map_err(|e| {
-                RemoteAgentError::transport(
-                    &self.endpoint,
-                    format_args!("parse RPC response: {e}"),
-                )
-            })?;
+        let rpc: JsonRpcResponse<R> = response.json().await.map_err(|e| {
+            RemoteAgentError::transport(&self.endpoint, format_args!("parse RPC response: {e}"))
+        })?;
 
         if let Some(err) = rpc.error {
             return Err(RemoteAgentError::rejected(
@@ -685,7 +658,10 @@ impl MockHttpRemoteTransport {
     // ── Spawn configuration ─────────────────────────────────────
 
     /// Set the spawn response to the given result.
-    pub fn with_spawn_result(mut self, result: Result<RemoteSpawnResponse, RemoteAgentError>) -> Self {
+    pub fn with_spawn_result(
+        mut self,
+        result: Result<RemoteSpawnResponse, RemoteAgentError>,
+    ) -> Self {
         self.spawn_result = result;
         self
     }
@@ -761,10 +737,7 @@ impl MockHttpRemoteTransport {
     // ── Events configuration ─────────────────────────────────────
 
     /// Set the events returned by `spawn`'s event stream.
-    pub fn with_events(
-        mut self,
-        events: Vec<Result<RemoteAgentEvent, RemoteAgentError>>,
-    ) -> Self {
+    pub fn with_events(mut self, events: Vec<Result<RemoteAgentEvent, RemoteAgentError>>) -> Self {
         self.events = Arc::new(events);
         self
     }
@@ -943,13 +916,20 @@ mod tests {
     async fn remote_agent_error_display_contains_endpoint() {
         let err = RemoteAgentError::transport("http://example.com", "something broke");
         let msg = format!("{err}");
-        assert!(msg.contains("example.com"), "error should contain endpoint, got: {msg}");
-        assert!(msg.contains("something broke"), "error should contain detail, got: {msg}");
+        assert!(
+            msg.contains("example.com"),
+            "error should contain endpoint, got: {msg}"
+        );
+        assert!(
+            msg.contains("something broke"),
+            "error should contain detail, got: {msg}"
+        );
     }
 
     #[tokio::test]
     async fn remote_agent_error_connection_refused_message() {
-        let err = RemoteAgentError::connection_refused("http://down-server:8080", "connection reset");
+        let err =
+            RemoteAgentError::connection_refused("http://down-server:8080", "connection reset");
         let msg = format!("{err}");
         assert!(msg.contains("connection refused"));
         assert!(msg.contains("down-server:8080"));
@@ -989,7 +969,10 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, RemoteAgentError::NotConfigured);
-        assert_eq!(RemoteAgentError::NotConfigured, RemoteAgentError::NotConfigured);
+        assert_eq!(
+            RemoteAgentError::NotConfigured,
+            RemoteAgentError::NotConfigured
+        );
     }
 
     // ── RemoteAgentEvent SSE event parsing ────────────────────────────
@@ -1047,7 +1030,10 @@ mod tests {
     async fn sse_parses_error_event() {
         let raw = r#"{"type":"error","data":"something went wrong"}"#;
         let event: RemoteAgentEvent = serde_json::from_str(raw).unwrap();
-        assert_eq!(event, RemoteAgentEvent::Error("something went wrong".into()));
+        assert_eq!(
+            event,
+            RemoteAgentEvent::Error("something went wrong".into())
+        );
     }
 
     #[tokio::test]
@@ -1185,18 +1171,23 @@ mod tests {
 
     #[tokio::test]
     async fn mock_status_returns_configured_state() {
-        let transport = MockHttpRemoteTransport::new()
-            .with_status_completed("agent-42", "all done");
-        let status = transport.status_agent("agent-42").await.expect("status should succeed");
+        let transport =
+            MockHttpRemoteTransport::new().with_status_completed("agent-42", "all done");
+        let status = transport
+            .status_agent("agent-42")
+            .await
+            .expect("status should succeed");
         assert_eq!(status.state, "completed");
         assert_eq!(status.output_text.as_deref(), Some("all done"));
     }
 
     #[tokio::test]
     async fn mock_status_returns_running_state() {
-        let transport = MockHttpRemoteTransport::new()
-            .with_status_running("agent-99");
-        let status = transport.status_agent("agent-99").await.expect("status should succeed");
+        let transport = MockHttpRemoteTransport::new().with_status_running("agent-99");
+        let status = transport
+            .status_agent("agent-99")
+            .await
+            .expect("status should succeed");
         assert_eq!(status.state, "running");
         assert!(status.session_id.is_some());
     }
@@ -1228,8 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_multiple_spawns_independent() {
-        let transport = MockHttpRemoteTransport::new()
-            .with_spawn_ok("multi-agent");
+        let transport = MockHttpRemoteTransport::new().with_spawn_ok("multi-agent");
 
         // First spawn
         let s1 = transport
@@ -1373,19 +1363,22 @@ mod tests {
             "test-token".into(),
             vec![], // no retries for faster tests
         );
-        let healthy = transport.health_check().await.expect("health check should succeed");
+        let healthy = transport
+            .health_check()
+            .await
+            .expect("health check should succeed");
         assert!(healthy);
     }
 
     #[tokio::test]
     async fn http_health_check_returns_false_on_non_200() {
         let server = TestServer::fixed(StatusCode::NOT_FOUND, "text/plain", "not found").await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
-        let healthy = transport.health_check().await.expect("health check should return Ok(false)");
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
+        let healthy = transport
+            .health_check()
+            .await
+            .expect("health check should return Ok(false)");
         assert!(!healthy);
     }
 
@@ -1414,11 +1407,8 @@ mod tests {
             r#"{"error":{"code":-32001,"message":"unauthorized"}}"#,
         )
         .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "bad-token".into(),
-            vec![],
-        );
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "bad-token".into(), vec![]);
         let result = transport.cancel("agent-1").await;
         match result {
             Err(RemoteAgentError::Rejected { detail, .. }) => {
@@ -1439,11 +1429,8 @@ mod tests {
             r#"{"error":{"code":-32003,"message":"forbidden"}}"#,
         )
         .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "bad-token".into(),
-            vec![],
-        );
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "bad-token".into(), vec![]);
         let result = transport.cancel("agent-1").await;
         match result {
             Err(RemoteAgentError::Rejected { detail, .. }) => {
@@ -1458,17 +1445,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_rpc_returns_parse_error_on_invalid_json() {
-        let server = TestServer::fixed(
-            StatusCode::OK,
-            "application/json",
-            "this is not json",
-        )
-        .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
+        let server =
+            TestServer::fixed(StatusCode::OK, "application/json", "this is not json").await;
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
         let result = transport.cancel("agent-1").await;
         match result {
             Err(RemoteAgentError::Transport { detail, .. }) => {
@@ -1489,11 +1469,8 @@ mod tests {
             r#"{"error":{"code":-32603,"message":"internal engine error"},"id":1}"#,
         )
         .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
         let result: Result<(), _> = transport.cancel("agent-1").await;
         match result {
             Err(RemoteAgentError::Rejected { detail, .. }) => {
@@ -1522,10 +1499,7 @@ mod tests {
         let result: Result<(), _> = transport.cancel("agent-1").await;
         match result {
             Err(RemoteAgentError::Transport { detail, .. }) => {
-                assert!(
-                    detail.contains("500"),
-                    "expected 500 detail, got: {detail}"
-                );
+                assert!(detail.contains("500"), "expected 500 detail, got: {detail}");
             }
             other => panic!("expected Transport(500), got: {other:?}"),
         }
@@ -1545,17 +1519,9 @@ mod tests {
             r#"{"type":"final","data":{"stop_reason":"done","output_text":"Hello World"}}"#,
             "\n\n",
         );
-        let server = TestServer::fixed(
-            StatusCode::OK,
-            "text/event-stream",
-            sse_body,
-        )
-        .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
+        let server = TestServer::fixed(StatusCode::OK, "text/event-stream", sse_body).await;
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
 
         let mut stream = transport
             .events("agent-sse")
@@ -1597,12 +1563,8 @@ mod tests {
         //
         // Step 1: POST /rpc with spawn_agent → returns agent_id
         let spawn_response = r#"{"result":{"agent_id":"agent-001"},"id":1}"#;
-        let rpc_server = TestServer::fixed(
-            StatusCode::OK,
-            "application/json",
-            spawn_response,
-        )
-        .await;
+        let rpc_server =
+            TestServer::fixed(StatusCode::OK, "application/json", spawn_response).await;
 
         // Build transport pointing at the RPC server.
         // `spawn()` first connects to the RPC server, then to the events
@@ -1651,11 +1613,8 @@ mod tests {
         })
         .await;
 
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
 
         let mut stream = transport
             .spawn(test_request("do some work"))
@@ -1679,7 +1638,10 @@ mod tests {
             }
         );
 
-        assert!(stream.next().await.is_none(), "stream should end after final event");
+        assert!(
+            stream.next().await.is_none(),
+            "stream should end after final event"
+        );
     }
 
     #[tokio::test]
@@ -1717,15 +1679,24 @@ mod tests {
         let transport = HttpRemoteTransport::with_retry_delays(
             server.url(),
             "test-token".into(),
-            vec![Duration::from_millis(5), Duration::from_millis(5), Duration::from_millis(5)],
+            vec![
+                Duration::from_millis(5),
+                Duration::from_millis(5),
+                Duration::from_millis(5),
+            ],
         );
 
-        let response: RemoteSpawnResponse =
-            transport.rpc("spawn_agent", RemoteSpawnRequest {
-                prompt: "test".into(),
-                allowed_tools: vec![],
-                worktree_slug: None,
-            }).await.expect("rpc should succeed after retries");
+        let response: RemoteSpawnResponse = transport
+            .rpc(
+                "spawn_agent",
+                RemoteSpawnRequest {
+                    prompt: "test".into(),
+                    allowed_tools: vec![],
+                    worktree_slug: None,
+                },
+            )
+            .await
+            .expect("rpc should succeed after retries");
 
         assert_eq!(response.agent_id, "retry-agent");
         // The handler was called 3 times (2 fails + 1 success).
@@ -1773,17 +1744,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_events_rejects_401() {
-        let server = TestServer::fixed(
-            StatusCode::UNAUTHORIZED,
-            "text/plain",
-            "unauthorized",
-        )
-        .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "bad-token".into(),
-            vec![],
-        );
+        let server =
+            TestServer::fixed(StatusCode::UNAUTHORIZED, "text/plain", "unauthorized").await;
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "bad-token".into(), vec![]);
         let result = transport.events("agent-1").await;
         match result {
             Err(RemoteAgentError::Rejected { detail, .. }) => {
@@ -1800,17 +1764,9 @@ mod tests {
     async fn http_event_stream_rejects_bad_json() {
         // SSE with bad inner JSON
         let sse_body = "data: not-valid-json\n\n";
-        let server = TestServer::fixed(
-            StatusCode::OK,
-            "text/event-stream",
-            sse_body,
-        )
-        .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
+        let server = TestServer::fixed(StatusCode::OK, "text/event-stream", sse_body).await;
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
         let mut stream = transport
             .events("agent-1")
             .await
@@ -1848,18 +1804,13 @@ mod tests {
     #[tokio::test]
     async fn http_status_returns_agent_state() {
         let body = r#"{"result":{"agent_id":"agent-1","state":"running","session_id":"sess-1","output_text":null,"error":null},"id":1}"#;
-        let server = TestServer::fixed(
-            StatusCode::OK,
-            "application/json",
-            body,
-        )
-        .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
-        let status = transport.status("agent-1").await.expect("status should succeed");
+        let server = TestServer::fixed(StatusCode::OK, "application/json", body).await;
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
+        let status = transport
+            .status("agent-1")
+            .await
+            .expect("status should succeed");
         assert_eq!(status.agent_id, "agent-1");
         assert_eq!(status.state, "running");
         assert_eq!(status.session_id.as_deref(), Some("sess-1"));
@@ -1867,18 +1818,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_rpc_endpoint_appears_in_error_messages() {
-        let server = TestServer::fixed(
-            StatusCode::OK,
-            "application/json",
-            "bad json",
-        )
-        .await;
+        let server = TestServer::fixed(StatusCode::OK, "application/json", "bad json").await;
         let url = server.url();
-        let transport = HttpRemoteTransport::with_retry_delays(
-            url.clone(),
-            "test-token".into(),
-            vec![],
-        );
+        let transport =
+            HttpRemoteTransport::with_retry_delays(url.clone(), "test-token".into(), vec![]);
         let result: Result<(), _> = transport.cancel("agent-1").await;
         match result {
             Err(e) => {
@@ -1895,17 +1838,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_rpc_handles_304_redirect_status() {
-        let server = TestServer::fixed(
-            StatusCode::NOT_MODIFIED,
-            "text/plain",
-            "not modified",
-        )
-        .await;
-        let transport = HttpRemoteTransport::with_retry_delays(
-            server.url(),
-            "test-token".into(),
-            vec![],
-        );
+        let server =
+            TestServer::fixed(StatusCode::NOT_MODIFIED, "text/plain", "not modified").await;
+        let transport =
+            HttpRemoteTransport::with_retry_delays(server.url(), "test-token".into(), vec![]);
         let result: Result<(), _> = transport.cancel("agent-1").await;
         match result {
             Err(RemoteAgentError::Rejected { detail, .. }) => {
@@ -1922,18 +1858,11 @@ mod tests {
     /// endpoint URL rather than a cryptic generic message.
     #[tokio::test]
     async fn http_error_messages_are_diagnostic() {
-        let server = TestServer::fixed(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "text/plain",
-            "crash",
-        )
-        .await;
+        let server =
+            TestServer::fixed(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "crash").await;
         let url = server.url();
-        let transport = HttpRemoteTransport::with_retry_delays(
-            url.clone(),
-            "test-token".into(),
-            vec![],
-        );
+        let transport =
+            HttpRemoteTransport::with_retry_delays(url.clone(), "test-token".into(), vec![]);
         let result = transport.cancel("agent-x").await;
         let msg = format!("{}", result.unwrap_err());
         // The message should contain the endpoint URL (strip protocol for matching)

@@ -74,7 +74,8 @@ mod tests {
                 stage_name: "research".into(),
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "agent_spawned");
         assert_eq!(v["role"], "researcher");
     }
@@ -94,7 +95,8 @@ mod tests {
                 duration_ms: 45000,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "agent_completed");
         assert_eq!(v["turn_count"], 5);
     }
@@ -113,7 +115,8 @@ mod tests {
                 agents_with_errors: 0,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "team_stage_complete");
         assert_eq!(v["agent_count"], 3);
     }
@@ -134,7 +137,8 @@ mod tests {
             },
         )
         .redact(&policy);
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "agent_message");
         assert_eq!(v["sender_id"], "agent_01");
         assert_eq!(v["error_message"], "[REDACTED]");

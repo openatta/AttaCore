@@ -30,8 +30,11 @@ impl PluginCache {
 
     /// Ensure the cache directory exists.
     pub fn ensure_dirs(&self) -> Result<(), PluginError> {
-        std::fs::create_dir_all(&self.root)
-            .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to create cache dir: {e}"))))?;
+        std::fs::create_dir_all(&self.root).map_err(|e| {
+            PluginError::Io(std::io::Error::other(format!(
+                "failed to create cache dir: {e}"
+            )))
+        })?;
         Ok(())
     }
 
@@ -87,8 +90,11 @@ impl PluginCache {
     pub fn remove_version(&self, name: &str, version: &str) -> Result<(), PluginError> {
         let dir = self.version_dir(name, version);
         if dir.is_dir() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to remove cached plugin: {e}"))))?;
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                PluginError::Io(std::io::Error::other(format!(
+                    "failed to remove cached plugin: {e}"
+                )))
+            })?;
         }
         // If no more versions remain, remove the plugin directory
         let plugin_dir = self.root.join(name);
@@ -105,8 +111,11 @@ impl PluginCache {
     /// Store cached registry index.
     pub fn cache_registry_index(&self, index_json: &str) -> Result<(), PluginError> {
         let path = self.root.join("registry.json");
-        std::fs::write(&path, index_json)
-            .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to cache registry index: {e}"))))?;
+        std::fs::write(&path, index_json).map_err(|e| {
+            PluginError::Io(std::io::Error::other(format!(
+                "failed to cache registry index: {e}"
+            )))
+        })?;
         Ok(())
     }
 
@@ -122,7 +131,8 @@ impl PluginCache {
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() && path.file_name() != Some(std::ffi::OsStr::new("registry.json")) {
+                if path.is_dir() && path.file_name() != Some(std::ffi::OsStr::new("registry.json"))
+                {
                     if let Ok(versions) = std::fs::read_dir(&path) {
                         count += versions
                             .flatten()
@@ -155,7 +165,11 @@ mod tests {
         let cache = PluginCache::new(tmp.path().join("plugins").join("cache"));
         let dir = cache.version_dir("my-plugin", "1.0.0");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("plugin.toml"), "[plugin]\nname = \"my-plugin\"\nversion = \"1.0.0\"").unwrap();
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"my-plugin\"\nversion = \"1.0.0\"",
+        )
+        .unwrap();
         assert!(cache.is_cached("my-plugin", "1.0.0"));
         assert!(!cache.is_cached("my-plugin", "2.0.0"));
     }

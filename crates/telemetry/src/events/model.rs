@@ -95,7 +95,8 @@ mod tests {
             },
         )
         .redact(&policy);
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["error_message"], "[REDACTED]");
         assert_eq!(v["error_kind"], "rate_limited");
         assert_eq!(v["http_status"], 429);
@@ -116,7 +117,8 @@ mod tests {
                 threshold_pct: 80.0,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "context_window_report");
         assert_eq!(v["total_tokens"], 45000);
         assert_eq!(v["exceeded_threshold"], true);
@@ -136,7 +138,8 @@ mod tests {
                 is_escalated: false,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "model_route");
         assert_eq!(v["resolved_model"], "claude-opus-4-6");
         assert_eq!(v["is_fallback"], true);

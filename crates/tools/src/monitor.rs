@@ -108,10 +108,7 @@ impl Tool for MonitorTool {
                 ValidationResult::err("description must not be empty", 2)
             }
             Ok(p) if !p.persistent && p.timeout_ms.unwrap_or(0) > MAX_TIMEOUT_MS => {
-                ValidationResult::err(
-                    format!("timeout_ms exceeds {} ms cap", MAX_TIMEOUT_MS),
-                    3,
-                )
+                ValidationResult::err(format!("timeout_ms exceeds {} ms cap", MAX_TIMEOUT_MS), 3)
             }
             Ok(_) => ValidationResult::Ok,
             Err(e) => ValidationResult::err(format!("invalid input: {e}"), 4),
@@ -151,7 +148,8 @@ impl Tool for MonitorTool {
         // Spawn a background task to drain stdout lines and send them as progress events.
         let progress_clone = progress.clone();
         let drain_handle = tokio::spawn(async move {
-            let mut framed = FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
+            let mut framed =
+                FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
             let mut line_count: u64 = 0;
             while let Some(line_res) = framed.next().await {
                 match line_res {
@@ -233,7 +231,10 @@ mod tests {
         let tool = MonitorTool;
         let dir = TempDir::new().unwrap();
         let result = tool
-            .validate_input(&json!({"command": "", "description": "test"}), &ctx_in(dir.path()))
+            .validate_input(
+                &json!({"command": "", "description": "test"}),
+                &ctx_in(dir.path()),
+            )
             .await;
         assert!(!result.is_ok(), "empty command should be rejected");
     }
@@ -279,7 +280,10 @@ mod tests {
                 &ctx_in(dir.path()),
             )
             .await;
-        assert!(result.is_ok(), "persistent should skip timeout cap validation");
+        assert!(
+            result.is_ok(),
+            "persistent should skip timeout cap validation"
+        );
     }
 
     #[tokio::test]
@@ -302,7 +306,10 @@ mod tests {
         let result = tool
             .validate_input(&json!({"bad": "data"}), &ctx_in(dir.path()))
             .await;
-        assert!(result.is_err(), "missing required fields should be rejected");
+        assert!(
+            result.is_err(),
+            "missing required fields should be rejected"
+        );
     }
 
     // ── Schema ──

@@ -4,11 +4,13 @@
 //! 目录不在则自动创建。：路径白名单 / 黑名单（`.env*` 等）由上层权限闸做，
 //! 这里只做 schema + 大小校验。
 
+use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
-use crate::cancel::run_with_cancel;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,7 +26,8 @@ pub struct FileWriteInput {
     pub file_path: String,
 
     /// The content to write. Replaces the file's existing content entirely.
-    pub content: String}
+    pub content: String,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileWriteTool;
@@ -104,7 +107,8 @@ impl Tool for FileWriteTool {
                 }
                 ValidationResult::Ok
             }
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
 
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
@@ -129,35 +133,41 @@ impl Tool for FileWriteTool {
             {
                 return PermissionDecision::Deny {
                     reason: Some(format!("Write to sensitive file '{file_name}' is denied")),
-                    decision_reason: Some("path_safety".into())};
+                    decision_reason: Some("path_safety".into()),
+                };
             }
             let path = match std::path::PathBuf::from(&parsed.file_path).is_absolute() {
                 true => std::path::PathBuf::from(parsed.file_path),
-                false => ctx.cwd.join(parsed.file_path)};
+                false => ctx.cwd.join(parsed.file_path),
+            };
             let path = crate::security::normalize_path_lexically(&path);
             let policy = crate::security::WritePolicy::new(ctx.cwd.clone())
                 .with_additional_roots(ctx.additional_writable_dirs.clone());
             match crate::security::check_write(&path, &policy) {
                 Ok(()) => {
                     return PermissionDecision::Allow {
-                        decision_reason: Some("project_write".into())};
+                        decision_reason: Some("project_write".into()),
+                    };
                 }
                 Err(crate::security::PathSafetyError::OutsideAllowedRoots { .. }) => {
                     return PermissionDecision::Ask {
                         message: "Write outside the project requires confirmation".into(),
-                        decision_reason: None};
+                        decision_reason: None,
+                    };
                 }
                 Err(err) => {
                     return PermissionDecision::Deny {
                         reason: Some(format!("{err:?}")),
-                        decision_reason: Some("path_safety".into())};
+                        decision_reason: Some("path_safety".into()),
+                    };
                 }
             }
         }
 
         PermissionDecision::Ask {
             message: "Write requires confirmation".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -240,7 +250,8 @@ mod tests {
                 assert!(s.contains("Wrote 6 bytes"));
                 assert!(s.contains(&p.to_string_lossy().to_string()));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]

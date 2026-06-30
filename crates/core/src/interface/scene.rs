@@ -5,6 +5,31 @@
 use crate::interface::prompt::PromptBlock;
 use std::borrow::Cow;
 
+/// Re-export from scene crate for trait default impl. v2.0.0.
+/// We use a simple struct to avoid a circular dependency.
+#[derive(Debug, Clone)]
+pub struct SceneVerificationPolicy {
+    pub required_level: u8, // 0=None, 1=DiffSelfCheck, 2=StaticCheck, 3=TargetedTest, 4=FullTest, 5=CiEquivalent
+    pub block_completion_on_failure: bool,
+    pub allow_explain_if_unavailable: bool,
+    pub max_repair_iterations: u32,
+}
+
+impl SceneVerificationPolicy {
+    pub fn none() -> Self {
+        Self {
+            required_level: 0,
+            block_completion_on_failure: false,
+            allow_explain_if_unavailable: true,
+            max_repair_iterations: 0,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.required_level > 0
+    }
+}
+
 /// Context passed to `AgentScene::build_system_prompt()`.
 #[derive(Debug, Clone)]
 pub struct ScenePromptContext<'a> {
@@ -36,6 +61,10 @@ pub struct ScenePromptContext<'a> {
     /// Comma-separated list of tool names available in this session.
     /// Used to conditionally include tool-specific guidance.
     pub available_tools: Option<Cow<'a, str>>,
+    /// v2.0.0: Current user message text. Used by task routers and
+    /// context pack builders to classify the task without a separate API call.
+    /// None on initial system prompt (before the first user message).
+    pub user_message: Option<Cow<'a, str>>,
 }
 
 /// Context for building the `<system-reminder>` block.
@@ -127,6 +156,12 @@ pub trait AgentScene: Send + Sync + 'static {
     /// 生成 session 名称的 prompt（仅当 auto_name_session() = true 时调用）。
     /// 参数 `first_message` 是用户的首条消息内容。
     fn session_name_prompt(&self, _first_message: &str) -> Option<String> {
+        None
+    }
+
+    /// v2.0.0: Verification policy for this scene.
+    /// Returns None if this scene does not support verification (default).
+    fn verification_policy(&self) -> Option<SceneVerificationPolicy> {
         None
     }
 }

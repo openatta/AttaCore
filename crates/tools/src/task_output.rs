@@ -15,8 +15,7 @@ use async_trait::async_trait;
 use base::context::RunningStatus;
 use base::error::ToolError;
 use base::tool::{
-    PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult,
-    ValidationResult,
+    PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult, ValidationResult,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -255,9 +254,12 @@ mod tests {
     async fn requires_task_id() {
         let tool = TaskOutputTool;
         let r = tool
-            .validate_input(&json!({}), &ctx_with_tasks(MockTasks {
-                tasks: HashMap::new(),
-            }))
+            .validate_input(
+                &json!({}),
+                &ctx_with_tasks(MockTasks {
+                    tasks: HashMap::new(),
+                }),
+            )
             .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
@@ -266,9 +268,12 @@ mod tests {
     async fn empty_task_id_rejected() {
         let tool = TaskOutputTool;
         let r = tool
-            .validate_input(&json!({"task_id": ""}), &ctx_with_tasks(MockTasks {
-                tasks: HashMap::new(),
-            }))
+            .validate_input(
+                &json!({"task_id": ""}),
+                &ctx_with_tasks(MockTasks {
+                    tasks: HashMap::new(),
+                }),
+            )
             .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
@@ -277,9 +282,12 @@ mod tests {
     async fn timeout_cap_enforced() {
         let tool = TaskOutputTool;
         let r = tool
-            .validate_input(&json!({"task_id": "t1", "timeout": 999999}), &ctx_with_tasks(
-                MockTasks { tasks: HashMap::new() },
-            ))
+            .validate_input(
+                &json!({"task_id": "t1", "timeout": 999999}),
+                &ctx_with_tasks(MockTasks {
+                    tasks: HashMap::new(),
+                }),
+            )
             .await;
         assert!(!matches!(r, ValidationResult::Ok));
     }
@@ -291,7 +299,11 @@ mod tests {
         });
         let tool = TaskOutputTool;
         let r = tool
-            .call(json!({"task_id": "nonexistent"}), ctx, ProgressSender::noop("t"))
+            .call(
+                json!({"task_id": "nonexistent"}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(r.is_error);
@@ -305,16 +317,16 @@ mod tests {
         let mut tasks = HashMap::new();
         tasks.insert(
             "ag-done".into(),
-            (
-                "output text".into(),
-                vec![],
-                RunningStatus::Completed,
-            ),
+            ("output text".into(), vec![], RunningStatus::Completed),
         );
         let ctx = ctx_with_tasks(MockTasks { tasks });
         let tool = TaskOutputTool;
         let r = tool
-            .call(json!({"task_id": "ag-done", "block": false}), ctx, ProgressSender::noop("t"))
+            .call(
+                json!({"task_id": "ag-done", "block": false}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -329,16 +341,16 @@ mod tests {
         let mut tasks = HashMap::new();
         tasks.insert(
             "ag-running".into(),
-            (
-                "partial output".into(),
-                vec![],
-                RunningStatus::Running,
-            ),
+            ("partial output".into(), vec![], RunningStatus::Running),
         );
         let ctx = ctx_with_tasks(MockTasks { tasks });
         let tool = TaskOutputTool;
         let r = tool
-            .call(json!({"task_id": "ag-running", "block": false}), ctx, ProgressSender::noop("t"))
+            .call(
+                json!({"task_id": "ag-running", "block": false}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -362,7 +374,11 @@ mod tests {
         let ctx = ctx_with_tasks(MockTasks { tasks });
         let tool = TaskOutputTool;
         let r = tool
-            .call(json!({"task_id": "ag-fail", "block": false}), ctx, ProgressSender::noop("t"))
+            .call(
+                json!({"task_id": "ag-fail", "block": false}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -380,11 +396,7 @@ mod tests {
             let mut t = tasks.lock().unwrap();
             t.insert(
                 "ag-blocking".into(),
-                (
-                    "initial output".into(),
-                    vec![],
-                    RunningStatus::Running,
-                ),
+                ("initial output".into(), vec![], RunningStatus::Running),
             );
         }
 
@@ -400,12 +412,18 @@ mod tests {
         }
         impl RunningTasksCallback for BlockingMock {
             fn find(&self, tid: &str) -> Option<(String, Vec<String>, RunningStatus)> {
-                let prev = self.poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let prev = self
+                    .poll_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let t = self.tasks.lock().unwrap();
                 if prev >= 2 {
                     // After 2+ polls, mark as completed
                     if let Some((output, events, _)) = t.get(tid) {
-                        return Some((format!("{output} [final]"), events.clone(), RunningStatus::Completed));
+                        return Some((
+                            format!("{output} [final]"),
+                            events.clone(),
+                            RunningStatus::Completed,
+                        ));
                     }
                 }
                 t.get(tid).cloned()

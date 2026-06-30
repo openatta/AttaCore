@@ -41,9 +41,7 @@ pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
     // 16 hex chars = 64 bits 命名空间，碰撞率 < 2^-32 即便 50k 项目也安全
     let hash_hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
 
-    let dir = crate::paths::atta_code_dir()
-        .join("memory")
-        .join(&hash_hex);
+    let dir = crate::paths::atta_code_dir().join("memory").join(&hash_hex);
 
     let index_path = dir.join("MEMORY.md");
     let index = tokio::fs::read_to_string(&index_path)
@@ -292,11 +290,7 @@ pub async fn find_relevant_memories(
                 score,
                 MemoryFileEntry {
                     path,
-                    content: truncate_chars(
-                        content.trim(),
-                        8_000,
-                        "\n... (memory truncated)",
-                    ),
+                    content: truncate_chars(content.trim(), 8_000, "\n... (memory truncated)"),
                 },
             ));
         }
@@ -583,18 +577,14 @@ mod tests {
         assert!(with_walk
             .iter()
             .any(|e| e.content.contains("PARENT-MONOREPO")));
-        assert!(with_walk
-            .iter()
-            .any(|e| e.content.contains("CHILD-LOCAL")));
+        assert!(with_walk.iter().any(|e| e.content.contains("CHILD-LOCAL")));
 
         // walk_up = false -- 只 child
         let no_walk = collect_memory_files_with(&child, false).await;
         assert!(!no_walk
             .iter()
             .any(|e| e.content.contains("PARENT-MONOREPO")));
-        assert!(no_walk
-            .iter()
-            .any(|e| e.content.contains("CHILD-LOCAL")));
+        assert!(no_walk.iter().any(|e| e.content.contains("CHILD-LOCAL")));
     }
 
     // -----------------------------------------------------------------------
@@ -867,7 +857,11 @@ mod tests {
         let home = tmp.path();
         let cwd = std::path::Path::new("/fake/project/abc");
         let sanitized = sanitize_for_dir(&cwd.display().to_string());
-        let dir = home.join(".atta").join("code").join("memory").join(&sanitized);
+        let dir = home
+            .join(".atta")
+            .join("code")
+            .join("memory")
+            .join(&sanitized);
         tokio::fs::create_dir_all(&dir).await.unwrap();
         for i in 0..250u32 {
             tokio::fs::write(dir.join(format!("m{i}.md")), format!("body {i}"))

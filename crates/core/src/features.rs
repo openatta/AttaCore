@@ -56,16 +56,10 @@ impl FeatureFlags {
     pub fn is_enabled(&self, flag: &str) -> bool {
         // Compile-time gates take precedence (Cargo features disable at build time)
         match flag {
-            "team_mode" => {
-                cfg!(feature = "team-mode") && self.team_mode
-            }
-            "plugin_marketplace" => {
-                cfg!(feature = "plugin-marketplace") && self.plugin_marketplace
-            }
+            "team_mode" => cfg!(feature = "team-mode") && self.team_mode,
+            "plugin_marketplace" => cfg!(feature = "plugin-marketplace") && self.plugin_marketplace,
             "extended_memory" => self.extended_memory,
-            "experimental_agent" => {
-                cfg!(feature = "experimental-agent") && self.experimental_agent
-            }
+            "experimental_agent" => cfg!(feature = "experimental-agent") && self.experimental_agent,
             "vcr_auto_detect" => self.vcr_auto_detect,
             "cached_microcompact" => self.cached_microcompact,
             "reactive_compact" => self.reactive_compact,

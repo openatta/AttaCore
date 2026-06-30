@@ -67,7 +67,10 @@ impl CronStore {
             agent_id: None,
             last_fired_ms: None,
         };
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(job);
         if durable {
             self.save();
         }
@@ -97,8 +100,7 @@ impl CronStore {
     /// within the same minute. Non-recurring jobs are removed after firing.
     /// Returns due jobs (oldest first).
     pub fn pop_due(&self) -> Vec<CronJob> {
-        let now =
-            time::OffsetDateTime::now_utc();
+        let now = time::OffsetDateTime::now_utc();
         let now_ms = now_ms();
         let current_minute = now.minute();
 

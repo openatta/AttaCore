@@ -13,12 +13,15 @@ pub struct CliRunnerConfig {
     pub daemon_binary: PathBuf,
     pub config_path: PathBuf,
     pub scenario: String,
-    pub vcr_mode: Option<String>,    // "record" | "replay"
-    pub output_dir: PathBuf,         // tests/output/{scenario}/cli
+    pub vcr_mode: Option<String>, // "record" | "replay"
+    pub output_dir: PathBuf,      // tests/output/{scenario}/cli
 }
 
 /// 启动 daemon，执行所有轮次，返回输出，最后停止 daemon 并清理 session。
-pub async fn run_test_case(config: CliRunnerConfig, case: &TestCase) -> anyhow::Result<Vec<TurnOutput>> {
+pub async fn run_test_case(
+    config: CliRunnerConfig,
+    case: &TestCase,
+) -> anyhow::Result<Vec<TurnOutput>> {
     // 0. Source config file to get env vars
     let env_vars = source_config_file(&config.config_path)?;
 
@@ -36,11 +39,16 @@ pub async fn run_test_case(config: CliRunnerConfig, case: &TestCase) -> anyhow::
     // 2. 等待 socket ready
     let mut attempts = 0;
     while attempts < 100 {
-        if config.socket_path.exists() { break; }
+        if config.socket_path.exists() {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         attempts += 1;
     }
-    anyhow::ensure!(config.socket_path.exists(), "daemon socket not ready after 10s");
+    anyhow::ensure!(
+        config.socket_path.exists(),
+        "daemon socket not ready after 10s"
+    );
 
     // 3. 连接
     let stream = UnixStream::connect(&config.socket_path).await?;
@@ -65,7 +73,8 @@ pub async fn run_test_case(config: CliRunnerConfig, case: &TestCase) -> anyhow::
             // Canonicalize to absolute path for daemon
             let vcr_dir = std::fs::canonicalize(&config.output_dir)
                 .unwrap_or_else(|_| config.output_dir.clone())
-                .to_string_lossy().to_string();
+                .to_string_lossy()
+                .to_string();
             let _ = std::fs::create_dir_all(&vcr_dir);
             let telemetry_path = std::fs::canonicalize(&config.output_dir)
                 .unwrap_or_else(|_| config.output_dir.clone())
@@ -104,7 +113,9 @@ pub async fn run_test_case(config: CliRunnerConfig, case: &TestCase) -> anyhow::
                 Ok(0) => break,
                 Ok(_) => {
                     let trimmed = line.trim();
-                    if trimmed.is_empty() { continue; }
+                    if trimmed.is_empty() {
+                        continue;
+                    }
                     let msg: Value = serde_json::from_str(trimmed)?;
 
                     // StreamFrame: {"jsonrpc":"2.0","method":"session.event","params":{...}}
@@ -117,7 +128,11 @@ pub async fn run_test_case(config: CliRunnerConfig, case: &TestCase) -> anyhow::
                                     }
                                 }
                                 Some("tool_use") => {
-                                    let name = event.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                                    let name = event
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?")
+                                        .to_string();
                                     let input = event.get("input").cloned().unwrap_or_default();
                                     tool_uses.push((name, input));
                                 }
@@ -129,8 +144,12 @@ pub async fn run_test_case(config: CliRunnerConfig, case: &TestCase) -> anyhow::
                         }
                     }
                     // RpcResponse: has "id" and "result" or "error"
-                    if msg.get("id").is_some() && (msg.get("result").is_some() || msg.get("error").is_some()) {
-                        if turn_complete { break; }
+                    if msg.get("id").is_some()
+                        && (msg.get("result").is_some() || msg.get("error").is_some())
+                    {
+                        if turn_complete {
+                            break;
+                        }
                     }
                 }
                 Err(e) => anyhow::bail!("read error: {e}"),
@@ -204,7 +223,9 @@ fn source_config_file(path: &PathBuf) -> anyhow::Result<Vec<(String, String)>> {
     let mut vars = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("export ") {
             if let Some((k, v)) = rest.split_once('=') {
                 let v = v.trim().trim_matches('"').trim_matches('\'');

@@ -77,17 +77,35 @@ impl Default for RemoteConfig {
     }
 }
 
-fn default_true() -> bool { true }
-fn default_flush_interval() -> u64 { 60 }
-fn default_max_queue_size() -> usize { 500 }
-fn default_retry_backoff_ms() -> u64 { 1000 }
+fn default_true() -> bool {
+    true
+}
+fn default_flush_interval() -> u64 {
+    60
+}
+fn default_max_queue_size() -> usize {
+    500
+}
+fn default_retry_backoff_ms() -> u64 {
+    1000
+}
 
 impl TelemetryConfig {
     pub fn disabled() -> Self {
-        Self { enabled: false, mode: TelemetryMode::Disabled, ..Default::default() }
+        Self {
+            enabled: false,
+            mode: TelemetryMode::Disabled,
+            ..Default::default()
+        }
     }
     pub fn queue_size(&self) -> usize {
-        if self.queue_size > 0 { self.queue_size }
-        else { self.remote.as_ref().map(|r| r.max_queue_size).unwrap_or(500) }
+        if self.queue_size > 0 {
+            self.queue_size
+        } else {
+            self.remote
+                .as_ref()
+                .map(|r| r.max_queue_size)
+                .unwrap_or(500)
+        }
     }
 }

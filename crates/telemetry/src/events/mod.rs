@@ -6,30 +6,30 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-mod session;
-mod tool;
-mod model;
 mod mcp;
+mod model;
+mod session;
 mod team;
+mod tool;
 
-pub use session::{
-    ConfigLoadedPayload, SessionEndPayload, SessionStartPayload, ShutdownSignalPayload,
-    StartupTimingPayload,
-};
-pub use tool::{
-    PermissionDecisionOutcome, PermissionDecisionPayload, ToolCancelledPayload,
-    ToolDecisionPayload, ToolExecutionPayload, ToolOutcome, ToolStartPayload,
+pub use mcp::{
+    McpConnectionErrorPayload, McpServerConnectedPayload, McpServerDisconnectedPayload,
+    McpToolCallPayload,
 };
 pub use model::{
     ApiErrorPayload, ApiRequestPayload, ContextWindowReportPayload, IntentClassifiedPayload,
     ModelRoutePayload,
 };
-pub use mcp::{
-    McpConnectionErrorPayload, McpServerConnectedPayload, McpServerDisconnectedPayload,
-    McpToolCallPayload,
+pub use session::{
+    ConfigLoadedPayload, SessionEndPayload, SessionStartPayload, ShutdownSignalPayload,
+    StartupTimingPayload,
 };
 pub use team::{
     AgentCompletedPayload, AgentMessagePayload, AgentSpawnedPayload, TeamStageCompletePayload,
+};
+pub use tool::{
+    PermissionDecisionOutcome, PermissionDecisionPayload, ToolCancelledPayload,
+    ToolDecisionPayload, ToolExecutionPayload, ToolOutcome, ToolStartPayload,
 };
 
 /// 一个遥测事件（转成 JSON 时展平 `event_id`/`session_id`/`timestamp` 在顶层）。
@@ -411,7 +411,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: PermissionDecisionPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::PermissionDecision(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::PermissionDecision(p),
+        )
     }
 
     // ---- intent & user ----
@@ -423,7 +428,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: IntentClassifiedPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::IntentClassified(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::IntentClassified(p),
+        )
     }
 
     /// 用户提交 prompt。
@@ -433,7 +443,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: UserPromptSubmitPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::UserPromptSubmit(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::UserPromptSubmit(p),
+        )
     }
 
     /// Slash 命令使用。
@@ -443,7 +458,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: SlashCommandUsedPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::SlashCommandUsed(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::SlashCommandUsed(p),
+        )
     }
 
     /// 用户中断（Ctrl-C 等）。
@@ -453,7 +473,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: InterruptSignalPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::InterruptSignal(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::InterruptSignal(p),
+        )
     }
 
     // ---- turn lifecycle ----
@@ -485,7 +510,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: ContextWindowReportPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::ContextWindowReport(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::ContextWindowReport(p),
+        )
     }
 
     /// 模型路由决策（含 fallback）。
@@ -539,7 +569,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: ShutdownSignalPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::ShutdownSignal(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::ShutdownSignal(p),
+        )
     }
 
     // ---- MCP ----
@@ -551,7 +586,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: McpServerConnectedPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::McpServerConnected(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::McpServerConnected(p),
+        )
     }
 
     /// MCP 服务器已断开。
@@ -561,7 +601,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: McpServerDisconnectedPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::McpServerDisconnected(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::McpServerDisconnected(p),
+        )
     }
 
     /// MCP 工具调用。
@@ -581,7 +626,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: McpConnectionErrorPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::McpConnectionError(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::McpConnectionError(p),
+        )
     }
 
     // ---- team / multi-agent ----
@@ -603,7 +653,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: AgentCompletedPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::AgentCompleted(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::AgentCompleted(p),
+        )
     }
 
     /// Team 阶段完成。
@@ -613,7 +668,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: TeamStageCompletePayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::TeamStageComplete(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::TeamStageComplete(p),
+        )
     }
 
     /// Agent 间消息。
@@ -635,7 +695,12 @@ impl TelemetryEvent {
         turn_id: Option<String>,
         p: MemorySnapshotPayload,
     ) -> Self {
-        Self::new(session_id, turn_no, turn_id, EventPayload::MemorySnapshot(p))
+        Self::new(
+            session_id,
+            turn_no,
+            turn_id,
+            EventPayload::MemorySnapshot(p),
+        )
     }
 
     /// 文件操作统计。
@@ -780,7 +845,8 @@ mod tests {
             },
         );
 
-        let value = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let value =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(value["type"], "resume_action");
         assert_eq!(value["outcome"], "degraded");
         assert_eq!(value["warning_kind"], "missing_sidecar");
@@ -806,7 +872,8 @@ mod tests {
                 latency_ms: 50,
             };
             let event = TelemetryEvent::compact_action("sess", 5, None, payload);
-            let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+            let v = serde_json::to_value(event)
+                .expect("serialization of telemetry event should not fail");
             assert_eq!(v["type"], "compact_action");
             assert_eq!(v["strategy"], "auto");
             assert_eq!(v["before_tokens"], 1000);
@@ -833,7 +900,8 @@ mod tests {
                 latency_ms: 10,
             };
             let event = TelemetryEvent::resume_action("sess", 1, None, payload);
-            let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+            let v = serde_json::to_value(event)
+                .expect("serialization of telemetry event should not fail");
             assert_eq!(v["type"], "resume_action");
             assert_eq!(v["outcome"], expected);
         }
@@ -854,7 +922,8 @@ mod tests {
             },
         )
         .redact(&policy);
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["error_message"], "[REDACTED]");
         assert_eq!(v["context"], "[REDACTED]");
         assert_eq!(v["error_kind"], "tool_failure");
@@ -877,7 +946,8 @@ mod tests {
             },
         )
         .redact(&policy);
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["error_message"], "[REDACTED]");
         assert_eq!(v["hook_name"], "PreToolUse");
         assert_eq!(v["decision"], "blocked");
@@ -898,7 +968,8 @@ mod tests {
             },
         )
         .redact(&policy);
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["error_message"], "/tmp/secret.key: permission denied");
         assert_eq!(v["context"], "read config");
     }
@@ -916,7 +987,8 @@ mod tests {
                 latency_ms: 5,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "outcome_record");
         assert_eq!(v["category"], "context_window");
         assert_eq!(v["outcome"], "compact_triggered");
@@ -941,7 +1013,8 @@ mod tests {
                 turn_duration_ms: 12000,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "turn_complete");
         assert_eq!(v["turn_no"], 7);
         assert_eq!(v["stop_reason"], "end_turn");
@@ -964,7 +1037,8 @@ mod tests {
                 turn_no: 2,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "user_prompt_submit");
         assert_eq!(v["char_count"], 80);
         assert_eq!(v["heuristic_class"], "coding");
@@ -983,7 +1057,8 @@ mod tests {
                 has_arg: false,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "slash_command_used");
         assert_eq!(v["command"], "/help");
     }
@@ -1002,7 +1077,8 @@ mod tests {
                 current_tool: Some("Bash".into()),
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "interrupt_signal");
         assert_eq!(v["signal"], "SIGINT");
         assert_eq!(v["in_tool_execution"], true);
@@ -1021,7 +1097,8 @@ mod tests {
                 is_retry: false,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "turn_start");
         assert_eq!(v["turn_no"], 3);
     }
@@ -1039,7 +1116,8 @@ mod tests {
                 elapsed_ms: 60000,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "memory_snapshot");
         assert_eq!(v["rss_kb"], 256000);
     }
@@ -1058,7 +1136,8 @@ mod tests {
                 errors: 0,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "file_operation");
         assert_eq!(v["operation"], "write");
     }
@@ -1075,7 +1154,8 @@ mod tests {
                 detail: Some("regex".into()),
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "tui_action");
         assert_eq!(v["view"], "transcript");
     }

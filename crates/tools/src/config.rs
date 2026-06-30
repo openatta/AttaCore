@@ -273,9 +273,7 @@ fn apply_setting(setting: &str, value: &str, ctx: &ToolContext) -> Result<(), St
         }
         "permission_mode" => {
             // Normalize: lowercase + strip separators
-            let normalized = value
-                .to_lowercase()
-                .replace([' ', '_', '-'], "");
+            let normalized = value.to_lowercase().replace([' ', '_', '-'], "");
             let mode = match normalized.as_str() {
                 "default" => PermissionMode::Default,
                 "plan" => PermissionMode::Plan,
@@ -330,7 +328,11 @@ mod tests {
     async fn config_get_model() {
         let tool = ConfigTool;
         let r = tool
-            .call(json!({"setting": "model"}), ctx(), ProgressSender::noop("t"))
+            .call(
+                json!({"setting": "model"}),
+                ctx(),
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -530,7 +532,11 @@ mod tests {
         let tool = ConfigTool;
 
         let r = tool
-            .call(json!({"setting": "_test_theme"}), ctx(), ProgressSender::noop("t"))
+            .call(
+                json!({"setting": "_test_theme"}),
+                ctx(),
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -540,7 +546,11 @@ mod tests {
         }
 
         let r = tool
-            .call(json!({"setting": "_test_mem"}), ctx(), ProgressSender::noop("t"))
+            .call(
+                json!({"setting": "_test_mem"}),
+                ctx(),
+                ProgressSender::noop("t"),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);

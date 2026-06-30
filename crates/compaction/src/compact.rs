@@ -6,8 +6,8 @@
 //! - FullCompact: LLM summary of all old messages
 //! - SessionMemory: extract memories to persistent store during compact
 
-use base::interface::model::{MessageRole, ModelContentBlock, ModelMessage};
 use async_trait::async_trait;
+use base::interface::model::{MessageRole, ModelContentBlock, ModelMessage};
 use std::sync::Arc;
 
 use crate::grouping::{estimate_tokens, group_by_api_round, ApiRound};
@@ -87,9 +87,12 @@ impl DefaultCompactor {
     /// Snip: drop oldest API rounds until within token budget (keep at least 1 round).
     /// Returns (messages, strategy, dropped_rounds, dropped_messages, tokens_saved) so the
     /// caller can build a SnipProjection for telemetry/UI.
-    fn snip(&self, messages: Vec<ModelMessage>, max_tokens: usize, keep_rounds: usize)
-        -> (Vec<ModelMessage>, CompactStrategy, usize, usize, usize)
-    {
+    fn snip(
+        &self,
+        messages: Vec<ModelMessage>,
+        max_tokens: usize,
+        keep_rounds: usize,
+    ) -> (Vec<ModelMessage>, CompactStrategy, usize, usize, usize) {
         let rounds = group_by_api_round(&messages);
         let total_rounds = rounds.len();
         let total_messages = messages.len();
@@ -118,11 +121,21 @@ impl DefaultCompactor {
         let dropped_rounds = total_rounds.saturating_sub(kept_rounds);
         let dropped_messages = total_messages.saturating_sub(result.len());
         let tokens_saved = tokens_before.saturating_sub(tokens);
-        (result, CompactStrategy::Snip, dropped_rounds, dropped_messages, tokens_saved)
+        (
+            result,
+            CompactStrategy::Snip,
+            dropped_rounds,
+            dropped_messages,
+            tokens_saved,
+        )
     }
 
     /// MicroCompact: replace old tool results with a placeholder (TS parity).
-    pub fn micro_compact(&self, messages: Vec<ModelMessage>, keep_rounds: usize) -> (Vec<ModelMessage>, CompactStrategy) {
+    pub fn micro_compact(
+        &self,
+        messages: Vec<ModelMessage>,
+        keep_rounds: usize,
+    ) -> (Vec<ModelMessage>, CompactStrategy) {
         let rounds = group_by_api_round(&messages);
         if rounds.len() <= keep_rounds {
             return (messages, CompactStrategy::MicroCompact);
@@ -168,7 +181,11 @@ impl DefaultCompactor {
 
     /// CollapseContext: fold old rounds into a single summary message (no LLM).
     /// Keeps the structure but truncates text to a fixed summary length.
-    fn collapse_context(&self, messages: Vec<ModelMessage>, keep_rounds: usize) -> (Vec<ModelMessage>, CompactStrategy) {
+    fn collapse_context(
+        &self,
+        messages: Vec<ModelMessage>,
+        keep_rounds: usize,
+    ) -> (Vec<ModelMessage>, CompactStrategy) {
         let rounds = group_by_api_round(&messages);
         if rounds.len() <= keep_rounds {
             return (messages, CompactStrategy::CollapseContext);
@@ -296,7 +313,10 @@ pub struct LlmCompactor {
 
 impl LlmCompactor {
     pub fn new(model: Arc<dyn base::interface::model::Model>) -> Self {
-        Self { model, memory_store: None }
+        Self {
+            model,
+            memory_store: None,
+        }
     }
 
     /// Create an LlmCompactor with a MemoryStore for SessionMemory extraction.
@@ -304,7 +324,10 @@ impl LlmCompactor {
         model: Arc<dyn base::interface::model::Model>,
         memory_store: Arc<base::interface::memory::MemoryStore>,
     ) -> Self {
-        Self { model, memory_store: Some(memory_store) }
+        Self {
+            model,
+            memory_store: Some(memory_store),
+        }
     }
 
     /// Set the memory store after construction.
@@ -499,7 +522,11 @@ fn extract_summary_tag(raw: &str) -> Option<&str> {
     }
     // No tags found, return the full text trimmed
     let trimmed = raw.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 impl LlmCompactor {
@@ -561,7 +588,9 @@ Return only a JSON array of memories. If nothing is worth saving, return []."
                 role: MessageRole::User,
                 content: vec![
                     ModelContentBlock::Text { text: prompt },
-                    ModelContentBlock::Text { text: messages_text },
+                    ModelContentBlock::Text {
+                        text: messages_text,
+                    },
                 ],
             }];
             let params = base::interface::model::StreamParams {
@@ -572,13 +601,16 @@ Return only a JSON array of memories. If nothing is worth saving, return []."
                 cache_edits: vec![],
             };
             let mut full_text = String::new();
-            let stream_result = self.model.stream(
-                vec![],
-                vec![],
-                request_messages,
-                params,
-                tokio_util::sync::CancellationToken::new(),
-            ).await;
+            let stream_result = self
+                .model
+                .stream(
+                    vec![],
+                    vec![],
+                    request_messages,
+                    params,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
 
             let Ok(mut stream) = stream_result else {
                 return 0;
@@ -707,14 +739,14 @@ const MAX_CHARS_SKILLS: usize = 25_000;
 /// After compaction removes old messages, critical context (recently read files,
 /// invoked skills, plan mode status) needs to be re-injected so the model doesn't
 /// lose its bearings. This mirrors Claude Code's `createPostCompactAttachments`.
-pub fn build_post_compact_recovery(
-    ctx: &PostCompactContext,
-) -> Vec<ModelMessage> {
+pub fn build_post_compact_recovery(ctx: &PostCompactContext) -> Vec<ModelMessage> {
     let mut recovery = Vec::new();
 
     // 1. Recently read files
     if !ctx.recent_files.is_empty() {
-        let files: Vec<_> = ctx.recent_files.iter()
+        let files: Vec<_> = ctx
+            .recent_files
+            .iter()
             .take(MAX_RECOVER_FILES)
             .map(|(path, content)| {
                 let truncated = if content.len() > MAX_CHARS_PER_FILE {
@@ -761,7 +793,10 @@ pub fn build_post_compact_recovery(
     if ctx.in_plan_mode {
         if let Some(ref plan) = ctx.plan_content {
             let truncated = if plan.len() > MAX_CHARS_PER_FILE {
-                format!("{}...\n[plan content truncated]", &plan[..MAX_CHARS_PER_FILE])
+                format!(
+                    "{}...\n[plan content truncated]",
+                    &plan[..MAX_CHARS_PER_FILE]
+                )
             } else {
                 plan.clone()
             };
@@ -783,7 +818,9 @@ pub fn build_post_compact_recovery(
 
     // 4. Background running tasks
     if !ctx.running_tasks.is_empty() {
-        let tasks_lines: Vec<_> = ctx.running_tasks.iter()
+        let tasks_lines: Vec<_> = ctx
+            .running_tasks
+            .iter()
             .map(|(id, status)| format!("- task:{id} — {status}"))
             .collect();
         let body = format!(
@@ -819,7 +856,10 @@ pub fn extract_recent_reads(messages: &[ModelMessage]) -> Vec<(String, String)> 
     let mut seen = std::collections::HashSet::new();
     for msg in messages.iter().rev() {
         for block in &msg.content {
-            if let ModelContentBlock::ToolResult { content, is_error, .. } = block {
+            if let ModelContentBlock::ToolResult {
+                content, is_error, ..
+            } = block
+            {
                 // Look for Read tool results — heuristic: content starts with file path pattern
                 // and is preceded by a ToolUse that has a Read-ish name
                 if is_error != &Some(true) && !content.is_empty() {
@@ -862,7 +902,14 @@ pub fn strip_images_from_messages(messages: &mut [ModelMessage]) {
 
 /// Tool names that MicroCompact may clear. TS parity: COMPACTABLE_TOOLS in microCompact.ts.
 const COMPACTABLE_TOOLS: &[&str] = &[
-    "Read", "Bash", "Grep", "Glob", "WebSearch", "WebFetch", "Edit", "Write",
+    "Read",
+    "Bash",
+    "Grep",
+    "Glob",
+    "WebSearch",
+    "WebFetch",
+    "Edit",
+    "Write",
 ];
 
 // ── P2-1: Compact Analysis (TS parity: contextAnalysis.ts) ──
@@ -926,9 +973,10 @@ pub fn analyze_context(messages: &[ModelMessage]) -> ContextAnalysis {
                     }
                 }
                 ModelContentBlock::ToolUse { name, input, .. } => {
-                    let tokens = estimate(name) + serde_json::to_string(input)
-                        .map(|s| estimate(&s))
-                        .unwrap_or(0);
+                    let tokens = estimate(name)
+                        + serde_json::to_string(input)
+                            .map(|s| estimate(&s))
+                            .unwrap_or(0);
                     analysis.total_estimated_tokens += tokens;
                     analysis.tool_use_tokens += tokens;
                     let entry = analysis.tool_usage.entry(name.clone()).or_insert((0, 0));
@@ -960,7 +1008,8 @@ pub fn format_context_analysis(analysis: &ContextAnalysis) -> String {
     s.push_str(&format!(
         "  user text: {:.0}%  assistant: {:.0}%  tool results: {:.0}%  tool uses: {:.0}%\n",
         (analysis.user_text_tokens as f64 / analysis.total_estimated_tokens.max(1) as f64) * 100.0,
-        (analysis.assistant_text_tokens as f64 / analysis.total_estimated_tokens.max(1) as f64) * 100.0,
+        (analysis.assistant_text_tokens as f64 / analysis.total_estimated_tokens.max(1) as f64)
+            * 100.0,
         analysis.tool_result_pct,
         (analysis.tool_use_tokens as f64 / analysis.total_estimated_tokens.max(1) as f64) * 100.0,
     ));
@@ -970,7 +1019,10 @@ pub fn format_context_analysis(analysis: &ContextAnalysis) -> String {
         tools.sort_by_key(|(_, (_calls, tokens))| std::cmp::Reverse(*tokens));
         s.push_str("  top tools by tokens:\n");
         for (name, (calls, tokens)) in tools.iter().take(5) {
-            s.push_str(&format!("    {}: {} calls, ~{} tokens\n", name, calls, tokens));
+            s.push_str(&format!(
+                "    {}: {} calls, ~{} tokens\n",
+                name, calls, tokens
+            ));
         }
     }
 
@@ -1040,7 +1092,9 @@ mod tests {
     fn text_user(s: &str) -> ModelMessage {
         ModelMessage {
             role: MessageRole::User,
-            content: vec![ModelContentBlock::Text { text: s.to_string() }],
+            content: vec![ModelContentBlock::Text {
+                text: s.to_string(),
+            }],
         }
     }
 
@@ -1058,7 +1112,9 @@ mod tests {
     fn assistant_text(s: &str) -> ModelMessage {
         ModelMessage {
             role: MessageRole::Assistant,
-            content: vec![ModelContentBlock::Text { text: s.to_string() }],
+            content: vec![ModelContentBlock::Text {
+                text: s.to_string(),
+            }],
         }
     }
 
@@ -1089,7 +1145,11 @@ mod tests {
         // Use tight budget to force snip: each round ~3 tokens
         let (result, _) = compactor.compact(msgs.clone(), 20, 3).await.unwrap();
         // Should keep ~3 rounds * 2 messages = 6 messages (if fits under 20 tokens)
-        assert!(!result.is_empty() && result.len() <= 8, "expected <=8 and non-empty, got {}", result.len());
+        assert!(
+            !result.is_empty() && result.len() <= 8,
+            "expected <=8 and non-empty, got {}",
+            result.len()
+        );
     }
 
     #[tokio::test]
@@ -1099,15 +1159,15 @@ mod tests {
         let long = "VERY LONG TOOL RESULT ".repeat(100);
         let msgs = vec![
             text_user("read a"),
-            tool_use("t1", "Read", "{}"),   // whitelisted → will be cleared
+            tool_use("t1", "Read", "{}"), // whitelisted → will be cleared
             tool_result("t1", &long),
             assistant_text("done a"),
             text_user("grep b"),
-            tool_use("t2", "Grep", "{}"),   // whitelisted → will be cleared
+            tool_use("t2", "Grep", "{}"), // whitelisted → will be cleared
             tool_result("t2", &long),
             assistant_text("done b"),
             text_user("edit c"),
-            tool_use("t3", "Edit", "{}"),   // whitelisted but in recent round → kept
+            tool_use("t3", "Edit", "{}"), // whitelisted but in recent round → kept
             assistant_text("done c"),
         ];
         let compactor = DefaultCompactor;
@@ -1119,7 +1179,10 @@ mod tests {
                 ModelContentBlock::ToolResult { content, .. } if content == "[Old tool result content cleared]"
             ))
         }).count();
-        assert_eq!(cleared_count, 2, "Expected exactly 2 cleared tool results, got {cleared_count}");
+        assert_eq!(
+            cleared_count, 2,
+            "Expected exactly 2 cleared tool results, got {cleared_count}"
+        );
     }
 
     #[test]

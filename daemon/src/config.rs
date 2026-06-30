@@ -41,17 +41,27 @@ impl DefaultDaemonPaths {
             PathBuf::from("/tmp/attacore")
         };
         let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self { config_root, project_root }
+        Self {
+            config_root,
+            project_root,
+        }
     }
 
     pub fn new(config_root: PathBuf, project_root: PathBuf) -> Self {
-        Self { config_root, project_root }
+        Self {
+            config_root,
+            project_root,
+        }
     }
 }
 
 impl DaemonPaths for DefaultDaemonPaths {
-    fn config_root(&self) -> PathBuf { self.config_root.clone() }
-    fn project_root(&self) -> PathBuf { self.project_root.clone() }
+    fn config_root(&self) -> PathBuf {
+        self.config_root.clone()
+    }
+    fn project_root(&self) -> PathBuf {
+        self.project_root.clone()
+    }
 }
 
 /// Fixed-path provider for integration tests.
@@ -63,16 +73,26 @@ pub struct StaticDaemonPaths {
 
 impl StaticDaemonPaths {
     pub fn new(path: PathBuf) -> Self {
-        Self { config_root: path.clone(), project_root: path }
+        Self {
+            config_root: path.clone(),
+            project_root: path,
+        }
     }
     pub fn with_project(config_root: PathBuf, project_root: PathBuf) -> Self {
-        Self { config_root, project_root }
+        Self {
+            config_root,
+            project_root,
+        }
     }
 }
 
 impl DaemonPaths for StaticDaemonPaths {
-    fn config_root(&self) -> PathBuf { self.config_root.clone() }
-    fn project_root(&self) -> PathBuf { self.project_root.clone() }
+    fn config_root(&self) -> PathBuf {
+        self.config_root.clone()
+    }
+    fn project_root(&self) -> PathBuf {
+        self.project_root.clone()
+    }
 }
 
 // ── Config struct ────────────────────────────────────────────────────────
@@ -106,7 +126,10 @@ impl std::fmt::Debug for DaemonConfig {
             .field("tcp_addr", &self.tcp_addr)
             .field("tcp_token", &"...")
             .field("paths", &"...")
-            .field("permission_rules", &format!("RuleSet({})", self.permission_rules.len()))
+            .field(
+                "permission_rules",
+                &format!("RuleSet({})", self.permission_rules.len()),
+            )
             .finish()
     }
 }
@@ -153,7 +176,10 @@ pub fn load_daemon_config(
     let user_path = config_root.join("settings.json");
     let mut merged = load_single(&user_path).unwrap_or_default();
 
-    let project_path = project_root.join(".atta").join("code").join("settings.json");
+    let project_path = project_root
+        .join(".atta")
+        .join("code")
+        .join("settings.json");
     if let Some(proj) = load_single(&project_path) {
         merged = merge_settings(merged, proj);
     }
@@ -179,21 +205,35 @@ pub fn load_daemon_config(
 }
 
 fn load_single(path: &Path) -> Option<SettingsFile> {
-    if !path.exists() { return None; }
+    if !path.exists() {
+        return None;
+    }
     let contents = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
 }
 
 fn merge_settings(mut base: SettingsFile, over: SettingsFile) -> SettingsFile {
-    if over.model.is_some() { base.model = over.model; }
-    if over.max_tokens.is_some() { base.max_tokens = over.max_tokens; }
-    if !over.mcp_servers.is_empty() { base.mcp_servers = over.mcp_servers; }
+    if over.model.is_some() {
+        base.model = over.model;
+    }
+    if over.max_tokens.is_some() {
+        base.max_tokens = over.max_tokens;
+    }
+    if !over.mcp_servers.is_empty() {
+        base.mcp_servers = over.mcp_servers;
+    }
     base
 }
 
 pub fn socket_path_from_root(root: &Path) -> PathBuf {
-    #[cfg(windows)] { PathBuf::from(r"\\.\pipe\attacore-daemon") }
-    #[cfg(not(windows))] { root.join("daemon.sock") }
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"\\.\pipe\attacore-daemon")
+    }
+    #[cfg(not(windows))]
+    {
+        root.join("daemon.sock")
+    }
 }
 
 pub fn lock_path_from_root(root: &Path) -> PathBuf {
@@ -253,7 +293,10 @@ mod tests {
     #[test]
     fn load_single_parses_valid_json() {
         let dir = tempfile::tempdir().unwrap();
-        write_settings(dir.path(), r#"{"model": "claude-sonnet-4-6", "max_tokens": 4096}"#);
+        write_settings(
+            dir.path(),
+            r#"{"model": "claude-sonnet-4-6", "max_tokens": 4096}"#,
+        );
         let s = load_single(&dir.path().join("settings.json")).unwrap();
         assert_eq!(s.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(s.max_tokens, Some(4096));
@@ -272,7 +315,10 @@ mod tests {
     fn load_daemon_config_project_overrides_user() {
         let config_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
-        write_settings(config_dir.path(), r#"{"model": "user-model", "max_tokens": 1000}"#);
+        write_settings(
+            config_dir.path(),
+            r#"{"model": "user-model", "max_tokens": 1000}"#,
+        );
         write_project_settings(project_dir.path(), r#"{"model": "project-model"}"#);
         let paths = StaticDaemonPaths::with_project(
             config_dir.path().to_path_buf(),

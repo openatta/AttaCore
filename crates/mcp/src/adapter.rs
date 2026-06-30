@@ -9,15 +9,15 @@ use crate::manager::ElicitationCallback;
 use crate::output_cache::McpOutputCache;
 use async_trait::async_trait;
 use base::{
+    error::ToolError,
     tool::PermissionDecision,
     tool::ProgressSender,
-    tool::{PromptContext, ToolContext},
     tool::Tool,
-    error::ToolError,
     tool::ToolResult,
     tool::ToolResultBlock,
     tool::ToolResultContent,
     tool::ValidationResult,
+    tool::{PromptContext, ToolContext},
 };
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -205,12 +205,21 @@ impl Tool for McpToolAdapter {
 fn into_tool_result(result: McpCallResult) -> ToolResult {
     let is_error = result.is_error;
     if result.content.len() <= 1 {
-        let text = result.content.iter().map(|b| match b {
-            McpContent::Text(t) => t.clone(),
-            McpContent::Image { .. } => "[image]".to_string(),
-            McpContent::Other(v) => format!("[mcp content: {v}]"),
-        }).collect::<Vec<_>>().join("\n");
-        let text = if text.is_empty() { "(empty response)".to_string() } else { text };
+        let text = result
+            .content
+            .iter()
+            .map(|b| match b {
+                McpContent::Text(t) => t.clone(),
+                McpContent::Image { .. } => "[image]".to_string(),
+                McpContent::Other(v) => format!("[mcp content: {v}]"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            "(empty response)".to_string()
+        } else {
+            text
+        };
         let mut r = ToolResult::text(text);
         r.is_error = is_error;
         return r;

@@ -27,10 +27,7 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    pub fn new(
-        pool: Arc<SessionPool>,
-        shutdown_token: CancellationToken,
-    ) -> Self {
+    pub fn new(pool: Arc<SessionPool>, shutdown_token: CancellationToken) -> Self {
         Self {
             pool,
             started_at: Instant::now(),

@@ -5,8 +5,8 @@
 //! consume the same replayable representation.
 
 use crate::entry::{EnvelopedEntry, LogEntry};
-use base::message::{ContentBlock, Message, StopReason, ToolResultContent};
 use base::id::Id;
+use base::message::{ContentBlock, Message, StopReason, ToolResultContent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeProjectionReport {
@@ -159,7 +159,9 @@ pub fn latest_projected_message_entry_id(entries: &[EnvelopedEntry]) -> Option<I
 
 fn apply_entry_to_messages(entry: &LogEntry, messages: &mut Vec<Message>) {
     match entry {
-        LogEntry::Meta { .. } | LogEntry::System { .. } | LogEntry::UsageSnapshot { .. }
+        LogEntry::Meta { .. }
+        | LogEntry::System { .. }
+        | LogEntry::UsageSnapshot { .. }
         | LogEntry::PasteRef { .. } => {} // PasteRef hydrated by store::load()
         LogEntry::User { content } => messages.push(Message::User {
             content: content.clone(),

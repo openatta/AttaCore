@@ -7,12 +7,12 @@
 //! `EngineConfig.compact_model` — same cheap-model knob compactor uses.
 
 use async_trait::async_trait;
-use model::client::AnthropicClient;
-use model::stream::{BlockDelta, ContentBlockStart, StreamEvent};
-use model::types::{MessageParam, MessagesRequest, SystemBlock};
 use base::message::{ContentBlock, Role};
 use base::tool::SecondaryLlm;
 use futures::stream::StreamExt;
+use model::client::AnthropicClient;
+use model::stream::{BlockDelta, ContentBlockStart, StreamEvent};
+use model::types::{MessageParam, MessagesRequest, SystemBlock};
 use std::sync::Arc;
 
 const SECONDARY_LLM_SYSTEM_PROMPT: &str = "\
@@ -53,11 +53,7 @@ impl AnthropicSecondaryLlm {
 
 #[async_trait]
 impl SecondaryLlm for AnthropicSecondaryLlm {
-    async fn extract_with_prompt(
-        &self,
-        prompt: &str,
-        content: &str,
-    ) -> Result<String, String> {
+    async fn extract_with_prompt(&self, prompt: &str, content: &str) -> Result<String, String> {
         let req = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -153,10 +149,12 @@ mod tests {
         mock.push_turn(text_response("the answer is 42"));
         let secondary = AnthropicSecondaryLlm::new(mock, "claude-haiku-4-5");
         let r = <AnthropicSecondaryLlm as SecondaryLlm>::extract_with_prompt(
-            &secondary, "what's the answer?", "page text",
+            &secondary,
+            "what's the answer?",
+            "page text",
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(r.contains("42"));
     }
 
@@ -167,7 +165,8 @@ mod tests {
         let secondary = AnthropicSecondaryLlm::new(mock, "claude-haiku-4-5");
         let r = <AnthropicSecondaryLlm as SecondaryLlm>::extract_with_prompt(
             &secondary, "question", "page",
-        ).await;
+        )
+        .await;
         assert!(r.is_err());
     }
 }

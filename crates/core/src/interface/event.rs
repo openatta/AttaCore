@@ -14,10 +14,7 @@ use std::path::PathBuf;
 pub enum AgentEvent {
     // ── Streaming ──
     /// Model text delta (high frequency).
-    TextDelta {
-        text: String,
-        turn_id: String,
-    },
+    TextDelta { text: String, turn_id: String },
 
     /// Model requested a tool call.
     ToolUse {

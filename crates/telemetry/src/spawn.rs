@@ -15,7 +15,9 @@ pub struct TelemetryConsumer {
 
 impl TelemetryConsumer {
     pub(crate) fn new(fut: impl Future<Output = ()> + Send + 'static) -> Self {
-        Self { inner: Some(Box::pin(fut)) }
+        Self {
+            inner: Some(Box::pin(fut)),
+        }
     }
     pub(crate) fn disabled() -> Self {
         Self { inner: None }
@@ -45,9 +47,7 @@ pub enum SpawnError {
 /// If `otel_enabled` is true in the config and the `otel` feature is active,
 /// the OTLP exporter is also initialised (warnings are logged on failure but
 /// the pipeline itself still starts).
-pub fn spawn(
-    config: TelemetryConfig,
-) -> Result<(TelemetryHandle, TelemetryConsumer), SpawnError> {
+pub fn spawn(config: TelemetryConfig) -> Result<(TelemetryHandle, TelemetryConsumer), SpawnError> {
     if !config.enabled || matches!(config.mode, TelemetryMode::Disabled) {
         return Ok((TelemetryHandle::noop(), TelemetryConsumer::disabled()));
     }
@@ -100,8 +100,6 @@ pub fn spawn(
             let exporter = RemoteExporter::new(config, rx);
             Ok((handle, TelemetryConsumer::new(exporter.run())))
         }
-        TelemetryMode::Disabled => {
-            Ok((TelemetryHandle::noop(), TelemetryConsumer::disabled()))
-        }
+        TelemetryMode::Disabled => Ok((TelemetryHandle::noop(), TelemetryConsumer::disabled())),
     }
 }

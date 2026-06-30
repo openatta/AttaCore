@@ -13,11 +13,11 @@ pub mod file_recorder;
 pub mod handle;
 #[cfg(feature = "otel")]
 pub mod otel;
+pub mod perf;
 pub mod redact;
 pub mod remote;
 pub mod spawn;
 pub mod stats;
-pub mod perf;
 pub mod vcr;
 
 pub use config::{RemoteConfig, TelemetryConfig, TelemetryMode};

@@ -15,16 +15,16 @@ use base::interface::memory::MemoryStore;
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::Settings;
+use base::interface::settings::{VcrConfig, VcrMode};
 use model::adapter::AnthropicModel;
 use model::client::AnthropicClient;
-use telemetry::file_recorder::FileRecorder;
-use telemetry::vcr::VcrModel;
-use base::interface::settings::{VcrConfig, VcrMode};
 use runtime::agent::{Builder, EventReceiver, InputMessage, InputSender};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use telemetry::file_recorder::FileRecorder;
+use telemetry::vcr::VcrModel;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
@@ -130,21 +130,26 @@ impl SessionPool {
         config.permission_mode = base::permission::PermissionMode::BypassPermissions;
 
         // Apply VCR wrapping if configured
-        let model: Arc<dyn base::interface::model::Model> = match options.and_then(|o| o.vcr.as_ref()) {
-            Some(vcr) => {
-                let mode = match vcr.mode.as_str() {
-                    "record" => VcrMode::Record,
-                    _ => VcrMode::Replay,
-                };
-                Arc::new(VcrModel::new(
-                    self.model.clone(),
-                    Some(VcrConfig { mode, scenario: vcr.scenario.clone(), fallback_on_miss: true }),
-                    std::path::PathBuf::from("/tmp/atta_vcr_nonexistent"),
-                    std::path::PathBuf::from(&vcr.dir),
-                ))
-            }
-            None => self.model.clone(),
-        };
+        let model: Arc<dyn base::interface::model::Model> =
+            match options.and_then(|o| o.vcr.as_ref()) {
+                Some(vcr) => {
+                    let mode = match vcr.mode.as_str() {
+                        "record" => VcrMode::Record,
+                        _ => VcrMode::Replay,
+                    };
+                    Arc::new(VcrModel::new(
+                        self.model.clone(),
+                        Some(VcrConfig {
+                            mode,
+                            scenario: vcr.scenario.clone(),
+                            fallback_on_miss: true,
+                        }),
+                        std::path::PathBuf::from("/tmp/atta_vcr_nonexistent"),
+                        std::path::PathBuf::from(&vcr.dir),
+                    ))
+                }
+                None => self.model.clone(),
+            };
 
         let mut builder = Builder::new()
             .scene(scene)
@@ -155,10 +160,14 @@ impl SessionPool {
             .session_id(session_id.clone());
 
         // Apply telemetry file recorder if configured
-        if let Some(telemetry_path) = options.and_then(|o| o.telemetry.as_ref()).map(|t| t.output.clone()) {
+        if let Some(telemetry_path) = options
+            .and_then(|o| o.telemetry.as_ref())
+            .map(|t| t.output.clone())
+        {
             if let Ok(rec) = FileRecorder::new(&telemetry_path) {
                 let rec = std::sync::Arc::new(rec);
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<telemetry::events::TelemetryEvent>(1024);
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<telemetry::events::TelemetryEvent>(1024);
                 let rec_clone = rec.clone();
                 tokio::spawn(async move {
                     use telemetry::TelemetryRecorder;
@@ -170,9 +179,8 @@ impl SessionPool {
             }
         }
 
-        let (agent, event_rx, input_tx) = builder
-            .build()
-            .map_err(|e| format!("build agent: {e}"))?;
+        let (agent, event_rx, input_tx) =
+            builder.build().map_err(|e| format!("build agent: {e}"))?;
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -228,7 +236,10 @@ impl SessionPool {
             }
             None => {
                 let sid = Id::new().to_string();
-                match self.create(sid.clone(), self.scene_coding.clone(), options.as_ref()).await {
+                match self
+                    .create(sid.clone(), self.scene_coding.clone(), options.as_ref())
+                    .await
+                {
                     Ok(sid) => sid,
                     Err(e) => {
                         return RpcResponse::err(id, codes::INTERNAL_ERROR, e);
@@ -288,7 +299,12 @@ impl SessionPool {
                         }
                     }
                 }
-                Some(AgentEvent::ToolUse { id: tid, name, input, .. }) => {
+                Some(AgentEvent::ToolUse {
+                    id: tid,
+                    name,
+                    input,
+                    ..
+                }) => {
                     let f = StreamFrame::event(
                         &sid,
                         &turn_id,
@@ -302,7 +318,13 @@ impl SessionPool {
                         }
                     }
                 }
-                Some(AgentEvent::ToolResult { id: tid, name, content, is_error, .. }) => {
+                Some(AgentEvent::ToolResult {
+                    id: tid,
+                    name,
+                    content,
+                    is_error,
+                    ..
+                }) => {
                     let f = StreamFrame::event(
                         &sid,
                         &turn_id,
@@ -316,7 +338,12 @@ impl SessionPool {
                         }
                     }
                 }
-                Some(AgentEvent::TurnComplete { stop_reason, api_calls: ac, usage, .. }) => {
+                Some(AgentEvent::TurnComplete {
+                    stop_reason,
+                    api_calls: ac,
+                    usage,
+                    ..
+                }) => {
                     api_calls = ac;
                     let f = StreamFrame::event(
                         &sid,
@@ -370,10 +397,7 @@ impl SessionPool {
                     // 尝试通过场景判断是否需要命名
                     // CODING 场景不需要；CHAT 场景需要额外 LLM 调用
                     if self.scene_chat.auto_name_session() {
-                        if let Some(prompt) = self
-                            .scene_chat
-                            .session_name_prompt(&message)
-                        {
+                        if let Some(prompt) = self.scene_chat.session_name_prompt(&message) {
                             match self.generate_session_name(&prompt).await {
                                 Ok(name) => {
                                     live.name = Some(name.clone());
@@ -490,7 +514,11 @@ impl SessionPool {
                     }
                 }
                 if !to_evict.is_empty() {
-                    debug!(evicted = to_evict.len(), remaining = sessions.len(), "janitor run");
+                    debug!(
+                        evicted = to_evict.len(),
+                        remaining = sessions.len(),
+                        "janitor run"
+                    );
                 }
             }
         });
@@ -502,7 +530,10 @@ impl SessionPool {
     async fn resume_or_create(&self, sid: String, options: Option<&SessionOptions>) -> String {
         // 尝试从 HistoryStore 加载历史消息
         let has_history = if let Some(ref store) = self.history_store {
-            match store.load(base::session::SessionId::parse(&sid).unwrap()).await {
+            match store
+                .load(base::session::SessionId::parse(&sid).unwrap())
+                .await
+            {
                 Ok(entries) => !entries.is_empty(),
                 Err(_) => false,
             }
@@ -511,7 +542,10 @@ impl SessionPool {
         };
 
         if has_history {
-            match self.create(sid.clone(), self.scene_coding.clone(), options).await {
+            match self
+                .create(sid.clone(), self.scene_coding.clone(), options)
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(%sid, error=%e, "resume failed, creating new");
@@ -522,7 +556,10 @@ impl SessionPool {
                 }
             }
         } else {
-            match self.create(sid.clone(), self.scene_coding.clone(), options).await {
+            match self
+                .create(sid.clone(), self.scene_coding.clone(), options)
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(sid, error=%e, "create with given sid failed");
@@ -555,7 +592,9 @@ impl SessionPool {
         use base::interface::prompt::PromptBlock;
         use futures::StreamExt;
 
-        let system = PromptBlock::system("你是一个简洁的标题生成器。只输出 3-5 个词的中文标题，不要任何解释。");
+        let system = PromptBlock::system(
+            "你是一个简洁的标题生成器。只输出 3-5 个词的中文标题，不要任何解释。",
+        );
         let messages = vec![ModelMessage {
             role: MessageRole::User,
             content: vec![ModelContentBlock::Text {

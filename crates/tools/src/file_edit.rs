@@ -3,11 +3,13 @@
 //! 字符串字面替换：要么唯一匹配 + 单次替换，要么 `replace_all=true` 全量替换。
 //! 不带 unified diff（简化输出）；接 `similar` 给 model 看 diff。
 
+use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
-use crate::cancel::run_with_cancel;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,7 +43,8 @@ pub struct FileEditInput {
     /// Single-edit shorthand: when false (default), `old_string` must appear
     /// exactly once. When true, every occurrence is replaced at once.
     #[serde(default)]
-    pub replace_all: Option<bool>}
+    pub replace_all: Option<bool>,
+}
 
 /// **Q2 **: one entry in a multi-edit batch.
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
@@ -53,7 +56,8 @@ pub struct SingleEdit {
     /// `false` (default) → `old_string` must appear exactly once at the time
     /// this edit is applied. `true` → replace every occurrence.
     #[serde(default)]
-    pub replace_all: Option<bool>}
+    pub replace_all: Option<bool>,
+}
 
 impl FileEditInput {
     /// Normalise into the canonical edits list. Returns Err if neither shape
@@ -80,7 +84,8 @@ impl FileEditInput {
             vec![SingleEdit {
                 old_string: old,
                 new_string: new,
-                replace_all: self.replace_all}],
+                replace_all: self.replace_all,
+            }],
         ))
     }
 }
@@ -186,7 +191,8 @@ impl Tool for FileEditTool {
                     ValidationResult::Ok
                 }
             }
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 7)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 7),
+        }
     }
 
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
@@ -211,7 +217,8 @@ impl Tool for FileEditTool {
             {
                 return PermissionDecision::Deny {
                     reason: Some(format!("Edit of sensitive file '{file_name}' is denied")),
-                    decision_reason: Some("path_safety".into())};
+                    decision_reason: Some("path_safety".into()),
+                };
             }
             let path = if PathBuf::from(&parsed.file_path).is_absolute() {
                 PathBuf::from(parsed.file_path)
@@ -224,24 +231,28 @@ impl Tool for FileEditTool {
             match crate::security::check_write(&path, &policy) {
                 Ok(()) => {
                     return PermissionDecision::Allow {
-                        decision_reason: Some("project_write".into())};
+                        decision_reason: Some("project_write".into()),
+                    };
                 }
                 Err(crate::security::PathSafetyError::OutsideAllowedRoots { .. }) => {
                     return PermissionDecision::Ask {
                         message: "Edit outside the project requires confirmation".into(),
-                        decision_reason: None};
+                        decision_reason: None,
+                    };
                 }
                 Err(err) => {
                     return PermissionDecision::Deny {
                         reason: Some(format!("{err:?}")),
-                        decision_reason: Some("path_safety".into())};
+                        decision_reason: Some("path_safety".into()),
+                    };
                 }
             }
         }
 
         PermissionDecision::Ask {
             message: "File edit requires confirmation".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -255,9 +266,12 @@ impl Tool for FileEditTool {
         let path = resolve_path(&file_path, &ctx.cwd);
 
         // **P1 **: snapshot before mutate so /rewind can restore.
-        if let Some(snapshot) = &ctx.snapshot_file { snapshot.record(&path, "Edit"); }
+        if let Some(snapshot) = &ctx.snapshot_file {
+            snapshot.record(&path, "Edit");
+        }
 
-        let outcome = run_with_cancel(&ctx.cancel, perform_edits_structured(&path, &edits)).await??;
+        let outcome =
+            run_with_cancel(&ctx.cancel, perform_edits_structured(&path, &edits)).await??;
 
         // **S1-a **: emit structured diff payload alongside text. TUI
         // parses `structured_content.kind == "diff"` and renders inline; CLI
@@ -288,7 +302,8 @@ pub struct DiffPayload {
     pub after_bytes: usize,
     pub hunks: Vec<DiffHunk>,
     /// `true` when the diff is too long and was truncated; UI may show "expand".
-    pub truncated: bool}
+    pub truncated: bool,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffHunk {
@@ -297,7 +312,8 @@ pub struct DiffHunk {
     pub before_count: usize,
     pub after_start: usize,
     pub after_count: usize,
-    pub lines: Vec<DiffLine>}
+    pub lines: Vec<DiffLine>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", rename_all = "lowercase")]
@@ -307,11 +323,13 @@ pub enum DiffLine {
     /// Removed line
     Delete { text: String },
     /// Added line
-    Insert { text: String }}
+    Insert { text: String },
+}
 
 struct PerformOutcome {
     summary: String,
-    diff: DiffPayload}
+    diff: DiffPayload,
+}
 
 /// **Q2 **: apply N edits atomically. Each edit runs against the
 /// in-memory result of the previous one. If any edit fails (no match, or
@@ -327,7 +345,8 @@ async fn perform_edits_structured(
             std::io::ErrorKind::NotFound => {
                 ToolError::Validation(format!("file not found: {}", path.display()))
             }
-            _ => ToolError::exec(e.to_string())})?;
+            _ => ToolError::exec(e.to_string()),
+        })?;
     if metadata.is_dir() {
         return Err(ToolError::Validation(format!(
             "path is a directory, not a file: {}",
@@ -337,11 +356,14 @@ async fn perform_edits_structured(
 
     // File size limit (TS parity: MAX_EDIT_FILE_SIZE = 1 GiB)
     const MAX_EDIT_BYTES: u64 = 1024 * 1024 * 1024;
-    let meta = tokio::fs::metadata(path).await
+    let meta = tokio::fs::metadata(path)
+        .await
         .map_err(|e| ToolError::exec(format!("stat: {e}")))?;
     if meta.len() > MAX_EDIT_BYTES {
         return Err(ToolError::Validation(format!(
-            "file is {} bytes; max edit size is {} bytes", meta.len(), MAX_EDIT_BYTES
+            "file is {} bytes; max edit size is {} bytes",
+            meta.len(),
+            MAX_EDIT_BYTES
         )));
     }
 
@@ -351,7 +373,8 @@ async fn perform_edits_structured(
             std::io::ErrorKind::InvalidData => {
                 ToolError::Validation(format!("file is not valid UTF-8: {}", path.display()))
             }
-            _ => ToolError::exec(e.to_string())})?;
+            _ => ToolError::exec(e.to_string()),
+        })?;
 
     let mut current = original.clone();
     let mut total_replacements: usize = 0;
@@ -398,7 +421,8 @@ async fn perform_edits_structured(
     );
     Ok(PerformOutcome {
         summary,
-        diff: diff_payload})
+        diff: diff_payload,
+    })
 }
 
 /// **S1-a **: generate both unified-text (for headless / model) AND
@@ -441,14 +465,16 @@ fn render_diff(before: &str, after: &str, path: &str) -> (String, DiffPayload) {
             let sign = match change.tag() {
                 ChangeTag::Delete => '-',
                 ChangeTag::Insert => '+',
-                ChangeTag::Equal => ' '};
+                ChangeTag::Equal => ' ',
+            };
             let s = change.to_string();
             let s = s.strip_suffix('\n').unwrap_or(&s).to_string();
             text.push_str(&format!("{sign}{s}\n"));
             hunk_lines.push(match change.tag() {
                 ChangeTag::Delete => DiffLine::Delete { text: s },
                 ChangeTag::Insert => DiffLine::Insert { text: s },
-                ChangeTag::Equal => DiffLine::Context { text: s }});
+                ChangeTag::Equal => DiffLine::Context { text: s },
+            });
             total_lines += 1;
         }
 
@@ -457,7 +483,8 @@ fn render_diff(before: &str, after: &str, path: &str) -> (String, DiffPayload) {
             before_count: b_count,
             after_start: a_start,
             after_count: a_count,
-            lines: hunk_lines});
+            lines: hunk_lines,
+        });
         hunk_count += 1;
     }
 
@@ -473,7 +500,8 @@ fn render_diff(before: &str, after: &str, path: &str) -> (String, DiffPayload) {
         before_bytes: before.len(),
         after_bytes: after.len(),
         hunks,
-        truncated};
+        truncated,
+    };
     (text, payload)
 }
 
@@ -494,7 +522,8 @@ fn parse_hunk_header(s: &str) -> Option<(usize, usize, usize, usize)> {
 fn parse_pair(s: &str) -> Option<(usize, usize)> {
     match s.split_once(',') {
         Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
-        None => Some((s.parse().ok()?, 1))}
+        None => Some((s.parse().ok()?, 1)),
+    }
 }
 
 #[cfg(test)]
@@ -538,7 +567,8 @@ mod tests {
                 assert!(s.contains("-hello world"));
                 assert!(s.contains("+hello AttaCode"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -563,7 +593,8 @@ mod tests {
             ToolError::Validation(msg) => {
                 assert!(msg.contains("3 times"));
             }
-            other => panic!("expected Validation, got {other:?}")}
+            other => panic!("expected Validation, got {other:?}"),
+        }
         // 文件未被改
         assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "x\nx\nx\n");
     }
@@ -591,7 +622,8 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "yy\nyy\nyy\n");
         match r.content {
             ToolResultContent::Text(s) => assert!(s.contains("3 replacements")),
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     // ---- S1-a : structured diff payload ----
@@ -684,7 +716,8 @@ mod tests {
                 assert!(s.contains("2 edits"));
                 assert!(s.contains("2 replacements"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]

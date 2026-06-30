@@ -9,8 +9,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use ignore::{WalkBuilder, WalkState};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -54,7 +56,8 @@ pub struct GrepInput {
 
     /// Prefix each line with its line number (content mode only).
     #[serde(default)]
-    pub line_numbers: Option<bool>}
+    pub line_numbers: Option<bool>,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GrepTool;
@@ -100,13 +103,17 @@ impl Tool for GrepTool {
         let parsed: Result<GrepInput, _> = serde_json::from_value(input.clone());
         match parsed {
             Ok(p) if p.pattern.is_empty() => ValidationResult::err("pattern must not be empty", 1),
-            Ok(p) => match GrepMode::parse(p.output_mode.as_deref().unwrap_or("files_with_matches")) {
-                Ok(_) => ValidationResult::Ok,
-                Err(_) => ValidationResult::err(
-                    "output_mode must be 'content', 'files_with_matches', or 'count'",
-                    2,
-                )},
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Ok(p) => {
+                match GrepMode::parse(p.output_mode.as_deref().unwrap_or("files_with_matches")) {
+                    Ok(_) => ValidationResult::Ok,
+                    Err(_) => ValidationResult::err(
+                        "output_mode must be 'content', 'files_with_matches', or 'count'",
+                        2,
+                    ),
+                }
+            }
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -123,11 +130,13 @@ impl Tool for GrepTool {
         let mode = GrepMode::parse(input.output_mode.as_deref().unwrap_or("files_with_matches"))?;
         let head_limit = input.head_limit.unwrap_or(match mode {
             GrepMode::Content => DEFAULT_HEAD_LIMIT,
-            _ => 0});
+            _ => 0,
+        });
 
         let root = match &input.path {
             Some(p) => resolve_path(p, &ctx.cwd),
-            None => ctx.cwd.clone()};
+            None => ctx.cwd.clone(),
+        };
 
         // 构造 regex
         let mut regex_builder = regex::RegexBuilder::new(&input.pattern);
@@ -137,13 +146,15 @@ impl Tool for GrepTool {
         }
         let re = match regex_builder.build() {
             Ok(r) => r,
-            Err(e) => return Err(ToolError::Validation(format!("invalid regex pattern: {e}")))};
+            Err(e) => return Err(ToolError::Validation(format!("invalid regex pattern: {e}"))),
+        };
 
         // 构造可选 glob filter
         let glob_matcher = if let Some(g) = &input.glob {
             match globset::Glob::new(g) {
                 Ok(g) => Some(g.compile_matcher()),
-                Err(e) => return Err(ToolError::Validation(format!("invalid glob '{g}': {e}")))}
+                Err(e) => return Err(ToolError::Validation(format!("invalid glob '{g}': {e}"))),
+            }
         } else {
             None
         };
@@ -175,7 +186,8 @@ impl Tool for GrepTool {
                 Box::new(move |entry| {
                     let entry = match entry {
                         Ok(e) => e,
-                        Err(_) => return WalkState::Continue};
+                        Err(_) => return WalkState::Continue,
+                    };
                     let path = entry.path();
                     if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                         return WalkState::Continue;
@@ -191,7 +203,8 @@ impl Tool for GrepTool {
                     // 读 + 跳大文件 / 二进制
                     let bytes = match std::fs::read(path) {
                         Ok(b) => b,
-                        Err(_) => return WalkState::Continue};
+                        Err(_) => return WalkState::Continue,
+                    };
                     if bytes.len() > 4 * 1024 * 1024 {
                         return WalkState::Continue;
                     }
@@ -200,7 +213,8 @@ impl Tool for GrepTool {
                     }
                     let content = match std::str::from_utf8(&bytes) {
                         Ok(s) => s,
-                        Err(_) => return WalkState::Continue};
+                        Err(_) => return WalkState::Continue,
+                    };
 
                     match mode {
                         GrepMode::FilesWithMatches => {
@@ -249,8 +263,7 @@ impl Tool for GrepTool {
             return Err(ToolError::Cancelled);
         }
 
-        let mut lines =
-            result.map_err(|e| ToolError::exec(format!("grep walk panicked: {e}")))?;
+        let mut lines = result.map_err(|e| ToolError::exec(format!("grep walk panicked: {e}")))?;
 
         // 截断输出
         let total_lines = lines.len();
@@ -279,7 +292,8 @@ impl Tool for GrepTool {
 enum GrepMode {
     Content,
     FilesWithMatches,
-    Count}
+    Count,
+}
 
 impl GrepMode {
     fn parse(s: &str) -> Result<Self, ToolError> {
@@ -289,7 +303,8 @@ impl GrepMode {
             "count" => Ok(Self::Count),
             other => Err(ToolError::Validation(format!(
                 "invalid output_mode '{other}' (expected content / files_with_matches / count)"
-            )))}
+            ))),
+        }
     }
 }
 
@@ -350,7 +365,8 @@ mod tests {
                 let foo_lines = t.matches("foo").count();
                 assert!(foo_lines >= 2);
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -379,7 +395,8 @@ mod tests {
                 assert!(t.contains("a.txt"));
                 assert!(!t.contains("b.txt"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -404,7 +421,8 @@ mod tests {
             ToolResultContent::Text(t) => {
                 assert!(t.contains("a.txt:3") || t.contains("a.txt:3\n"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -433,7 +451,8 @@ mod tests {
                 assert!(t.contains("a.rs"));
                 assert!(!t.contains("b.txt"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -456,7 +475,8 @@ mod tests {
             .unwrap();
         match r.content {
             ToolResultContent::Text(t) => assert!(t.contains("(no matches)")),
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -513,16 +533,13 @@ mod tests {
         cancel.cancel();
         let tool = GrepTool;
         let r = tool
-            .call(
-                json!({"pattern": "x"}),
-                ctx,
-                ProgressSender::noop("t"),
-            )
+            .call(json!({"pattern": "x"}), ctx, ProgressSender::noop("t"))
             .await;
         // Either cancelled or completed (due to race) — both acceptable
         match r {
-            Ok(_) => {} // completed before cancel took effect
+            Ok(_) => {}                     // completed before cancel took effect
             Err(ToolError::Cancelled) => {} // cancel worked
-            Err(e) => panic!("unexpected error: {e:?}")}
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 }

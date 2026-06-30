@@ -10,6 +10,42 @@ use std::path::{Path, PathBuf};
 use super::frontmatter::{parse_skill_file, split_frontmatter};
 use super::regex::Regex;
 
+/// v2.0.0: Skill-driven hook rule — a policy rule declared in skill frontmatter.
+///
+/// When a skill has `hook_rules`, the SkillRequiredHook at BeforeTaskComplete
+/// checks whether the conditions match and the required actions were performed.
+#[derive(Debug, Clone)]
+pub struct SkillHookRule {
+    /// Unique rule identifier (e.g. "rust-fmt-required").
+    pub id: String,
+    /// Human-readable description of what this rule enforces.
+    pub description: Option<String>,
+    /// Conditions under which this rule fires.
+    pub condition: SkillHookCondition,
+    /// Actions that must have been performed to satisfy this rule.
+    pub require: SkillHookRequirement,
+}
+
+/// Conditions that trigger a skill hook rule.
+#[derive(Debug, Clone)]
+pub struct SkillHookCondition {
+    /// Match when files with this extension have been changed.
+    pub changed_file_ext: Option<String>,
+    /// Match when a file matching this glob pattern was changed.
+    pub changed_file_glob: Option<String>,
+    /// Match when a command containing this substring was executed.
+    pub command_contains: Option<String>,
+}
+
+/// Required actions to satisfy a rule.
+#[derive(Debug, Clone)]
+pub struct SkillHookRequirement {
+    /// A command that must have been executed (substring match).
+    pub command_executed: Option<String>,
+    /// A command that must match this regex pattern.
+    pub command_executed_matches: Option<String>,
+}
+
 /// 单个 Skill：从 `<dir>/<skill_name>/SKILL.md` 的 YAML frontmatter 抽出。
 #[derive(Debug, Clone)]
 pub struct SkillEntry {
@@ -48,6 +84,10 @@ pub struct SkillEntry {
     /// loaded, these hooks are registered with the HookRunner.
     /// TS parity: Skill frontmatter hooks.
     pub hooks: Option<Vec<String>>,
+    /// **v2.0.0 **: Skill-driven hook rules — policy rules that are enforced
+    /// by the PolicyHook system. Each rule specifies a condition (e.g. changed
+    /// file extension) and required actions (e.g. must run cargo fmt).
+    pub hook_rules: Option<Vec<SkillHookRule>>,
 }
 
 impl Default for SkillEntry {
@@ -68,6 +108,7 @@ impl Default for SkillEntry {
             version: None,
             files: None,
             hooks: None,
+            hook_rules: None,
         }
     }
 }
@@ -188,7 +229,11 @@ pub async fn load_session_skills(cwd: &Path) -> Vec<SkillEntry> {
         Some(h) => collect_skills(&h, cwd).await,
         None => {
             // 没有 HOME 时只扫 project
-            scan_skills_dir(&cwd.join(".atta").join("code").join("skills"), SkillSource::Project).await
+            scan_skills_dir(
+                &cwd.join(".atta").join("code").join("skills"),
+                SkillSource::Project,
+            )
+            .await
         }
     };
     // Disk skills are loaded first (take priority for slash commands).
@@ -336,7 +381,8 @@ pub async fn try_expand_skill_command(
 ) -> Option<Result<String, std::io::Error>> {
     let trimmed = line.trim();
     // Support both /skill and !skill prefix conventions
-    let stripped = trimmed.strip_prefix('/')
+    let stripped = trimmed
+        .strip_prefix('/')
         .or_else(|| trimmed.strip_prefix('!'))?;
     let (cmd, args) = match stripped.split_once(char::is_whitespace) {
         Some((c, a)) => (c, a.trim()),
@@ -406,7 +452,10 @@ pub fn expand_skill_vars(body: &str, args: &str) -> String {
     }
 }
 
-pub async fn format_skill_invocation(skill: &SkillEntry, args: &str) -> Result<String, std::io::Error> {
+pub async fn format_skill_invocation(
+    skill: &SkillEntry,
+    args: &str,
+) -> Result<String, std::io::Error> {
     let body = skill.read_body().await?;
     // **P6 **: variable expansion supports:
     //   - `{ARGS}` -- full args string (legacy; we keep it for backwards compat)
@@ -622,12 +671,9 @@ mod tests {
     async fn try_expand_substitutes_args_placeholder() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("SKILL.md");
-        tokio::fs::write(
-            &p,
-            "---\ndescription: test\n---\nReview {ARGS} and report.",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(&p, "---\ndescription: test\n---\nReview {ARGS} and report.")
+            .await
+            .unwrap();
         let skills = vec![SkillEntry {
             name: "x".into(),
             description: "test".into(),

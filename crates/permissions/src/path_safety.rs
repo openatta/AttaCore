@@ -147,11 +147,9 @@ impl std::fmt::Display for PathSafetyError {
                 "path contains shell expansion pattern '{matched}': {}",
                 path.display()
             ),
-            Self::UncPathDetected(p) => write!(
-                f,
-                "Windows UNC path is not allowed: {}",
-                p.display()
-            ),
+            Self::UncPathDetected(p) => {
+                write!(f, "Windows UNC path is not allowed: {}", p.display())
+            }
             Self::SymlinkEscape {
                 symlink_path,
                 real_path,
@@ -187,10 +185,7 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
     //    必须在绝对路径检查之前，因为 `~/foo` 不是绝对路径（shell 未展开）
     {
         let path_str = target.to_string_lossy();
-        if path_str == "~"
-            || path_str.starts_with("~/")
-            || path_str.starts_with("~\\")
-        {
+        if path_str == "~" || path_str.starts_with("~/") || path_str.starts_with("~\\") {
             return Err(PathSafetyError::TildeExpansion(target.to_path_buf()));
         }
     }
@@ -310,10 +305,7 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
         // ancestors[0] = target itself, ancestors[last] = root "/"
         // Check all intermediate directory components, from root toward
         // target, but only those that are WITHIN a root.
-        for component in ancestors[1..ancestors.len().saturating_sub(1)]
-            .iter()
-            .rev()
-        {
+        for component in ancestors[1..ancestors.len().saturating_sub(1)].iter().rev() {
             // Skip components that ARE one of the roots
             // (root-level symlinks are not our concern here)
             if roots.iter().any(|r| r == *component) {
@@ -326,9 +318,7 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
             if let Ok(real_path) = std::fs::canonicalize(component) {
                 if real_path != *component
                     && !roots.iter().any(|r| starts_within(&real_path, r))
-                    && !canonical_roots
-                        .iter()
-                        .any(|r| starts_within(&real_path, r))
+                    && !canonical_roots.iter().any(|r| starts_within(&real_path, r))
                 {
                     return Err(PathSafetyError::SymlinkEscape {
                         symlink_path: component.to_path_buf(),

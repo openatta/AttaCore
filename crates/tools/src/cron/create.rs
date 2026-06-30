@@ -9,8 +9,10 @@ use std::sync::Arc;
 use super::parser::cron_expression_valid;
 use super::store::CronStore;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CronCreateInput {
@@ -30,14 +32,16 @@ pub struct CronCreateInput {
     /// session ends. Use true only when the user explicitly asks
     /// the task to survive across sessions.
     #[serde(default)]
-    pub durable: bool}
+    pub durable: bool,
+}
 
 fn default_true() -> bool {
     true
 }
 
 pub struct CronCreateTool {
-    store: Arc<CronStore>}
+    store: Arc<CronStore>,
+}
 
 impl CronCreateTool {
     pub fn new(store: Arc<CronStore>) -> Self {
@@ -94,7 +98,8 @@ impl Tool for CronCreateTool {
                 }
                 ValidationResult::Ok
             }
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 4)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 4),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -132,7 +137,8 @@ impl Tool for CronCreateTool {
                 "recurring": input.recurring,
                 "durable": input.durable})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -168,7 +174,8 @@ mod tests {
                 let token = s.split_whitespace().nth(3).unwrap();
                 token.trim_end_matches('.').to_string()
             }
-            _ => panic!("expected text")};
+            _ => panic!("expected text"),
+        };
         assert_eq!(id.len(), 8, "id '{id}' should be 8 chars");
 
         // Delete it

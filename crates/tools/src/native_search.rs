@@ -7,17 +7,17 @@
 //!
 //! 参见 docs/COMPARISON_EXPERIMENT.md。
 
+use crate::web_search::{
+    SearchError, SearchOutput, SearchOutputItem, SearchProvider, SearchResult,
+};
 use async_trait::async_trait;
+use base::message::{ContentBlock, Role};
+use futures::stream::StreamExt;
 use model::client::AnthropicClient;
 use model::stream::{BlockDelta, ContentBlockStart, StreamEvent};
 use model::types::{
     BuiltinTool, MessageParam, MessagesRequest, SystemBlock, ThinkingConfig, ToolChoice,
 };
-use crate::web_search::{
-    SearchError, SearchOutput, SearchOutputItem, SearchProvider, SearchResult,
-};
-use base::message::{ContentBlock, Role};
-use futures::stream::StreamExt;
 use std::sync::Arc;
 
 /// Calls the provider API with a built-in web search tool (`web_search_20250305`)
@@ -164,9 +164,7 @@ impl SearchProvider for NativeSearchProvider {
 mod tests {
     use super::*;
     use model::mock::MockAnthropicClient;
-    use model::stream::{
-        ContentBlockStart, MessageDeltaPayload, MessageStartPayload, Usage,
-    };
+    use model::stream::{ContentBlockStart, MessageDeltaPayload, MessageStartPayload, Usage};
 
     fn web_search_stream(results: &[(&str, &str)]) -> Vec<StreamEvent> {
         let content: Vec<serde_json::Value> = results

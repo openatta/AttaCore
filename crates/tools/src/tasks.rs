@@ -13,8 +13,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,7 +58,8 @@ pub enum TaskStatus {
     InProgress,
     Completed,
     Cancelled,
-    Deleted}
+    Deleted,
+}
 
 impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
@@ -93,7 +96,8 @@ pub struct TaskEntry {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
     /// epoch 秒；测试稳定性考虑只看相对顺序
     pub created_at: i64,
-    pub updated_at: i64}
+    pub updated_at: i64,
+}
 
 /// 生成短 ID —— 简单 base58(uuid v4)；attacode 里没引 uuid crate（避免膨胀），
 /// 用 std::time + 计数器自滚（够给 in-memory 任务用，不需要全局唯一）
@@ -149,14 +153,17 @@ pub struct TaskCreateInput {
     pub blocks: Vec<String>,
     /// Task IDs that block this task
     #[serde(default)]
-    pub blocked_by: Vec<String>}
+    pub blocked_by: Vec<String>,
+}
 
 pub struct TaskCreateTool;
 
 #[async_trait]
 impl Tool for TaskCreateTool {
-    fn description(&self) -> &str { "Create a task in the task list" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Create a task in the task list"
+    }
+    fn name(&self) -> &str {
         "TaskCreate"
     }
 
@@ -181,7 +188,8 @@ impl Tool for TaskCreateTool {
                 ValidationResult::err("description must not be empty", 2)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()
@@ -205,8 +213,12 @@ impl Tool for TaskCreateTool {
             metadata: None,
             status: TaskStatus::Pending,
             created_at: now,
-            updated_at: now};
-        task_store().lock().unwrap_or_else(|e| e.into_inner()).push(entry.clone());
+            updated_at: now,
+        };
+        task_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(entry.clone());
         Ok(ToolResult {
             content: base::tool::ToolResultContent::Text(format!(
                 "Task created: id={} subject={}",
@@ -215,7 +227,8 @@ impl Tool for TaskCreateTool {
             is_error: false,
             structured_content: Some(json!({"id": entry.id, "task": entry})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -223,14 +236,17 @@ impl Tool for TaskCreateTool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskGetInput {
-    pub task_id: String}
+    pub task_id: String,
+}
 
 pub struct TaskGetTool;
 
 #[async_trait]
 impl Tool for TaskGetTool {
-    fn description(&self) -> &str { "Retrieve a task by ID from the task list" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Retrieve a task by ID from the task list"
+    }
+    fn name(&self) -> &str {
         "TaskGet"
     }
 
@@ -255,7 +271,8 @@ impl Tool for TaskGetTool {
                 ValidationResult::err("task_id must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()
@@ -267,7 +284,12 @@ impl Tool for TaskGetTool {
         _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: TaskGetInput = serde_json::from_value(input)?;
-        let task: Option<TaskEntry> = task_store().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|t| t.id == input.task_id).cloned();
+        let task: Option<TaskEntry> = task_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|t| t.id == input.task_id)
+            .cloned();
         match task {
             Some(t) => Ok(ToolResult {
                 content: base::tool::ToolResultContent::Text(
@@ -276,7 +298,8 @@ impl Tool for TaskGetTool {
                 is_error: false,
                 structured_content: Some(json!(t)),
                 mcp_meta: None,
-                new_messages: Some(vec![])}),
+                new_messages: Some(vec![]),
+            }),
             None => Ok(ToolResult {
                 content: base::tool::ToolResultContent::Text(format!(
                     "no task with id={}",
@@ -285,7 +308,9 @@ impl Tool for TaskGetTool {
                 is_error: true,
                 structured_content: None,
                 mcp_meta: None,
-                new_messages: Some(vec![])})}
+                new_messages: Some(vec![]),
+            }),
+        }
     }
 }
 
@@ -295,14 +320,17 @@ impl Tool for TaskGetTool {
 pub struct TaskListInput {
     /// Filter by status; None = all
     #[serde(default)]
-    pub status: Option<TaskStatus>}
+    pub status: Option<TaskStatus>,
+}
 
 pub struct TaskListTool;
 
 #[async_trait]
 impl Tool for TaskListTool {
-    fn description(&self) -> &str { "List all tasks in the task list" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "List all tasks in the task list"
+    }
+    fn name(&self) -> &str {
         "TaskList"
     }
 
@@ -334,10 +362,14 @@ impl Tool for TaskListTool {
         _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: TaskListInput = serde_json::from_value(input).unwrap_or_default();
-        let all: Vec<TaskEntry> = task_store().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let all: Vec<TaskEntry> = task_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let filtered: Vec<TaskEntry> = match input.status {
             Some(s) => all.into_iter().filter(|t| t.status == s).collect(),
-            None => all};
+            None => all,
+        };
         let summary = filtered
             .iter()
             .map(|t| {
@@ -368,7 +400,8 @@ impl Tool for TaskListTool {
             is_error: false,
             structured_content: Some(json!(filtered)),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -392,14 +425,17 @@ pub struct TaskUpdateInput {
     pub blocks: Option<Vec<String>>,
     #[serde(default)]
     #[serde(alias = "blockedBy")]
-    pub blocked_by: Option<Vec<String>>}
+    pub blocked_by: Option<Vec<String>>,
+}
 
 pub struct TaskUpdateTool;
 
 #[async_trait]
 impl Tool for TaskUpdateTool {
-    fn description(&self) -> &str { "Update task status, description, or dependencies" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Update task status, description, or dependencies"
+    }
+    fn name(&self) -> &str {
         "TaskUpdate"
     }
 
@@ -421,7 +457,8 @@ impl Tool for TaskUpdateTool {
                 ValidationResult::err("task_id must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()
@@ -436,9 +473,18 @@ impl Tool for TaskUpdateTool {
 
         // Blocking check: when transitioning to InProgress, verify blockers are resolved
         if matches!(input.status, Some(TaskStatus::InProgress)) {
-            if let Some(task) = task_store().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|t| t.id == input.task_id).cloned() {
+            if let Some(task) = task_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|t| t.id == input.task_id)
+                .cloned()
+            {
                 if !task.blocked_by.is_empty() {
-                    let all_tasks = task_store().lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let all_tasks = task_store()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let unresolved: Vec<String> = task
                         .blocked_by
                         .into_iter()
@@ -460,7 +506,8 @@ impl Tool for TaskUpdateTool {
                                 json!({"task_id": input.task_id, "blocked_by": unresolved}),
                             ),
                             mcp_meta: None,
-                            new_messages: Some(vec![])});
+                            new_messages: Some(vec![]),
+                        });
                     }
                 }
             }
@@ -478,7 +525,8 @@ impl Tool for TaskUpdateTool {
                     is_error: false,
                     structured_content: Some(json!({"task_id": input.task_id, "deleted": true})),
                     mcp_meta: None,
-                    new_messages: Some(vec![])}),
+                    new_messages: Some(vec![]),
+                }),
                 false => Ok(ToolResult {
                     content: base::tool::ToolResultContent::Text(format!(
                         "no task with id={}",
@@ -487,7 +535,9 @@ impl Tool for TaskUpdateTool {
                     is_error: true,
                     structured_content: None,
                     mcp_meta: None,
-                    new_messages: Some(vec![])})}
+                    new_messages: Some(vec![]),
+                }),
+            }
         } else {
             let updated: Option<TaskEntry> =
                 update_task_in_store(&input.task_id, |t: &mut TaskEntry| {
@@ -523,7 +573,8 @@ impl Tool for TaskUpdateTool {
                     is_error: false,
                     structured_content: Some(json!(t)),
                     mcp_meta: None,
-                    new_messages: Some(vec![])}),
+                    new_messages: Some(vec![]),
+                }),
                 None => Ok(ToolResult {
                     content: base::tool::ToolResultContent::Text(format!(
                         "no task with id={}",
@@ -532,7 +583,9 @@ impl Tool for TaskUpdateTool {
                     is_error: true,
                     structured_content: None,
                     mcp_meta: None,
-                    new_messages: Some(vec![])})}
+                    new_messages: Some(vec![]),
+                }),
+            }
         }
     }
 }
@@ -541,14 +594,17 @@ impl Tool for TaskUpdateTool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskStopInput {
-    pub task_id: String}
+    pub task_id: String,
+}
 
 pub struct TaskStopTool;
 
 #[async_trait]
 impl Tool for TaskStopTool {
-    fn description(&self) -> &str { "Stop a running background task" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Stop a running background task"
+    }
+    fn name(&self) -> &str {
         "TaskStop"
     }
 
@@ -570,7 +626,8 @@ impl Tool for TaskStopTool {
                 ValidationResult::err("task_id must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::allow()
@@ -584,10 +641,19 @@ impl Tool for TaskStopTool {
         let input: TaskStopInput = serde_json::from_value(input)?;
 
         // : 优先 cancel running task（后台 sub-agent）—— 触发 cancel token
-        if ctx.running_tasks.as_ref().map(|rt| rt.cancel(&input.task_id)).unwrap_or(false) {
+        if ctx
+            .running_tasks
+            .as_ref()
+            .map(|rt| rt.cancel(&input.task_id))
+            .unwrap_or(false)
+        {
             // 也把 status 标 Cancelled（防 sub-agent 还没收到 token 信号时
             // TaskOutput 显示 Running）
-            if let Some((_, _, _)) = ctx.running_tasks.as_ref().and_then(|rt| rt.find(&input.task_id)) {
+            if let Some((_, _, _)) = ctx
+                .running_tasks
+                .as_ref()
+                .and_then(|rt| rt.find(&input.task_id))
+            {
                 // status already returned from RunningTasksCallback; no mutation needed
             }
             return Ok(ToolResult {
@@ -598,7 +664,8 @@ impl Tool for TaskStopTool {
                 is_error: false,
                 structured_content: Some(json!({"task_id": input.task_id, "background": true})),
                 mcp_meta: None,
-                new_messages: Some(vec![])});
+                new_messages: Some(vec![]),
+            });
         }
 
         // 否则走 declarative task 路径
@@ -616,7 +683,8 @@ impl Tool for TaskStopTool {
                 is_error: false,
                 structured_content: Some(json!(t)),
                 mcp_meta: None,
-                new_messages: Some(vec![])}),
+                new_messages: Some(vec![]),
+            }),
             None => Ok(ToolResult {
                 content: base::tool::ToolResultContent::Text(format!(
                     "no task with id={}",
@@ -625,7 +693,8 @@ impl Tool for TaskStopTool {
                 is_error: true,
                 structured_content: None,
                 mcp_meta: None,
-                new_messages: Some(vec![])})}
+                new_messages: Some(vec![]),
+            }),
+        }
     }
 }
-

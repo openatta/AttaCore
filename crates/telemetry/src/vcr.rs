@@ -9,13 +9,13 @@
 //! - CI protection: missing fixture → hard error with VCR_RECORD=1 hint
 //! - Default: pass-through (zero overhead when no VCR config)
 
+use async_trait::async_trait;
 use base::interface::model::{
     Model, ModelError, ModelEvent, ModelMessage, ModelStream, StreamParams, ToolDef, Usage,
 };
 use base::interface::prompt::PromptBlock;
 use base::interface::settings::{VcrConfig, VcrMode};
 use base::provider::ApiType;
-use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -66,9 +66,17 @@ struct VcrResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum VcrChunk {
-    TextDelta { text: String },
-    ToolUse { id: String, name: String, input: serde_json::Value },
-    EndTurn { stop_reason: String },
+    TextDelta {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    EndTurn {
+        stop_reason: String,
+    },
 }
 
 impl VcrModel {
@@ -79,7 +87,13 @@ impl VcrModel {
         local_vcr_dir: PathBuf,
     ) -> Self {
         let config = config.or_else(Self::env_config);
-        Self { inner, config, user_vcr_dir, local_vcr_dir, current_turn_id: None }
+        Self {
+            inner,
+            config,
+            user_vcr_dir,
+            local_vcr_dir,
+            current_turn_id: None,
+        }
     }
 
     /// 设置当前 turn 的 ID，VCR 录制时携带此 ID 以支持按 turn 分组。
@@ -95,11 +109,23 @@ impl VcrModel {
         let in_test = std::env::var("CARGO_TEST_RUNNER").is_ok()
             || std::env::var("ATTA_VCR_AUTO_DETECT").is_ok();
         if let Ok(name) = std::env::var("ATTA_VCR_RECORD") {
-            Some(VcrConfig { mode: VcrMode::Record, scenario: name, fallback_on_miss: true })
+            Some(VcrConfig {
+                mode: VcrMode::Record,
+                scenario: name,
+                fallback_on_miss: true,
+            })
         } else if let Ok(name) = std::env::var("ATTA_VCR_REPLAY") {
-            Some(VcrConfig { mode: VcrMode::Replay, scenario: name, fallback_on_miss: true })
+            Some(VcrConfig {
+                mode: VcrMode::Replay,
+                scenario: name,
+                fallback_on_miss: true,
+            })
         } else if in_test {
-            Some(VcrConfig { mode: VcrMode::Replay, scenario: "auto".into(), fallback_on_miss: true })
+            Some(VcrConfig {
+                mode: VcrMode::Replay,
+                scenario: "auto".into(),
+                fallback_on_miss: true,
+            })
         } else {
             None
         }
@@ -111,7 +137,11 @@ impl VcrModel {
     }
 
     fn storage_dir(&self) -> &Path {
-        if self.local_vcr_dir.exists() { &self.local_vcr_dir } else { &self.user_vcr_dir }
+        if self.local_vcr_dir.exists() {
+            &self.local_vcr_dir
+        } else {
+            &self.user_vcr_dir
+        }
     }
 
     /// SHA-256 first 16 hex chars of (system_text + sorted_tool_names + model + messages).
@@ -126,13 +156,16 @@ impl VcrModel {
         h.update(system_text.as_bytes());
         let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         names.sort();
-        for n in &names { h.update(n.as_bytes()); }
+        for n in &names {
+            h.update(n.as_bytes());
+        }
         h.update(model.as_bytes());
         // Include dehydrated message contents in hash (T0.4)
         if !messages.is_empty() {
-            let msg_bodies: Vec<String> = messages.iter().map(|m| {
-                dehydrate(&format!("{:?}", m))
-            }).collect();
+            let msg_bodies: Vec<String> = messages
+                .iter()
+                .map(|m| dehydrate(&format!("{:?}", m)))
+                .collect();
             h.update(msg_bodies.join("||").as_bytes());
         }
         hex::encode(&h.finalize()[..8])
@@ -159,15 +192,21 @@ impl VcrModel {
         let path = dir.join(format!("{scenario}.jsonl"));
         let line = serde_json::to_string(entry).unwrap_or_default();
         let _ = std::fs::OpenOptions::new()
-            .create(true).append(true)
+            .create(true)
+            .append(true)
             .open(&path)
-            .map(|mut f| { use std::io::Write; let _ = writeln!(f, "{line}"); });
+            .map(|mut f| {
+                use std::io::Write;
+                let _ = writeln!(f, "{line}");
+            });
     }
 }
 
 #[async_trait]
 impl Model for VcrModel {
-    fn api_type(&self) -> ApiType { self.inner.api_type() }
+    fn api_type(&self) -> ApiType {
+        self.inner.api_type()
+    }
 
     async fn stream(
         &self,
@@ -177,31 +216,49 @@ impl Model for VcrModel {
         params: StreamParams,
         cancel: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
-        let system_text = prompt_blocks.iter().map(|b| &b.content).cloned().collect::<Vec<_>>().join("\n");
+        let system_text = prompt_blocks
+            .iter()
+            .map(|b| &b.content)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         let model_name = params.model.clone();
         // Dehydrate before hashing: replace CWD and config home for portable fixtures
         let dehydrated_system = dehydrate(&system_text);
         let req_hash = Self::hash_request(&dehydrated_system, &tools, &model_name, &messages);
 
         match &self.config {
-            Some(VcrConfig { mode: VcrMode::Replay, scenario, fallback_on_miss, .. }) => {
+            Some(VcrConfig {
+                mode: VcrMode::Replay,
+                scenario,
+                fallback_on_miss,
+                ..
+            }) => {
                 let entries = self.load_entries(scenario);
                 if let Some(entry) = entries.get(&req_hash) {
-                    let chunks: Vec<Result<ModelEvent, ModelError>> = entry.chunks.iter().map(|c| {
-                        Ok(match c {
-                            VcrChunk::TextDelta { text } => ModelEvent::TextDelta { text: hydrate(text) },
-                            VcrChunk::ToolUse { id, name, input } => ModelEvent::ToolUse {
-                                id: id.clone(), name: name.clone(), input: input.clone(),
-                            },
-                            VcrChunk::EndTurn { stop_reason } => ModelEvent::EndTurn {
-                                stop_reason: stop_reason.clone(),
-                                usage: Usage {
-                                    input_tokens: entry.response.input_tokens,
-                                    output_tokens: entry.response.output_tokens,
+                    let chunks: Vec<Result<ModelEvent, ModelError>> = entry
+                        .chunks
+                        .iter()
+                        .map(|c| {
+                            Ok(match c {
+                                VcrChunk::TextDelta { text } => ModelEvent::TextDelta {
+                                    text: hydrate(text),
                                 },
-                            },
+                                VcrChunk::ToolUse { id, name, input } => ModelEvent::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                },
+                                VcrChunk::EndTurn { stop_reason } => ModelEvent::EndTurn {
+                                    stop_reason: stop_reason.clone(),
+                                    usage: Usage {
+                                        input_tokens: entry.response.input_tokens,
+                                        output_tokens: entry.response.output_tokens,
+                                    },
+                                },
+                            })
                         })
-                    }).collect();
+                        .collect();
                     return Ok(Box::new(futures::stream::iter(chunks)));
                 }
                 if !fallback_on_miss {
@@ -211,11 +268,16 @@ impl Model for VcrModel {
                 }
                 // fallback_on_miss: pass through to real API
             }
-            Some(VcrConfig { mode: VcrMode::Record, scenario, .. }) => {
+            Some(VcrConfig {
+                mode: VcrMode::Record,
+                scenario,
+                ..
+            }) => {
                 let mut chunks: Vec<VcrChunk> = Vec::new();
-                let inner_stream = self.inner.stream(
-                    prompt_blocks, tools.clone(), messages, params, cancel,
-                ).await?;
+                let inner_stream = self
+                    .inner
+                    .stream(prompt_blocks, tools.clone(), messages, params, cancel)
+                    .await?;
                 tokio::pin!(inner_stream);
                 let captured: Vec<Result<ModelEvent, ModelError>> = inner_stream.collect().await;
 
@@ -232,41 +294,54 @@ impl Model for VcrModel {
                                 _ => chunks.push(VcrChunk::TextDelta { text: t }),
                             }
                         }
-                        ModelEvent::ToolUse { id, name, input } => {
-                            chunks.push(VcrChunk::ToolUse { id: id.clone(), name: name.clone(), input: input.clone() })
-                        }
-                        ModelEvent::EndTurn { stop_reason: sr, usage: u } => {
+                        ModelEvent::ToolUse { id, name, input } => chunks.push(VcrChunk::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        }),
+                        ModelEvent::EndTurn {
+                            stop_reason: sr,
+                            usage: u,
+                        } => {
                             stop_reason = sr.clone();
                             usage = u.clone();
-                            chunks.push(VcrChunk::EndTurn { stop_reason: sr.clone() });
+                            chunks.push(VcrChunk::EndTurn {
+                                stop_reason: sr.clone(),
+                            });
                         }
                         _ => {}
                     }
                 }
-                self.save_entry(scenario, &VcrEntry {
-                    request_hash: req_hash,
-                    turn_id: self.current_turn_id.clone(),
-                    request: VcrRequest {
-                        system_text: dehydrated_system,
-                        model: model_name,
-                        tools: tools.iter().map(|t| t.name.clone()).collect(),
-                        messages_count: 0,
+                self.save_entry(
+                    scenario,
+                    &VcrEntry {
+                        request_hash: req_hash,
+                        turn_id: self.current_turn_id.clone(),
+                        request: VcrRequest {
+                            system_text: dehydrated_system,
+                            model: model_name,
+                            tools: tools.iter().map(|t| t.name.clone()).collect(),
+                            messages_count: 0,
+                        },
+                        response: VcrResponse {
+                            stop_reason,
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                        },
+                        chunks,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
                     },
-                    response: VcrResponse {
-                        stop_reason,
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                    },
-                    chunks,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default().as_millis() as u64,
-                });
+                );
                 return Ok(Box::new(futures::stream::iter(captured)));
             }
             None => {}
         }
-        self.inner.stream(prompt_blocks, tools, messages, params, cancel).await
+        self.inner
+            .stream(prompt_blocks, tools, messages, params, cancel)
+            .await
     }
 }
 
@@ -281,52 +356,85 @@ use std::sync::LazyLock;
 /// These replacements ensure the VCR hash is stable across machines and runs,
 /// so recorded fixtures can be used for cross-version regression testing.
 fn dehydrate(s: &str) -> String {
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".into());
-    let mut result = s
-        .replace(&cwd, "[CWD]")
-        .replace(&home, "[HOME]");
+    let mut result = s.replace(&cwd, "[CWD]").replace(&home, "[HOME]");
 
     // ── Numeric / counters ──
-    static RE_NUM_FILES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"num_files="\d+""#).unwrap());
-    static RE_DURATION_MS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"duration_ms="\d+""#).unwrap());
-    static RE_COST_USD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"cost_usd="[\d.]+""#).unwrap());
-    result = RE_NUM_FILES.replace_all(&result, r#"num_files="[NUM]""#).to_string();
-    result = RE_DURATION_MS.replace_all(&result, r#"duration_ms="[DURATION]""#).to_string();
-    result = RE_COST_USD.replace_all(&result, r#"cost_usd="[COST]""#).to_string();
+    static RE_NUM_FILES: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"num_files="\d+""#).unwrap());
+    static RE_DURATION_MS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"duration_ms="\d+""#).unwrap());
+    static RE_COST_USD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"cost_usd="[\d.]+""#).unwrap());
+    result = RE_NUM_FILES
+        .replace_all(&result, r#"num_files="[NUM]""#)
+        .to_string();
+    result = RE_DURATION_MS
+        .replace_all(&result, r#"duration_ms="[DURATION]""#)
+        .to_string();
+    result = RE_COST_USD
+        .replace_all(&result, r#"cost_usd="[COST]""#)
+        .to_string();
 
     // ── Lists / dynamic content ──
-    static RE_COMMANDS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Available commands: .+").unwrap());
-    static RE_FILES_MODIFIED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Files modified by user: .+").unwrap());
-    result = RE_COMMANDS.replace_all(&result, "Available commands: [COMMANDS]").to_string();
-    result = RE_FILES_MODIFIED.replace_all(&result, "Files modified by user: [FILES]").to_string();
+    static RE_COMMANDS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Available commands: .+").unwrap());
+    static RE_FILES_MODIFIED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Files modified by user: .+").unwrap());
+    result = RE_COMMANDS
+        .replace_all(&result, "Available commands: [COMMANDS]")
+        .to_string();
+    result = RE_FILES_MODIFIED
+        .replace_all(&result, "Files modified by user: [FILES]")
+        .to_string();
 
     // ── Environment (cross-run stable) ──
     static RE_DATE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Date: \S+").unwrap());
-    static RE_OS_VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"OS Version: \S[^\n]*").unwrap());
-    static RE_GIT_BRANCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Git branch: \S[^\n]*").unwrap());
-    static RE_GIT_STATUS_BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"gitStatus: [^\n]*(\n\s*[^\n]*)*").unwrap());
-    static RE_KNOWLEDGE_CUTOFF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(Assistant )?knowledge cutoff is \S[^\n.]*").unwrap());
-    static RE_POWERED_BY_MODEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"You are powered by the model \S[^\n]*").unwrap());
-    static RE_MODEL_DESC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"The most recent Claude models are [^\n]*").unwrap());
+    static RE_OS_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"OS Version: \S[^\n]*").unwrap());
+    static RE_GIT_BRANCH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Git branch: \S[^\n]*").unwrap());
+    static RE_GIT_STATUS_BLOCK: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"gitStatus: [^\n]*(\n\s*[^\n]*)*").unwrap());
+    static RE_KNOWLEDGE_CUTOFF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(Assistant )?knowledge cutoff is \S[^\n.]*").unwrap());
+    static RE_POWERED_BY_MODEL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"You are powered by the model \S[^\n]*").unwrap());
+    static RE_MODEL_DESC: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"The most recent Claude models are [^\n]*").unwrap());
 
     result = RE_DATE.replace_all(&result, "Date: [DATE]").to_string();
-    result = RE_OS_VERSION.replace_all(&result, "OS Version: [OS]").to_string();
-    result = RE_GIT_BRANCH.replace_all(&result, "Git branch: [BRANCH]").to_string();
-    result = RE_GIT_STATUS_BLOCK.replace_all(&result, "gitStatus: [GIT_STATUS]").to_string();
-    result = RE_KNOWLEDGE_CUTOFF.replace_all(&result, "knowledge cutoff is [CUTOFF]").to_string();
-    result = RE_POWERED_BY_MODEL.replace_all(&result, "You are powered by the model [MODEL]").to_string();
-    result = RE_MODEL_DESC.replace_all(&result, "The most recent Claude models are [MODELS]").to_string();
+    result = RE_OS_VERSION
+        .replace_all(&result, "OS Version: [OS]")
+        .to_string();
+    result = RE_GIT_BRANCH
+        .replace_all(&result, "Git branch: [BRANCH]")
+        .to_string();
+    result = RE_GIT_STATUS_BLOCK
+        .replace_all(&result, "gitStatus: [GIT_STATUS]")
+        .to_string();
+    result = RE_KNOWLEDGE_CUTOFF
+        .replace_all(&result, "knowledge cutoff is [CUTOFF]")
+        .to_string();
+    result = RE_POWERED_BY_MODEL
+        .replace_all(&result, "You are powered by the model [MODEL]")
+        .to_string();
+    result = RE_MODEL_DESC
+        .replace_all(&result, "The most recent Claude models are [MODELS]")
+        .to_string();
     result
 }
 
 /// Replace placeholders with machine-specific paths.
 fn hydrate(s: &str) -> String {
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".into());
-    let mut result = s
-        .replace("[CWD]", &cwd)
-        .replace("[HOME]", &home);
+    let mut result = s.replace("[CWD]", &cwd).replace("[HOME]", &home);
     // Numerical placeholders → non-zero dummy values (TS parity)
     result = result.replace("[NUM]", "1");
     result = result.replace("[DURATION]", "100");
@@ -357,11 +465,17 @@ where
     Fut: std::future::Future<Output = Result<Vec<Result<ModelEvent, ModelError>>, ModelError>>,
 {
     match &vcr_model.config {
-        Some(VcrConfig { mode: VcrMode::Replay, .. }) => {
+        Some(VcrConfig {
+            mode: VcrMode::Replay,
+            ..
+        }) => {
             // Replay handled by VcrModel::stream — just delegate
             f().await
         }
-        Some(VcrConfig { mode: VcrMode::Record, .. }) => {
+        Some(VcrConfig {
+            mode: VcrMode::Record,
+            ..
+        }) => {
             // Record: execution happens in VcrModel::stream
             f().await
         }
@@ -403,17 +517,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl base::interface::model::Model for MockModel {
-        fn api_type(&self) -> base::provider::ApiType { base::provider::ApiType::Anthropic }
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
         async fn stream(
-            &self, _: Vec<base::interface::prompt::PromptBlock>,
+            &self,
+            _: Vec<base::interface::prompt::PromptBlock>,
             _: Vec<base::interface::model::ToolDef>,
             _: Vec<base::interface::model::ModelMessage>,
             _: base::interface::model::StreamParams,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError> {
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
             Ok(Box::new(futures::stream::iter(vec![
-                Ok(ModelEvent::TextDelta { text: "Hello, World!".into() }),
-                Ok(ModelEvent::EndTurn { stop_reason: "end_turn".into(), usage: Default::default() }),
+                Ok(ModelEvent::TextDelta {
+                    text: "Hello, World!".into(),
+                }),
+                Ok(ModelEvent::EndTurn {
+                    stop_reason: "end_turn".into(),
+                    usage: Default::default(),
+                }),
             ])))
         }
     }
@@ -462,27 +585,48 @@ mod tests {
             content: "You are a helpful assistant.".into(),
             cache_strategy: None,
         }];
-        let tools: Vec<base::interface::model::ToolDef> = vec![
-            base::interface::model::ToolDef { name: "Bash".into(), description: "Run shell".into(), input_schema: serde_json::json!({}) },
-        ];
+        let tools: Vec<base::interface::model::ToolDef> = vec![base::interface::model::ToolDef {
+            name: "Bash".into(),
+            description: "Run shell".into(),
+            input_schema: serde_json::json!({}),
+        }];
         let messages: Vec<base::interface::model::ModelMessage> = vec![];
         let params = base::interface::model::StreamParams {
-            model: "test-model".into(), max_tokens: 100,
+            model: "test-model".into(),
+            max_tokens: 100,
             thinking_mode: base::interface::settings::ThinkingMode::Off,
-            fallback_model: None, cache_edits: vec![],
+            fallback_model: None,
+            cache_edits: vec![],
         };
         let cancel = tokio_util::sync::CancellationToken::new();
 
         // Phase 1: Record
         let mock: Arc<dyn base::interface::model::Model> = Arc::new(MockModel);
         let record_vcr = VcrModel::new(
-            mock, Some(VcrConfig { mode: VcrMode::Record, scenario: scenario.into(), fallback_on_miss: true }),
-            PathBuf::from("/tmp/atta_vcr_nonexistent"), dir.clone(),
+            mock,
+            Some(VcrConfig {
+                mode: VcrMode::Record,
+                scenario: scenario.into(),
+                fallback_on_miss: true,
+            }),
+            PathBuf::from("/tmp/atta_vcr_nonexistent"),
+            dir.clone(),
         );
-        let mut stream = record_vcr.stream(prompt.clone(), tools.clone(), messages.clone(), params.clone(), cancel.clone()).await.unwrap();
+        let mut stream = record_vcr
+            .stream(
+                prompt.clone(),
+                tools.clone(),
+                messages.clone(),
+                params.clone(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
         let mut text = String::new();
         while let Some(e) = futures::StreamExt::next(&mut stream).await {
-            if let Ok(ModelEvent::TextDelta { text: t }) = e { text.push_str(&t); }
+            if let Ok(ModelEvent::TextDelta { text: t }) = e {
+                text.push_str(&t);
+            }
         }
         assert_eq!(text, "Hello, World!");
         assert!(fixture.exists(), "fixture should exist after record");
@@ -491,20 +635,41 @@ mod tests {
         struct Panic;
         #[async_trait::async_trait]
         impl base::interface::model::Model for Panic {
-            fn api_type(&self) -> base::provider::ApiType { base::provider::ApiType::Anthropic }
-            async fn stream(&self, _: Vec<base::interface::prompt::PromptBlock>, _: Vec<base::interface::model::ToolDef>, _: Vec<base::interface::model::ModelMessage>, _: base::interface::model::StreamParams, _: tokio_util::sync::CancellationToken) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError> {
+            fn api_type(&self) -> base::provider::ApiType {
+                base::provider::ApiType::Anthropic
+            }
+            async fn stream(
+                &self,
+                _: Vec<base::interface::prompt::PromptBlock>,
+                _: Vec<base::interface::model::ToolDef>,
+                _: Vec<base::interface::model::ModelMessage>,
+                _: base::interface::model::StreamParams,
+                _: tokio_util::sync::CancellationToken,
+            ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+            {
                 panic!("should not be called");
             }
         }
 
         let replay_vcr = VcrModel::new(
-            Arc::new(Panic), Some(VcrConfig { mode: VcrMode::Replay, scenario: scenario.into(), fallback_on_miss: false }),
-            PathBuf::from("/tmp/atta_vcr_nonexistent"), dir,
+            Arc::new(Panic),
+            Some(VcrConfig {
+                mode: VcrMode::Replay,
+                scenario: scenario.into(),
+                fallback_on_miss: false,
+            }),
+            PathBuf::from("/tmp/atta_vcr_nonexistent"),
+            dir,
         );
-        let mut stream = replay_vcr.stream(prompt, tools, messages, params, cancel).await.unwrap();
+        let mut stream = replay_vcr
+            .stream(prompt, tools, messages, params, cancel)
+            .await
+            .unwrap();
         let mut text = String::new();
         while let Some(e) = futures::StreamExt::next(&mut stream).await {
-            if let Ok(ModelEvent::TextDelta { text: t }) = e { text.push_str(&t); }
+            if let Ok(ModelEvent::TextDelta { text: t }) = e {
+                text.push_str(&t);
+            }
         }
         assert_eq!(text, "Hello, World!", "replay should return same text");
     }

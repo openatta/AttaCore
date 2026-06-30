@@ -17,8 +17,8 @@ use notify::event::{Event, EventKind};
 use notify::{recommended_watcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing;
 

@@ -3,12 +3,12 @@
 
 pub mod agent_registry;
 pub mod bundled;
+pub mod cache;
+pub mod cli;
 pub mod homograph;
 pub mod manifest;
 pub mod marketplace;
 pub mod resolver;
-pub mod cache;
-pub mod cli;
 
 pub use manifest::{Plugin, PluginError, PluginManifest, SlashEntry};
 

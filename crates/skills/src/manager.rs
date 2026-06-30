@@ -34,6 +34,8 @@ pub struct SkillInfo {
     pub user_invocable: bool,
     /// Version string
     pub version: Option<String>,
+    /// v2.0.0: Skill-driven hook rules for PolicyHook enforcement.
+    pub hook_rules: Option<Vec<base::frozen::skill::SkillHookRule>>,
 }
 
 impl From<SkillEntry> for SkillInfo {
@@ -51,6 +53,7 @@ impl From<SkillEntry> for SkillInfo {
             disable_model_invocation: e.disable_model_invocation,
             user_invocable: e.user_invocable,
             version: e.version,
+            hook_rules: e.hook_rules,
         }
     }
 }
@@ -177,32 +180,37 @@ impl SkillManager {
             let mut current = if path.is_dir() {
                 path.clone()
             } else {
-                path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
             };
             // Walk up to filesystem root
             loop {
                 let candidate = current.join("skills");
                 if candidate.is_dir() && seen_dirs.insert(candidate.clone()) {
-                        if let Ok(entries) = std::fs::read_dir(&candidate) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_dir() {
-                                    let skill_md = p.join("SKILL.md");
-                                    if skill_md.is_file() {
-                                        let dir_name = p
-                                            .file_name()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let info =
-                                            Self::load_skill_at_path(&skill_md, &dir_name, SkillSource::Project);
-                                        if let Some(info) = info {
-                                            discovered.push(info);
-                                        }
+                    if let Ok(entries) = std::fs::read_dir(&candidate) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                let skill_md = p.join("SKILL.md");
+                                if skill_md.is_file() {
+                                    let dir_name = p
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let info = Self::load_skill_at_path(
+                                        &skill_md,
+                                        &dir_name,
+                                        SkillSource::Project,
+                                    );
+                                    if let Some(info) = info {
+                                        discovered.push(info);
                                     }
                                 }
                             }
                         }
+                    }
                 }
                 match current.parent() {
                     Some(parent) if parent != current => current = parent.to_path_buf(),
@@ -249,10 +257,7 @@ impl SkillManager {
     /// - `?`  matches any single character except `/`
     /// - Leading `/` anchors the pattern to the root of the path
     /// - Trailing `/` is ignored for file-path matching
-    pub fn activate_conditional_skills_for_paths(
-        &self,
-        file_paths: &[PathBuf],
-    ) -> Vec<SkillInfo> {
+    pub fn activate_conditional_skills_for_paths(&self, file_paths: &[PathBuf]) -> Vec<SkillInfo> {
         if file_paths.is_empty() {
             return Vec::new();
         }
@@ -261,7 +266,9 @@ impl SkillManager {
         let mut activated = Vec::new();
 
         'skill: for info in skills.values() {
-            let Some(patterns) = &info.paths else { continue };
+            let Some(patterns) = &info.paths else {
+                continue;
+            };
             if patterns.is_empty() {
                 continue;
             }
@@ -388,8 +395,7 @@ impl SkillManager {
         }
 
         // Determine skill name from path
-        let (name, _file_name) = if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md")
-        {
+        let (name, _file_name) = if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
             // Subdirectory format: skills/<name>/SKILL.md
             let name = path
                 .parent()
@@ -431,9 +437,8 @@ impl SkillManager {
 
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("Failed to read skill: {e}"))?;
-        let entry = parse_skill_file(&content, name.clone(), path, frozen_source).ok_or_else(
-            || format!("Failed to parse skill file: {}", path.display()),
-        )?;
+        let entry = parse_skill_file(&content, name.clone(), path, frozen_source)
+            .ok_or_else(|| format!("Failed to parse skill file: {}", path.display()))?;
 
         let mut skills = self.skills.write().unwrap();
         skills.insert(name, SkillInfo::from(entry));
@@ -526,7 +531,10 @@ mod tests {
             ..Default::default()
         };
         mgr.register_bundled(bundled);
-        assert_eq!(mgr.get("test-skill").unwrap().description, "bundled version");
+        assert_eq!(
+            mgr.get("test-skill").unwrap().description,
+            "bundled version"
+        );
 
         // Load a disk skill with the same name — should override
         let dir = tempfile::tempdir().unwrap();
@@ -580,23 +588,20 @@ mod tests {
         mgr.register_bundled(skill_empty_paths);
 
         // Matching .rs files
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/tmp/project/src/main.rs"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/tmp/project/src/main.rs")]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "rust-helper");
 
         // Matching Cargo.toml files
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/tmp/project/Cargo.toml"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/tmp/project/Cargo.toml")]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "rust-helper");
 
         // Non-matching paths
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/tmp/project/README.md"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/tmp/project/README.md")]);
         assert_eq!(result.len(), 0);
 
         // Empty file_paths returns empty
@@ -622,21 +627,19 @@ mod tests {
         // with literal_separator expects .claude as an immediate child of the
         // path root. Paths like /.claude/settings.json match because .claude
         // sits at the root of the path string.
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from(".claude/settings.json"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from(".claude/settings.json")]);
         assert_eq!(result.len(), 1);
 
         // No match: file not under .claude/
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/project/src/main.rs"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/project/src/main.rs")]);
         assert_eq!(result.len(), 0);
 
         // Deep path with .claude is not matched by /.claude/* anchoring
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/project/.claude/settings.json"),
-        ]);
+        let result = mgr.activate_conditional_skills_for_paths(&[PathBuf::from(
+            "/project/.claude/settings.json",
+        )]);
         assert_eq!(result.len(), 0);
     }
 

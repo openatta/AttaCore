@@ -37,7 +37,9 @@ pub struct DurableMemory {
     pub recall_count: u32,
 }
 
-fn default_confidence() -> f64 { 0.8 }
+fn default_confidence() -> f64 {
+    0.8
+}
 
 impl DurableMemory {
     /// Compute a staleness penalty (0.0–1.0) based on time since last update.
@@ -124,7 +126,10 @@ pub const INDEX_FILE: &str = "MEMORY.md";
 
 impl MemoryStore {
     pub fn new(user_dir: PathBuf, local_dir: PathBuf) -> Self {
-        Self { user_dir, local_dir }
+        Self {
+            user_dir,
+            local_dir,
+        }
     }
 
     /// Load all memories from both directories (local overrides user on same name).
@@ -201,10 +206,16 @@ impl MemoryStore {
         }
         // Rebuild indices
         if !user_mems.is_empty() {
-            Self::rebuild_index(&self.user_dir, &Self::merge_with_existing(&self.user_dir, &user_mems))?;
+            Self::rebuild_index(
+                &self.user_dir,
+                &Self::merge_with_existing(&self.user_dir, &user_mems),
+            )?;
         }
         if !local_mems.is_empty() {
-            Self::rebuild_index(&self.local_dir, &Self::merge_with_existing(&self.local_dir, &local_mems))?;
+            Self::rebuild_index(
+                &self.local_dir,
+                &Self::merge_with_existing(&self.local_dir, &local_mems),
+            )?;
         }
         Ok(total)
     }
@@ -214,9 +225,7 @@ impl MemoryStore {
         self.load_all()
             .into_iter()
             .filter(|m| {
-                m.name.contains(query)
-                    || m.description.contains(query)
-                    || m.content.contains(query)
+                m.name.contains(query) || m.description.contains(query) || m.content.contains(query)
             })
             .collect()
     }
@@ -253,7 +262,9 @@ impl MemoryStore {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if p.extension().is_some_and(|e| e == "md") && p.file_name() != Some(std::ffi::OsStr::new(INDEX_FILE)) {
+                        if p.extension().is_some_and(|e| e == "md")
+                            && p.file_name() != Some(std::ffi::OsStr::new(INDEX_FILE))
+                        {
                             let _ = std::fs::remove_file(&p);
                         }
                     }
@@ -318,23 +329,24 @@ impl MemoryStore {
         let memory_type: MemoryType;
 
         if let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
-            name = parsed.get("name")
+            name = parsed
+                .get("name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())?;
-            description = parsed.get("description")
+            description = parsed
+                .get("description")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_default();
             // Look for flat "type:" field first (new format).
             // Fall back to nested "metadata.type:" for backward compatibility
             // with files written by the old write_memory_file.
-            let type_str = parsed.get("type")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    parsed.get("metadata")
-                        .and_then(|v| v.get("type"))
-                        .and_then(|v| v.as_str())
-                });
+            let type_str = parsed.get("type").and_then(|v| v.as_str()).or_else(|| {
+                parsed
+                    .get("metadata")
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+            });
             memory_type = type_str
                 .map(|t| match t {
                     "user" => MemoryType::User,
@@ -397,11 +409,7 @@ impl MemoryStore {
             mem.description,
             mem.memory_type.as_str(),
         );
-        let frontmatter = format!(
-            "---\n{}---\n\n{}",
-            frontmatter_fields,
-            mem.content,
-        );
+        let frontmatter = format!("---\n{}---\n\n{}", frontmatter_fields, mem.content,);
         std::fs::write(&path, frontmatter).map_err(|e| MemoryError::Io(e.to_string()))?;
         Ok(())
     }
@@ -416,8 +424,7 @@ impl MemoryStore {
                 mem.name, mem.name, mem.description
             ));
         }
-        std::fs::write(md.join(INDEX_FILE), index)
-            .map_err(|e| MemoryError::Io(e.to_string()))?;
+        std::fs::write(md.join(INDEX_FILE), index).map_err(|e| MemoryError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -484,7 +491,13 @@ fn extract_yaml_field_nested(
 /// Prevents path traversal and filesystem issues.
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -818,7 +831,9 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
     let request_messages = vec![
         ModelMessage {
             role: MessageRole::User,
-            content: vec![ModelContentBlock::Text { text: system_prompt.into() }],
+            content: vec![ModelContentBlock::Text {
+                text: system_prompt.into(),
+            }],
         },
         ModelMessage {
             role: MessageRole::User,
@@ -835,7 +850,13 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
     };
 
     let stream_result = model
-        .stream(vec![], vec![], request_messages, params, tokio_util::sync::CancellationToken::new())
+        .stream(
+            vec![],
+            vec![],
+            request_messages,
+            params,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await;
 
     let Ok(mut stream) = stream_result else {
@@ -949,7 +970,10 @@ It can have multiple lines."#;
         assert_eq!(mem.name, "test-memory");
         assert_eq!(mem.description, "A test memory");
         assert_eq!(mem.memory_type, MemoryType::Project);
-        assert_eq!(mem.content, "This is the content of the memory.\nIt can have multiple lines.");
+        assert_eq!(
+            mem.content,
+            "This is the content of the memory.\nIt can have multiple lines."
+        );
     }
 
     #[test]
@@ -1033,7 +1057,10 @@ This memory was written before the flat-format fix."#;
         let mem = MemoryStore::parse_memory_file(raw).unwrap();
         assert_eq!(mem.name, "old-format");
         assert_eq!(mem.memory_type, MemoryType::Feedback);
-        assert_eq!(mem.content, "This memory was written before the flat-format fix.");
+        assert_eq!(
+            mem.content,
+            "This memory was written before the flat-format fix."
+        );
     }
 
     #[test]

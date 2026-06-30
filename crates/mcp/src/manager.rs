@@ -35,7 +35,10 @@ pub enum McpServerState {
     Connected,
     Failed,
     NeedsAuth,
-    Pending { reconnect_attempt: u32, max_reconnect_attempts: u32 },
+    Pending {
+        reconnect_attempt: u32,
+        max_reconnect_attempts: u32,
+    },
     Disabled,
 }
 
@@ -135,7 +138,7 @@ impl McpManager {
     /// Returns true if the tool is allowed, false if blocked by per-server rules.
     pub fn is_tool_allowed(&self, server: &str, tool_name: &str) -> bool {
         match self.tool_permissions.get(server) {
-            None => true, // No rules → allow all
+            None => true,                                // No rules → allow all
             Some(allowed) if allowed.is_empty() => true, // Empty list → allow all
             Some(allowed) => allowed.iter().any(|t| t == tool_name),
         }

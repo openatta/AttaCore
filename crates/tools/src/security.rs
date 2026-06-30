@@ -67,7 +67,9 @@ pub fn canonicalize_best_effort(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| {
         // On non-existent paths, resolve parent and append
         if let Some(parent) = p.parent() {
-            let parent_ok = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+            let parent_ok = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
             parent_ok.join(p.file_name().unwrap_or_default())
         } else {
             p.to_path_buf()
@@ -96,22 +98,38 @@ mod tests {
 // ── Write policy types ──
 
 #[derive(Debug, Clone)]
-pub enum PathSafetyError { OutsideAllowedRoots { path: PathBuf, allowed: Vec<PathBuf> }, Other(String) }
+pub enum PathSafetyError {
+    OutsideAllowedRoots {
+        path: PathBuf,
+        allowed: Vec<PathBuf>,
+    },
+    Other(String),
+}
 
 #[derive(Debug, Clone)]
-pub struct WritePolicy { roots: Vec<PathBuf> }
+pub struct WritePolicy {
+    roots: Vec<PathBuf>,
+}
 impl WritePolicy {
-    pub fn new(cwd: PathBuf) -> Self { Self { roots: vec![cwd] } }
-    pub fn with_additional_roots(mut self, roots: Vec<PathBuf>) -> Self { self.roots.extend(roots); self }
+    pub fn new(cwd: PathBuf) -> Self {
+        Self { roots: vec![cwd] }
+    }
+    pub fn with_additional_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.roots.extend(roots);
+        self
+    }
 }
 
 pub fn check_write(path: &Path, policy: &WritePolicy) -> Result<(), PathSafetyError> {
     let resolved = canonicalize_best_effort(path);
     for root in &policy.roots {
-        if resolved.starts_with(canonicalize_best_effort(root)) { return Ok(()); }
+        if resolved.starts_with(canonicalize_best_effort(root)) {
+            return Ok(());
+        }
     }
     Err(PathSafetyError::OutsideAllowedRoots {
-        path: path.to_path_buf(), allowed: policy.roots.clone(),
+        path: path.to_path_buf(),
+        allowed: policy.roots.clone(),
     })
 }
 
@@ -123,11 +141,14 @@ pub fn normalize_path_lexically(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
-            Component::ParentDir => { out.pop(); }
+            Component::ParentDir => {
+                out.pop();
+            }
             Component::CurDir => {}
-            other => { out.push(other); }
+            other => {
+                out.push(other);
+            }
         }
     }
     out
 }
-

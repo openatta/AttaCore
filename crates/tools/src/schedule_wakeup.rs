@@ -62,7 +62,9 @@ impl Tool for ScheduleWakeupTool {
         match serde_json::from_value::<ScheduleWakeupInput>(input.clone()) {
             Ok(p) if p.delay_seconds < MIN_DELAY_SECONDS || p.delay_seconds > MAX_DELAY_SECONDS => {
                 ValidationResult::err(
-                    format!("delaySeconds must be between {MIN_DELAY_SECONDS} and {MAX_DELAY_SECONDS}"),
+                    format!(
+                        "delaySeconds must be between {MIN_DELAY_SECONDS} and {MAX_DELAY_SECONDS}"
+                    ),
                     1,
                 )
             }
@@ -88,7 +90,9 @@ impl Tool for ScheduleWakeupTool {
         _progress: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: ScheduleWakeupInput = serde_json::from_value(input)?;
-        let delay = input.delay_seconds.clamp(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS);
+        let delay = input
+            .delay_seconds
+            .clamp(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS);
         Ok(ToolResult {
             content: ToolResultContent::Text(format!(
                 "Scheduled wakeup in {}s: {}",
@@ -209,9 +213,7 @@ mod tests {
     #[tokio::test]
     async fn check_permissions_always_allows() {
         let tool = ScheduleWakeupTool;
-        let r = tool
-            .check_permissions(&Value::Null, &test_ctx())
-            .await;
+        let r = tool.check_permissions(&Value::Null, &test_ctx()).await;
         assert!(matches!(r, PermissionDecision::Allow { .. }));
     }
 
@@ -238,7 +240,9 @@ mod tests {
         }
 
         // Check structured content
-        let structured = result.structured_content.expect("structured_content should be present");
+        let structured = result
+            .structured_content
+            .expect("structured_content should be present");
         assert_eq!(structured["delay_seconds"], 300);
         assert_eq!(structured["reason"], "check CI status");
         assert_eq!(structured["prompt"], "continue checking");
@@ -256,7 +260,9 @@ mod tests {
             .await
             .expect("call should succeed");
 
-        let structured = result.structured_content.expect("structured_content should be present");
+        let structured = result
+            .structured_content
+            .expect("structured_content should be present");
         assert_eq!(structured["delay_seconds"], MAX_DELAY_SECONDS);
     }
 
@@ -272,7 +278,9 @@ mod tests {
             .await
             .expect("call should succeed");
 
-        let structured = result.structured_content.expect("structured_content should be present");
+        let structured = result
+            .structured_content
+            .expect("structured_content should be present");
         assert_eq!(structured["delay_seconds"], MIN_DELAY_SECONDS);
     }
 
@@ -282,6 +290,9 @@ mod tests {
         let schema = tool.input_schema();
         // The schema should reference delaySeconds somewhere
         let schema_str = serde_json::to_string(&schema).unwrap();
-        assert!(schema_str.contains("delaySeconds"), "schema should contain camelCase field 'delaySeconds'");
+        assert!(
+            schema_str.contains("delaySeconds"),
+            "schema should contain camelCase field 'delaySeconds'"
+        );
     }
 }

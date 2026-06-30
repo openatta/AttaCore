@@ -154,10 +154,7 @@ mod tests {
         let t2 = perf.checkpoint("second");
 
         assert!(t1 >= 0.0, "first checkpoint should be non-negative");
-        assert!(
-            t2 > t1,
-            "second checkpoint ({t2}) should be > first ({t1})"
-        );
+        assert!(t2 > t1, "second checkpoint ({t2}) should be > first ({t1})");
 
         let snapshot = perf.checkpoint_snapshot();
         assert_eq!(snapshot.len(), 2);

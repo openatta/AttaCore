@@ -44,23 +44,46 @@ pub fn write_reports(
 
     let summary = JsonSummary {
         total: comparisons.len(),
-        passed: comparisons.iter().filter(|c| c.verdict == Verdict::Pass).count(),
-        failed: comparisons.iter().filter(|c| c.verdict == Verdict::Fail).count(),
-        partial: comparisons.iter().filter(|c| c.verdict == Verdict::Partial).count(),
-        skipped: comparisons.iter().filter(|c| c.verdict == Verdict::Skipped).count(),
+        passed: comparisons
+            .iter()
+            .filter(|c| c.verdict == Verdict::Pass)
+            .count(),
+        failed: comparisons
+            .iter()
+            .filter(|c| c.verdict == Verdict::Fail)
+            .count(),
+        partial: comparisons
+            .iter()
+            .filter(|c| c.verdict == Verdict::Partial)
+            .count(),
+        skipped: comparisons
+            .iter()
+            .filter(|c| c.verdict == Verdict::Skipped)
+            .count(),
     };
 
     // JSON report
     let json = JsonReport {
         case: case.source_path.clone(),
         meta: case.meta.clone(),
-        turns: comparisons.iter().map(|c| JsonTurn {
-            index: c.turn_index,
-            input: case.turns.get(c.turn_index).map(|t| t.input.clone()).unwrap_or_default(),
-            expected: case.turns.get(c.turn_index).map(|t| t.expected.clone()).unwrap_or_default(),
-            verdict: format!("{:?}", c.verdict).to_lowercase(),
-            reasoning: c.reasoning.clone(),
-        }).collect(),
+        turns: comparisons
+            .iter()
+            .map(|c| JsonTurn {
+                index: c.turn_index,
+                input: case
+                    .turns
+                    .get(c.turn_index)
+                    .map(|t| t.input.clone())
+                    .unwrap_or_default(),
+                expected: case
+                    .turns
+                    .get(c.turn_index)
+                    .map(|t| t.expected.clone())
+                    .unwrap_or_default(),
+                verdict: format!("{:?}", c.verdict).to_lowercase(),
+                reasoning: c.reasoning.clone(),
+            })
+            .collect(),
         summary,
     };
     let json_path = out_dir.join(format!("{stem}.report.json"));
@@ -71,11 +94,20 @@ pub fn write_reports(
     md.push_str(&format!("# Test Report: {}\n\n", stem));
     md.push_str(&format!("{}\n\n", case.meta));
     md.push_str("## Summary\n\n");
-    md.push_str(&format!("| total | passed | failed | partial | skipped |\n"));
-    md.push_str(&format!("|-------|--------|--------|---------|---------|\n"));
-    md.push_str(&format!("| {} | {} | {} | {} | {} |\n\n",
-        json.summary.total, json.summary.passed, json.summary.failed,
-        json.summary.partial, json.summary.skipped));
+    md.push_str(&format!(
+        "| total | passed | failed | partial | skipped |\n"
+    ));
+    md.push_str(&format!(
+        "|-------|--------|--------|---------|---------|\n"
+    ));
+    md.push_str(&format!(
+        "| {} | {} | {} | {} | {} |\n\n",
+        json.summary.total,
+        json.summary.passed,
+        json.summary.failed,
+        json.summary.partial,
+        json.summary.skipped
+    ));
 
     for c in comparisons {
         let turn = case.turns.get(c.turn_index);
@@ -87,10 +119,14 @@ pub fn write_reports(
         };
         md.push_str(&format!("---\n\n### Turn {} {}\n\n", c.turn_index, emoji));
         md.push_str("**Input:**\n\n```text\n");
-        if let Some(t) = turn { md.push_str(&t.input); }
+        if let Some(t) = turn {
+            md.push_str(&t.input);
+        }
         md.push_str("\n```\n\n");
         md.push_str("**Expected:**\n\n```text\n");
-        if let Some(t) = turn { md.push_str(&t.expected); }
+        if let Some(t) = turn {
+            md.push_str(&t.expected);
+        }
         md.push_str("\n```\n\n");
         md.push_str("**Verdict:**\n\n");
         md.push_str(&c.reasoning);

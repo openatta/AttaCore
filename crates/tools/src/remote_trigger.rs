@@ -80,9 +80,7 @@ impl Tool for RemoteTriggerTool {
                 "list" | "create" | "run" | "get" => {}
                 other => {
                     return ValidationResult::err(
-                        format!(
-                            "Invalid action '{other}'. Must be one of: list, get, create, run"
-                        ),
+                        format!("Invalid action '{other}'. Must be one of: list, get, create, run"),
                         1,
                     );
                 }
@@ -161,7 +159,10 @@ mod tests {
             let r = tool
                 .validate_input(&json!({"action": action}), &ctx(Path::new("/tmp")))
                 .await;
-            assert!(matches!(r, ValidationResult::Ok), "action '{action}' should be valid");
+            assert!(
+                matches!(r, ValidationResult::Ok),
+                "action '{action}' should be valid"
+            );
         }
     }
 

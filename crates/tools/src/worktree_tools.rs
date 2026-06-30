@@ -14,11 +14,13 @@
 //! 创建 worktree + 把 path 注入 SessionState；ExitWorktree 调 cleanup 并从
 //! activated 移除。
 
+use crate::worktree::WorktreeHandle;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
-use crate::worktree::WorktreeHandle;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,7 +30,8 @@ use std::sync::{Arc, Mutex};
 /// in-memory 单 session 状态；不持久化。
 #[derive(Default)]
 pub struct WorktreeRegistry {
-    inner: Mutex<Option<WorktreeHandle>>}
+    inner: Mutex<Option<WorktreeHandle>>,
+}
 
 impl std::fmt::Debug for WorktreeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,23 +43,20 @@ impl WorktreeRegistry {
     /// Construct a new instance.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(None)}
+            inner: Mutex::new(None),
+        }
     }
 
     /// Currently active worktree path + slug, if any.
     pub fn current(&self) -> Option<(String, std::path::PathBuf)> {
-        self.inner
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|h| {
-                let slug = h
-                    .branch()
-                    .strip_prefix("attacode/worktree-")
-                    .unwrap_or("?")
-                    .to_string();
-                (slug, h.path().to_path_buf())
-            })
+        self.inner.lock().unwrap().as_ref().map(|h| {
+            let slug = h
+                .branch()
+                .strip_prefix("attacode/worktree-")
+                .unwrap_or("?")
+                .to_string();
+            (slug, h.path().to_path_buf())
+        })
     }
 }
 
@@ -64,10 +64,12 @@ impl WorktreeRegistry {
 pub struct EnterWorktreeInput {
     /// Slug for the worktree directory (e.g. `experiment-foo`). Path-traversal
     /// safe; segments must match `[a-zA-Z0-9._-]`.
-    pub slug: String}
+    pub slug: String,
+}
 
 pub struct EnterWorktreeTool {
-    registry: Arc<WorktreeRegistry>}
+    registry: Arc<WorktreeRegistry>,
+}
 
 impl EnterWorktreeTool {
     /// Construct a new instance.
@@ -78,8 +80,10 @@ impl EnterWorktreeTool {
 
 #[async_trait]
 impl Tool for EnterWorktreeTool {
-    fn description(&self) -> &str { "Create an isolated git worktree and switch the session into it" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Create an isolated git worktree and switch the session into it"
+    }
+    fn name(&self) -> &str {
         "EnterWorktree"
     }
     /// **P3b **: 标 deferred —— 系统 prompt 仅暴露 name + 短描述。
@@ -99,14 +103,18 @@ impl Tool for EnterWorktreeTool {
         match serde_json::from_value::<EnterWorktreeInput>(input.clone()) {
             Ok(p) => match crate::worktree::validate_slug(&p.slug) {
                 Ok(_) => ValidationResult::Ok,
-                Err(e) => ValidationResult::err(format!("invalid slug: {e}"), 1)},
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+                Err(e) => ValidationResult::err(format!("invalid slug: {e}"), 1),
+            },
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         // 创建 worktree 是文件系统副作用，但很受控；ask 是合理默认
         PermissionDecision::Ask {
-            message: "EnterWorktree will create a new git worktree under .atta/code/worktrees/".into(),
-            decision_reason: None}
+            message: "EnterWorktree will create a new git worktree under .atta/code/worktrees/"
+                .into(),
+            decision_reason: None,
+        }
     }
     async fn call(
         &self,
@@ -124,7 +132,8 @@ impl Tool for EnterWorktreeTool {
                 is_error: true,
                 structured_content: None,
                 mcp_meta: None,
-                new_messages: Some(vec![])});
+                new_messages: Some(vec![]),
+            });
         }
         match crate::worktree::create_worktree(&ctx.cwd, &input.slug).await {
             Ok(handle) => {
@@ -147,11 +156,11 @@ impl Tool for EnterWorktreeTool {
                         "branch": branch,
                         "slug": input.slug})),
                     mcp_meta: None,
-                    new_messages: Some(vec![])})
+                    new_messages: Some(vec![]),
+                })
             }
-            Err(e) => Err(ToolError::exec(format!(
-                "EnterWorktree failed: {e}"
-            )))}
+            Err(e) => Err(ToolError::exec(format!("EnterWorktree failed: {e}"))),
+        }
     }
 }
 
@@ -162,10 +171,12 @@ pub struct ExitWorktreeInput {
     pub action: Option<String>,
     /// With action "remove": force removal even with uncommitted changes or unpushed commits.
     #[serde(default)]
-    pub discard_changes: Option<bool>}
+    pub discard_changes: Option<bool>,
+}
 
 pub struct ExitWorktreeTool {
-    registry: Arc<WorktreeRegistry>}
+    registry: Arc<WorktreeRegistry>,
+}
 
 impl ExitWorktreeTool {
     /// Construct a new instance.
@@ -176,8 +187,10 @@ impl ExitWorktreeTool {
 
 #[async_trait]
 impl Tool for ExitWorktreeTool {
-    fn description(&self) -> &str { "Exit a worktree session (keep or remove)" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Exit a worktree session (keep or remove)"
+    }
+    fn name(&self) -> &str {
         "ExitWorktree"
     }
     /// **P3b **: 标 deferred —— 系统 prompt 仅暴露 name + 短描述。
@@ -202,7 +215,8 @@ impl Tool for ExitWorktreeTool {
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::Ask {
             message: "ExitWorktree will delete the worktree directory and its branch".into(),
-            decision_reason: None}
+            decision_reason: None,
+        }
     }
     async fn call(
         &self,
@@ -210,21 +224,19 @@ impl Tool for ExitWorktreeTool {
         _ctx: ToolContext,
         _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
-        let inp: ExitWorktreeInput = serde_json::from_value(input)
-            .unwrap_or_default();
+        let inp: ExitWorktreeInput = serde_json::from_value(input).unwrap_or_default();
         let action = inp.action.as_deref().unwrap_or("remove").to_string();
         let discard = inp.discard_changes.unwrap_or(false);
 
         // Release lock before any await points
         let Some(mut handle) = self.registry.inner.lock().unwrap().take() else {
             return Ok(ToolResult {
-                content: base::tool::ToolResultContent::Text(
-                    "No active worktree to exit.".into(),
-                ),
+                content: base::tool::ToolResultContent::Text("No active worktree to exit.".into()),
                 is_error: true,
                 structured_content: None,
                 mcp_meta: None,
-                new_messages: Some(vec![])});
+                new_messages: Some(vec![]),
+            });
         };
         let path = handle.path().to_path_buf();
         let branch = handle.branch().to_string();
@@ -234,21 +246,23 @@ impl Tool for ExitWorktreeTool {
             return Ok(ToolResult {
                 content: base::tool::ToolResultContent::Text(format!(
                     "Kept worktree at {} (branch {}). Continue working there.",
-                    path.display(), branch,
+                    path.display(),
+                    branch,
                 )),
                 is_error: false,
                 structured_content: Some(json!({
                     "kept_path": path.display().to_string(),
                     "branch": branch})),
                 mcp_meta: None,
-                new_messages: Some(vec![])});
+                new_messages: Some(vec![]),
+            });
         }
 
         // "remove" or unknown — handle is owned, lock is dropped, safe to await
         {
             if !discard {
                 if let Ok(true) = has_uncommitted_changes(&path).await {
-                        return Ok(ToolResult {
+                    return Ok(ToolResult {
                             content: base::tool::ToolResultContent::Text(
                                 "Worktree has uncommitted changes. Use discard_changes: true to force removal.".into(),
                             ),
@@ -256,17 +270,18 @@ impl Tool for ExitWorktreeTool {
                             structured_content: None,
                             mcp_meta: None,
                             new_messages: Some(vec![])});
-                    }
                 }
-                handle.cleanup().await;
-                let slug = branch
-                    .strip_prefix("attacode/worktree-")
-                    .unwrap_or("?")
-                    .to_string();
+            }
+            handle.cleanup().await;
+            let slug = branch
+                .strip_prefix("attacode/worktree-")
+                .unwrap_or("?")
+                .to_string();
             Ok(ToolResult {
                 content: base::tool::ToolResultContent::Text(format!(
                     "Removed worktree {} (branch {}).",
-                    path.display(), branch,
+                    path.display(),
+                    branch,
                 )),
                 is_error: false,
                 structured_content: Some(json!({
@@ -274,7 +289,8 @@ impl Tool for ExitWorktreeTool {
                     "removed_branch": branch,
                     "slug": slug})),
                 mcp_meta: None,
-                new_messages: Some(vec![])})
+                new_messages: Some(vec![]),
+            })
         } // end of "remove" block
     }
 }

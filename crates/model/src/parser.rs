@@ -166,7 +166,8 @@ data: {\"type\":\"message_stop\"}\n\
     }
 
     #[tokio::test]
-    async fn contract_fixture_covers_thinking_tool_use_and_cache_usage() -> Result<(), AnthropicError> {
+    async fn contract_fixture_covers_thinking_tool_use_and_cache_usage(
+    ) -> Result<(), AnthropicError> {
         const CONTRACT: &[u8] = b"\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_contract\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":101,\"output_tokens\":0,\"cache_creation_input_tokens\":12,\"cache_read_input_tokens\":34},\"future_field\":\"ignored\"}}\n\

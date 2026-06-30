@@ -148,7 +148,12 @@ impl RuleSet {
     ///   由调用方应用路径安全检查后再决定。
     /// - **DontAsk / Plan**: 安全工具直接允许（只读操作不应被严格模式误杀）。
     /// - 其它模式: 一律 `Deferred`，走标准规则匹配与模式分派流程。
-    pub fn check(&self, tool_name: &str, _content: Option<&str>, mode: PermissionMode) -> CheckResult {
+    pub fn check(
+        &self,
+        tool_name: &str,
+        _content: Option<&str>,
+        mode: PermissionMode,
+    ) -> CheckResult {
         match mode {
             PermissionMode::BypassPermissions => {
                 // 安全工具绕过

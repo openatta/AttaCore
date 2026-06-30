@@ -1,16 +1,16 @@
 //! `TeamCreate` tool — spawn multiple sub-agents with staged parallel execution.
 //! Uses agent's own Coordinator + AgentTool.
 
-use base::interface::model::Model;
 use crate::coordinator::{Coordinator, DefaultCoordinator, OrchestrateRequest};
-use base::tool::InMemoryToolRegistry;
 use async_trait::async_trait;
 use base::context::EngineConfig;
-use base::tool::PromptContext;
-use base::tool::{PermissionDecision, ValidationResult};
-use base::tool::ToolContext;
-use base::tool::{ProgressSender, ToolResult};
 use base::error::ToolError;
+use base::interface::model::Model;
+use base::tool::InMemoryToolRegistry;
+use base::tool::PromptContext;
+use base::tool::ToolContext;
+use base::tool::{PermissionDecision, ValidationResult};
+use base::tool::{ProgressSender, ToolResult};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -30,7 +30,11 @@ pub struct TeamCreateInput {
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum AggregateMode { Concat, Best, Aggregate }
+pub enum AggregateMode {
+    Concat,
+    Best,
+    Aggregate,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TeamStage {
@@ -58,22 +62,32 @@ pub struct TeamCreateTool {
 
 impl TeamCreateTool {
     pub fn new(
-        model: Arc<dyn Model>, config: Arc<EngineConfig>,
-        parent_tools: Arc<InMemoryToolRegistry>, sub_tools: Arc<InMemoryToolRegistry>,
+        model: Arc<dyn Model>,
+        config: Arc<EngineConfig>,
+        parent_tools: Arc<InMemoryToolRegistry>,
+        sub_tools: Arc<InMemoryToolRegistry>,
     ) -> Self {
         Self {
-            model, config, parent_tools, sub_tools,
+            model,
+            config,
+            parent_tools,
+            sub_tools,
             coordinator: Box::new(DefaultCoordinator::new()),
         }
     }
 
     pub fn with_spawner(
-        model: Arc<dyn Model>, config: Arc<EngineConfig>,
-        parent_tools: Arc<InMemoryToolRegistry>, sub_tools: Arc<InMemoryToolRegistry>,
+        model: Arc<dyn Model>,
+        config: Arc<EngineConfig>,
+        parent_tools: Arc<InMemoryToolRegistry>,
+        sub_tools: Arc<InMemoryToolRegistry>,
         spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner>,
     ) -> Self {
         Self {
-            model, config, parent_tools, sub_tools,
+            model,
+            config,
+            parent_tools,
+            sub_tools,
             coordinator: Box::new(DefaultCoordinator::with_agent_spawner(spawner)),
         }
     }
@@ -81,15 +95,21 @@ impl TeamCreateTool {
 
 #[async_trait]
 impl base::tool::Tool for TeamCreateTool {
-    fn name(&self) -> &str { "TeamCreate" }
+    fn name(&self) -> &str {
+        "TeamCreate"
+    }
     fn description(&self) -> &str {
         "Create a team of sub-agents for multi-stage parallel task execution"
     }
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(TeamCreateInput)).unwrap_or(Value::Null)
     }
-    fn is_concurrency_safe(&self, _: &Value) -> bool { false }
-    fn is_read_only(&self, _: &Value) -> bool { false }
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        false
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
     async fn prompt(&self, _: &PromptContext) -> String {
         include_str!("tool.prompt.md").to_string()
     }
@@ -100,23 +120,32 @@ impl base::tool::Tool for TeamCreateTool {
         PermissionDecision::allow()
     }
     async fn call(
-        &self, input: Value, ctx: ToolContext, _: ProgressSender,
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
-        let inp: TeamCreateInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::Validation(format!("{e}")))?;
+        let inp: TeamCreateInput =
+            serde_json::from_value(input).map_err(|e| ToolError::Validation(format!("{e}")))?;
         let stages = inp.stages.unwrap_or_else(|| {
-            vec![TeamStage { name: "main".into(), agents: inp.agents, aggregate: None }]
+            vec![TeamStage {
+                name: "main".into(),
+                agents: inp.agents,
+                aggregate: None,
+            }]
         });
-        self.coordinator.orchestrate(OrchestrateRequest {
-            model: self.model.clone(),
-            config: self.config.clone(),
-            parent_tools: self.parent_tools.clone(),
-            sub_tools: self.sub_tools.clone(),
-            stages,
-            name: inp.name,
-            scratchpad: inp.scratchpad,
-            ctx,
-        }).await
+        self.coordinator
+            .orchestrate(OrchestrateRequest {
+                model: self.model.clone(),
+                config: self.config.clone(),
+                parent_tools: self.parent_tools.clone(),
+                sub_tools: self.sub_tools.clone(),
+                stages,
+                name: inp.name,
+                scratchpad: inp.scratchpad,
+                ctx,
+            })
+            .await
     }
 }
 
@@ -140,15 +169,21 @@ impl TeamDeleteTool {
 
 #[async_trait]
 impl base::tool::Tool for TeamDeleteTool {
-    fn name(&self) -> &str { "TeamDelete" }
+    fn name(&self) -> &str {
+        "TeamDelete"
+    }
     fn description(&self) -> &str {
         "Delete a previously created team and clean up its resources"
     }
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(TeamDeleteInput)).unwrap_or(Value::Null)
     }
-    fn is_concurrency_safe(&self, _: &Value) -> bool { false }
-    fn is_read_only(&self, _: &Value) -> bool { false }
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        false
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
     async fn prompt(&self, _: &PromptContext) -> String {
         "Delete a team by name. This cancels any running sub-agents and \
          cleans up team-scoped resources (task lists, scratchpads). \
@@ -162,12 +197,17 @@ impl base::tool::Tool for TeamDeleteTool {
         PermissionDecision::allow()
     }
     async fn call(
-        &self, input: Value, _ctx: ToolContext, _: ProgressSender,
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
-        let inp: TeamDeleteInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::Validation(format!("{e}")))?;
+        let inp: TeamDeleteInput =
+            serde_json::from_value(input).map_err(|e| ToolError::Validation(format!("{e}")))?;
         if let Err(e) = self.coordinator.cleanup_team(&inp.name).await {
-            return Ok(ToolResult::error_text(format!("Failed to delete team: {e}")));
+            return Ok(ToolResult::error_text(format!(
+                "Failed to delete team: {e}"
+            )));
         }
         Ok(ToolResult::text(format!("Team '{}' deleted.", inp.name)))
     }

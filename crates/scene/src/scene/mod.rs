@@ -50,7 +50,7 @@ impl SceneRegistry {
     }
     pub fn register_builtin(&mut self) {
         self.register(Arc::new(chat::ChatScene));
-        self.register(Arc::new(coding::CodingScene));
+        self.register(Arc::new(coding::CodingScene::default_scene()));
         self.register(Arc::new(demo::DemoScene));
     }
 }

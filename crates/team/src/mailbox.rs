@@ -11,8 +11,8 @@
 use async_trait::async_trait;
 use base::error::ToolError;
 use base::tool::{
-    PermissionDecision, ProgressSender, PromptContext, ToolContext,
-    ToolResult, ToolResultContent, ValidationResult,
+    PermissionDecision, ProgressSender, PromptContext, ToolContext, ToolResult, ToolResultContent,
+    ValidationResult,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;

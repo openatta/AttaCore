@@ -3,8 +3,8 @@
 //! Wraps AgentTool::run_sub from this crate to provide sub-agent spawning
 //! to consumers (e.g., the team coordinator) without creating a circular dependency.
 
-use base::interface::agent_spawner::AgentSpawner;
 use async_trait::async_trait;
+use base::interface::agent_spawner::AgentSpawner;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;

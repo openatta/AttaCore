@@ -207,10 +207,7 @@ impl HookRunner {
     /// P2: Builder-style setter for the wake channel receiver.
     /// The receiver is used by `check_rewakes()` to detect when background
     /// async work has completed and pending rewake hooks should be re-executed.
-    pub fn with_wake_receiver(
-        mut self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-    ) -> Self {
+    pub fn with_wake_receiver(mut self, rx: tokio::sync::mpsc::UnboundedReceiver<()>) -> Self {
         self.wake_receiver = std::sync::Mutex::new(Some(rx));
         self
     }
@@ -282,7 +279,10 @@ impl HookRunner {
         response: Option<&serde_json::Value>,
     ) -> HookRunResult {
         let mut tool_input = serde_json::Map::new();
-        tool_input.insert("server_name".into(), serde_json::Value::String(server_name.into()));
+        tool_input.insert(
+            "server_name".into(),
+            serde_json::Value::String(server_name.into()),
+        );
         tool_input.insert("url".into(), serde_json::Value::String(url.into()));
         if let Some(r) = response {
             tool_input.insert("response".into(), r.clone());
@@ -376,10 +376,7 @@ impl HookRunner {
                             }
                         );
                         if is_async_rewake {
-                            self.pending_rewakes
-                                .lock()
-                                .unwrap()
-                                .insert((event, idx));
+                            self.pending_rewakes.lock().unwrap().insert((event, idx));
                         }
                     }
                 }
@@ -415,16 +412,13 @@ impl HookRunner {
                     }
                 }
                 if only_on_error.unwrap_or(false) && input.is_error != Some(true) {
-                    return HookOutcome::Skipped(
-                        "only_on_error=true but tool was not in error",
-                    );
+                    return HookOutcome::Skipped("only_on_error=true but tool was not in error");
                 }
                 let timeout_dur = timeout
                     .map(Duration::from_millis)
                     .unwrap_or(self.default_timeout);
                 let shell = shell.as_deref().unwrap_or("bash");
-                self.exec_command(shell, command, input, timeout_dur)
-                    .await
+                self.exec_command(shell, command, input, timeout_dur).await
             }
             HookConfig::Prompt {
                 prompt,
@@ -469,11 +463,13 @@ impl HookRunner {
                 // Parse JSON response: {"ok": bool, "reason": "..."}
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
                     let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let reason = parsed.get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("");
                     let hook_response = crate::payload::HookResponse {
-                        decision: if ok { Some(crate::payload::HookDecision::Approve) } else { Some(crate::payload::HookDecision::Block) },
+                        decision: if ok {
+                            Some(crate::payload::HookDecision::Approve)
+                        } else {
+                            Some(crate::payload::HookDecision::Block)
+                        },
                         message: Some(reason.to_string()),
                         ..Default::default()
                     };

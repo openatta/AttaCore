@@ -65,9 +65,7 @@ pub struct CommandResult {
 /// A registered slash command.
 pub enum Command {
     /// Prompt command: expand skill content and feed to LLM.
-    Prompt {
-        entry: Box<SkillEntry>,
-    },
+    Prompt { entry: Box<SkillEntry> },
     /// Local command: execute handler, return result, skip LLM.
     Local {
         description: String,
@@ -98,7 +96,9 @@ pub struct CommandRegistry {
 impl CommandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { commands: HashMap::new() }
+        Self {
+            commands: HashMap::new(),
+        }
     }
 
     /// Build a registry from a skill manager (disk + bundled skills).
@@ -113,7 +113,9 @@ impl CommandRegistry {
                     description: skill.description.clone(),
                     source: match skill.source {
                         ::skills::manager::SkillSource::User => base::frozen::SkillSource::User,
-                        ::skills::manager::SkillSource::Project => base::frozen::SkillSource::Project,
+                        ::skills::manager::SkillSource::Project => {
+                            base::frozen::SkillSource::Project
+                        }
                         ::skills::manager::SkillSource::Plugin => base::frozen::SkillSource::Plugin,
                     },
                     path: skill.path.clone(),
@@ -136,7 +138,9 @@ impl CommandRegistry {
     pub fn insert_prompt(&mut self, entry: SkillEntry) {
         self.commands.insert(
             entry.name.clone(),
-            Command::Prompt { entry: Box::new(entry) },
+            Command::Prompt {
+                entry: Box::new(entry),
+            },
         );
     }
 
@@ -207,41 +211,33 @@ impl Default for CommandRegistry {
         registry.insert_local(
             "skills",
             "List all available skills",
-            Box::new(|_cmd| {
-                CommandResult {
-                    text: "Use /skills to see available skills".into(),
-                    should_query: false,
-                }
+            Box::new(|_cmd| CommandResult {
+                text: "Use /skills to see available skills".into(),
+                should_query: false,
             }),
         );
         registry.insert_local(
             "clear",
             "Clear the current session context",
-            Box::new(|_cmd| {
-                CommandResult {
-                    text: "Session cleared. All messages have been removed.".into(),
-                    should_query: false,
-                }
+            Box::new(|_cmd| CommandResult {
+                text: "Session cleared. All messages have been removed.".into(),
+                should_query: false,
             }),
         );
         registry.insert_local(
             "compact",
             "Trigger context compaction now",
-            Box::new(|_cmd| {
-                CommandResult {
-                    text: "Compaction triggered. Context has been summarized.".into(),
-                    should_query: true,
-                }
+            Box::new(|_cmd| CommandResult {
+                text: "Compaction triggered. Context has been summarized.".into(),
+                should_query: true,
             }),
         );
         registry.insert_local(
             "cost",
             "Show session API cost",
-            Box::new(|_cmd| {
-                CommandResult {
-                    text: "Cost tracking: use /cost for details".into(),
-                    should_query: false,
-                }
+            Box::new(|_cmd| CommandResult {
+                text: "Cost tracking: use /cost for details".into(),
+                should_query: false,
             }),
         );
         registry
@@ -266,9 +262,8 @@ pub fn expand_skill_for_command(entry: &SkillEntry, args: &str) -> String {
             .unwrap_or_else(|| format!("# {}\n\n{}", entry.name, entry.description))
     } else {
         // Disk skills: read from filesystem
-        std::fs::read_to_string(&entry.path).unwrap_or_else(|_| {
-            format!("# {}\n\n{}", entry.name, entry.description)
-        })
+        std::fs::read_to_string(&entry.path)
+            .unwrap_or_else(|_| format!("# {}\n\n{}", entry.name, entry.description))
     };
 
     // Expand variables: {args}, $ARGUMENTS, etc.

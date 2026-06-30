@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SESSION_MEMORY_HEADER: &str = "# Session Memory\n\nTrack persistent facts about the user, project, and workflow.\n";
+const SESSION_MEMORY_HEADER: &str =
+    "# Session Memory\n\nTrack persistent facts about the user, project, and workflow.\n";
 
 /// Manages the session_memory.md sidecar file with timestamp and staleness tracking.
 ///
@@ -83,7 +84,8 @@ impl SessionMemory {
     pub async fn mark_extraction_started(&self) -> std::io::Result<()> {
         let _guard = self.inner.io_lock.lock().await;
         let now = iso_now();
-        self.update_frontmatter_field("extraction_started", &now).await?;
+        self.update_frontmatter_field("extraction_started", &now)
+            .await?;
         Ok(())
     }
 
@@ -92,7 +94,8 @@ impl SessionMemory {
     pub async fn mark_extraction_completed(&self, turn_count: u32) -> std::io::Result<()> {
         let _guard = self.inner.io_lock.lock().await;
         let now = iso_now();
-        self.update_frontmatter_field("extraction_completed", &now).await?;
+        self.update_frontmatter_field("extraction_completed", &now)
+            .await?;
         self.inner
             .last_update_turn
             .store(turn_count, Ordering::Release);
@@ -260,9 +263,9 @@ mod tests {
         sm.init_session_memory().await.unwrap();
 
         sm.mark_extraction_completed(5).await.unwrap();
-        assert!(!sm.is_stale(10));  // delta ≤ 10
-        assert!(!sm.is_stale(15));  // delta = 10, not > 10
-        assert!(sm.is_stale(16));   // delta = 11, > 10
+        assert!(!sm.is_stale(10)); // delta ≤ 10
+        assert!(!sm.is_stale(15)); // delta = 10, not > 10
+        assert!(sm.is_stale(16)); // delta = 11, > 10
     }
 
     #[tokio::test]

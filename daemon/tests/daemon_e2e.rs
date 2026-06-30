@@ -21,7 +21,13 @@ use tokio_util::sync::CancellationToken;
 struct AllowAllPermission;
 #[async_trait::async_trait]
 impl base::interface::permission::Permission for AllowAllPermission {
-    async fn check(&self, _: &str, _: &serde_json::Value, _: &std::path::Path, _: &str) -> base::interface::permission::PermissionOutcome {
+    async fn check(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+        _: &std::path::Path,
+        _: &str,
+    ) -> base::interface::permission::PermissionOutcome {
         base::interface::permission::PermissionOutcome::Permit
     }
 }
@@ -42,15 +48,13 @@ async fn start_server() -> (
         dir.path().join("local").join("memory"),
     ));
     let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> =
-        Arc::new(AllowAllPermission);
+        Arc::new(scene::scene::coding::CodingScene::default_scene());
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
     let engine_config = EngineConfig::defaults_for("claude-sonnet-4-6");
 
     // 使用 dummy client（不真正调 LLM）
-    let client: Arc<dyn AnthropicClient> = Arc::new(
-        HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap(),
-    );
+    let client: Arc<dyn AnthropicClient> =
+        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
 
     let pool = Arc::new(SessionPool::new(
         8,
@@ -98,7 +102,11 @@ async fn rpc_call(sock: &std::path::Path, msg: &str) -> String {
 #[tokio::test]
 async fn status_returns_info() {
     let (_server, sock, _dir, handle) = start_server().await;
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"daemon.status","id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"daemon.status","id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(v["result"].is_object(), "expected success, got: {v}");
     assert!(v["result"]["version"].is_string());
@@ -169,5 +177,9 @@ async fn unknown_method_returns_error() {
 #[tokio::test]
 async fn turn_id_is_base58_uuid_22_chars() {
     let id = Id::new().to_string();
-    assert!((21..=22).contains(&id.len()), "expected 21-22 chars, got {}: {id}", id.len());
+    assert!(
+        (21..=22).contains(&id.len()),
+        "expected 21-22 chars, got {}: {id}",
+        id.len()
+    );
 }

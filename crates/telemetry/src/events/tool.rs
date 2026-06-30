@@ -130,7 +130,8 @@ mod tests {
             },
         );
 
-        let value = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let value =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(value["type"], "permission_decision");
         assert_eq!(value["outcome"], "escalated");
         assert_eq!(value["tool_name"], "bash");
@@ -160,7 +161,8 @@ mod tests {
                 user_approved: true,
             };
             let event = TelemetryEvent::tool_execution("sess", 1, None, payload);
-            let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+            let v = serde_json::to_value(event)
+                .expect("serialization of telemetry event should not fail");
             assert_eq!(v["type"], "tool_execution");
             assert_eq!(v["outcome"], expected);
             assert_eq!(v["tool_name"], "Bash");
@@ -185,7 +187,8 @@ mod tests {
                 latency_ms: 3,
             };
             let event = TelemetryEvent::permission_decision("sess", 2, None, payload);
-            let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+            let v = serde_json::to_value(event)
+                .expect("serialization of telemetry event should not fail");
             assert_eq!(v["type"], "permission_decision");
             assert_eq!(v["outcome"], expected);
         }
@@ -211,7 +214,8 @@ mod tests {
             },
         )
         .redact(&policy);
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["error_message"], "[REDACTED]");
         assert_eq!(v["tool_name"], "Bash");
         assert_eq!(v["outcome"], "failed");
@@ -231,7 +235,8 @@ mod tests {
                 deferred: false,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "tool_start");
         assert_eq!(v["tool_name"], "Bash");
         assert_eq!(v["destructive"], true);
@@ -249,7 +254,8 @@ mod tests {
                 elapsed_ms: 500,
             },
         );
-        let v = serde_json::to_value(event).expect("serialization of telemetry event should not fail");
+        let v =
+            serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "tool_cancelled");
         assert_eq!(v["reason"], "user_interrupt");
     }

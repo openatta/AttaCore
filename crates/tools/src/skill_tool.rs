@@ -4,10 +4,10 @@
 //!     checks disable_model_invocation, uses full expand_skill_vars substitution.
 //!     Supports forked execution via AgentSpawner when skill.context = "fork".
 
+use async_trait::async_trait;
 use base::error::ToolError;
 use base::interface::agent_spawner::AgentSpawner;
 use base::tool::{ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ToolResultContent};
-use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -27,7 +27,11 @@ impl SkillTool {
         skill_manager: std::sync::Arc<skills::manager::SkillManager>,
         user_invocable: Vec<String>,
     ) -> Self {
-        Self { skill_manager, user_invocable, spawner: None }
+        Self {
+            skill_manager,
+            user_invocable,
+            spawner: None,
+        }
     }
 
     /// P2-10: Set the agent spawner for forked skill execution.
@@ -69,7 +73,12 @@ impl Tool for SkillTool {
         include_str!("prompts/coding/skill_tool.prompt.md").to_string()
     }
 
-    async fn call(&self, input: Value, _ctx: ToolContext, _progress: ProgressSender) -> Result<ToolResult, ToolError> {
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSender,
+    ) -> Result<ToolResult, ToolError> {
         let skill_name = input["skill"]
             .as_str()
             .ok_or_else(|| ToolError::Validation("skill name required".into()))?;
@@ -94,13 +103,18 @@ impl Tool for SkillTool {
         // run the skill in a sub-agent with isolated context.
         if context_mode.as_deref() == Some("fork") {
             if let Some(ref spawner) = self.spawner {
-                let body = self.skill_manager.get_skill_content(skill_name)
-                    .ok_or_else(|| ToolError::NotFound(format!(
-                        "Skill '{skill_name}' not found."
-                    )))?;
+                let body = self
+                    .skill_manager
+                    .get_skill_content(skill_name)
+                    .ok_or_else(|| {
+                        ToolError::NotFound(format!("Skill '{skill_name}' not found."))
+                    })?;
                 let expanded = base::frozen::skill::expand_skill_vars(&body, args);
                 let cancel = _ctx.cancel.clone();
-                match spawner.spawn_agent(expanded, vec![], _ctx.cwd.clone(), cancel).await {
+                match spawner
+                    .spawn_agent(expanded, vec![], _ctx.cwd.clone(), cancel)
+                    .await
+                {
                     Ok(output) => {
                         return Ok(ToolResult {
                             content: ToolResultContent::Text(format!(
@@ -126,8 +140,16 @@ impl Tool for SkillTool {
 
         // Allow scene skills + user-invocable skills
         let scene_skills = [
-            "simplify", "verify", "debug", "batch", "stuck", "loop",
-            "remember", "skillify", "updateConfig", "loremIpsum",
+            "simplify",
+            "verify",
+            "debug",
+            "batch",
+            "stuck",
+            "loop",
+            "remember",
+            "skillify",
+            "updateConfig",
+            "loremIpsum",
         ];
         let denied = !scene_skills.contains(&skill_name)
             && !self.user_invocable.iter().any(|s| s == skill_name);
@@ -140,10 +162,10 @@ impl Tool for SkillTool {
         }
 
         // Get the skill body content
-        let body = self.skill_manager.get_skill_content(skill_name)
-            .ok_or_else(|| ToolError::NotFound(format!(
-                "Skill '{skill_name}' not found."
-            )))?;
+        let body = self
+            .skill_manager
+            .get_skill_content(skill_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Skill '{skill_name}' not found.")))?;
 
         // Use full expand_skill_vars (TS parity: $1..$9, $@, $ARGUMENTS, {ARGS}, etc.)
         let expanded = base::frozen::skill::expand_skill_vars(&body, args);

@@ -20,8 +20,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -37,13 +39,15 @@ pub struct ToolSearchInput {
 
     /// Cap on returned matches (default 5).
     #[serde(default)]
-    pub max_results: Option<usize>}
+    pub max_results: Option<usize>,
+}
 
 pub struct ToolSearchTool {
     /// 引用 ToolRegistry 里的全部工具列表（含 deferred 与非 deferred）。这里持
     /// `Arc<dyn ToolRegistry>` 让 ToolSearch 在 call 时能即时扫工具池 —— 用户
     /// 中途装/卸 MCP server 后立刻反映。
-    registry: std::sync::Arc<base::tool::InMemoryToolRegistry>}
+    registry: std::sync::Arc<base::tool::InMemoryToolRegistry>,
+}
 
 impl ToolSearchTool {
     /// Construct a new instance.
@@ -54,8 +58,10 @@ impl ToolSearchTool {
 
 #[async_trait]
 impl Tool for ToolSearchTool {
-    fn description(&self) -> &str { "Fetch full schema definitions for deferred tools" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Fetch full schema definitions for deferred tools"
+    }
+    fn name(&self) -> &str {
         "ToolSearch"
     }
 
@@ -84,7 +90,8 @@ impl Tool for ToolSearchTool {
                 ValidationResult::err("query must not be empty", 1)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 2),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
@@ -188,7 +195,8 @@ impl Tool for ToolSearchTool {
                 "query": q,
                 "total_deferred_tools": total})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -203,7 +211,8 @@ mod tests {
     /// 一个声称 deferred 的虚构工具。
     struct DeferredTool {
         name: &'static str,
-        desc: &'static str}
+        desc: &'static str,
+    }
     #[async_trait]
     impl Tool for DeferredTool {
         fn name(&self) -> &str {
@@ -259,13 +268,16 @@ mod tests {
         reg.register(Arc::new(ActiveTool));
         reg.register(Arc::new(DeferredTool {
             name: "GitHubIssues",
-            desc: "Fetch GitHub issues for a repo"}));
+            desc: "Fetch GitHub issues for a repo",
+        }));
         reg.register(Arc::new(DeferredTool {
             name: "GitHubPRs",
-            desc: "List GitHub pull requests"}));
+            desc: "List GitHub pull requests",
+        }));
         reg.register(Arc::new(DeferredTool {
             name: "Datadog",
-            desc: "Query Datadog metrics"}));
+            desc: "Query Datadog metrics",
+        }));
         Arc::new(reg)
     }
 
@@ -292,7 +304,8 @@ mod tests {
                 assert!(t.contains("GitHubPRs"));
                 assert!(!t.contains("Datadog"), "Datadog should not match 'github'");
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -312,7 +325,8 @@ mod tests {
             base::tool::ToolResultContent::Text(t) => {
                 assert!(t.contains("Datadog"));
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -328,7 +342,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(Vec::<String>::new() /* activated_tools managed by ToolRegistry now */.is_empty());
+        assert!(
+            Vec::<String>::new() /* activated_tools managed by ToolRegistry now */
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -345,7 +362,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(Vec::<String>::new() /* activated_tools managed by ToolRegistry now */.is_empty());
+        assert!(
+            Vec::<String>::new() /* activated_tools managed by ToolRegistry now */
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -376,6 +396,7 @@ mod tests {
             base::tool::ToolResultContent::Text(t) => {
                 assert!(t.contains("1 tool"), "expected 1 tool, got: {t}");
             }
-            _ => panic!()}
+            _ => panic!(),
+        }
     }
 }

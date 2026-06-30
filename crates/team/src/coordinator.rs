@@ -3,18 +3,18 @@
 //! Also provides [`PermissionBridge`] — intercepts sub-agent permission prompts
 //! and forwards them to the parent agent via the team mailbox (Bubble mode).
 
+use async_trait::async_trait;
+use base::context::EngineConfig;
+use base::error::ToolError;
 use base::interface::agent_spawner::AgentSpawner;
 use base::interface::model::{Model, ModelEvent, StreamParams};
 use base::interface::permission::{Permission, PermissionOutcome};
 use base::interface::prompt::{BlockRole, PromptBlock};
 use base::interface::settings::ThinkingMode;
 use base::tool::InMemoryToolRegistry;
-use async_trait::async_trait;
-use base::context::EngineConfig;
-use base::tool::ToolResultContent;
 use base::tool::ToolContext;
 use base::tool::ToolResult;
-use base::error::ToolError;
+use base::tool::ToolResultContent;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -305,7 +305,9 @@ impl DefaultCoordinator {
     /// The spawner wraps the runtime's `AgentTool` logic and is safe to pass
     /// across crate boundaries because both sides depend only on the trait in `base`.
     pub fn with_agent_spawner(spawner: Arc<dyn AgentSpawner>) -> Self {
-        Self { spawner: Some(spawner) }
+        Self {
+            spawner: Some(spawner),
+        }
     }
 }
 
@@ -318,14 +320,27 @@ impl Default for DefaultCoordinator {
 #[async_trait]
 impl Coordinator for DefaultCoordinator {
     async fn orchestrate(&self, req: OrchestrateRequest) -> Result<ToolResult, ToolError> {
-        let OrchestrateRequest { model, config, parent_tools: _, sub_tools: _, stages, name, scratchpad, ctx } = req;
+        let OrchestrateRequest {
+            model,
+            config,
+            parent_tools: _,
+            sub_tools: _,
+            stages,
+            name,
+            scratchpad,
+            ctx,
+        } = req;
 
-        let all_labels: Vec<String> = stages.iter()
-            .flat_map(|s| s.agents.iter().map(|a| a.label.clone())).collect();
+        let all_labels: Vec<String> = stages
+            .iter()
+            .flat_map(|s| s.agents.iter().map(|a| a.label.clone()))
+            .collect();
         let team_id = format!("team-{}-{}", name, chrono_id());
         let team_dir = ctx.session.cwd.join(".atta/code/teams").join(&team_id);
         let sp_path = team_dir.join("SCRATCHPAD.md");
-        if let Some(p) = sp_path.parent() { let _ = tokio::fs::create_dir_all(p).await; }
+        if let Some(p) = sp_path.parent() {
+            let _ = tokio::fs::create_dir_all(p).await;
+        }
 
         // P1-9: Write team metadata (config.json) for tool discoverability.
         // TS parity: TeamFile in teamHelpers.ts.
@@ -345,20 +360,21 @@ impl Coordinator for DefaultCoordinator {
                 })
             })).collect::<Vec<_>>(),
         });
-        let _ = tokio::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default()).await;
+        let _ = tokio::fs::write(
+            &meta_path,
+            serde_json::to_string_pretty(&meta).unwrap_or_default(),
+        )
+        .await;
 
         let mailbox = Arc::new(crate::mailbox::MailboxStore::with_persistence(
-            all_labels, team_dir.join("mailbox"),
+            all_labels,
+            team_dir.join("mailbox"),
         ));
 
         // Create permission bridges for each agent in the team.
         // These bridges are used when spawning team members to bubble
         // permission decisions up to the coordinator.
-        let _permission_bridges = create_permission_bridges(
-            mailbox.clone(),
-            &stages,
-            &name,
-        );
+        let _permission_bridges = create_permission_bridges(mailbox.clone(), &stages, &name);
 
         // Inject coordinator system prompt (TS parity: coordinatorMode.ts)
         let stage_names: Vec<String> = stages.iter().map(|s| s.name.clone()).collect();
@@ -375,10 +391,11 @@ impl Coordinator for DefaultCoordinator {
         let _ = tokio::fs::write(&sp_path, &scratch).await;
 
         // P1-8: Teammate lifecycle tracking. TS parity: InProcessTeammateTask.
-        let mut lifecycles: std::collections::HashMap<String, TeammateLifecycle> =
-            stages.iter().flat_map(|s| s.agents.iter())
-                .map(|a| (a.label.clone(), TeammateLifecycle::Idle))
-                .collect();
+        let mut lifecycles: std::collections::HashMap<String, TeammateLifecycle> = stages
+            .iter()
+            .flat_map(|s| s.agents.iter())
+            .map(|a| (a.label.clone(), TeammateLifecycle::Idle))
+            .collect();
 
         let mut any_err = false;
         for (si, stage) in stages.iter().enumerate() {
@@ -390,12 +407,15 @@ impl Coordinator for DefaultCoordinator {
                     // Transition to Active
                     lifecycles.insert(agent_spec.label.clone(), TeammateLifecycle::Active);
                     let cancel = ctx.cancel.child_token();
-                    match spawner.spawn_agent(
-                        agent_spec.prompt.clone(),
-                        vec![], // allowed_tools: empty = all tools
-                        ctx.cwd.clone(),
-                        cancel,
-                    ).await {
+                    match spawner
+                        .spawn_agent(
+                            agent_spec.prompt.clone(),
+                            vec![], // allowed_tools: empty = all tools
+                            ctx.cwd.clone(),
+                            cancel,
+                        )
+                        .await
+                    {
                         Ok(text) => {
                             sections.push((agent_spec.label.clone(), text, false));
                         }
@@ -416,7 +436,8 @@ impl Coordinator for DefaultCoordinator {
                 for agent_spec in &stage.agents {
                     sections.push((
                         agent_spec.label.clone(),
-                        "[AgentSpawner not available — team coordination requires daemon wiring]".to_string(),
+                        "[AgentSpawner not available — team coordination requires daemon wiring]"
+                            .to_string(),
                         true,
                     ));
                     any_err = true;
@@ -425,21 +446,33 @@ impl Coordinator for DefaultCoordinator {
 
             if let Some(mode) = stage.aggregate {
                 if !sections.is_empty() {
-                    sections = aggregate(&*model, &config.model, mode, &stage.name, &sections).await;
+                    sections =
+                        aggregate(&*model, &config.model, mode, &stage.name, &sections).await;
                 }
             }
 
             let mut md = format!("\n## {}_{}\n\n", si + 1, stage.name);
             for (l, b, e) in &sections {
-                md.push_str(&format!("### {}{}\n{b}\n\n", l, if *e { " (ERROR)" } else { "" }));
+                md.push_str(&format!(
+                    "### {}{}\n{b}\n\n",
+                    l,
+                    if *e { " (ERROR)" } else { "" }
+                ));
             }
             scratch.push_str(&md);
             let _ = tokio::fs::write(&sp_path, &scratch).await;
         }
 
         Ok(ToolResult {
-            content: ToolResultContent::Text(format!("{}\n\n_(scratchpad: {})_", scratch, sp_path.display())),
-            is_error: any_err, structured_content: None, mcp_meta: None, new_messages: None,
+            content: ToolResultContent::Text(format!(
+                "{}\n\n_(scratchpad: {})_",
+                scratch,
+                sp_path.display()
+            )),
+            is_error: any_err,
+            structured_content: None,
+            mcp_meta: None,
+            new_messages: None,
         })
     }
 
@@ -474,7 +507,8 @@ impl Coordinator for DefaultCoordinator {
 
         // Identify the last completed stage heading
         let last_stage: &str = scratchpad
-            .lines().rfind(|l| l.starts_with("## "))
+            .lines()
+            .rfind(|l| l.starts_with("## "))
             .map(|l| l.trim_start_matches("## ").trim())
             .unwrap_or("(none)");
 
@@ -512,21 +546,33 @@ impl Coordinator for DefaultCoordinator {
 // ═══════════════════════════════════════════════════════════
 
 pub async fn aggregate(
-    model: &dyn Model, model_name: &str, mode: AggregateMode,
-    stage_name: &str, sections: &[(String, String, bool)],
+    model: &dyn Model,
+    model_name: &str,
+    mode: AggregateMode,
+    stage_name: &str,
+    sections: &[(String, String, bool)],
 ) -> Vec<(String, String, bool)> {
     match mode {
         AggregateMode::Concat => sections.to_vec(),
         AggregateMode::Best => {
             if let Some(label) = pick_best(model, model_name, stage_name, sections).await {
-                sections.iter().filter(|(l,_,_)| *l == label).cloned().collect()
-            } else { sections.to_vec() }
+                sections
+                    .iter()
+                    .filter(|(l, _, _)| *l == label)
+                    .cloned()
+                    .collect()
+            } else {
+                sections.to_vec()
+            }
         }
         AggregateMode::Aggregate => {
-            let text = merge(model, model_name, stage_name, sections).await
+            let text = merge(model, model_name, stage_name, sections)
+                .await
                 .unwrap_or_else(|| {
                     let mut a = String::new();
-                    for (l, b, _) in sections { a.push_str(&format!("### {l}\n{b}\n\n")); }
+                    for (l, b, _) in sections {
+                        a.push_str(&format!("### {l}\n{b}\n\n"));
+                    }
                     a
                 });
             vec![("(aggregated)".into(), text, false)]
@@ -535,20 +581,28 @@ pub async fn aggregate(
 }
 
 pub async fn aggregate_stage_results(
-    model: &dyn Model, model_name: &str, mode: AggregateMode,
-    stage_name: &str, sections: &[(String, String, bool)],
+    model: &dyn Model,
+    model_name: &str,
+    mode: AggregateMode,
+    stage_name: &str,
+    sections: &[(String, String, bool)],
 ) -> Vec<(String, String, bool)> {
     aggregate(model, model_name, mode, stage_name, sections).await
 }
 
 async fn pick_best(
-    model: &dyn Model, model_name: &str, stage_name: &str,
+    model: &dyn Model,
+    model_name: &str,
+    stage_name: &str,
     sections: &[(String, String, bool)],
 ) -> Option<String> {
-    let formatted: Vec<String> = sections.iter().map(|(l, b, e)| {
-        let s = if *e { " (ERROR)" } else { "" };
-        format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
-    }).collect();
+    let formatted: Vec<String> = sections
+        .iter()
+        .map(|(l, b, e)| {
+            let s = if *e { " (ERROR)" } else { "" };
+            format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
+        })
+        .collect();
     let prompt = format!(
         "You are evaluating results of a team of AI agents on stage \"{stage_name}\".\n\n\
          Results:\n{}\n\n\
@@ -557,17 +611,26 @@ async fn pick_best(
     );
     let label = drain(model, model_name, prompt, 100).await?;
     let label = label.trim().to_string();
-    if sections.iter().any(|(l,_,_)| l == &label) { Some(label) } else { None }
+    if sections.iter().any(|(l, _, _)| l == &label) {
+        Some(label)
+    } else {
+        None
+    }
 }
 
 async fn merge(
-    model: &dyn Model, model_name: &str, stage_name: &str,
+    model: &dyn Model,
+    model_name: &str,
+    stage_name: &str,
     sections: &[(String, String, bool)],
 ) -> Option<String> {
-    let formatted: Vec<String> = sections.iter().map(|(l, b, e)| {
-        let s = if *e { " (ERROR)" } else { "" };
-        format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
-    }).collect();
+    let formatted: Vec<String> = sections
+        .iter()
+        .map(|(l, b, e)| {
+            let s = if *e { " (ERROR)" } else { "" };
+            format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
+        })
+        .collect();
     let prompt = format!(
         "Synthesize results of AI agents on stage \"{stage_name}\".\n\nResults:\n{}\n\n\
          Combine into one document. Capture best insights, remove redundancy, preserve facts.",
@@ -576,7 +639,12 @@ async fn merge(
     drain(model, model_name, prompt, 4096).await
 }
 
-async fn drain(model: &dyn Model, model_name: &str, prompt: String, max_tokens: u32) -> Option<String> {
+async fn drain(
+    model: &dyn Model,
+    model_name: &str,
+    prompt: String,
+    max_tokens: u32,
+) -> Option<String> {
     let blocks = vec![PromptBlock {
         role: BlockRole::System,
         content: "You are a strict judge. Output only the requested text, nothing else.".into(),
@@ -587,12 +655,17 @@ async fn drain(model: &dyn Model, model_name: &str, prompt: String, max_tokens: 
         content: vec![base::interface::model::ModelContentBlock::Text { text: prompt }],
     }];
     let params = StreamParams {
-        model: model_name.to_string(), max_tokens,
-        thinking_mode: ThinkingMode::Off, fallback_model: None,
+        model: model_name.to_string(),
+        max_tokens,
+        thinking_mode: ThinkingMode::Off,
+        fallback_model: None,
         cache_edits: vec![],
     };
     let cancel = tokio_util::sync::CancellationToken::new();
-    let mut stream = model.stream(blocks, vec![], messages, params, cancel).await.ok()?;
+    let mut stream = model
+        .stream(blocks, vec![], messages, params, cancel)
+        .await
+        .ok()?;
     let mut text = String::new();
     while let Some(ev) = stream.next().await {
         match ev.ok()? {
@@ -601,11 +674,17 @@ async fn drain(model: &dyn Model, model_name: &str, prompt: String, max_tokens: 
             _ => {}
         }
     }
-    if text.trim().is_empty() { None } else { Some(text) }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn chrono_id() -> String {
     let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!("{n:x}")
 }

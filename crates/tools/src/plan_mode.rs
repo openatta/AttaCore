@@ -16,7 +16,10 @@
 use anyhow;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -43,7 +46,10 @@ pub fn plan_mode_active() -> bool {
 
 /// Get current plan text, if any.
 pub fn plan_text() -> Option<String> {
-    plan_text_lock().lock().unwrap_or_else(|e| e.into_inner()).clone()
+    plan_text_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Test helper: directly set plan text in the static store.
@@ -64,8 +70,10 @@ pub struct EnterPlanModeTool;
 
 #[async_trait]
 impl Tool for EnterPlanModeTool {
-    fn description(&self) -> &str { "Enter plan mode to design before implementing" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Enter plan mode to design before implementing"
+    }
+    fn name(&self) -> &str {
         "EnterPlanMode"
     }
 
@@ -135,7 +143,7 @@ impl Tool for EnterPlanModeTool {
              6. When ready, use ExitPlanMode to present your plan for approval\n\n\
              Remember: DO NOT write or edit any files yet. This is a read-only \
              exploration and planning phase."
-            .to_string(),
+                .to_string(),
         ))
     }
 }
@@ -168,8 +176,10 @@ pub struct ExitPlanModeTool;
 
 #[async_trait]
 impl Tool for ExitPlanModeTool {
-    fn description(&self) -> &str { "Exit plan mode with plan summary and permission requests" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Exit plan mode with plan summary and permission requests"
+    }
+    fn name(&self) -> &str {
         "ExitPlanMode"
     }
 
@@ -235,9 +245,7 @@ impl Tool for ExitPlanModeTool {
             )))
         } else {
             // Should not reach here — validate_input rejects non-plan mode.
-            Ok(ToolResult::text(
-                "Already not in plan mode; no change."
-            ))
+            Ok(ToolResult::text("Already not in plan mode; no change."))
         }
     }
 }
@@ -275,14 +283,17 @@ mod tests {
         // call changes state to Plan.
         let c2 = ToolContext::for_test(PathBuf::from("/tmp"));
         PLAN_MODE_ACTIVE.store(0, Ordering::SeqCst);
-        let r = tool.call(serde_json::json!({}), c2, ProgressSender::noop("t")).await.unwrap();
+        let r = tool
+            .call(serde_json::json!({}), c2, ProgressSender::noop("t"))
+            .await
+            .unwrap();
         assert!(plan_mode_active());
         match r.content {
             base::tool::ToolResultContent::Text(s) => {
                 assert!(s.contains("Entered plan mode"));
                 assert!(s.contains("exploration and planning phase"));
             }
-            _ => panic!()
+            _ => panic!(),
         }
 
         // agent context rejected.
@@ -293,7 +304,9 @@ mod tests {
             parent_session: base::session::SessionId::new(),
             depth: 0,
         });
-        let r = tool.call(serde_json::json!({}), c3, ProgressSender::noop("t")).await;
+        let r = tool
+            .call(serde_json::json!({}), c3, ProgressSender::noop("t"))
+            .await;
         assert!(r.is_err());
         match r.unwrap_err() {
             ToolError::Execution(e) => assert!(e.to_string().contains("agent contexts")),
@@ -318,7 +331,10 @@ mod tests {
 
         // Scenario 2: call exits plan mode (Plan → Default).
         PLAN_MODE_ACTIVE.store(1, Ordering::SeqCst);
-        let _ = tool.call(serde_json::json!({}), c, ProgressSender::noop("t")).await.unwrap();
+        let _ = tool
+            .call(serde_json::json!({}), c, ProgressSender::noop("t"))
+            .await
+            .unwrap();
         assert!(!plan_mode_active());
     }
 

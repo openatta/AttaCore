@@ -10,8 +10,10 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -21,14 +23,16 @@ use serde_json::{json, Map, Value};
 pub enum NotebookEditMode {
     Insert,
     Edit,
-    Delete}
+    Delete,
+}
 
 #[derive(Debug, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotebookCellType {
     Code,
     Markdown,
-    Raw}
+    Raw,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NotebookEditInput {
@@ -44,14 +48,17 @@ pub struct NotebookEditInput {
     pub new_source: Option<String>,
     /// Cell type for new cells (required for insert; defaults to code)
     #[serde(default)]
-    pub cell_type: Option<NotebookCellType>}
+    pub cell_type: Option<NotebookCellType>,
+}
 
 pub struct NotebookEditTool;
 
 #[async_trait]
 impl Tool for NotebookEditTool {
-    fn description(&self) -> &str { "Edit Jupyter notebook cells (replace, insert, delete)" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Edit Jupyter notebook cells (replace, insert, delete)"
+    }
+    fn name(&self) -> &str {
         "NotebookEdit"
     }
 
@@ -90,7 +97,8 @@ impl Tool for NotebookEditTool {
                 ValidationResult::err("new_source is required for insert/edit modes", 2)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
         // 复用 path safety：notebook 不能写出 cwd（除非 additional_writable_dirs）
@@ -114,11 +122,14 @@ impl Tool for NotebookEditTool {
             Err(crate::security::PathSafetyError::OutsideAllowedRoots { .. }) => {
                 PermissionDecision::Ask {
                     message: "NotebookEdit outside the project requires confirmation".into(),
-                    decision_reason: None}
+                    decision_reason: None,
+                }
             }
             Err(e) => PermissionDecision::Deny {
                 reason: Some(format!("path safety: {e:?}")),
-                decision_reason: Some("notebook path outside cwd".into())}}
+                decision_reason: Some("notebook path outside cwd".into()),
+            },
+        }
     }
     async fn call(
         &self,
@@ -130,7 +141,9 @@ impl Tool for NotebookEditTool {
         let path = std::path::Path::new(&input.file_path);
 
         // **P1 **: snapshot before mutating so /rewind can restore.
-        if let Some(snapshot) = &ctx.snapshot_file { snapshot.record(path, "NotebookEdit"); }
+        if let Some(snapshot) = &ctx.snapshot_file {
+            snapshot.record(path, "NotebookEdit");
+        }
 
         // 读 + 解析
         let content = tokio::fs::read_to_string(path)
@@ -216,7 +229,8 @@ impl Tool for NotebookEditTool {
                 "mode": format!("{:?}", input.mode).to_lowercase(),
                 "cells_after": cells_after})),
             mcp_meta: None,
-            new_messages: Some(vec![])})
+            new_messages: Some(vec![]),
+        })
     }
 }
 
@@ -225,7 +239,8 @@ fn build_cell(ctype: NotebookCellType, source: &str) -> Value {
     let cell_type = match ctype {
         NotebookCellType::Code => "code",
         NotebookCellType::Markdown => "markdown",
-        NotebookCellType::Raw => "raw"};
+        NotebookCellType::Raw => "raw",
+    };
     let mut obj = Map::new();
     obj.insert("cell_type".into(), json!(cell_type));
     obj.insert("source".into(), source_to_lines(source));

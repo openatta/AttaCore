@@ -7,7 +7,7 @@
 //! - [`prompt`] — coordinator system prompt (TS parity)
 
 pub mod coordinator;
-pub mod tool;
 pub mod mailbox;
-pub mod remote_agent;
 pub mod prompt;
+pub mod remote_agent;
+pub mod tool;

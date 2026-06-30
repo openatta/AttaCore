@@ -5,11 +5,13 @@
 //!
 //! `SearchProvider` trait 可插拔 —— test mock 或自定义后端注入。
 
+use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
-use base::tool::{PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
-    ValidationResult};
-use crate::cancel::run_with_cancel;
+use base::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+    ValidationResult,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -30,7 +32,8 @@ pub struct WebSearchInput {
     pub allowed_domains: Option<Vec<String>>,
     /// Never include search results from these domains.
     #[serde(default)]
-    pub blocked_domains: Option<Vec<String>>}
+    pub blocked_domains: Option<Vec<String>>,
+}
 
 /// An item in the ordered search output, preserving the natural interleaving
 /// of model commentary and search result links from the API response.
@@ -39,7 +42,8 @@ pub enum SearchOutputItem {
     /// Model-generated text commentary.
     Text(String),
     /// Structured search result links.
-    Links(Vec<SearchResult>)}
+    Links(Vec<SearchResult>),
+}
 
 /// Return type from a search provider: ordered items preserving the sequence
 /// of text commentary and search result links from the sub-call response.
@@ -47,7 +51,8 @@ pub enum SearchOutputItem {
 pub struct SearchOutput {
     /// Ordered items from the sub-call. Preserves the natural sequence so the
     /// main model can match data commentary to its source links.
-    pub items: Vec<SearchOutputItem>}
+    pub items: Vec<SearchOutputItem>,
+}
 
 /// Pluggable search backend.
 #[async_trait]
@@ -58,7 +63,8 @@ pub trait SearchProvider: Send + Sync + std::fmt::Debug {
 
 #[derive(Debug)]
 pub struct WebSearchTool {
-    provider: Box<dyn SearchProvider>}
+    provider: Box<dyn SearchProvider>,
+}
 
 impl WebSearchTool {
     /// Create a WebSearchTool with a search provider.
@@ -69,8 +75,10 @@ impl WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
-    fn description(&self) -> &str { "Search the web and return results with linked sources" }
-        fn name(&self) -> &str {
+    fn description(&self) -> &str {
+        "Search the web and return results with linked sources"
+    }
+    fn name(&self) -> &str {
         "WebSearch"
     }
 
@@ -123,12 +131,14 @@ impl Tool for WebSearchTool {
                 ValidationResult::err("cannot specify both allowed_domains and blocked_domains", 4)
             }
             Ok(_) => ValidationResult::Ok,
-            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3)}
+            Err(e) => ValidationResult::err(format!("invalid input: {e}"), 3),
+        }
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         PermissionDecision::Allow {
-                        decision_reason: None}
+            decision_reason: None,
+        }
     }
 
     async fn call(
@@ -143,16 +153,19 @@ impl Tool for WebSearchTool {
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .min(HARD_CAP_RESULTS);
 
-        let SearchOutput { items } = run_with_cancel(&ctx.cancel, self.provider.search(&input.query, max))
-            .await?
-            .map_err(|e| match e {
-            SearchError::Timeout => ToolError::Timeout(std::time::Duration::from_secs(30)),
-            SearchError::Other(e) => ToolError::exec(e.to_string())})?;
+        let SearchOutput { items } =
+            run_with_cancel(&ctx.cancel, self.provider.search(&input.query, max))
+                .await?
+                .map_err(|e| match e {
+                    SearchError::Timeout => ToolError::Timeout(std::time::Duration::from_secs(30)),
+                    SearchError::Other(e) => ToolError::exec(e.to_string()),
+                })?;
         let items = filter_items_by_domain(items, &input.allowed_domains, &input.blocked_domains);
 
         let has_content = items.iter().any(|item| match item {
             SearchOutputItem::Text(t) => !t.is_empty(),
-            SearchOutputItem::Links(l) => !l.is_empty()});
+            SearchOutputItem::Links(l) => !l.is_empty(),
+        });
         if !has_content {
             Ok(ToolResult::text(format!(
                 "(no results for '{}')",
@@ -168,14 +181,16 @@ impl Tool for WebSearchTool {
 pub struct SearchResult {
     pub title: String,
     pub url: String,
-    pub snippet: String}
+    pub snippet: String,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum SearchError {
     #[error("timeout")]
     Timeout,
     #[error(transparent)]
-    Other(#[from] anyhow::Error)}
+    Other(#[from] anyhow::Error),
+}
 
 /// Filter search results by domain constraints.
 fn filter_by_domain(
@@ -200,7 +215,8 @@ fn filter_by_domain(
                 !blocked.iter().any(|d| host.contains(d.as_str()))
             })
             .collect(),
-        _ => items}
+        _ => items,
+    }
 }
 
 impl SearchResult {
@@ -227,7 +243,8 @@ fn filter_items_by_domain(
             SearchOutputItem::Links(results) => {
                 SearchOutputItem::Links(filter_by_domain(results, allowed, blocked))
             }
-            other => other})
+            other => other,
+        })
         .collect()
 }
 
@@ -285,7 +302,8 @@ mod tests {
                     vec![]
                 } else {
                     vec![SearchOutputItem::Links(self.0.clone())]
-                }})
+                },
+            })
         }
     }
 
@@ -341,7 +359,8 @@ mod tests {
             .unwrap();
         let text = match &r.content {
             base::tool::ToolResultContent::Text(t) => t.clone(),
-            _ => String::new()};
+            _ => String::new(),
+        };
         assert!(text.contains("no results"));
     }
 
@@ -351,11 +370,13 @@ mod tests {
             SearchResult {
                 title: "Rust Lang".into(),
                 url: "https://rust-lang.org".into(),
-                snippet: "Systems language".into()},
+                snippet: "Systems language".into(),
+            },
             SearchResult {
                 title: "Crates.io".into(),
                 url: "https://crates.io".into(),
-                snippet: "".into()},
+                snippet: "".into(),
+            },
         ];
         let tool = WebSearchTool::new(Box::new(MockProvider(items)));
         let r = tool
@@ -368,7 +389,8 @@ mod tests {
             .unwrap();
         let text = match &r.content {
             base::tool::ToolResultContent::Text(t) => t.clone(),
-            _ => String::new()};
+            _ => String::new(),
+        };
         assert!(
             text.contains("Web search results for query: \"rust\""),
             "{text}"
@@ -408,11 +430,13 @@ mod tests {
             SearchResult {
                 title: "Hello".into(),
                 url: "https://x.com".into(),
-                snippet: "World".into()},
+                snippet: "World".into(),
+            },
             SearchResult {
                 title: "Foo".into(),
                 url: "https://y.com".into(),
-                snippet: "".into()},
+                snippet: "".into(),
+            },
         ])];
         let s = format_results("test", &items);
         assert!(s.contains("Web search results for query: \"test\""));
@@ -428,11 +452,13 @@ mod tests {
             SearchResult {
                 title: "A".into(),
                 url: "https://rust-lang.org".into(),
-                snippet: "".into()},
+                snippet: "".into(),
+            },
             SearchResult {
                 title: "B".into(),
                 url: "https://example.com".into(),
-                snippet: "".into()},
+                snippet: "".into(),
+            },
         ];
         let allowed = Some(vec!["rust-lang.org".into()]);
         let r = filter_by_domain(items, &allowed, &None);
@@ -446,11 +472,13 @@ mod tests {
             SearchResult {
                 title: "A".into(),
                 url: "https://rust-lang.org".into(),
-                snippet: "".into()},
+                snippet: "".into(),
+            },
             SearchResult {
                 title: "B".into(),
                 url: "https://example.com".into(),
-                snippet: "".into()},
+                snippet: "".into(),
+            },
         ];
         let blocked = Some(vec!["example.com".into()]);
         let r = filter_by_domain(items, &None, &blocked);
@@ -463,7 +491,8 @@ mod tests {
         let r = SearchResult {
             title: "t".into(),
             url: "https://example.com/path".into(),
-            snippet: "".into()};
+            snippet: "".into(),
+        };
         assert_eq!(r.url_host(), Some("example.com"));
     }
 
@@ -472,7 +501,8 @@ mod tests {
         let r = SearchResult {
             title: "t".into(),
             url: "http://x.org".into(),
-            snippet: "".into()};
+            snippet: "".into(),
+        };
         assert_eq!(r.url_host(), Some("x.org"));
     }
 
@@ -481,7 +511,8 @@ mod tests {
         let r = SearchResult {
             title: "t".into(),
             url: "example.com".into(),
-            snippet: "".into()};
+            snippet: "".into(),
+        };
         assert!(r.url_host().is_none());
     }
 }
