@@ -114,7 +114,7 @@ pub(crate) async fn collect_memory_files_with(
         // 从 cwd 向上爬到根
         let mut p = cwd.to_path_buf();
         loop {
-            let candidates = [p.join("ATTA.md"), p.join(".atta/ATTA.md")];
+            let candidates = [p.join("AGENTS.md"), p.join(".atta/ATTA.md")];
             for c in candidates {
                 if c.exists() {
                     walk_up.push(c);
@@ -127,23 +127,17 @@ pub(crate) async fn collect_memory_files_with(
         }
     } else {
         // 只 cwd 级
-        for c in [cwd.join("ATTA.md"), cwd.join(".atta/ATTA.md")] {
+        for c in [cwd.join("AGENTS.md"), cwd.join(".atta/ATTA.md")] {
             if c.exists() {
                 walk_up.push(c);
             }
         }
     }
 
-    // 用户级 (~/.atta/ATTA.md)
-    let user_md = crate::paths::atta_code_dir().join("ATTA.md");
-    if user_md.exists() {
-        walk_up.push(user_md.clone());
-    }
-
-    // 远到近：先用户级 -> 顶层 repo -> cwd -> 子（这里 walk_up 是 cwd 向上，所以反转）
+    // 远到近：顶层 repo → cwd → 子（这里 walk_up 是 cwd 向上，所以反转）
     walk_up.reverse();
 
-    // memdir：在用户级 ATTA.md 之后、repo 顶层之前插入
+    // memdir：在 repo 顶层之前插入
     // ~/.atta/code/memory/<sanitized-cwd>/*.md
     let home = std::env::var("HOME").ok();
     let memdir_files = match home.as_deref() {
@@ -151,14 +145,8 @@ pub(crate) async fn collect_memory_files_with(
         None => Vec::new(),
     };
     let mut combined: Vec<PathBuf> = Vec::with_capacity(walk_up.len() + memdir_files.len());
-    // 找 walk_up 中第一个不是 user-level ATTA.md 的位置（split_at）
-    let split_at = walk_up
-        .iter()
-        .position(|p| p != &user_md)
-        .unwrap_or(walk_up.len());
-    combined.extend_from_slice(&walk_up[..split_at]);
     combined.extend(memdir_files);
-    combined.extend_from_slice(&walk_up[split_at..]);
+    combined.extend(walk_up);
 
     let mut entries: Vec<MemoryFileEntry> = Vec::new();
     let mut total_len = 0usize;
@@ -566,15 +554,15 @@ mod tests {
 
     #[tokio::test]
     async fn walk_up_false_skips_parent_claude_md() {
-        // parent 有 ATTA.md / cwd 有 ATTA.md；walk_up=false 应只读 cwd
+        // parent 有 AGENTS.md / cwd 有 AGENTS.md；walk_up=false 应只读 cwd
         let dir = TempDir::new().unwrap();
         let parent = dir.path().join("parent");
         let child = parent.join("child");
         tokio::fs::create_dir_all(&child).await.unwrap();
-        tokio::fs::write(parent.join("ATTA.md"), "PARENT-MONOREPO")
+        tokio::fs::write(parent.join("AGENTS.md"), "PARENT-MONOREPO")
             .await
             .unwrap();
-        tokio::fs::write(child.join("ATTA.md"), "CHILD-LOCAL")
+        tokio::fs::write(child.join("AGENTS.md"), "CHILD-LOCAL")
             .await
             .unwrap();
 

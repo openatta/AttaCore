@@ -356,12 +356,12 @@ mod tests {
     #[tokio::test]
     async fn loads_claude_md_from_cwd() {
         let dir = TempDir::new().unwrap();
-        let p = dir.path().join("ATTA.md");
+        let p = dir.path().join("AGENTS.md");
         tokio::fs::write(&p, "# Test instructions\nbe concise.")
             .await
             .unwrap();
         let ctx = FrozenContext::collect(dir.path().to_path_buf()).await;
-        assert_eq!(ctx.memory_blocks.len(), 1, "expected one ATTA.md");
+        assert_eq!(ctx.memory_blocks.len(), 1, "expected one AGENTS.md");
         assert!(ctx.memory_blocks[0].content.contains("be concise"));
     }
 
@@ -371,10 +371,10 @@ mod tests {
         let parent = dir.path().join("p");
         let child = parent.join("c");
         tokio::fs::create_dir_all(&child).await.unwrap();
-        tokio::fs::write(parent.join("ATTA.md"), "PARENT")
+        tokio::fs::write(parent.join("AGENTS.md"), "PARENT")
             .await
             .unwrap();
-        tokio::fs::write(child.join("ATTA.md"), "CHILD")
+        tokio::fs::write(child.join("AGENTS.md"), "CHILD")
             .await
             .unwrap();
 
