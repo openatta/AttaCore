@@ -395,6 +395,9 @@ fn kind_label(kind: CodingTaskKind) -> &'static str {
         CodingTaskKind::Refactor => "Refactor",
         CodingTaskKind::Document => "Document",
         CodingTaskKind::Plan => "Plan",
+        CodingTaskKind::Test => "Test",
+        CodingTaskKind::Perf => "Perf",
+        CodingTaskKind::Deps => "Deps",
     }
 }
 

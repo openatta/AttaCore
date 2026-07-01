@@ -90,6 +90,8 @@ pub struct Agent {
     pub(crate) changed_files_this_turn: Vec<String>,
     /// v2.0.0: Commands executed in the current turn (for policy hook context).
     pub(crate) executed_commands_this_turn: Vec<String>,
+    /// v2.1.0: Whether the current turn's tier requires verification (from escalation).
+    pub(crate) tier_requires_verification: bool,
     pub(crate) tools: Arc<InMemoryToolRegistry>,
     pub(crate) settings: Arc<Settings>,
     pub(crate) permission: Arc<dyn Permission>,
@@ -381,6 +383,7 @@ impl Agent {
             tool_name: tool_name.map(|s| s.to_string()),
             tool_input: None,
             command: command.map(|s| s.to_string()),
+            tier_requires_verification: self.tier_requires_verification,
         };
         self.policy_hooks.evaluate(point, &ctx)
     }
@@ -962,6 +965,7 @@ impl Builder {
                 verification_records: Vec::new(),
                 changed_files_this_turn: Vec::new(),
                 executed_commands_this_turn: Vec::new(),
+                tier_requires_verification: false,
                 tools,
                 settings,
                 permission,

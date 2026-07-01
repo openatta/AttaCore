@@ -102,6 +102,8 @@ pub struct PolicyContext {
     pub tool_input: Option<String>,
     /// The current command (for BeforeCommandExec/AfterCommandExec).
     pub command: Option<String>,
+    /// v2.1.0: Whether the current tier requires verification (from escalation).
+    pub tier_requires_verification: bool,
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -145,10 +147,18 @@ impl PolicyHook for CompletionVerificationHook {
         "Blocks task completion if verification was required but not performed or failed"
     }
     fn evaluate(&self, ctx: &PolicyContext) -> HookDecision {
-        if !ctx.has_verification {
+        // Determine if verification is required: either the tier demands it
+        // or the task profile explicitly requires it.
+        let requires_verification = ctx.tier_requires_verification;
+        if !requires_verification && !ctx.has_verification {
+            // No verification needed and none performed — allow
+            return HookDecision::Allow;
+        }
+        if requires_verification && !ctx.has_verification {
             return HookDecision::Deny {
-                reason: "Verification is required for this task but no verification was performed."
-                    .into(),
+                reason:
+                    "Verification is required for this task tier but no verification was performed."
+                        .into(),
             };
         }
         if !ctx.verification_passed {
@@ -457,6 +467,7 @@ mod tests {
         let hook = CompletionVerificationHook;
         let ctx = PolicyContext {
             has_verification: false,
+            tier_requires_verification: true,
             ..Default::default()
         };
         assert!(hook.evaluate(&ctx).is_blocked());
@@ -471,6 +482,18 @@ mod tests {
             ..Default::default()
         };
         assert!(hook.evaluate(&ctx).is_blocked());
+    }
+
+    #[test]
+    fn completion_verification_allows_when_no_tier_requirement() {
+        // No verification done but tier doesn't require it → allow
+        let hook = CompletionVerificationHook;
+        let ctx = PolicyContext {
+            has_verification: false,
+            tier_requires_verification: false,
+            ..Default::default()
+        };
+        assert!(hook.evaluate(&ctx).is_allowed());
     }
 
     #[test]
@@ -542,6 +565,7 @@ mod tests {
         let ctx = PolicyContext {
             hook_point: Some(PolicyHookPoint::BeforeTaskComplete),
             has_verification: false,
+            tier_requires_verification: true,
             ..Default::default()
         };
         let decision = runner.evaluate(PolicyHookPoint::BeforeTaskComplete, &ctx);

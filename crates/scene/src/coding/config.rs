@@ -8,6 +8,7 @@
 //! `$strong/$normal/$lite` are field-level references that resolve to the
 //! corresponding built-in profile's field value.
 
+use crate::coding::escalation::EscalationConfig;
 use crate::coding::prompt::TaskProfile;
 use crate::coding::task::CodingTaskKind;
 use base::provider::{ProviderDef, ProviderRegistry};
@@ -204,6 +205,8 @@ pub struct CodingSceneConfig {
     pub enable_verification_loop: bool,
     /// Enable policy hooks (default: false — Phase 4).
     pub enable_policy_hooks: bool,
+    /// v2.1.0: Enable model tier escalation (default: true).
+    pub enable_model_escalation: bool,
 
     /// Provider registry (Level 1: API endpoints, auth).
     pub provider_registry: ProviderRegistry,
@@ -213,6 +216,8 @@ pub struct CodingSceneConfig {
     pub task_profiles: HashMap<String, TaskProfile>,
     /// Default model profile id to use when a task doesn't specify one.
     pub default_model_profile: String,
+    /// Escalation configuration (v2.1.0).
+    pub escalation: EscalationConfig,
 }
 
 impl Default for CodingSceneConfig {
@@ -222,10 +227,12 @@ impl Default for CodingSceneConfig {
             enable_context_pack: true,
             enable_verification_loop: false,
             enable_policy_hooks: false,
+            enable_model_escalation: true,
             provider_registry: ProviderRegistry::from_env(),
             model_profiles: ModelProfileRegistry::builtin(),
             task_profiles: HashMap::new(),
             default_model_profile: "normal".into(),
+            escalation: EscalationConfig::default(),
         }
     }
 }

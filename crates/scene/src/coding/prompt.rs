@@ -131,6 +131,36 @@ impl TaskProfile {
                 require_review: false,
                 require_verification: false,
             },
+            CodingTaskKind::Test => Self {
+                kind: "test".into(),
+                model_profile: Some("normal".into()),
+                tool_policy: "read_write_test".into(),
+                verification_policy: "required".into(),
+                prompt_profile: None,
+                require_plan: false,
+                require_review: false,
+                require_verification: true,
+            },
+            CodingTaskKind::Perf => Self {
+                kind: "perf".into(),
+                model_profile: Some("strong".into()),
+                tool_policy: "read_write_test".into(),
+                verification_policy: "required".into(),
+                prompt_profile: None,
+                require_plan: false,
+                require_review: false,
+                require_verification: true,
+            },
+            CodingTaskKind::Deps => Self {
+                kind: "deps".into(),
+                model_profile: Some("normal".into()),
+                tool_policy: "read_write".into(),
+                verification_policy: "suggested".into(),
+                prompt_profile: None,
+                require_plan: false,
+                require_review: false,
+                require_verification: false,
+            },
         }
     }
 
@@ -210,6 +240,21 @@ impl PromptProfile {
                 id: "plan".into(),
                 system_rules: plan_rules(),
                 output_format: plan_output(),
+            },
+            CodingTaskKind::Test => Self {
+                id: "test".into(),
+                system_rules: test_rules(),
+                output_format: test_output(),
+            },
+            CodingTaskKind::Perf => Self {
+                id: "perf".into(),
+                system_rules: perf_rules(),
+                output_format: perf_output(),
+            },
+            CodingTaskKind::Deps => Self {
+                id: "deps".into(),
+                system_rules: deps_rules(),
+                output_format: deps_output(),
             },
         }
     }
@@ -393,6 +438,73 @@ fn plan_output() -> String {
      - Alternatives considered (with trade-offs)\n\
      - Implementation steps\n\
      - Risks / unknowns"
+        .into()
+}
+
+// ── Test ──
+
+fn test_rules() -> String {
+    "# Task: Write Tests\n\n\
+     You are writing tests for existing code. Do NOT change the implementation.\n\n\
+     - **Read the target first**: understand the function/module before writing tests\n\
+     - **Design test cases**: happy path, edge cases, error paths, boundary values\n\
+     - **Follow existing patterns**: match the project's test framework and style\n\
+     - **Coverage over cleverness**: prefer simple, comprehensive tests over clever ones\n\
+     - **Run the tests**: verify they pass (and fail when expected) before claiming completion"
+        .into()
+}
+
+fn test_output() -> String {
+    "# Output format\n\
+     - What was tested (function/module names)\n\
+     - Test cases added (list with one-line descriptions)\n\
+     - Test results (MANDATORY: run output or confirmation that tests pass)"
+        .into()
+}
+
+// ── Perf ──
+
+fn perf_rules() -> String {
+    "# Task: Performance Optimization\n\n\
+     You are improving performance. Do NOT change behavior — only efficiency.\n\n\
+     - **Profile first**: identify the actual bottleneck before making changes\n\
+     - **Benchmark before and after**: establish a baseline, measure improvement\n\
+     - **Minimal change**: the smallest change that achieves meaningful improvement\n\
+     - **Algorithm before micro-optimization**: fix O(n²) before tweaking allocations\n\
+     - **Verify correctness**: optimized code must pass all existing tests\n\
+     - **CRITICAL**: If you cannot measure the improvement, do NOT claim success"
+        .into()
+}
+
+fn perf_output() -> String {
+    "# Output format\n\
+     - Bottleneck identified (with evidence: profile output, timing data)\n\
+     - What was changed and why\n\
+     - Before/after comparison (MANDATORY: concrete numbers)\n\
+     - Test results confirming no regression"
+        .into()
+}
+
+// ── Deps ──
+
+fn deps_rules() -> String {
+    "# Task: Dependency Management\n\n\
+     You are managing project dependencies. Be careful with version changes.\n\n\
+     - **Read current versions first**: check lockfile and manifest before changes\n\
+     - **Understand semver**: prefer compatible ranges, avoid breaking changes unless required\n\
+     - **Check changelogs**: verify the target version doesn't have known issues\n\
+     - **Update lockfile**: run the package manager's lock command after version changes\n\
+     - **Verify build**: the project must build and tests must pass after dependency changes\n\
+     - **Resolve conflicts carefully**: when multiple packages conflict, explain the trade-offs"
+        .into()
+}
+
+fn deps_output() -> String {
+    "# Output format\n\
+     - Dependencies changed (old → new, with reason)\n\
+     - Package manager commands run\n\
+     - Build verification result\n\
+     - Any breaking changes or deprecation warnings noted"
         .into()
 }
 

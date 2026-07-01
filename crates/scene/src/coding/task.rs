@@ -29,6 +29,12 @@ pub enum CodingTaskKind {
     Document,
     /// Plan architecture or design — no code changes.
     Plan,
+    /// Write tests — read the target code, design cases, cover edge cases.
+    Test,
+    /// Optimize performance — profile, identify hotspots, improve efficiency.
+    Perf,
+    /// Manage dependencies — add, update, remove packages or resolve conflicts.
+    Deps,
 }
 
 impl CodingTaskKind {
@@ -44,6 +50,9 @@ impl CodingTaskKind {
             CodingTaskKind::Refactor => "refactor",
             CodingTaskKind::Document => "document",
             CodingTaskKind::Plan => "plan",
+            CodingTaskKind::Test => "test",
+            CodingTaskKind::Perf => "perf",
+            CodingTaskKind::Deps => "deps",
         }
     }
 
@@ -59,6 +68,9 @@ impl CodingTaskKind {
             CodingTaskKind::Refactor,
             CodingTaskKind::Document,
             CodingTaskKind::Plan,
+            CodingTaskKind::Test,
+            CodingTaskKind::Perf,
+            CodingTaskKind::Deps,
         ]
     }
 }
@@ -165,6 +177,32 @@ fn classify_task(prompt: &str) -> Option<CodingTaskKind> {
         return Some(CodingTaskKind::Refactor);
     }
 
+    // Perf — performance optimization request
+    let perf_markers = [
+        "optimize",
+        "optimise",
+        "performance",
+        "too slow",
+        "is slow",
+        "faster",
+        "speed up",
+        "bottleneck",
+        "profiling",
+        "profile",
+        "latency",
+        "throughput",
+        "memory leak",
+        "high cpu",
+        "reduce memory",
+        "make this faster",
+        "make it faster",
+        "more efficient",
+        "less memory",
+    ];
+    if perf_markers.iter().any(|m| pl.contains(m)) {
+        return Some(CodingTaskKind::Perf);
+    }
+
     // Explain — explicit understanding request
     let explain_markers = [
         "explain",
@@ -218,6 +256,44 @@ fn classify_task(prompt: &str) -> Option<CodingTaskKind> {
         return Some(CodingTaskKind::Document);
     }
 
+    // Deps — dependency/package management
+    let deps_markers = [
+        "update dependency",
+        "update dependencies",
+        "upgrade dependency",
+        "upgrade dependencies",
+        "add dependency",
+        "add package",
+        "install package",
+        "remove dependency",
+        "remove package",
+        "bump version",
+        "bump the version",
+        "update packages",
+        "upgrade packages",
+        "outdated package",
+        "outdated packages",
+        "dependency conflict",
+        "resolve conflict",
+        "package conflict",
+        "fix deps",
+        "update deps",
+        "upgrade deps",
+        "npm install",
+        "pip install",
+        "cargo add",
+        "cargo update",
+        "go get",
+        "go mod",
+        "gem install",
+        "package.json",
+        "requirements.txt",
+        "cargo.toml",
+    ];
+    if deps_markers.iter().any(|m| pl.contains(m)) {
+        return Some(CodingTaskKind::Deps);
+    }
+
     // Plan — explicit planning/design request
     let plan_markers = [
         "plan",
@@ -233,6 +309,39 @@ fn classify_task(prompt: &str) -> Option<CodingTaskKind> {
     ];
     if plan_markers.iter().any(|m| pl.contains(m)) {
         return Some(CodingTaskKind::Plan);
+    }
+
+    // Test — write tests, test coverage (check BEFORE Generate to catch
+    // "write a test" which would otherwise match gen_markers' "write a")
+    let test_markers = [
+        "write test",
+        "write a test",
+        "write tests",
+        "add test",
+        "add a test",
+        "add tests",
+        "test for",
+        "tests for",
+        "test coverage",
+        "unit test",
+        "unit tests",
+        "integration test",
+        "integration tests",
+        "e2e test",
+        "e2e tests",
+        "end to end test",
+        "test case",
+        "test cases",
+        "add testing",
+        "missing test",
+        "missing tests",
+        "need test",
+        "need tests",
+        "needs test",
+        "needs tests",
+    ];
+    if test_markers.iter().any(|m| pl.contains(m)) {
+        return Some(CodingTaskKind::Test);
     }
 
     // Generate — explicit creation request (new file, new project)
@@ -275,7 +384,11 @@ fn classify_task(prompt: &str) -> Option<CodingTaskKind> {
     // Diff/PR patterns → Review
     if pl.contains("diff")
         || pl.contains("pull request")
-        || pl.contains("pr")
+        || pl.contains(" pr ")
+        || pl.contains("pr review")
+        || pl.contains("#pr")
+        || pl.starts_with("pr ")
+        || pl.ends_with(" pr")
         || pl.contains("change")
     {
         return Some(CodingTaskKind::Review);
@@ -386,6 +499,68 @@ mod tests {
         assert_eq!(
             router.route("update the config parser"),
             CodingTaskKind::Modify
+        );
+    }
+
+    #[test]
+    fn classify_test() {
+        assert_eq!(
+            classify_task("write tests for the auth module"),
+            Some(CodingTaskKind::Test)
+        );
+        assert_eq!(
+            classify_task("add unit tests for parse_config"),
+            Some(CodingTaskKind::Test)
+        );
+        assert_eq!(
+            classify_task("this needs test coverage"),
+            Some(CodingTaskKind::Test)
+        );
+    }
+
+    #[test]
+    fn classify_perf() {
+        assert_eq!(
+            classify_task("optimize the database query"),
+            Some(CodingTaskKind::Perf)
+        );
+        assert_eq!(
+            classify_task("this endpoint is too slow"),
+            Some(CodingTaskKind::Perf)
+        );
+        assert_eq!(
+            classify_task("profile the memory usage"),
+            Some(CodingTaskKind::Perf)
+        );
+    }
+
+    #[test]
+    fn classify_deps() {
+        assert_eq!(
+            classify_task("upgrade dependencies to latest"),
+            Some(CodingTaskKind::Deps)
+        );
+        assert_eq!(
+            classify_task("cargo update serde"),
+            Some(CodingTaskKind::Deps)
+        );
+        assert_eq!(
+            classify_task("resolve dependency conflict"),
+            Some(CodingTaskKind::Deps)
+        );
+    }
+
+    #[test]
+    fn test_before_generate() {
+        // "write a test" should be Test, not Generate
+        assert_eq!(
+            classify_task("write a test for the login handler"),
+            Some(CodingTaskKind::Test)
+        );
+        // "write a tcp server" should still be Generate
+        assert_eq!(
+            classify_task("write a tcp echo server"),
+            Some(CodingTaskKind::Generate)
         );
     }
 }

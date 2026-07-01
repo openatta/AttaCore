@@ -11,8 +11,9 @@
 
 pub mod config;
 pub mod context;
+pub mod escalation;
 pub mod policy;
 pub mod prompt;
 pub mod task;
+pub mod tier;
 pub mod verify;
-// pub mod trace; // Phase 5

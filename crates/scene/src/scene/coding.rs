@@ -16,8 +16,12 @@
 
 use crate::coding::config::CodingSceneConfig;
 use crate::coding::context::ContextPackBuilder;
+use crate::coding::escalation::{
+    EscalationInput, KeywordSignalExtractor, RiskEvaluator, SignalExtractor, TierDecision,
+};
 use crate::coding::prompt::PromptProfile;
 use crate::coding::task::{CodingTaskKind, RuleBasedTaskRouter, TaskClassifier};
+use crate::coding::tier::{ModelTier, TierRuntimePolicy};
 use base::interface::prompt::{CacheStrategy, PromptBlock};
 use base::interface::scene::{
     AgentScene, ExecutionParams, ReminderContext, ScenePromptContext, TokenBudget,
@@ -26,22 +30,39 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
-/// CodingScene with v2.0.0 task routing.
+/// v2.1.0: Runtime feedback carried from the previous turn.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeFeedback {
+    pub previous_attempt_failed: bool,
+    pub last_verification_failed: bool,
+    pub hook_rejected_count: u32,
+    pub changed_files_estimate: usize,
+}
+
+/// CodingScene with v2.0.0 task routing + model tier escalation.
 ///
-/// Holds a `CodingSceneConfig` and `RuleBasedTaskRouter`.
+/// Holds a `CodingSceneConfig`, `RuleBasedTaskRouter`, and `RiskEvaluator`.
 /// When task routing is enabled, the system prompt is augmented with
-/// task-specific instructions based on the classified task kind.
+/// task-specific instructions and escalation decisions.
 pub struct CodingScene {
     config: CodingSceneConfig,
     task_router: RuleBasedTaskRouter,
+    escalation_evaluator: RiskEvaluator,
+    signal_extractor: Box<dyn SignalExtractor>,
+    /// v2.1.0: Feedback from the previous turn for escalation.
+    pub runtime_feedback: RuntimeFeedback,
 }
 
 impl CodingScene {
     /// Create a new CodingScene with the given config.
     pub fn new(config: CodingSceneConfig) -> Self {
+        let esc_config = config.escalation.clone();
         Self {
             config,
             task_router: RuleBasedTaskRouter::new(),
+            escalation_evaluator: RiskEvaluator::new(esc_config),
+            signal_extractor: Box::new(KeywordSignalExtractor),
+            runtime_feedback: RuntimeFeedback::default(),
         }
     }
 
@@ -53,6 +74,11 @@ impl CodingScene {
     /// Access the config (read-only).
     pub fn config(&self) -> &CodingSceneConfig {
         &self.config
+    }
+
+    /// Access the escalation evaluator (read-only).
+    pub fn escalation_evaluator(&self) -> &RiskEvaluator {
+        &self.escalation_evaluator
     }
 
     /// Classify the current user message (if any) and return the task kind.
@@ -82,14 +108,45 @@ impl AgentScene for CodingScene {
     fn build_system_prompt(&self, ctx: &ScenePromptContext) -> Vec<PromptBlock> {
         let mut sections = build_section_registry(ctx);
 
-        // ── v2.0.0: Task routing + ContextPack ──
+        // ── v2.0.0: Task routing + ContextPack + Escalation ──
         if let Some(kind) = self.classify_current_task(ctx) {
-            let task_profile = self.config.resolve_task_profile(kind);
+            let user_msg = ctx.user_message.as_deref().unwrap_or("");
+
+            // Evaluate escalation (v2.1.0)
+            let tier_decision = if self.config.enable_model_escalation {
+                let base_tier = ModelTier::default_for(kind);
+                let signals = self.signal_extractor.extract(user_msg);
+                let fb = &self.runtime_feedback;
+                let esc_input = EscalationInput {
+                    base_tier,
+                    task_kind: kind,
+                    signals,
+                    previous_attempt_failed: fb.previous_attempt_failed,
+                    last_verification_failed: fb.last_verification_failed,
+                    hook_rejected_count: fb.hook_rejected_count,
+                    changed_files_estimate: fb.changed_files_estimate,
+                };
+                self.escalation_evaluator.evaluate(&esc_input)
+            } else {
+                let base_tier = ModelTier::default_for(kind);
+                TierDecision {
+                    base_tier,
+                    final_tier: base_tier,
+                    score: 0,
+                    reasons: vec!["escalation disabled".into()],
+                    force_reason: None,
+                    runtime_policy: TierRuntimePolicy::for_tier(base_tier),
+                }
+            };
+
+            // Resolve task profile with escalation override
+            let mut task_profile = self.config.resolve_task_profile(kind);
+            if tier_decision.was_upgraded() && tier_decision.final_tier == ModelTier::Strong {
+                task_profile.model_profile = Some("strong".into());
+            }
             let prompt_profile = PromptProfile::builtin(kind);
 
-            // Build ContextPack from the ScenePromptContext (no tool calls needed —
-            // git status, branch, etc. are already in the context).
-            let user_msg = ctx.user_message.as_deref().unwrap_or("");
+            // Build ContextPack
             let context_pack = ContextPackBuilder::new(user_msg)
                 .task_kind(kind)
                 .git_status(ctx.git_status.as_deref().unwrap_or(""))
@@ -97,9 +154,10 @@ impl AgentScene for CodingScene {
                 .build();
             let context_text = context_pack.render();
 
-            // Inject task profile + ContextPack as a combined dynamic section
+            // Inject task profile + escalation + ContextPack
             let task_section_text = render_task_section(kind, &task_profile, &prompt_profile);
-            let combined = format!("{context_text}\n\n{task_section_text}");
+            let escalation_text = render_escalation_section(&tier_decision);
+            let combined = format!("{context_text}\n\n{escalation_text}\n\n{task_section_text}");
             sections.push(memoized_section("task_profile", 2, move || Some(combined)));
         }
 
@@ -210,6 +268,43 @@ fn render_task_section(
     )
 }
 
+/// Render the escalation decision as a prompt section.
+fn render_escalation_section(decision: &TierDecision) -> String {
+    if !decision.was_upgraded() {
+        return format!(
+            "# Execution Tier\n- Tier: {} (base)\n- Score: {}\n",
+            decision.final_tier.as_str(),
+            decision.score,
+        );
+    }
+    let reason_text = if let Some(ref force) = decision.force_reason {
+        format!("- Upgrade reason (force): {force}\n")
+    } else {
+        let reasons = decision.reasons.join(", ");
+        format!("- Upgrade reason (score): {reasons}\n")
+    };
+    format!(
+        "# Execution Tier (Upgraded)\n\
+         - Base tier: {base}\n\
+         - Final tier: {final_tier}\n\
+         - Score: {score}\n\
+         {reason}\
+         ## Runtime Requirements\n\
+         - require_plan: {plan}\n\
+         - require_review: {review}\n\
+         - require_verification: {verify}\n\
+         - max_repair_iterations: {repair}\n",
+        base = decision.base_tier.as_str(),
+        final_tier = decision.final_tier.as_str(),
+        score = decision.score,
+        reason = reason_text,
+        plan = decision.runtime_policy.require_plan,
+        review = decision.runtime_policy.require_review,
+        verify = decision.runtime_policy.require_verification,
+        repair = decision.runtime_policy.max_repair_iterations,
+    )
+}
+
 fn kind_label(kind: CodingTaskKind) -> &'static str {
     match kind {
         CodingTaskKind::Explain => "Explain",
@@ -221,6 +316,9 @@ fn kind_label(kind: CodingTaskKind) -> &'static str {
         CodingTaskKind::Refactor => "Refactor",
         CodingTaskKind::Document => "Document",
         CodingTaskKind::Plan => "Plan",
+        CodingTaskKind::Test => "Test",
+        CodingTaskKind::Perf => "Perf",
+        CodingTaskKind::Deps => "Deps",
     }
 }
 
