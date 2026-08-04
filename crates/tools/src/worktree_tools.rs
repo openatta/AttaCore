@@ -105,7 +105,7 @@ impl Tool for EnterWorktreeTool {
     async fn check_permissions(&self, _: &Value, _: &ToolContext) -> PermissionDecision {
         // 创建 worktree 是文件系统副作用，但很受控；ask 是合理默认
         PermissionDecision::Ask {
-            message: "EnterWorktree will create a new git worktree under .atta/code/worktrees/".into(),
+            message: "EnterWorktree will create a new git worktree under .atta/worktrees/".into(),
             decision_reason: None}
     }
     async fn call(

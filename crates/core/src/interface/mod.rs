@@ -5,6 +5,7 @@
 
 pub mod agent_spawner;
 pub mod event;
+pub mod import_callback;
 pub mod memory;
 pub mod model;
 pub mod permission;

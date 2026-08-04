@@ -1,8 +1,8 @@
-//! 内置 skills —— 14 个常用 prompt 模板。
+//! 内置 skills —— 15 个常用 prompt 模板。
 //!
 //! 不写盘、不需要用户设置；每 session 自动注入到 skill 列表。用户在
-//! `~/.atta/code/skills/<name>/SKILL.md` 或 `<cwd>/.atta/code/skills/<name>/SKILL.md`
-//! 创建同名 skill 即覆盖（disk 优先，因为 collect_skills 把 disk 后入但 dedup
+//! `~/.atta/<scope>/skills/<name>/SKILL.md`（用户级）或 `<cwd>/.agents/skills/<name>/SKILL.md`
+//! （项目级）创建同名 skill 即覆盖（disk 优先，因为 collect_skills 把 disk 后入但 dedup
 //! 不存在；同名时 `/<name>` slash 命中第一个 —— 即用户的）。
 //!
 //! # 技能列表
@@ -20,9 +20,10 @@
 //! | `skillify` | 把刚跑过的工作流抽成可复用的 SKILL.md |
 //! | `updateConfig` | 安全编辑 settings.json（permissions / hooks / mcp_servers） |
 //! | `keybindings-help` | 展示 CLI/TUI 键盘快捷键参考 |
-//! | `init` | 引导用户创建新项目的 ATTA.md 文件 |
+//! | `init` | 引导用户创建新项目的 AGENTS.md 文件 |
 //! | `security-review` | 审查代码变更中的安全漏洞 |
 //! | `rename` | 重命名当前对话会话标题 |
+//! | `import` | 检测并从 Claude Code/Codex/Cursor 导入配置到 AGENTS.md/.agents/.atta |
 //!
 //! 还有几个我们刻意不带：它们要么依赖 Anthropic SaaS / Chrome 扩展，要么是内部子流程。
 //!
@@ -99,7 +100,7 @@ pub fn bundled_skills() -> Vec<SkillEntry> {
         },
         SkillEntry {
             name: "remember".into(),
-            description: "Save a fact / preference / decision to cross-session memory (~/.atta/code/memory).".into(),
+            description: "Save a fact / preference / decision to cross-session memory (~/.atta/<scope>/memory).".into(),
             when_to_use: Some(
                 "When the user explicitly asks to remember something, or you learn a stable preference."
                     .into(),
@@ -145,9 +146,9 @@ pub fn bundled_skills() -> Vec<SkillEntry> {
         },
         SkillEntry {
             name: "init".into(),
-            description: "Guide the user through initializing a new ATTA.md file for a project.".into(),
+            description: "Guide the user through initializing a new AGENTS.md file for a project.".into(),
             when_to_use: Some(
-                "When starting a new project that lacks documentation, or when the user asks to create an ATTA.md."
+                "When starting a new project that lacks documentation, or when the user asks to create an AGENTS.md."
                     .into(),
             ),
             source: SkillSource::User,
@@ -176,6 +177,17 @@ pub fn bundled_skills() -> Vec<SkillEntry> {
             path: PathBuf::from("(bundled:rename)"),
             ..Default::default()
         },
+        SkillEntry {
+            name: "import".into(),
+            description: "Detect and import configuration from Claude Code, Codex, or Cursor into this project's AGENTS.md/.agents/.atta layout.".into(),
+            when_to_use: Some(
+                "When the user asks to import/migrate settings from Claude Code, Codex, or Cursor, or runs /import."
+                    .into(),
+            ),
+            source: SkillSource::User,
+            path: PathBuf::from("(bundled:import)"),
+            ..Default::default()
+        },
     ]
 }
 
@@ -197,6 +209,7 @@ pub fn bundled_body(name: &str) -> Option<String> {
         "init" => INIT,
         "security-review" => SECURITY_REVIEW,
         "rename" => RENAME,
+        "import" => IMPORT,
         _ => return None,
     };
     Some(body.to_string())
@@ -432,7 +445,7 @@ Persist a fact / decision / preference to the per-project memory directory so fu
 
 ## Where things go
 
-The memory dir is `~/.atta/code/memory/<sha256(canonical_cwd)[..16]>/` — already created and surfaced via the `# memory (cross-session)` system prompt block.
+The memory dir is `~/.atta/<scope>/memory/<sha256(canonical_cwd)[..16]>/` — already created and surfaced via the `# memory (cross-session)` system prompt block.
 
 - **`MEMORY.md`** — one-line index. Each entry like:
   `- [Title](file.md) — short hook (under ~150 chars)`
@@ -456,7 +469,7 @@ The memory dir is `~/.atta/code/memory/<sha256(canonical_cwd)[..16]>/` — alrea
 
 - Code patterns, file structure, git history (derivable from current state)
 - One-off task details, ephemeral debugging steps
-- Anything already in ATTA.md
+- Anything already in AGENTS.md
 "#;
 
 const SKILLIFY: &str = r#"# Skillify: Capture Workflow as a Skill
@@ -465,7 +478,7 @@ Turn the workflow you (or the user) just executed into a reusable `SKILL.md`.
 
 ## Output
 
-Write `<cwd>/.atta/code/skills/<kebab-name>/SKILL.md` with frontmatter:
+Write `<cwd>/.agents/skills/<kebab-name>/SKILL.md` with frontmatter:
 
 ```
 ---
@@ -492,15 +505,15 @@ Body sections — keep terse:
 
 const UPDATE_CONFIG: &str = r#"# UpdateConfig: Edit settings.json safely
 
-Make a precise change to `~/.atta/code/settings.json` (or `<cwd>/.atta/code/settings.json` / `.atta/code/settings.local.json`) without nuking adjacent fields.
+Make a precise change to `~/.atta/<scope>/settings.json` (or `<cwd>/.atta/settings.json` / `.atta/settings.local.json`) without nuking adjacent fields.
 
 ## Pre-flight
 
 1. Read the target file first. If absent, create with `{}` and proceed.
 2. Identify which layer to change:
-   - User-level (apply broadly): `~/.atta/code/settings.json`
-   - Project (committed): `<cwd>/.atta/code/settings.json`
-   - Local override (gitignored): `<cwd>/.atta/code/settings.local.json`
+   - User-level (apply broadly): `~/.atta/<scope>/settings.json`
+   - Project (committed): `<cwd>/.atta/settings.json`
+   - Local override (gitignored): `<cwd>/.atta/settings.local.json`
 3. Preserve `$schema` and any unknown fields verbatim — Claude Code writes fields we don't model.
 
 ## Common edits
@@ -570,13 +583,13 @@ Reference for navigating the Claude Code / AttaCode CLI and TUI using keyboard s
 - If a shortcut doesn't work, check whether a terminal emulator or tmux/screen is intercepting it first.
 "#;
 
-const INIT: &str = r#"# Init: New Project ATTA.md
+const INIT: &str = r#"# Init: New Project AGENTS.md
 
-Guide the user through initializing a well-structured ATTA.md (or equivalent project documentation) file for a new or existing project.
+Guide the user through initializing a well-structured AGENTS.md (or equivalent project documentation) file for a new or existing project.
 
 ## When to use
 
-- The working directory has no ATTA.md, README.md, or CLAUDE.md yet
+- The working directory has no AGENTS.md, README.md, or CLAUDE.md yet
 - The user explicitly asks "initialize this project" or "create documentation"
 - The user starts a new codebase with no onboarding doc
 
@@ -584,7 +597,7 @@ Guide the user through initializing a well-structured ATTA.md (or equivalent pro
 
 1. **Scan the project** — list the top-level directory contents, check for config files (Cargo.toml, package.json, pyproject.toml, go.mod, Makefile, etc.), and identify the project type and language(s).
 
-2. **Determine the file name** — check if the project convention calls for `ATTA.md`, `CLAUDE.md`, or `README.md`. Default to `ATTA.md` for Atta monorepo projects.
+2. **Determine the file name** — check if the project convention calls for `AGENTS.md`, `CLAUDE.md`, or `README.md`. Default to `AGENTS.md` — it's the shared convention across Codex, this engine, and other agent tools (see `docs/CONFIG_LAYOUT.md`).
 
 3. **Gather key info**:
    - Project name and one-line purpose
@@ -737,14 +750,44 @@ Rename the current conversation session to a descriptive title that makes it eas
 - Don't change the title without user confirmation unless they gave an explicit one
 "#;
 
+const IMPORT: &str = r#"# Import: Migrate Config from Claude Code / Codex / Cursor
+
+Detect and import project configuration left behind by another agent tool (Claude Code, Codex, or Cursor) into this engine's `AGENTS.md` + `.agents/skills/` + `.atta/rules/` layout.
+
+## When to use
+
+- The user runs `/import`, or asks to "import"/"migrate" settings from Claude Code, Codex, or Cursor
+- You notice `CLAUDE.md`, `.claude/skills/`, `.cursorrules`, `.cursor/rules/*.mdc`, or an `AGENTS.md` without `.agents/skills/` in the project and the user hasn't already declined an import for it
+
+## Process
+
+1. **List candidates** — call the `Import` tool with no `source`. It scans the project and returns each detected source (`claude_code`/`codex`/`cursor`) with a short description.
+2. **No candidates** — tell the user nothing importable was found; stop here.
+3. **One or more candidates** — present them to the user and ask which one to import from. **Single-select only**: even if multiple tools' configs are present, the user picks exactly one — importing from more than one at a time is not supported (avoids conflicting `AGENTS.md` sections).
+4. **Execute** — once the user picks one, call the `Import` tool again with `source` set to their choice (`claude_code`/`codex`/`cursor`). Report back the actions it took (what was written where).
+5. If the user declines entirely, do not call the tool again — just acknowledge and move on. (There's no "record the decline" step from the model side; the automatic detection path handles that separately for hosts that use it.)
+
+## What actually happens for each source
+
+- **claude_code**: `CLAUDE.md` content is merged into `AGENTS.md` (marker-wrapped, safe to re-run); `.claude/skills/*` are copied into `.agents/skills/*` (existing project skills of the same name are never overwritten).
+- **codex**: no content to migrate — Codex's `AGENTS.md` is already the target format. This just scaffolds an empty `.agents/skills/` if it's missing.
+- **cursor**: `.cursorrules` (plain text) is merged into `AGENTS.md`; each `.cursor/rules/*.mdc` file becomes `.atta/rules/<name>.md`, and any marked `alwaysApply: true` gets referenced from `AGENTS.md` too.
+
+## Don't
+
+- Don't guess a `source` value — only use one that the `Import` tool's list actually returned.
+- Don't call `Import` with a `source` the user didn't explicitly choose.
+- Don't try to import multiple sources in the same request.
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn fourteen_bundled_skills_present() {
+    fn fifteen_bundled_skills_present() {
         let s = bundled_skills();
-        assert_eq!(s.len(), 14);
+        assert_eq!(s.len(), 15);
         let names: Vec<&str> = s.iter().map(|e| e.name.as_str()).collect();
         for n in [
             "simplify",
@@ -761,6 +804,7 @@ mod tests {
             "init",
             "security-review",
             "rename",
+            "import",
         ] {
             assert!(names.contains(&n), "missing bundled skill: {n}");
         }
@@ -790,6 +834,7 @@ mod tests {
             "init",
             "security-review",
             "rename",
+            "import",
         ] {
             assert!(bundled_body(name).is_some(), "{name} missing body");
             let body = bundled_body(name).unwrap();

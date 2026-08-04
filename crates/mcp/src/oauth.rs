@@ -67,25 +67,20 @@ pub struct McpOAuthStore {
     cache: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-impl Default for McpOAuthStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl McpOAuthStore {
-    /// Default path: `~/.atta/code/mcp/oauth/`.
-    fn default_dir() -> PathBuf {
+    /// Default path: `~/.atta/<scope>/mcp/oauth/`. No default scope — callers
+    /// must say which product instance this belongs to.
+    fn default_dir(scope: &str) -> PathBuf {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".atta").join("code").join("mcp").join("oauth")
+        PathBuf::from(home).join(".atta").join(scope).join("mcp").join("oauth")
     }
 
     /// Create a new OAuth token store using the default directory.
     /// Creates the directory if it does not exist.
-    pub fn new() -> Self {
-        let dir = Self::default_dir();
+    pub fn new(scope: &str) -> Self {
+        let dir = Self::default_dir(scope);
         let _ = std::fs::create_dir_all(&dir);
         Self {
             dir,
@@ -156,8 +151,8 @@ static OAUTH_STORE: std::sync::OnceLock<McpOAuthStore> = std::sync::OnceLock::ne
 
 /// Initialise the process-wide OAuth token store with default path.
 /// Safe to call multiple times; only the first call takes effect.
-pub fn init_oauth_store() {
-    let _ = OAUTH_STORE.set(McpOAuthStore::new());
+pub fn init_oauth_store(scope: &str) {
+    let _ = OAUTH_STORE.set(McpOAuthStore::new(scope));
 }
 
 /// Initialise the process-wide OAuth token store with a custom directory.
@@ -453,6 +448,6 @@ mod tests {
     fn init_oauth_store_creates_directory() {
         // Just verify the constructor doesn't panic; we can't cleanly
         // test the global store reset since OnceLock doesn't support reset.
-        let _ = McpOAuthStore::new();
+        let _ = McpOAuthStore::new("code");
     }
 }

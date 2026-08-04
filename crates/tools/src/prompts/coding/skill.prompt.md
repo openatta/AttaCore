@@ -1,4 +1,4 @@
-Execute a user-invocable skill. Skills are loaded from ~/.atta/code/skills/ and project/.atta/code/skills/.
+Execute a user-invocable skill. Skills are loaded from ~/.atta/<scope>/skills/ (user-level) and <project>/.agents/skills/ (project-level).
 
 When the user references a "slash command" or "/<something>", they are referring to a skill. Use this tool to invoke it.
 

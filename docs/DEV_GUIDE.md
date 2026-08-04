@@ -30,7 +30,7 @@ attacored --listen 127.0.0.1:7878 --token my-secret         # TCP 模式
 
 ### 服务发现
 
-Daemon 启动时写入 `$HOME/.atta/code/daemon.lock`（权限 `0600`）：
+Daemon 启动时写入 `$HOME/.atta/<scene>/daemon.lock`（权限 `0600`；`<scene>` 是 `AgentScene` id，用 `--scene` 指定，默认 `coding`，非法值直接启动失败）：
 
 ```json
 {"pid": 12345, "socket_path": "/home/user/.atta/code/daemon.sock", "version": "0.1.0", "protocol_version": "1"}

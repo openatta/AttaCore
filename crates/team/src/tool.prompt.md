@@ -28,7 +28,7 @@ Create a new team to coordinate multiple agents working on a project. Teams have
 ```
 
 This creates:
-- A team file at `~/.atta/code/teams/{team-name}/config.json`
+- A team file at `.atta/teams/{team-name}/config.json`
 - A corresponding task list directory at `~/.atta/tasks/{team-name}/`
 
 ## Team Workflow
@@ -69,7 +69,7 @@ Teammates go idle after every turn—this is completely normal and expected. A t
 ## Discovering Team Members
 
 Teammates can read the team config file to discover other team members:
-- **Team config location**: `~/.atta/code/teams/{team-name}/config.json`
+- **Team config location**: `.atta/teams/{team-name}/config.json`
 
 The config file contains a `members` array with each teammate's:
 - `name`: Human-readable name (**always use this** for messaging and task assignment)

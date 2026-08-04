@@ -4,7 +4,7 @@
 //!
 //! Layout:
 //! ```text
-//! ~/.atta/code/plugins/cache/
+//! ~/.atta/<scope>/plugins/cache/
 //! ├── {name}/
 //! │   ├── {version}/
 //! │   │   ├── plugin.toml
@@ -23,7 +23,8 @@ pub struct PluginCache {
 }
 
 impl PluginCache {
-    /// Create a cache rooted at `~/.atta/code/plugins/cache/`.
+    /// Create a cache rooted at `~/.atta/<scope>/plugins/cache/` (caller
+    /// resolves `root`; this type doesn't construct the path itself).
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }

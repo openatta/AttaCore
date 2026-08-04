@@ -57,7 +57,6 @@ async fn start_server() -> (
         3600,
         client,
         settings,
-        scene.clone(),
         scene,
         permission,
         memory_store,

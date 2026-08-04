@@ -96,7 +96,8 @@ impl SkillManager {
         }
     }
 
-    /// Load skills from a directory (user skills: ~/.atta/code/skills/).
+    /// Load skills from a directory (user skills: ~/.atta/<scope>/skills/;
+    /// project skills: <cwd>/.agents/skills/).
     /// Each .md file is a skill; filename (without .md) is the skill name.
     pub fn load_dir(&self, dir: &Path, source: SkillSource) -> std::io::Result<usize> {
         let mut count = 0;

@@ -477,7 +477,7 @@ async fn spawn_stdio_service(
 /// `http` crate 类型，跨 crate 维护成本不值。
 ///
 /// **v2-4  — OAuth token 注入**：当 config 给了 `oauth_provider` 名字
-/// 时，尝试从 `~/.atta/code/tokens/<provider>.json` 读 stored token（必要时
+/// 时，尝试从 `~/.atta/<scope>/tokens/<provider>.json` 读 stored token（必要时
 /// 刷新）作为 Authorization。`headers.Authorization` 在此场景下被覆盖。
 /// **caveat**：rmcp 1.6 transport 在创建时锁定 auth_header；token 中途过期
 /// 不会自动刷新。daemon 长连接场景下用户需重启 MCP 子系统（重连）。

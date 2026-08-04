@@ -1,6 +1,6 @@
 //! File-persisted running background-task state.
 //!
-//! Stores individual task files at `~/.atta/code/running/{task_id}.json`.
+//! Stores individual task files at `~/.atta/<scope>/running/{task_id}.json`.
 //! Each file holds a snapshot of the task's output, events_log, and status.
 //! Written asynchronously (fire-and-forget) on each state transition.
 //!
@@ -39,7 +39,7 @@ impl RunningTaskData {
 #[cfg(test)]
 static TEST_BASE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-fn base_dir() -> PathBuf {
+fn base_dir(scope: &str) -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = TEST_BASE.lock().unwrap().clone() {
         return dir;
@@ -49,7 +49,7 @@ fn base_dir() -> PathBuf {
         .unwrap_or_else(|_| ".".into());
     PathBuf::from(home)
         .join(".atta")
-        .join("code")
+        .join(scope)
         .join("running")
 }
 
@@ -74,15 +74,16 @@ pub struct RunningTaskStore;
 
 impl RunningTaskStore {
     /// Persist a running task's current state to disk.
-    /// Creates `~/.attacode/running/` if needed.
+    /// Creates `~/.atta/<scope>/running/` if needed.
     pub async fn save(
         &self,
         task_id: &str,
         output: &str,
         events_log: &[String],
         status: &RunningStatus,
+        scope: &str,
     ) -> std::io::Result<()> {
-        let dir = base_dir();
+        let dir = base_dir(scope);
         tokio::fs::create_dir_all(&dir).await?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -98,14 +99,14 @@ impl RunningTaskStore {
             is_backgrounded: true,
         };
         let bytes = serde_json::to_vec_pretty(&data)?;
-        let path = base_dir().join(format!("{}.json", sanitise_path(task_id)));
+        let path = base_dir(scope).join(format!("{}.json", sanitise_path(task_id)));
         tokio::fs::write(&path, &bytes).await?;
         Ok(())
     }
 
     /// Remove a persisted running task file. Returns true if it existed.
-    pub async fn remove(&self, task_id: &str) -> bool {
-        let path = base_dir().join(format!("{}.json", sanitise_path(task_id)));
+    pub async fn remove(&self, task_id: &str, scope: &str) -> bool {
+        let path = base_dir(scope).join(format!("{}.json", sanitise_path(task_id)));
         match tokio::fs::remove_file(&path).await {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -114,18 +115,18 @@ impl RunningTaskStore {
     }
 
     /// Load a single running task from disk. Returns `None` silently on error.
-    pub async fn load(&self, task_id: &str) -> Option<RunningTaskData> {
-        let path = base_dir().join(format!("{}.json", sanitise_path(task_id)));
+    pub async fn load(&self, task_id: &str, scope: &str) -> Option<RunningTaskData> {
+        let path = base_dir(scope).join(format!("{}.json", sanitise_path(task_id)));
         let content = tokio::fs::read_to_string(&path).await.ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    /// Scan `~/.attacode/running/` for all persisted task files and return them
+    /// Scan `~/.atta/<scope>/running/` for all persisted task files and return them
     /// with their status overridden to `Failed("process restarted")`.
     ///
     /// Call this on engine startup to detect tasks orphaned by a crash.
-    pub fn scan_and_mark_stale(&self) -> std::io::Result<Vec<RunningTaskData>> {
-        let dir = base_dir();
+    pub fn scan_and_mark_stale(&self, scope: &str) -> std::io::Result<Vec<RunningTaskData>> {
+        let dir = base_dir(scope);
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -183,10 +184,11 @@ mod tests {
                         "output text",
                         &["→ Bash".into(), "  ✓ (result)".into()],
                         &RunningStatus::Running,
+                        "code",
                     )
                     .await
                     .unwrap();
-                let loaded = store.load("task-test-1").await.unwrap();
+                let loaded = store.load("task-test-1", "code").await.unwrap();
                 assert_eq!(loaded.task_id, "task-test-1");
                 assert_eq!(loaded.output, "output text");
                 assert_eq!(loaded.events_log, vec!["→ Bash", "  ✓ (result)"]);
@@ -198,7 +200,7 @@ mod tests {
         {
             *TEST_BASE.lock().unwrap() = Some(fresh_dir(&root, "load-missing"));
             rt.block_on(async {
-                assert!(store.load("nonexistent").await.is_none());
+                assert!(store.load("nonexistent", "code").await.is_none());
             });
         }
 
@@ -207,12 +209,12 @@ mod tests {
             *TEST_BASE.lock().unwrap() = Some(fresh_dir(&root, "remove"));
             rt.block_on(async {
                 store
-                    .save("task-remove-test", "", &[], &RunningStatus::Running)
+                    .save("task-remove-test", "", &[], &RunningStatus::Running, "code")
                     .await
                     .unwrap();
-                assert!(store.remove("task-remove-test").await);
-                assert!(store.load("task-remove-test").await.is_none());
-                assert!(!store.remove("task-remove-test").await);
+                assert!(store.remove("task-remove-test", "code").await);
+                assert!(store.load("task-remove-test", "code").await.is_none());
+                assert!(!store.remove("task-remove-test", "code").await);
             });
         }
 
@@ -226,6 +228,7 @@ mod tests {
                         "partial",
                         &["→ Bash".into()],
                         &RunningStatus::Running,
+                        "code",
                     )
                     .await
                     .unwrap();
@@ -235,11 +238,12 @@ mod tests {
                         "more",
                         &["→ Read".into()],
                         &RunningStatus::Running,
+                        "code",
                     )
                     .await
                     .unwrap();
             });
-            let stale = store.scan_and_mark_stale().unwrap();
+            let stale = store.scan_and_mark_stale("code").unwrap();
             assert_eq!(stale.len(), 2);
             for task in &stale {
                 match &task.status {
@@ -252,7 +256,7 @@ mod tests {
         // ---- scan empty ----
         {
             *TEST_BASE.lock().unwrap() = Some(fresh_dir(&root, "empty"));
-            let stale = store.scan_and_mark_stale().unwrap();
+            let stale = store.scan_and_mark_stale("code").unwrap();
             assert!(stale.is_empty());
         }
 
@@ -261,10 +265,10 @@ mod tests {
             *TEST_BASE.lock().unwrap() = Some(fresh_dir(&root, "sanitise"));
             rt.block_on(async {
                 store
-                    .save("../../evil", "data", &[], &RunningStatus::Running)
+                    .save("../../evil", "data", &[], &RunningStatus::Running, "code")
                     .await
                     .unwrap();
-                let loaded = store.load("../../evil").await;
+                let loaded = store.load("../../evil", "code").await;
                 assert!(
                     loaded.is_some(),
                     "should survive round-trip via sanitised path"

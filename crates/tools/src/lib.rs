@@ -11,6 +11,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod glob;
 pub mod grep;
+pub mod import_tool;
 pub mod lsp;
 pub mod monitor;
 pub mod notebook_edit;

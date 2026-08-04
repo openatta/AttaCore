@@ -29,11 +29,11 @@ pub struct TeamMemoryStore {
 }
 
 impl TeamMemoryStore {
-    /// Create a new team memory store at `~/.atta/code/teams/{name}/memory/`.
+    /// Create a new team memory store at `~/.atta/<scope>/teams/{name}/memory/`.
     ///
     /// Creates the directory if it does not exist.
-    pub fn new(team_name: &str) -> Self {
-        let team_memory_dir = team_memory_dir(team_name);
+    pub fn new(team_name: &str, scope: &str) -> Self {
+        let team_memory_dir = team_memory_dir(team_name, scope);
         Self::with_dir(team_memory_dir)
     }
 
@@ -409,21 +409,21 @@ pub fn scan_store_for_secrets(store: &TeamMemoryStore) -> Vec<SecretPattern> {
 }
 
 /// Build the path to a team's memory directory.
-pub fn team_memory_dir(team_name: &str) -> PathBuf {
-    base::paths::atta_code_dir()
+pub fn team_memory_dir(team_name: &str, scope: &str) -> PathBuf {
+    base::paths::atta_scope_dir(scope)
         .join("teams")
         .join(team_name)
         .join("memory")
 }
 
 /// Build the path to a team's root directory (contains `memory/` subdirectory).
-pub fn team_root_dir(team_name: &str) -> PathBuf {
-    base::paths::atta_code_dir().join("teams").join(team_name)
+pub fn team_root_dir(team_name: &str, scope: &str) -> PathBuf {
+    base::paths::atta_scope_dir(scope).join("teams").join(team_name)
 }
 
 /// Check if a team has any shared memories.
-pub fn team_has_memories(team_name: &str) -> bool {
-    let store = TeamMemoryStore::new(team_name);
+pub fn team_has_memories(team_name: &str, scope: &str) -> bool {
+    let store = TeamMemoryStore::new(team_name, scope);
     let dir = &store.team_memory_dir;
     if !dir.exists() {
         return false;
@@ -781,7 +781,7 @@ mod tests {
     fn team_has_memories_returns_false_for_empty_team() {
         let tmp = TempDir::new().unwrap();
 
-        // Override the global atta_code_dir for this test
+        // Use a local dir directly rather than atta_scope_dir(scope) for this test
         let dir = tmp.path().join("teams").join("empty-team");
         let mem_dir = dir.join("memory");
         std::fs::create_dir_all(&mem_dir).unwrap();

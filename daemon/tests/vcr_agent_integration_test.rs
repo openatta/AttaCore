@@ -128,6 +128,7 @@ fn build_agent(
         },
         paths: base::interface::settings::PathSettings {
             user_data_dir: tmp.join("user"), local_data_dir: tmp.join("local"),
+            scope: "code".into(),
         },
         execution: Default::default(), compaction: Default::default(), sandbox: Default::default(),
         instruction_file: None, prompt_append: None, prompt_override: None,
@@ -235,7 +236,7 @@ async fn test_vcr_agent_record() {
     let tmp_local = PathBuf::from("/tmp/atta_vcr_agent_test/local");
     let _ = std::fs::remove_dir_all(&tmp_local);
     let _ = std::fs::create_dir_all(&tmp_local);
-    let frozen = base::frozen::FrozenContext::collect(tmp_local).await;
+    let frozen = base::frozen::FrozenContext::collect(tmp_local, "code").await;
 
     let (agent, event_rx, input_tx) = build_agent(
         real_model, SCENARIO, VcrMode::Record,
@@ -298,7 +299,7 @@ async fn test_vcr_agent_replay() {
     let tmp_local = PathBuf::from("/tmp/atta_vcr_agent_test/local");
     let _ = std::fs::remove_dir_all(&tmp_local);
     let _ = std::fs::create_dir_all(&tmp_local);
-    let frozen = base::frozen::FrozenContext::collect(tmp_local).await;
+    let frozen = base::frozen::FrozenContext::collect(tmp_local, "code").await;
 
     let (agent, event_rx, input_tx) = build_agent(
         mock_model, SCENARIO, VcrMode::Replay,

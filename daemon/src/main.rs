@@ -25,7 +25,7 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(version, about = "AttaCore daemon: multi-session agent engine over JSON-RPC")]
 struct Cli {
-    /// Unix socket path (default: $HOME/.atta/code/daemon.sock)
+    /// Unix socket path (default: $HOME/.atta/<scene>/daemon.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -53,6 +53,29 @@ struct Cli {
     /// Shared secret for TCP auth. Falls back to `ATTACORE_DAEMON_TOKEN`.
     #[arg(long)]
     token: Option<String>,
+
+    /// Which scene this daemon serves (must be one the code actually
+    /// registers — see `resolve_scene()`). Determines both session behavior
+    /// (system prompt/tools) and the user-level state root (`~/.atta/<scene>/`).
+    /// There is no default scope concept separate from this — an unsupported
+    /// value fails startup outright rather than silently falling back to
+    /// anything.
+    #[arg(long, default_value = "coding")]
+    scene: String,
+}
+
+/// The closed set of scenes this daemon knows how to construct. Keep in sync
+/// with `crates/scene/src/scene/*.rs` and the sandbox's per-scene settings.json
+/// protection list (`crates/tools/src/bash/sandbox.rs::KNOWN_SCENES`).
+fn resolve_scene(name: &str) -> anyhow::Result<Arc<dyn base::interface::scene::AgentScene>> {
+    match name {
+        "coding" => Ok(Arc::new(scene::scene::coding::CodingScene)),
+        "chat" => Ok(Arc::new(scene::scene::chat::ChatScene)),
+        "demo" => Ok(Arc::new(scene::scene::demo::DemoScene)),
+        other => anyhow::bail!(
+            "unsupported --scene `{other}` — supported scenes: coding, chat, demo"
+        ),
+    }
 }
 
 /// Always-allow permission for daemon sessions (IDE plugins manage their own sandbox).
@@ -85,8 +108,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // ── Resolve scene (fails fast on an unsupported value) ──────────────
+    let scene = resolve_scene(&cli.scene)?;
+    let scope = scene.id().to_string();
+
     // ── Resolve paths ──────────────────────────────────────────────────
-    let paths = DefaultDaemonPaths::from_env();
+    let paths = DefaultDaemonPaths::from_env(&scope);
     let mut daemon_config =
         load_daemon_config(&cli.model, cli.max_tokens, cli.socket.as_deref(), &paths);
     daemon_config.session_cap = cli.session_cap;
@@ -137,14 +164,42 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── Build settings ─────────────────────────────────────────────────
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let user_dir = PathBuf::from(&home).join(".atta").join("code");
-    let local_dir = PathBuf::from(".").join(".atta").join("code");
+    // Single source of truth for user/local roots — replaces what used to be
+    // three independent `.atta/code` literal constructions (here, plus
+    // `DefaultDaemonPaths::from_env` above, plus the project settings.json
+    // lookup in `load_daemon_config`). `local_data_dir` is intentionally flat
+    // (no scope segment) — see `base::paths::ConfigPaths` docs.
+    let config_paths = base::paths::ConfigPaths::from_env(std::path::Path::new("."), &scope);
+    let user_dir = config_paths.user_data_dir.clone();
+    let local_dir = config_paths.local_data_dir.clone();
 
     use base::interface::settings::{
         CompactionConfig, ExecutionSettings, ModelSettings, PathSettings, SandboxConfig,
         Settings, ThinkingMode,
     };
+
+    // Convert the settings.json-parsed server map into `Settings.mcp_servers`
+    // (previously silently discarded — hardcoded `Vec::new()` regardless of
+    // what settings.json configured). NOTE: this only stops the value from
+    // being thrown away; it does not yet make these servers actually connect.
+    // `Builder::build()` only wires MCP servers when the caller explicitly
+    // constructs an `McpManager` and passes it via `.mcp_manager(...)` —
+    // `SessionPool::create()` doesn't do that today, so configured servers
+    // are visible in `Settings` but still inert. Actually connecting them is
+    // a separate, larger feature (build an `McpManager` from this list at
+    // daemon startup), not done as part of this fix.
+    let mcp_servers: Vec<serde_json::Value> = daemon_config
+        .mcp_servers
+        .iter()
+        .filter_map(|(name, cfg)| {
+            let mut v = serde_json::to_value(cfg).ok()?;
+            if let serde_json::Value::Object(ref mut map) = v {
+                map.insert("name".to_string(), serde_json::Value::String(name.clone()));
+            }
+            Some(v)
+        })
+        .collect();
+
     let settings = Arc::new(Settings {
         model: ModelSettings {
             api_type: base::provider::ApiType::Anthropic,
@@ -158,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         paths: PathSettings {
             user_data_dir: user_dir.clone(),
             local_data_dir: local_dir.clone(),
+            scope: scope.clone(),
         },
         execution: ExecutionSettings::default(),
         compaction: CompactionConfig::default(),
@@ -172,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
         permission_mode: base::interface::settings::PermissionMode::default(),
         permission_rules: Vec::new(),
         hooks_config: None,
-        mcp_servers: Vec::new(),
+        mcp_servers,
         language: None,
         feature_flags: Default::default(),
     });
@@ -197,11 +253,25 @@ async fn main() -> anyhow::Result<()> {
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // ── Scenes ─────────────────────────────────────────────────────────
-    let scene_coding: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let scene_chat: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::chat::ChatScene);
+    // ── Cross-tool config import (process-level, once) ─────────────────
+    // `daemon` is headless — no client is connected yet at this point in
+    // startup, so there's nobody to synchronously ask "import from X?".
+    // v1 scope decision: daemon registers no `ImportCallback` (passes
+    // `None`), so this call is effectively a fast no-op today; the manual
+    // `/import` slash command (ImportTool) is the real user-facing path.
+    // Spawned so a future non-`None` callback here can never block startup.
+    // See docs/design/2026-08-03-agents-config-migration.md §3.3/§3.7.
+    {
+        let import_cwd = cwd.clone();
+        tokio::spawn(async move {
+            let _ = base::interface::import_callback::maybe_detect_and_import(
+                &import_cwd,
+                None,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        });
+    }
 
     let permission: Arc<dyn base::interface::permission::Permission> =
         Arc::new(AllowAllPermission);
@@ -230,8 +300,7 @@ async fn main() -> anyhow::Result<()> {
         daemon_config.session_idle_timeout_secs,
         client,
         settings,
-        scene_coding,
-        scene_chat,
+        scene,
         permission,
         memory_store,
         cwd,

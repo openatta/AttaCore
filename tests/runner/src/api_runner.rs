@@ -64,6 +64,7 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
         },
         paths: base::interface::settings::PathSettings {
             user_data_dir: tmp.join("user"), local_data_dir: tmp.join("local"),
+            scope: "code".into(),
         },
         execution: Default::default(), compaction: Default::default(), sandbox: Default::default(),
         instruction_file: None, prompt_append: None, prompt_override: None,

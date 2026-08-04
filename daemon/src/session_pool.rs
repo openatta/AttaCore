@@ -57,8 +57,11 @@ pub struct SessionPool {
     _client: Arc<dyn AnthropicClient>,
     model: Arc<dyn base::interface::model::Model>,
     settings: Arc<Settings>,
-    scene_coding: Arc<dyn AgentScene>,
-    scene_chat: Arc<dyn AgentScene>,
+    /// The single scene this daemon instance serves (resolved + validated
+    /// from `--scene` at startup — see `main.rs::resolve_scene`). Every
+    /// session created by this pool uses this scene; there is no per-session
+    /// scene selection.
+    scene: Arc<dyn AgentScene>,
     permission: Arc<dyn Permission>,
     memory_store: Arc<MemoryStore>,
     _cwd: PathBuf,
@@ -92,8 +95,7 @@ impl SessionPool {
         idle_timeout_secs: u64,
         client: Arc<dyn AnthropicClient>,
         settings: Arc<Settings>,
-        scene_coding: Arc<dyn AgentScene>,
-        scene_chat: Arc<dyn AgentScene>,
+        scene: Arc<dyn AgentScene>,
         permission: Arc<dyn Permission>,
         memory_store: Arc<MemoryStore>,
         cwd: PathBuf,
@@ -108,8 +110,7 @@ impl SessionPool {
             _client: client,
             model,
             settings,
-            scene_coding,
-            scene_chat,
+            scene,
             permission,
             memory_store,
             _cwd: cwd,
@@ -228,7 +229,7 @@ impl SessionPool {
             }
             None => {
                 let sid = Id::new().to_string();
-                match self.create(sid.clone(), self.scene_coding.clone(), options.as_ref()).await {
+                match self.create(sid.clone(), self.scene.clone(), options.as_ref()).await {
                     Ok(sid) => sid,
                     Err(e) => {
                         return RpcResponse::err(id, codes::INTERNAL_ERROR, e);
@@ -367,11 +368,11 @@ impl SessionPool {
             if let Some(live) = sessions.get_mut(&sid) {
                 if live.is_first_turn {
                     live.is_first_turn = false;
-                    // 尝试通过场景判断是否需要命名
-                    // CODING 场景不需要；CHAT 场景需要额外 LLM 调用
-                    if self.scene_chat.auto_name_session() {
+                    // 尝试通过场景判断是否需要命名（现在是这个 daemon 实例唯一
+                    // 配置的那个 scene 说了算，不再写死查 chat 场景）
+                    if self.scene.auto_name_session() {
                         if let Some(prompt) = self
-                            .scene_chat
+                            .scene
                             .session_name_prompt(&message)
                         {
                             match self.generate_session_name(&prompt).await {
@@ -511,23 +512,23 @@ impl SessionPool {
         };
 
         if has_history {
-            match self.create(sid.clone(), self.scene_coding.clone(), options).await {
+            match self.create(sid.clone(), self.scene.clone(), options).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(%sid, error=%e, "resume failed, creating new");
                     let new_sid = Id::new().to_string();
-                    self.create(new_sid.clone(), self.scene_coding.clone(), options)
+                    self.create(new_sid.clone(), self.scene.clone(), options)
                         .await
                         .unwrap_or_else(|e| panic!("create session: {e}"))
                 }
             }
         } else {
-            match self.create(sid.clone(), self.scene_coding.clone(), options).await {
+            match self.create(sid.clone(), self.scene.clone(), options).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(sid, error=%e, "create with given sid failed");
                     let new_sid = Id::new().to_string();
-                    self.create(new_sid.clone(), self.scene_coding.clone(), options)
+                    self.create(new_sid.clone(), self.scene.clone(), options)
                         .await
                         .unwrap_or_else(|e| panic!("create session: {e}"))
                 }

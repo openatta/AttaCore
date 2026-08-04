@@ -97,7 +97,7 @@ pub struct Agent {
     /// Session-start frozen environment snapshot. Computed lazily on first turn.
     /// TS parity: `getSystemContext()` + `getUserContext()` in context.ts.
     pub(crate) frozen: Option<base::frozen::FrozenContext>,
-    /// Pre-read CLAUDE.md/ATTA.md content for userContext injection (TS parity).
+    /// Pre-read AGENTS.md/CLAUDE.md content for userContext injection (TS parity).
     pub(crate) claude_md_content: Option<String>,
     /// Whether CLAUDE.md has been injected as a synthetic user message this session.
     pub(crate) claude_md_injected: bool,
@@ -244,16 +244,21 @@ impl Agent {
     /// re-scanning skills directories, and pre-connecting to the API endpoint.
     /// All operations run in parallel via `tokio::join!` to minimize startup latency.
     async fn warmup(&mut self) {
-        let cwd = self.settings.paths.local_data_dir.clone();
+        // NOTE: the actual project root, not `local_data_dir` itself (which
+        // is `<project_root>/.atta` — see `PathSettings::project_root` docs).
+        let cwd = self.settings.paths.project_root();
+        let scope = self.settings.paths.scope.clone();
         let user_skills_dir = self.settings.paths.user_data_dir.join("skills");
-        let local_skills_dir = self.settings.paths.local_data_dir.join("skills");
+        // Project-level skills live in `.agents/skills/` (sibling of `.atta/`,
+        // not inside it) — the external fact standard Codex also scans.
+        let local_skills_dir = cwd.join(".agents").join("skills");
         let base_url = self.settings.model.base_url.clone();
         let skills = std::sync::Arc::clone(&self.skills);
 
         let (frozen, _skills_res, _) = tokio::join!(
             // 1. Pre-compute the frozen environment snapshot (git status, branch, platform, etc.)
-            base::frozen::FrozenContext::collect(cwd),
-            // 2. Re-scan skills directories for newly added skills
+            base::frozen::FrozenContext::collect(cwd.clone(), &scope),
+            // 2. Re-scan skills directories for newly added skills.
             async move {
                 let count1 = skills.load_dir(&user_skills_dir, skills::manager::SkillSource::User);
                 let count2 = skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
@@ -685,7 +690,7 @@ impl Builder {
             Arc::new(AllowAll)
         });
         let instruction_file = self.instruction_file.or(settings.instruction_file.clone());
-        // Pre-read CLAUDE.md / ATTA.md content for userContext injection (TS parity).
+        // Pre-read AGENTS.md / CLAUDE.md content for userContext injection (TS parity).
         let claude_md_content = instruction_file.as_ref().and_then(|p| {
             match std::fs::read_to_string(p) {
                 Ok(content) => {
@@ -728,17 +733,17 @@ impl Builder {
             });
         // MCP: use pre-built manager if injected, else empty (no servers).
         let mcp = self.mcp_manager_override.unwrap_or_else(McpManager::empty);
-        // Skill auto-loading: scan ~/.atta/code/skills/ and project/.atta/code/skills/
+        // Skill auto-loading: scan ~/.atta/<scope>/skills/ (user) and
+        // project/.agents/skills/ (project — external fact standard, also
+        // scanned by Codex).
         let skill_mgr = skills::manager::SkillManager::new();
+        let project_skills_dir = settings.paths.project_root().join(".agents").join("skills");
         let skill_load_results = [
             skill_mgr.load_dir(
                 &settings.paths.user_data_dir.join("skills"),
                 skills::manager::SkillSource::User,
             ),
-            skill_mgr.load_dir(
-                &settings.paths.local_data_dir.join("skills"),
-                skills::manager::SkillSource::Project,
-            ),
+            skill_mgr.load_dir(&project_skills_dir, skills::manager::SkillSource::Project),
         ];
         let loaded_count: usize = skill_load_results.iter().filter_map(|r| r.as_ref().ok()).sum();
         // Register built-in (bundled) skills after disk skills.
@@ -760,6 +765,10 @@ impl Builder {
         tools.register(std::sync::Arc::new(tools::task_stop::TaskStopTool));
         // Register TaskOutputTool — retrieve output from running/completed tasks
         tools.register(std::sync::Arc::new(tools::task_output::TaskOutputTool));
+        // Register ImportTool — backs the /import slash command (cross-tool
+        // config import from Claude Code/Codex/Cursor). See
+        // docs/design/2026-08-03-agents-config-migration.md §3.8.
+        tools.register(std::sync::Arc::new(tools::import_tool::ImportTool));
         // Register MCP resource tools if clients are available
         if !mcp.clients().is_empty() {
             tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(mcp.clients().to_vec())));
@@ -846,7 +855,11 @@ mod tests {
                 model_name: "test".into(), max_tokens: 2000,
                 thinking_mode: ThinkingMode::Auto, fallback_model: None,
             },
-            paths: PathSettings { user_data_dir: "/tmp".into(), local_data_dir: "/tmp".into() },
+            paths: PathSettings {
+                user_data_dir: "/tmp".into(),
+                local_data_dir: "/tmp".into(),
+                scope: "code".into(),
+            },
             execution: ExecutionSettings::default(),
             compaction: CompactionConfig::default(),
             sandbox: SandboxConfig::default(),

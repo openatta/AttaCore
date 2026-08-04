@@ -1,7 +1,7 @@
 //! Dream task — background thinking sub-agent that runs without blocking the user.
 //!
 //! The `DreamTask` spawns a lightweight background agent that "thinks" about a
-//! given prompt, writing its thoughts incrementally to `~/.atta/code/dreams/{session_id}.md`.
+//! given prompt, writing its thoughts incrementally to `~/.atta/<scope>/dreams/{session_id}.md`.
 //! The main agent can later read this file to incorporate background insights.
 //!
 //! Auto-stops after 30 turns or when explicitly cancelled via the CancellationToken.
@@ -19,6 +19,10 @@ pub struct DreamTask {
     pub task_id: String,
     /// Session identifier used for the output file name.
     session_id: String,
+    /// Which product instance's user-level state this dream's output file
+    /// lives under (`~/.atta/<scope>/dreams/`). No default — see
+    /// `base::paths::ConfigPaths`.
+    scope: String,
     /// The async handle for the background task (retained to keep the task alive;
     /// never read — cancellation goes through `cancel`).
     #[allow(dead_code)]
@@ -38,13 +42,17 @@ impl DreamTask {
     /// Start a new dream task.
     ///
     /// Spawns a background task that thinks about `prompt`, writing incremental
-    /// thoughts to `~/.atta/code/dreams/{session_id}.md`. The task auto-stops
+    /// thoughts to `~/.atta/<scope>/dreams/{session_id}.md`. The task auto-stops
     /// after `Self::DEFAULT_MAX_TURNS` turns or when the cancellation token is
     /// triggered.
     ///
     /// Returns a `DreamTask` handle that can be used to cancel or inspect the
     /// dream.
-    pub fn start_dream(prompt: String, _tools: Arc<base::tool::InMemoryToolRegistry>) -> Self {
+    pub fn start_dream(
+        prompt: String,
+        _tools: Arc<base::tool::InMemoryToolRegistry>,
+        scope: &str,
+    ) -> Self {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
         let task_id = format!("dream-{}", uuid::Uuid::new_v4());
@@ -55,9 +63,11 @@ impl DreamTask {
         let max_turns = Self::DEFAULT_MAX_TURNS;
         let turn_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let turn_counter_clone = turn_counter.clone();
+        let scope = scope.to_string();
+        let dream_scope = scope.clone();
 
         let handle = tokio::spawn(async move {
-            let dreams_dir = dream_base_dir();
+            let dreams_dir = dream_base_dir(&dream_scope);
             if let Err(e) = tokio::fs::create_dir_all(&dreams_dir).await {
                 tracing::warn!(error = %e, "failed to create dreams directory");
                 return;
@@ -124,6 +134,7 @@ impl DreamTask {
         DreamTask {
             task_id: dream_task_id_for_struct,
             session_id,
+            scope,
             handle: Some(handle),
             cancel,
             max_turns,
@@ -143,12 +154,12 @@ impl DreamTask {
 
     /// Get the path to the dream output file for the given session.
     pub fn dream_file_path(&self) -> PathBuf {
-        Self::dream_file_path_for_session(&self.session_id)
+        Self::dream_file_path_for_session(&self.session_id, &self.scope)
     }
 
     /// Get the path to the dream output file for a given session ID.
-    pub fn dream_file_path_for_session(session_id: &str) -> PathBuf {
-        dream_base_dir().join(format!("{}.md", session_id))
+    pub fn dream_file_path_for_session(session_id: &str, scope: &str) -> PathBuf {
+        dream_base_dir(scope).join(format!("{}.md", session_id))
     }
 
     /// Read the current dream output file content.
@@ -180,14 +191,15 @@ impl Drop for DreamTask {
     }
 }
 
-/// Get the base directory for dream files (`~/.atta/code/dreams/`).
-fn dream_base_dir() -> PathBuf {
+/// Get the base directory for dream files (`~/.atta/<scope>/dreams/`). No
+/// default scope — callers must say which product instance this belongs to.
+fn dream_base_dir(scope: &str) -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
     PathBuf::from(home)
         .join(".atta")
-        .join("code")
+        .join(scope)
         .join("dreams")
 }
 
@@ -214,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn dream_task_creates_file() {
         let tools = Arc::new(InMemoryToolRegistry::new());
-        let dream = DreamTask::start_dream("What is the meaning of life?".into(), tools);
+        let dream = DreamTask::start_dream("What is the meaning of life?".into(), tools, "code");
         let file_path = dream.dream_file_path();
 
         // Wait briefly for the background task to write initial content
@@ -238,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn dream_task_cancels_early() {
         let tools = Arc::new(InMemoryToolRegistry::new());
-        let dream = DreamTask::start_dream("Think about this".into(), tools);
+        let dream = DreamTask::start_dream("Think about this".into(), tools, "code");
 
         // Cancel before it completes
         dream.cancel();
@@ -257,7 +269,7 @@ mod tests {
 
     #[test]
     fn dream_file_path_uses_session() {
-        let path = DreamTask::dream_file_path_for_session("test-session-123");
+        let path = DreamTask::dream_file_path_for_session("test-session-123", "code");
         assert!(path.to_string_lossy().contains("dreams"));
         assert!(path.to_string_lossy().contains("test-session-123.md"));
     }

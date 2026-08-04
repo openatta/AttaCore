@@ -125,11 +125,11 @@ pub struct PermissionRule {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum RuleSource {
-    /// `~/.atta/code/settings.json`
+    /// `~/.atta/<scope>/settings.json`
     UserSettings,
-    /// `<git-root>/.atta/code/settings.json`
+    /// `<git-root>/.atta/settings.json`
     ProjectSettings,
-    /// `<git-root>/.atta/code/settings.local.json`
+    /// `<git-root>/.atta/settings.local.json`
     LocalSettings,
     /// CLI flag (`--permission-mode`, `--allow-tool` 等)
     CliArg,

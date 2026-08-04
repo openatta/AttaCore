@@ -25,6 +25,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// The closed set of scenes this engine registers, mirrored here so the
+/// sandbox can protect every scene's user-level `settings.json` without
+/// needing to know which one the current session actually uses (`tools`
+/// doesn't depend on the `scene` crate). Keep in sync with
+/// `daemon::main::resolve_scene` and `crates/scene/src/scene/*.rs`.
+const KNOWN_SCENES: &[&str] = &["coding", "chat", "demo"];
+
 /// 沙盒包装结果：直接喂给 `tokio::process::Command::new(prog).args(args)`。
 #[derive(Debug, Clone)]
 pub struct SandboxedCommand {
@@ -195,21 +202,32 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
     // **Q4-followup **: re-deny writes to settings.json files even though
     // they sit inside cwd. Stops Bash-driven sandbox escapes via attacode
     // overwriting its own permission rules. Aligns with TS sandbox-adapter.ts.
+    // Project-level settings.json is cwd-relative and flat (no scope
+    // segment) — see docs/design/2026-08-03-agents-config-migration.md.
     let cwd_str = cwd.display().to_string();
     s.push_str(&format!(
-        "(deny file-write* (literal \"{}/.atta/code/settings.json\"))\n",
+        "(deny file-write* (literal \"{}/.atta/settings.json\"))\n",
         sandbox_escape(&cwd_str)
     ));
     s.push_str(&format!(
-        "(deny file-write* (literal \"{}/.atta/code/settings.local.json\"))\n",
+        "(deny file-write* (literal \"{}/.atta/settings.local.json\"))\n",
         sandbox_escape(&cwd_str)
     ));
     if let Some(home) = std::env::var_os("HOME") {
         let home_str = std::path::Path::new(&home).display().to_string();
-        s.push_str(&format!(
-            "(deny file-write* (literal \"{}/.atta/code/settings.json\"))\n",
-            sandbox_escape(&home_str)
-        ));
+        // User-level settings.json lives at `~/.atta/<scene>/settings.json`,
+        // where `<scene>` is one of the small, closed set of scenes this
+        // engine registers (see `daemon::resolve_scene` / `KNOWN_SCENES`
+        // below) — not an arbitrary string, so we can just enumerate all of
+        // them rather than needing to know which one the current session
+        // actually uses.
+        for scene in KNOWN_SCENES {
+            s.push_str(&format!(
+                "(deny file-write* (literal \"{}/.atta/{}/settings.json\"))\n",
+                sandbox_escape(&home_str),
+                scene
+            ));
+        }
     }
 
     // ---- **Hardening **: deny-read for credential paths ----
@@ -625,11 +643,36 @@ mod tests {
         };
         let cmd = wrap(o);
         let profile = &cmd.args[1];
-        // Must still deny writes to .atta/code/settings.json even when deny_read is empty
+        // Must still deny writes to .atta/settings.json even when deny_read is empty
         assert!(
-            profile.contains("(deny file-write* (literal \"/tmp/work/.atta/code/settings.json\"))"),
+            profile.contains("(deny file-write* (literal \"/tmp/work/.atta/settings.json\"))"),
             "settings.json denial must appear unconditionally"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_profile_protects_user_level_settings_json_for_every_known_scene() {
+        // The sandbox doesn't know which scene the current session uses (no
+        // plumbing for that in `ToolContext`), so it must protect all of
+        // them — not just a single hardcoded one.
+        let o = SandboxOptions {
+            command: "ls",
+            cwd: Path::new("/tmp/work"),
+            additional_writable: &[],
+            disable: false,
+            policy: SandboxPolicy::default(),
+        };
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert!(!KNOWN_SCENES.is_empty(), "sanity: scene list must not be empty");
+        for scene in KNOWN_SCENES {
+            let needle = format!(".atta/{scene}/settings.json\"))");
+            assert!(
+                profile.contains(&needle),
+                "expected a deny-write rule for scene `{scene}`'s settings.json, profile:\n{profile}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

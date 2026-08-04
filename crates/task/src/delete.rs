@@ -38,7 +38,7 @@ impl Tool for TeamDeleteTool {
          Remove team and task directories when the swarm work is complete.\n\
          \n\
          This operation:\n\
-         - Removes the team directory (`~/.atta/code/teams/{team-name}/`)\n\
+         - Removes the team directory (`<project>/.atta/teams/{team-name}/`)\n\
          - Removes the task directory (`~/.atta/tasks/{team-name}/`)\n\
          - Clears team context from the current session\n\
          \n\

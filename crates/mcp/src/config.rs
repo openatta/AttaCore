@@ -374,7 +374,7 @@ pub fn load_mcp_configs(paths: &ConfigPaths) -> HashMap<String, McpServerConfig>
 
 /// Compute the enterprise policy file path.
 /// Uses parent of `user_data_dir` as the `data_dir` root
-/// (e.g., `$HOME/.atta/policy/mcp.json` when user_data_dir is `$HOME/.atta/code/`).
+/// (e.g., `$HOME/.atta/policy/mcp.json` when user_data_dir is `$HOME/.atta/<scope>/`).
 fn enterprise_policy_path(paths: &ConfigPaths) -> PathBuf {
     paths
         .user_data_dir
@@ -886,7 +886,7 @@ mod tests {
     fn enterprise_policy_path_uses_parent_of_user_data_dir() {
         let paths = ConfigPaths {
             user_data_dir: PathBuf::from("/home/user/.atta/code"),
-            local_data_dir: PathBuf::from("/tmp/proj/.atta/code"),
+            local_data_dir: PathBuf::from("/tmp/proj/.atta"),
         };
         let path = enterprise_policy_path(&paths);
         assert_eq!(path, PathBuf::from("/home/user/.atta/policy/mcp.json"));

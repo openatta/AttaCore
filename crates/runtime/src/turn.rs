@@ -177,8 +177,9 @@ impl Agent {
         // Compute frozen context lazily on first turn (TS parity: getSystemContext +
         // getUserContext in query.ts). Includes git status, branch, platform, etc.
         if self.frozen.is_none() {
-            let cwd = self.settings.paths.local_data_dir.clone();
-            self.frozen = Some(base::frozen::FrozenContext::collect(cwd).await);
+            let cwd = self.settings.paths.project_root();
+            let scope = self.settings.paths.scope.clone();
+            self.frozen = Some(base::frozen::FrozenContext::collect(cwd, &scope).await);
         }
 
         // Inject CLAUDE.md as userContext — synthetic <system-reminder> user message
@@ -1567,7 +1568,10 @@ fn build_prompt_context<'a>(
         git_status: git_status.map(Cow::Owned),
         is_worktree,
         language: settings.language.clone().map(Cow::Owned),
-        scratchpad_dir: settings.paths.local_data_dir.join(".atta/scratchpad").to_str().map(|s| Cow::Owned(s.to_string())),
+        // `local_data_dir` is already the `.atta/` dir (flat, no scope
+        // segment) — no need to prepend another `.atta/` (previously double-
+        // nested to `.atta/.atta/scratchpad`).
+        scratchpad_dir: settings.paths.local_data_dir.join("scratchpad").to_str().map(|s| Cow::Owned(s.to_string())),
         output_style_content: output_style.map(Cow::Owned),
         available_tools: None, // populated by caller if needed
     }
@@ -2000,6 +2004,7 @@ mod tests {
             paths: base::interface::settings::PathSettings {
                 user_data_dir: "/tmp/user".into(),
                 local_data_dir: "/tmp/local".into(),
+                scope: "code".into(),
             },
             execution: Default::default(),
             compaction: Default::default(),

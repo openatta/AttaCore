@@ -195,7 +195,7 @@ pub struct PasteStore {
 }
 
 impl PasteStore {
-    /// Create a new paste store rooted at `base` (e.g. `~/.atta/code`).
+    /// Create a new paste store rooted at `base` (e.g. `~/.atta/<scope>`).
     /// The actual paste files live in `<base>/pastes/`.
     pub fn new(base: &Path) -> Self {
         Self {

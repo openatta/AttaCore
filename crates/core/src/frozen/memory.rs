@@ -22,15 +22,15 @@ pub struct MemoryFileEntry {
 
 /// 跨会话 memory 目录 ＋ MEMORY.md 加载。
 ///
-/// 路径：`~/.atta/code/memory/<sha256(canonical_cwd)[..16]>/`
+/// 路径：`~/.atta/<scope>/memory/<sha256(canonical_cwd)[..16]>/`
 ///
 /// 行为：
 /// - 目录不存在不主动创建（避免到处冒目录）；模型用 FileWrite 写时它会自动创建
-/// - 目录里 `MEMORY.md` 存在则读出来注入 system prompt（同 ATTA.md 玩法）
+/// - 目录里 `MEMORY.md` 存在则读出来注入 system prompt（同 AGENTS.md 玩法）
 /// - MEMORY.md 长度截 8KB -- 它本就该是索引而非详情
 ///
 /// 失败时返回 (默认 Path, None) -- 不阻塞 session 启动。
-pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
+pub(crate) async fn collect_memory(cwd: &Path, scope: &str) -> (PathBuf, Option<String>) {
     use sha2::{Digest, Sha256};
     let canonical = tokio::fs::canonicalize(cwd)
         .await
@@ -41,7 +41,7 @@ pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
     // 16 hex chars = 64 bits 命名空间，碰撞率 < 2^-32 即便 50k 项目也安全
     let hash_hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
 
-    let dir = crate::paths::atta_code_dir()
+    let dir = crate::paths::atta_scope_dir(scope)
         .join("memory")
         .join(&hash_hex);
 
@@ -54,17 +54,17 @@ pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
     (dir, index)
 }
 
-/// 项目级 memdir：`~/.atta/code/memory/<sanitize(cwd)>/*.md`，跨 session 持久知识
+/// 项目级 memdir：`~/.atta/<scope>/memory/<sanitize(cwd)>/*.md`，跨 session 持久知识
 /// （如"项目 X 常用命令"、"曾经的设计决策"）。只是文件加载；
 /// auto-extract / save tools 推迟。返回路径列表按文件名排序，让加载顺序稳定。
-pub(crate) async fn collect_memdir_files(home: &Path, cwd: &Path) -> Vec<PathBuf> {
+pub(crate) async fn collect_memdir_files(home: &Path, cwd: &Path, scope: &str) -> Vec<PathBuf> {
     // TS parity: memdir/memoryScan.ts MAX_MEMORY_FILES = 200 — cap the count of
     // memory files loaded, keeping the newest by mtime (ref sorts newest-first).
     const MAX_MEMORY_FILES: usize = 200;
     let sanitized = sanitize_for_dir(&cwd.display().to_string());
     let dir = home
         .join(".atta")
-        .join("code")
+        .join(scope)
         .join("memory")
         .join(&sanitized);
     let mut files: Vec<PathBuf> = Vec::new();
@@ -95,17 +95,19 @@ pub(crate) async fn collect_memdir_files(home: &Path, cwd: &Path) -> Vec<PathBuf
         .collect()
 }
 
-/// 简版 ATTA.md 加载：从 cwd 向上找到 git root（或 $HOME），每一层看
-/// `ATTA.md`、`.atta/ATTA.md`；最后追加 `~/.atta/ATTA.md`。
-/// 顺序：用户级 -> repo root -> 子目录 -> cwd（远到近）。去重 by canonical path。
+/// 简版 AGENTS.md 加载：从 cwd 向上找到 git root（或 $HOME），每一层看
+/// `AGENTS.md`。顺序：repo root -> 子目录 -> cwd（远到近）。去重 by canonical path。
 /// **总长上限**：20 KB；超了从最远那段截。
 ///
-/// `walk_up=false` 时只读 cwd 级（ATTA.md / .atta/ATTA.md）+
-/// 用户级 ~/.atta/ATTA.md，跳过中间所有父目录。给 monorepo 子目录想隔离
-/// 父级上下文用。
+/// `walk_up=false` 时只读 cwd 级 `AGENTS.md`，跳过中间所有父目录。给 monorepo
+/// 子目录想隔离父级上下文用。
+///
+/// **不再读取** `.atta/ATTA.md`（旧的双轨指令文件）——`AGENTS.md` 是唯一权威
+/// 指令文件，见 `docs/design/2026-08-03-agents-config-migration.md` Phase 2。
 pub(crate) async fn collect_memory_files_with(
     cwd: &Path,
     do_walk_up: bool,
+    scope: &str,
 ) -> Vec<MemoryFileEntry> {
     let mut visited = std::collections::HashSet::new();
     let mut walk_up: Vec<PathBuf> = Vec::new();
@@ -114,11 +116,9 @@ pub(crate) async fn collect_memory_files_with(
         // 从 cwd 向上爬到根
         let mut p = cwd.to_path_buf();
         loop {
-            let candidates = [p.join("AGENTS.md"), p.join(".atta/ATTA.md")];
-            for c in candidates {
-                if c.exists() {
-                    walk_up.push(c);
-                }
+            let candidate = p.join("AGENTS.md");
+            if candidate.exists() {
+                walk_up.push(candidate);
             }
             match p.parent() {
                 Some(parent) if parent != p => p = parent.to_path_buf(),
@@ -127,10 +127,9 @@ pub(crate) async fn collect_memory_files_with(
         }
     } else {
         // 只 cwd 级
-        for c in [cwd.join("AGENTS.md"), cwd.join(".atta/ATTA.md")] {
-            if c.exists() {
-                walk_up.push(c);
-            }
+        let candidate = cwd.join("AGENTS.md");
+        if candidate.exists() {
+            walk_up.push(candidate);
         }
     }
 
@@ -138,10 +137,10 @@ pub(crate) async fn collect_memory_files_with(
     walk_up.reverse();
 
     // memdir：在 repo 顶层之前插入
-    // ~/.atta/code/memory/<sanitized-cwd>/*.md
+    // ~/.atta/<scope>/memory/<sanitized-cwd>/*.md
     let home = std::env::var("HOME").ok();
     let memdir_files = match home.as_deref() {
-        Some(h) => collect_memdir_files(&PathBuf::from(h), cwd).await,
+        Some(h) => collect_memdir_files(&PathBuf::from(h), cwd, scope).await,
         None => Vec::new(),
     };
     let mut combined: Vec<PathBuf> = Vec::with_capacity(walk_up.len() + memdir_files.len());
@@ -387,6 +386,15 @@ fn expand_synonyms(terms: &[String]) -> Vec<String> {
 /// marker (user edits) is preserved.
 ///
 /// This runs at session start only (not on compact rebuilds).
+///
+/// **Not currently called anywhere in this codebase** — verified by
+/// full-repo grep during the 2026-08-03 AGENTS.md/.agents migration. This is
+/// meant as the foundation for the future user-confirmed import feature
+/// (migration doc Phase 3), which will supersede the automatic/silent
+/// behavior described above with an explicit user-confirmation step and
+/// retarget the output to `AGENTS.md` instead of `ATTA.md`. Left as-is (not
+/// deleted, not wired up) so that future work can reuse the merge-marker
+/// logic.
 pub async fn maybe_migrate_claude_to_atta(cwd: &Path) {
     // Walk up from cwd to root (same pattern as collect_memory_files_with)
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -567,7 +575,7 @@ mod tests {
             .unwrap();
 
         // walk_up = true（默认）-- parent 应该出现
-        let with_walk = collect_memory_files_with(&child, true).await;
+        let with_walk = collect_memory_files_with(&child, true, "code").await;
         assert!(with_walk
             .iter()
             .any(|e| e.content.contains("PARENT-MONOREPO")));
@@ -576,7 +584,7 @@ mod tests {
             .any(|e| e.content.contains("CHILD-LOCAL")));
 
         // walk_up = false -- 只 child
-        let no_walk = collect_memory_files_with(&child, false).await;
+        let no_walk = collect_memory_files_with(&child, false, "code").await;
         assert!(!no_walk
             .iter()
             .any(|e| e.content.contains("PARENT-MONOREPO")));
@@ -613,7 +621,7 @@ mod tests {
             .await
             .unwrap();
 
-        let files = collect_memdir_files(home.path(), cwd.path()).await;
+        let files = collect_memdir_files(home.path(), cwd.path(), "code").await;
         assert_eq!(files.len(), 2);
         // Order is mtime-newest-first (TS parity: memoryScan.ts); assert by
         // membership, not position.
@@ -630,7 +638,7 @@ mod tests {
     async fn memdir_returns_empty_when_dir_missing() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let files = collect_memdir_files(home.path(), cwd.path()).await;
+        let files = collect_memdir_files(home.path(), cwd.path(), "code").await;
         assert!(files.is_empty());
     }
 
@@ -862,7 +870,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let got = collect_memdir_files(home, cwd).await;
+        let got = collect_memdir_files(home, cwd, "code").await;
         assert_eq!(got.len(), 200);
     }
 }

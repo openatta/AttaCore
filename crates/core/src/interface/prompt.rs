@@ -167,6 +167,7 @@ mod tests {
             paths: PathSettings {
                 user_data_dir: "/tmp/atta/user".into(),
                 local_data_dir: "/tmp/atta/local".into(),
+                scope: "code".into(),
             },
             execution: ExecutionSettings::default(),
             compaction: Default::default(),

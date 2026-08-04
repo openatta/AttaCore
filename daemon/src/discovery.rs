@@ -1,8 +1,10 @@
 //! Discovery lock file.
 //!
-//! The daemon writes `~/.atta/code/daemon.lock` (mode 0600) on startup
-//! with `{pid, socket_path, version, started_at}`. IDE plugins read
-//! this file to find a running daemon — no env var hunting, no port scan.
+//! The daemon writes `~/.atta/<scene>/daemon.lock` (mode 0600, `<scene>` is
+//! the `AgentScene` id resolved from `--scene` in `main.rs`, default
+//! `coding`) on startup with `{pid, socket_path, version, started_at}`. IDE
+//! plugins read this file to find a running daemon — no env var hunting, no
+//! port scan.
 //!
 //! On graceful shutdown the file is removed. On crash, the next daemon
 //! startup detects the stale file (pid no longer alive) and overwrites.

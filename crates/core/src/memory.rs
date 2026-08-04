@@ -7,7 +7,7 @@
 //!
 //! The lifecycle:
 //! 1. During session memory extraction, the engine produces `Vec<DurableMemory>`.
-//! 2. `DurableMemoryStore` persists them under `~/.atta/code/memories/` as individual
+//! 2. `DurableMemoryStore` persists them under `~/.atta/<scope>/memories/` as individual
 //!    JSON files, deduplicating by topic.
 //! 3. On resume or new session, relevant memories are surfaced via the cross-
 //!    session memory system prompt section.
@@ -88,7 +88,7 @@ pub enum MemoryStoreError {
 ///
 /// Layout:
 /// ```text
-/// ~/.atta/code/memories/
+/// ~/.atta/<scope>/memories/
 /// ├── <topic-hash>.json   # one per unique topic
 /// └── index.json          # topic → filename mapping (optional, for fast listing)
 /// ```

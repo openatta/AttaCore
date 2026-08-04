@@ -1,4 +1,4 @@
-//! Token persistence. v0 uses plaintext JSON under `~/.atta/code/tokens/<provider>.json`
+//! Token persistence. v0 uses plaintext JSON under `~/.atta/<scope>/tokens/<provider>.json`
 //! with `0600` perms on Unix. Future: switch to `keyring` crate so the OS
 //! keychain holds the secret.
 
@@ -53,13 +53,14 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// Open the default store under `$HOME/.atta/`.
-    pub fn from_home() -> Result<Self, TokenStoreError> {
+    /// Open the default store under `$HOME/.atta/<scope>/tokens`. No default
+    /// scope — callers must say which product instance this belongs to.
+    pub fn from_home(scope: &str) -> Result<Self, TokenStoreError> {
         let home = std::env::var_os("HOME").ok_or(TokenStoreError::NoHome)?;
         Ok(Self {
             root: PathBuf::from(home)
                 .join(".atta")
-                .join("code")
+                .join(scope)
                 .join("tokens"),
         })
     }

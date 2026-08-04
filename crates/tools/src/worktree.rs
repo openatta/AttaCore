@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 
 const SLUG_MAX_LEN: usize = 64;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
-const WORKTREES_SUBDIR: &str = ".atta/code/worktrees";
+const WORKTREES_SUBDIR: &str = ".atta/worktrees";
 const BRANCH_PREFIX: &str = "attacode/worktree-";
 
 /// `WorktreeHandle` —— 创建后持有；drop 时不自动清（避免 sync drop 起 tokio
@@ -163,11 +163,11 @@ pub async fn create_worktree(cwd: &Path, slug: &str) -> Result<WorktreeHandle, W
 /// - 找当前 cwd 所在 git repo（非 git 仓库时 silently no-op）
 /// - 跑 `git worktree prune` —— 清掉 git 元数据里"目录已经不存在"的 worktree
 ///   引用（这是 git 自带操作；安全）
-/// - 扫 `.atta/code/worktrees/<*>/` 下每个目录：如果对应分支
+/// - 扫 `.atta/worktrees/<*>/` 下每个目录：如果对应分支
 ///   `attacode/worktree-<flat>` 还在但 git worktree list 不见这个 worktree
 ///   注册，就把整个目录 + 分支删了（恢复磁盘空间）
 ///
-/// 设计权衡：**我们只清以 `.atta/code/worktrees/` 为前缀的目录**。
+/// 设计权衡：**我们只清以 `.atta/worktrees/` 为前缀的目录**。
 /// 其它工具的 worktree 不动。
 ///
 /// 失败仅 warn，不阻塞启动 —— 用户体验上 "attacode 启动忽然卡住" 比 "孤儿没清"
@@ -183,7 +183,7 @@ pub async fn prune_orphan_worktrees(cwd: &Path) {
         debug!(error = %e, "git worktree prune failed; ignoring");
     }
 
-    // 2. 扫 `.atta/code/worktrees/` 残留
+    // 2. 扫 `.atta/worktrees/` 残留
     let worktrees_root = repo_root.join(WORKTREES_SUBDIR);
     let mut entries = match tokio::fs::read_dir(&worktrees_root).await {
         Ok(e) => e,
@@ -484,7 +484,7 @@ mod tests {
 
         // cleanup 后路径 + 分支都应当消失
         handle.cleanup().await;
-        assert!(!repo.path().join(".atta/code/worktrees/probe").exists());
+        assert!(!repo.path().join(".atta/worktrees/probe").exists());
         let branches = run_git_capture(repo.path(), &["branch", "--list"])
             .await
             .unwrap();
@@ -562,8 +562,8 @@ mod tests {
     #[tokio::test]
     async fn prune_removes_orphan_worktree_dir() {
         let repo = make_minimal_repo().await;
-        // 模拟孤儿：手动 mkdir .atta/code/worktrees/orphan/ —— 没经过 git worktree add
-        let orphan = repo.path().join(".atta/code/worktrees/orphan");
+        // 模拟孤儿：手动 mkdir .atta/worktrees/orphan/ —— 没经过 git worktree add
+        let orphan = repo.path().join(".atta/worktrees/orphan");
         tokio::fs::create_dir_all(&orphan).await.unwrap();
         tokio::fs::write(orphan.join("leftover.txt"), "stale")
             .await
@@ -585,7 +585,7 @@ mod tests {
         let mut active = create_worktree(repo.path(), "active").await.unwrap();
         let active_path = active.path().to_path_buf();
         // 一个孤儿（不经 git worktree add）
-        let orphan = repo.path().join(".atta/code/worktrees/orphan");
+        let orphan = repo.path().join(".atta/worktrees/orphan");
         tokio::fs::create_dir_all(&orphan).await.unwrap();
 
         prune_orphan_worktrees(repo.path()).await;
@@ -609,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn prune_with_no_attacode_dir_is_silent_noop() {
         let repo = make_minimal_repo().await;
-        // 全新 repo 没 .atta/code/worktrees/ 目录
+        // 全新 repo 没 .atta/worktrees/ 目录
         prune_orphan_worktrees(repo.path()).await;
         // git 还是好的
         let r = run_git_capture(repo.path(), &["status"]).await;

@@ -10,9 +10,10 @@
 //! # Agent type registry
 //!
 //! The module defines built-in agent types (`builtin_agent_types()`) and can
-//! load user-defined types from `~/.atta/code/agents/*.md` via
-//! `load_agent_types_from_dir()`. Each type specifies a system prompt and an
-//! allowed tool set, which `resolve_tools()` applies when spawning sub-agents.
+//! load user-defined types from a directory (e.g. `~/.atta/<scope>/agents/*.md`
+//! or `<project>/.atta/agents/*.md`) via `load_agent_types_from_dir()`. Each
+//! type specifies a system prompt and an allowed tool set, which
+//! `resolve_tools()` applies when spawning sub-agents.
 
 use crate::agent::{Builder, InputMessage};
 use base::interface::event::AgentEvent;
@@ -464,10 +465,16 @@ impl AgentTool {
                 fallback_model: c.fallback_model.clone(),
             },
             paths: PathSettings {
+                // NOTE: this `AgentTool` (runtime crate) currently has no
+                // production construction site (verified during the
+                // 2026-08-03 AGENTS.md/.agents migration) — no live caller
+                // supplies a real scope, so this stays a fixed literal
+                // rather than threading scope through an unreachable path.
                 user_data_dir: std::env::var("HOME")
                     .map(|h| std::path::PathBuf::from(h).join(".atta/code"))
                     .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta/code")),
                 local_data_dir: std::path::PathBuf::from("."),
+                scope: "code".to_string(),
             },
             execution: ExecutionSettings::default(),
             compaction: Default::default(),
@@ -615,10 +622,13 @@ impl AgentTool {
                 fallback_model: inner.config.fallback_model.clone(),
             },
             paths: PathSettings {
+                // Same caveat as `sub_settings` above: unreachable in
+                // production today, so no real scope source to thread.
                 user_data_dir: std::env::var("HOME")
                     .map(|h| std::path::PathBuf::from(h).join(".atta/code"))
                     .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta/code")),
                 local_data_dir: cwd,
+                scope: "code".to_string(),
             },
             execution: ExecutionSettings::default(),
             compaction: Default::default(),

@@ -211,7 +211,7 @@ cargo test -p daemon
 ```sh
 export ANTHROPIC_API_KEY=sk-...
 cargo run -p daemon
-# 监听 $HOME/.atta/code/daemon.sock
+# 监听 $HOME/.atta/<scene>/daemon.sock（--scene 默认为 "coding"，必须是已注册的场景——coding/chat/demo——否则 daemon 启动失败）
 # 写入 discovery lock file → 客户端自动发现
 ```
 
@@ -239,7 +239,7 @@ cargo run -p daemon --release
 
 # 通过 socat 发送 turn
 echo '{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"用 Rust 写一个 TCP echo 服务"},"id":1}' \
-  | socat - UNIX-CONNECT:$HOME/.atta/code/daemon.sock
+  | socat - UNIX-CONNECT:$HOME/.atta/coding/daemon.sock  # 默认 scene；若传了 --scene，改用 $HOME/.atta/<scene>/daemon.sock
 ```
 
 Daemon 特性：
@@ -306,8 +306,8 @@ Builder::new()
 ### Settings 层级（优先级从低到高）
 
 1. 内置默认值
-2. `$HOME/.atta/code/settings.json`（或 `.toml`）
-3. `<project>/.atta/code/settings.json`（或 `.toml`）
+2. `$HOME/.atta/<scene>/settings.json`（或 `.toml`）—— `<scene>` 是 daemon 的 `AgentScene` id（`coding`/`chat`/`demo`）；用 `--scene` 指定（默认 `coding`）
+3. `<project>/.atta/settings.json`（或 `.toml`）—— 项目级状态是扁平的，没有 scope 这一层
 4. CLI 参数
 
 ```json
@@ -330,7 +330,7 @@ Builder::new()
 | `ANTHROPIC_API_KEY` | **必需。**模型提供商的 API 密钥 |
 | `ANTHROPIC_BASE_URL` | 自定义 API 端点（代理、兼容提供商） |
 | `ATTACORE_DAEMON_TOKEN` | TCP 模式认证令牌 |
-| `ATTA_CONFIG_HOME` | 配置根目录（默认：`$HOME/.atta/code`） |
+| `ATTA_CONFIG_HOME` | 配置根目录（默认：`$HOME/.atta/<scene>`） |
 | `ATTA_VCR_RECORD` | 录制模式：`ATTA_VCR_RECORD=<场景名>` |
 | `ATTA_VCR_REPLAY` | 回放模式：`ATTA_VCR_REPLAY=<场景名>` |
 

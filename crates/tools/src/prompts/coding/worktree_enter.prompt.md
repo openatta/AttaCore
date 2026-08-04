@@ -3,7 +3,7 @@ Use this tool ONLY when the user explicitly asks to work in a worktree. This too
 ## When to Use
 
 - The user explicitly says "worktree" (e.g., "start a worktree", "work in a worktree", "create a worktree", "use a worktree")
-- CLAUDE.md or memory instructions direct you to work in a worktree for the current task
+- AGENTS.md or memory instructions direct you to work in a worktree for the current task
 
 ## When NOT to Use
 
@@ -17,7 +17,7 @@ Use this tool ONLY when the user explicitly asks to work in a worktree. This too
 
 ## Behavior
 
-- In a git repository: creates a new git worktree inside `.atta/code/worktrees/` on a new branch. The base ref is governed by the `worktree.baseRef` setting: `fresh` (default) branches from origin/<default-branch>; `head` branches from your current local HEAD
+- In a git repository: creates a new git worktree inside `.atta/worktrees/` on a new branch. The base ref is governed by the `worktree.baseRef` setting: `fresh` (default) branches from origin/<default-branch>; `head` branches from your current local HEAD
 - Outside a git repository: delegates to WorktreeCreate/WorktreeRemove hooks for VCS-agnostic isolation
 - Switches the session's working directory to the new worktree
 - Use ExitWorktree to leave the worktree mid-session (keep or remove). On session exit, if still in the worktree, the user will be prompted to keep or remove it

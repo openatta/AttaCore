@@ -211,7 +211,7 @@ cargo test -p daemon
 ```sh
 export ANTHROPIC_API_KEY=sk-...
 cargo run -p daemon
-# Listens on $HOME/.atta/code/daemon.sock
+# Listens on $HOME/.atta/<scene>/daemon.sock (--scene defaults to "coding"; must be a registered scene — coding/chat/demo — or the daemon fails to start)
 # Writes discovery lock file → clients auto-discover
 ```
 
@@ -239,7 +239,7 @@ cargo run -p daemon --release
 
 # Send a turn via socat
 echo '{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"Write hello world in Rust"},"id":1}' \
-  | socat - UNIX-CONNECT:$HOME/.atta/code/daemon.sock
+  | socat - UNIX-CONNECT:$HOME/.atta/coding/daemon.sock  # default scene; use $HOME/.atta/<scene>/daemon.sock if you passed --scene
 ```
 
 Daemon features:
@@ -306,8 +306,8 @@ Builder::new()
 ### Settings Layers (lowest to highest priority)
 
 1. Built-in defaults
-2. `$HOME/.atta/code/settings.json` (or `.toml`)
-3. `<project>/.atta/code/settings.json` (or `.toml`)
+2. `$HOME/.atta/<scene>/settings.json` (or `.toml`) — `<scene>` is the daemon's `AgentScene` id (`coding`/`chat`/`demo`); set via `--scene` (defaults to `coding`)
+3. `<project>/.atta/settings.json` (or `.toml`) — project-level state is flat, no scope segment
 4. CLI arguments
 
 ```json
@@ -330,7 +330,7 @@ Builder::new()
 | `ANTHROPIC_API_KEY` | **Required.** API key for the model provider |
 | `ANTHROPIC_BASE_URL` | Custom API endpoint (proxies, compatible providers) |
 | `ATTACORE_DAEMON_TOKEN` | TCP mode authentication token |
-| `ATTA_CONFIG_HOME` | Config root directory (default: `$HOME/.atta/code`) |
+| `ATTA_CONFIG_HOME` | Config root directory (default: `$HOME/.atta/<scene>`) |
 | `ATTA_VCR_RECORD` | Record mode: `ATTA_VCR_RECORD=<scenario_name>` |
 | `ATTA_VCR_REPLAY` | Replay mode: `ATTA_VCR_REPLAY=<scenario_name>` |
 

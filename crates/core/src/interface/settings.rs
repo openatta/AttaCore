@@ -16,7 +16,7 @@ pub struct Settings {
     pub compaction: CompactionConfig,
     pub sandbox: SandboxConfig,
 
-    /// Path to an instruction file (e.g. CLAUDE.md, ATTA.md).
+    /// Path to an instruction file (e.g. AGENTS.md, CLAUDE.md).
     /// The AGENT reads the file at its discretion (every turn, on change, etc.).
     pub instruction_file: Option<PathBuf>,
 
@@ -156,10 +156,42 @@ pub struct ModelSettings {
 /// Path configuration for data directories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathSettings {
-    /// User-level data root (e.g. `~/.atta/code/`)
+    /// User-level data root (e.g. `~/.atta/<scope>/`)
     pub user_data_dir: PathBuf,
-    /// Local/project data root (e.g. `<cwd>/.atta/code/`)
+    /// Local/project data root (e.g. `<cwd>/.atta/`)
     pub local_data_dir: PathBuf,
+    /// Which product instance's user-level state `user_data_dir` was built
+    /// for (see `base::paths::ConfigPaths`). Carried alongside the resolved
+    /// dirs so downstream code (e.g. `FrozenContext::collect`) doesn't have
+    /// to re-derive it from the path. Defaults to `"code"` on deserialize
+    /// for settings.json files predating this field — `Settings::merge`
+    /// never copies a deserialized `paths` value over the one `Settings::load`
+    /// sets explicitly, so this default only matters for standalone
+    /// (de)serialization, not for the daemon's actual startup path.
+    #[serde(default = "default_scope")]
+    pub scope: String,
+}
+
+fn default_scope() -> String {
+    "code".to_string()
+}
+
+impl PathSettings {
+    /// The actual project working directory — **not** `local_data_dir`
+    /// itself, which is `<project_root>/.atta` (flat, no scope segment; see
+    /// `base::paths::ConfigPaths`). Several call sites used to pass
+    /// `local_data_dir` straight to `FrozenContext::collect` as if it were
+    /// the project root, which meant `AGENTS.md`/git-status discovery was
+    /// scanning the `.atta/` directory instead of the real project — this is
+    /// the fixed, single place that derives it correctly (falls back to
+    /// `local_data_dir` itself if it has no parent, e.g. `.atta` sitting at
+    /// filesystem root — not expected in practice).
+    pub fn project_root(&self) -> PathBuf {
+        self.local_data_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.local_data_dir.clone())
+    }
 }
 
 /// Execution constraints.
@@ -244,11 +276,15 @@ pub enum ThinkingMode {
 impl Settings {
     /// Load settings from user and local directories, with ENV override.
     /// Priority (low→high): user_dir/settings.json → local_dir/settings.json → ENV
-    pub fn load(user_dir: PathBuf, local_dir: PathBuf) -> Result<Self, SettingsError> {
+    ///
+    /// `scope` identifies which product instance `user_dir` belongs to (see
+    /// `base::paths::ConfigPaths`) — no default at this layer; callers decide.
+    pub fn load(user_dir: PathBuf, local_dir: PathBuf, scope: &str) -> Result<Self, SettingsError> {
         let mut base = Self::defaults_for("claude-sonnet-4-6");
         base.paths = PathSettings {
             user_data_dir: user_dir.clone(),
             local_data_dir: local_dir.clone(),
+            scope: scope.to_string(),
         };
 
         // 1. Load user settings
@@ -312,6 +348,7 @@ impl Settings {
             paths: PathSettings {
                 user_data_dir: PathBuf::from("~/.atta/agent"),
                 local_data_dir: PathBuf::from("."),
+                scope: default_scope(),
             },
             execution: ExecutionSettings::default(),
             compaction: CompactionConfig::default(),

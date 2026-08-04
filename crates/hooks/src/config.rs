@@ -105,7 +105,7 @@ pub enum HookEvent {
     /// Git worktree lifecycle.
     WorktreeCreate,
     WorktreeRemove,
-    /// CLAUDE.md / ATTA.md loaded.
+    /// AGENTS.md loaded.
     InstructionsLoaded,
     /// Working directory changed.
     CwdChanged,

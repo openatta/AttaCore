@@ -1,9 +1,11 @@
 //! Skill loading, expansion, and activation.
 //!
-//! Skills are loaded from `~/.atta/code/skills/<name>/SKILL.md` (user-level)
-//! and `<cwd>/.atta/code/skills/<name>/SKILL.md` (project-level). They can be
-//! invoked via slash commands (`/<name> [args]`) or conditionally activated
-//! when matching file paths are touched.
+//! Skills are loaded from `~/.atta/<scope>/skills/<name>/SKILL.md` (user-level;
+//! `scope` identifies the product instance, no default) and
+//! `<cwd>/.agents/skills/<name>/SKILL.md` (project-level — this is the
+//! external fact standard also scanned by Codex). They can be invoked via
+//! slash commands (`/<name> [args]`) or conditionally activated when
+//! matching file paths are touched.
 
 use std::path::{Path, PathBuf};
 
@@ -102,25 +104,25 @@ impl SkillEntry {
 /// Skill 来源 -- user / project；同名时 project 后入但保留两者
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
-    /// `~/.atta/code/skills/`
+    /// `~/.atta/<scope>/skills/`
     User,
-    /// `<cwd>/.atta/code/skills/`
+    /// `<cwd>/.agents/skills/`（外部事实标准，Codex 也扫描这个路径）
     Project,
-    /// Loaded from a plugin's manifest (`~/.atta/code/plugins/<name>/SKILL.md`)
+    /// Loaded from a plugin's manifest (`~/.atta/<scope>/plugins/<name>/SKILL.md`)
     Plugin,
 }
 
-/// 从两个来源扫 SKILL.md：用户级 `~/.atta/code/skills/<name>/SKILL.md` + 项目级
-/// `<cwd>/.atta/code/skills/<name>/SKILL.md`。返回顺序：用户在前 -> 项目在后；同
-/// 来源内按目录名字母序。不做 dedup（同名两份都展示，方便用户看
-/// 到来源差异）。
-async fn collect_skills(home: &Path, cwd: &Path) -> Vec<SkillEntry> {
-    let user_dir = home.join(".atta").join("code").join("skills");
-    let project_dir = cwd.join(".atta").join("code").join("skills");
-    let plugin_skills_dir = home.join(".atta").join("code").join("plugins");
+/// 从两个来源扫 SKILL.md：用户级 `~/.atta/<scope>/skills/<name>/SKILL.md` + 项目级
+/// `<cwd>/.agents/skills/<name>/SKILL.md`（外部事实标准）。返回顺序：用户在前 ->
+/// 项目在后。同来源内按目录名字母序。
+async fn collect_skills(home: &Path, cwd: &Path, scope: &str) -> Vec<SkillEntry> {
+    let user_dir = home.join(".atta").join(scope).join("skills");
+    let project_dir = cwd.join(".agents").join("skills");
+    let plugin_skills_dir = home.join(".atta").join(scope).join("plugins");
     let mut all = Vec::new();
     all.extend(scan_skills_dir(&user_dir, SkillSource::User).await);
     all.extend(scan_skills_dir(&project_dir, SkillSource::Project).await);
+
     // Scan plugin skill directories
     if let Ok(mut plugins) = tokio::fs::read_dir(&plugin_skills_dir).await {
         while let Ok(Some(entry)) = plugins.next_entry().await {
@@ -182,13 +184,14 @@ pub async fn load_skill_from_path(path: &Path, source: SkillSource) -> Option<Sk
 ///
 /// 把 5 个内置 bundled skills 追加到列表末尾。disk 上同名 skill 优先
 /// （因为先入列表，slash 命中第一个）。
-pub async fn load_session_skills(cwd: &Path) -> Vec<SkillEntry> {
+pub async fn load_session_skills(cwd: &Path, scope: &str) -> Vec<SkillEntry> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let all = match home {
-        Some(h) => collect_skills(&h, cwd).await,
+        Some(h) => collect_skills(&h, cwd, scope).await,
         None => {
             // 没有 HOME 时只扫 project
-            scan_skills_dir(&cwd.join(".atta").join("code").join("skills"), SkillSource::Project).await
+            let project_dir = cwd.join(".agents").join("skills");
+            scan_skills_dir(&project_dir, SkillSource::Project).await
         }
     };
     // Disk skills are loaded first (take priority for slash commands).
@@ -205,8 +208,9 @@ pub async fn load_session_skills(cwd: &Path) -> Vec<SkillEntry> {
 pub async fn load_session_skills_with_bundled(
     cwd: &Path,
     bundled: Vec<SkillEntry>,
+    scope: &str,
 ) -> Vec<SkillEntry> {
-    let mut all = load_session_skills(cwd).await;
+    let mut all = load_session_skills(cwd, scope).await;
     let disk_names: std::collections::HashSet<String> =
         all.iter().map(|s| s.name.clone()).collect();
     for s in bundled {
@@ -446,8 +450,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // project skill
-        let p_dir = cwd.path().join(".atta/code/skills/p-skill");
+        // project skill — lives under the new authoritative `.agents/skills/`
+        let p_dir = cwd.path().join(".agents/skills/p-skill");
         tokio::fs::create_dir_all(&p_dir).await.unwrap();
         tokio::fs::write(
             p_dir.join("SKILL.md"),
@@ -455,7 +459,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let skills = collect_skills(home.path(), cwd.path()).await;
+        let skills = collect_skills(home.path(), cwd.path(), "code").await;
         assert_eq!(skills.len(), 2);
         // user 在前
         assert_eq!(skills[0].name, "u-skill");
@@ -471,8 +475,27 @@ mod tests {
         // 目录存在但没有 SKILL.md
         let d = home.path().join(".atta/code/skills/empty");
         tokio::fs::create_dir_all(&d).await.unwrap();
-        let skills = collect_skills(home.path(), cwd.path()).await;
+        let skills = collect_skills(home.path(), cwd.path(), "code").await;
         assert!(skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skills_ignores_old_atta_code_skills_path() {
+        // Pre-release, no back-compat: `.atta/code/skills/` is not scanned at
+        // all (only `.agents/skills/` is the project-level source of truth).
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let old_dir = cwd.path().join(".atta/code/skills/old-skill");
+        tokio::fs::create_dir_all(&old_dir).await.unwrap();
+        tokio::fs::write(
+            old_dir.join("SKILL.md"),
+            "---\ndescription: old path\n---\nbody",
+        )
+        .await
+        .unwrap();
+
+        let skills = collect_skills(home.path(), cwd.path(), "code").await;
+        assert!(skills.is_empty(), "`.atta/code/skills/` must not be scanned");
     }
 
     #[tokio::test]

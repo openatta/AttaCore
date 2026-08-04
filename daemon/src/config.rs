@@ -24,7 +24,15 @@ pub trait DaemonPaths: Send + Sync {
     fn project_root(&self) -> PathBuf;
 }
 
-/// Default path provider: `$ATTA_CONFIG_HOME` → `$HOME/.atta/code`.
+/// Default path provider: `$ATTA_CONFIG_HOME` → `$HOME/.atta/<scope>`.
+///
+/// `scope` identifies which product instance owns this user-level state (see
+/// `base::paths::ConfigPaths`). This struct itself does not default
+/// anything — callers must pass a value. `daemon`'s own caller
+/// (`daemon/src/main.rs::resolve_scene`) derives that value from the
+/// validated `--scene` CLI flag (`coding`/`chat`/`demo`; unsupported values
+/// fail startup) rather than accepting an arbitrary string — see
+/// `docs/design/2026-08-03-agents-config-migration.md` §9.1.
 #[derive(Debug, Clone)]
 pub struct DefaultDaemonPaths {
     config_root: PathBuf,
@@ -32,11 +40,11 @@ pub struct DefaultDaemonPaths {
 }
 
 impl DefaultDaemonPaths {
-    pub fn from_env() -> Self {
+    pub fn from_env(scope: &str) -> Self {
         let config_root = if let Ok(p) = std::env::var("ATTA_CONFIG_HOME") {
             PathBuf::from(p)
         } else if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".atta").join("code")
+            PathBuf::from(home).join(".atta").join(scope)
         } else {
             PathBuf::from("/tmp/attacore")
         };
@@ -153,7 +161,7 @@ pub fn load_daemon_config(
     let user_path = config_root.join("settings.json");
     let mut merged = load_single(&user_path).unwrap_or_default();
 
-    let project_path = project_root.join(".atta").join("code").join("settings.json");
+    let project_path = project_root.join(".atta").join("settings.json");
     if let Some(proj) = load_single(&project_path) {
         merged = merge_settings(merged, proj);
     }
@@ -210,16 +218,27 @@ mod tests {
     }
 
     fn write_project_settings(project: &Path, content: &str) {
-        let atta_dir = project.join(".atta").join("code");
+        let atta_dir = project.join(".atta");
         std::fs::create_dir_all(&atta_dir).unwrap();
         std::fs::write(atta_dir.join("settings.json"), content).unwrap();
     }
 
     #[test]
     fn default_paths_from_env_falls_back_to_home() {
-        let paths = DefaultDaemonPaths::from_env();
+        let paths = DefaultDaemonPaths::from_env("code");
         let root = paths.config_root();
         assert!(!root.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn default_paths_from_env_respects_scope() {
+        // Clear ATTA_CONFIG_HOME so scope actually drives the path in this test.
+        std::env::remove_var("ATTA_CONFIG_HOME");
+        let code_paths = DefaultDaemonPaths::from_env("code");
+        let ops_paths = DefaultDaemonPaths::from_env("ops");
+        assert_ne!(code_paths.config_root(), ops_paths.config_root());
+        assert!(code_paths.config_root().ends_with("code"));
+        assert!(ops_paths.config_root().ends_with("ops"));
     }
 
     #[test]
