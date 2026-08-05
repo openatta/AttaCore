@@ -12,6 +12,7 @@ use base::interface::model::{
 use base::interface::prompt::{assemble_prompt, PromptBlock};
 use base::interface::scene::ScenePromptContext;
 use base::tool::{ToolContext, ToolResultContent};
+use mcp::manager::McpManager;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -723,6 +724,11 @@ Use these memories to inform your response.
                 }
                 // Refresh MCP tools between turns (TS parity: refreshTools in query.ts:1659)
                 self.mcp.refresh_tools().await;
+                // Any tool a server exposed for the first time in that
+                // refresh (e.g. after a reconnect) needs to actually be
+                // callable, not just advertised — see
+                // `register_new_mcp_adapters`'s doc comment.
+                register_new_mcp_adapters(&self.tools, &self.mcp);
                 continue;
             }
 
@@ -1697,6 +1703,23 @@ async fn execute_tool_inner(
     outcome
 }
 
+/// Register any of `mcp`'s current tool adapters that aren't already in
+/// `tools` by name. `McpManager::refresh_tools()` (called between turns —
+/// TS parity: refreshTools in query.ts:1659) only updates the manager's own
+/// internal adapter list; a tool a server exposes for the first time after
+/// that refresh (e.g. following a reconnect) would otherwise be advertised
+/// to the model via `build_tool_defs()` but stay uncallable — the same bug
+/// class as the `Builder::build()`-time registration gap this mirrors.
+/// Already-registered adapters are left alone (checked by name) so this is
+/// safe to call every refresh, not just the first time.
+fn register_new_mcp_adapters(tools: &base::tool::InMemoryToolRegistry, mcp: &McpManager) {
+    for adapter in mcp.tool_adapters() {
+        if tools.get(adapter.name()).is_none() {
+            tools.register(adapter.clone());
+        }
+    }
+}
+
 fn build_prompt_context<'a>(
     settings: &'a base::interface::settings::Settings,
     _session: &'a session::session::SessionManager,
@@ -2173,6 +2196,61 @@ mod tests {
             marker.exists(),
             "PostToolUse hook should have run and created the marker file"
         );
+    }
+
+    // ── register_new_mcp_adapters (dynamic MCP tool discovery) ──
+
+    #[tokio::test]
+    async fn register_new_mcp_adapters_adds_previously_unseen_tools() {
+        let tools = base::tool::InMemoryToolRegistry::new();
+        let mock_client = Arc::new(mcp::client::MockMcpClient::new(
+            "test-server",
+            vec![mcp::client::McpToolMeta {
+                name: "new-tool".into(),
+                description: Some("appeared after reconnect".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        ));
+        let mut mgr = McpManager::from_clients(vec![mock_client]);
+        mgr.refresh_tools().await;
+
+        assert!(
+            tools.get("mcp__test-server__new-tool").is_none(),
+            "sanity: not registered yet"
+        );
+        register_new_mcp_adapters(&tools, &mgr);
+        assert!(
+            tools.get("mcp__test-server__new-tool").is_some(),
+            "newly-discovered MCP adapter should now be registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_new_mcp_adapters_does_not_duplicate_already_registered_tools() {
+        let tools = base::tool::InMemoryToolRegistry::new();
+        let mock_client = Arc::new(mcp::client::MockMcpClient::new(
+            "test-server",
+            vec![mcp::client::McpToolMeta {
+                name: "existing-tool".into(),
+                description: Some("was already there".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        ));
+        let mut mgr = McpManager::from_clients(vec![mock_client]);
+        mgr.refresh_tools().await;
+
+        // Simulate this having already been registered once (e.g. at
+        // Builder::build() time), then refresh_tools() running again later
+        // with the exact same tool still present — must not duplicate.
+        register_new_mcp_adapters(&tools, &mgr);
+        register_new_mcp_adapters(&tools, &mgr);
+
+        let count = tools
+            .list()
+            .iter()
+            .filter(|t| t.name() == "mcp__test-server__existing-tool")
+            .count();
+        assert_eq!(count, 1, "must not register the same tool twice");
     }
 
     #[test]
