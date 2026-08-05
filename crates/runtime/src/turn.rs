@@ -441,6 +441,8 @@ impl Agent {
             let tid = self.current_turn_id.clone();
             let cancel_for_exec = cancel.clone();
             let hooks_for_exec = Arc::clone(&self.hooks);
+            let discontinued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let discontinued_for_exec = Arc::clone(&discontinued);
             let stream_result = crate::streaming::execute_stream(
                 stream,
                 &mut self.session,
@@ -456,6 +458,7 @@ impl Agent {
                         turn_id: tid.clone(),
                         cancel: cancel_for_exec.clone(),
                         hooks: Arc::clone(&hooks_for_exec),
+                        discontinued: Arc::clone(&discontinued_for_exec),
                     };
                     async move { execute_tool_with_telemetry(&exec_ctx, &name, input).await }
                 },
@@ -474,6 +477,43 @@ impl Agent {
             tool_calls += stream_result.tool_calls;
             let stop_reason = stream_result.stop_reason;
             let usage = stream_result.usage;
+
+            // A PostToolUse hook can request the turn end right here — every
+            // tool_use emitted in this round already has its tool_result
+            // pushed to the session by this point (execute_stream pushes
+            // results as each tool call completes, not after the whole
+            // stream finishes), so there's no risk of a dangling tool_use
+            // block without a matching result. Mirrors the Stop hook's
+            // discontinue path below, just triggered from a different point.
+            if discontinued.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("PostToolUse hook discontinued the turn");
+                let tid = self.current_turn_id.clone();
+                let _ = self
+                    .telemetry_handle
+                    .record(telemetry::TelemetryEvent::turn_complete(
+                        &self.session.session_id,
+                        self.session.turn_count,
+                        Some(tid),
+                        telemetry::TurnCompletePayload {
+                            turn_no: self.session.turn_count,
+                            turn_id: Some(self.current_turn_id.clone()),
+                            stop_reason: "stopped_by_hook".into(),
+                            api_calls,
+                            tool_calls,
+                            permission_denials: self.permission_denial_count,
+                            last_tool_name: None,
+                            last_tool_was_error: false,
+                            turn_duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    ));
+                self.last_had_tool_uses = had_tool_uses_this_turn;
+                return Ok(TurnOutcome {
+                    stop_reason: "stopped_by_hook".into(),
+                    api_calls,
+                    tool_calls,
+                    usage,
+                });
+            }
 
             // ── Memory prefetch: collect results from background task ──
             // TS parity: collectRelevantMemoryPrefetch in query.ts:1599-1614.
@@ -1557,6 +1597,11 @@ pub(crate) struct ToolExecCtx {
     pub turn_id: String,
     pub cancel: tokio_util::sync::CancellationToken,
     pub hooks: Arc<hooks::HookRunner>,
+    /// Set by a `PostToolUse` hook that returns `continue: false` — checked
+    /// by `process_turn` after `execute_stream` returns to end the turn
+    /// early, same outcome as the `Stop` hook's discontinue path. Shared
+    /// (not per-call) so any tool in this round's batch can request it.
+    pub discontinued: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Execute a single tool and record telemetry. Free function for streaming executor.
@@ -1671,12 +1716,16 @@ async fn execute_tool_inner(
         Err(e) => Err(e.to_string()),
     };
 
-    // PostToolUse: fire-and-forget notification — the tool already ran, so
-    // there's no "block" to apply here (unlike PreToolUse). Aborting the
-    // whole turn from a PostToolUse hook (`continue: false`) isn't wired up:
-    // this function can only report this one call's outcome, not reach back
-    // into the streaming loop that's iterating tool calls — a bigger change
-    // than this fix's scope. TS parity: executePostToolUseHooks in query.ts.
+    // PostToolUse: notification after the fact — there's no "block" to apply
+    // here (unlike PreToolUse; the tool already ran), but `continue: false`
+    // can still request that the whole turn end. That's a turn-level
+    // decision this function can't act on directly (it only reports this one
+    // call's outcome) — it's surfaced via `ctx.discontinued`, a shared flag
+    // `process_turn` checks once `execute_stream` returns. Same story for
+    // in-flight sibling tool calls in the same concurrent batch: this
+    // doesn't cancel them, it only prevents looping back to the model for
+    // another round once the current batch finishes. TS parity:
+    // executePostToolUseHooks in query.ts.
     if ctx.hooks.has_hooks_for(hooks::HookEvent::PostToolUse) {
         let (result_json, is_error_flag) = match &outcome {
             Ok((text, _)) => (serde_json::Value::String(text.clone()), false),
@@ -1694,10 +1743,14 @@ async fn execute_tool_inner(
             is_error: Some(is_error_flag),
             user_prompt: None,
         };
-        let _ = ctx
+        let hook_result = ctx
             .hooks
             .run(hooks::HookEvent::PostToolUse, &post_input)
             .await;
+        if hook_result.discontinued() {
+            ctx.discontinued
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     outcome
@@ -2097,6 +2150,7 @@ mod tests {
             turn_id: "test-turn".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
             hooks,
+            discontinued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2195,6 +2249,41 @@ mod tests {
         assert!(
             marker.exists(),
             "PostToolUse hook should have run and created the marker file"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_discontinue_sets_the_shared_flag() {
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }));
+
+        let mut settings: hooks::config::HooksSettings = std::collections::HashMap::new();
+        settings.insert(
+            hooks::HookEvent::PostToolUse,
+            vec![hooks::config::HookConfig::Command {
+                command: r#"echo '{"continue":false}'"#.into(),
+                shell: None,
+                timeout: None,
+                if_pattern: None,
+                only_on_error: None,
+                once: None,
+                async_rewake: None,
+            }],
+        );
+        let hooks_runner = Arc::new(hooks::HookRunner::new(settings));
+        let ctx = test_exec_ctx(tools, hooks_runner);
+
+        assert!(!ctx.discontinued.load(std::sync::atomic::Ordering::Relaxed));
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
+        assert!(
+            result.is_ok(),
+            "the tool call itself still succeeds: {result:?}"
+        );
+        assert!(
+            ctx.discontinued.load(std::sync::atomic::Ordering::Relaxed),
+            "PostToolUse discontinue should have set the shared flag"
         );
     }
 

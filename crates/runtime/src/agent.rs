@@ -1178,6 +1178,130 @@ mod tests {
         );
     }
 
+    /// Test tool: always succeeds, records nothing — just needs to exist so
+    /// the mock model's `ToolUse` call has something real to dispatch to.
+    struct ProbeTool;
+    #[async_trait::async_trait]
+    impl base::tool::Tool for ProbeTool {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: base::tool::ToolContext,
+            _progress: base::tool::ProgressSender,
+        ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+            Ok(base::tool::ToolResult::text("probe-ok"))
+        }
+    }
+
+    /// Mock model: 1st call emits a `Probe` tool call, every later call just
+    /// ends the turn normally. Used to prove the discontinue path actually
+    /// stops the outer loop — if it didn't, the agent would call the model
+    /// a 2nd time asking what to do with the tool result.
+    struct ToolThenStopModel {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Model for ToolThenStopModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            let call_no = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events: Vec<
+                Result<base::interface::model::ModelEvent, base::interface::model::ModelError>,
+            > = if call_no == 0 {
+                vec![
+                    Ok(base::interface::model::ModelEvent::ToolUse {
+                        id: "toolu_1".into(),
+                        name: "Probe".into(),
+                        input: serde_json::json!({}),
+                    }),
+                    Ok(base::interface::model::ModelEvent::EndTurn {
+                        stop_reason: "tool_use".into(),
+                        usage: Default::default(),
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(base::interface::model::ModelEvent::TextDelta {
+                        text: "done".into(),
+                    }),
+                    Ok(base::interface::model::ModelEvent::EndTurn {
+                        stop_reason: "end_turn".into(),
+                        usage: Default::default(),
+                    }),
+                ]
+            };
+            Ok(Box::new(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_discontinue_ends_the_turn_early() {
+        // End-to-end regression test for the PostToolUse -> discontinue
+        // wiring: a PostToolUse hook returning `continue: false` must stop
+        // the turn right after the tool that triggered it, instead of
+        // looping back to the model for another round. Proven two ways:
+        // stop_reason == "stopped_by_hook", and the model is called exactly
+        // once (a working-but-broken discontinue would still call it a 2nd
+        // time to hand back the tool result).
+        let mut settings = test_settings();
+        settings.hooks_config = Some(serde_json::json!({
+            "PostToolUse": [
+                { "type": "command", "command": "echo '{\"continue\":false}'" }
+            ]
+        }));
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: call_count.clone(),
+        });
+        let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(ProbeTool));
+
+        let (mut agent, _event_rx, _input_tx) = Builder::new()
+            .scene(scene)
+            .model(model)
+            .settings(Arc::new(settings))
+            .tools(tools)
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let outcome = agent
+            .process_turn(
+                InputMessage::User {
+                    content: "please use the probe tool".into(),
+                    attachments: vec![],
+                    turn_id: "t1".into(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("process_turn should succeed");
+
+        assert_eq!(outcome.stop_reason, "stopped_by_hook");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "model should only have been called once — the turn must not have looped back for a 2nd round"
+        );
+    }
+
     #[test]
     fn build_hook_runner_defaults_to_empty_without_hooks_config() {
         let settings = test_settings();
