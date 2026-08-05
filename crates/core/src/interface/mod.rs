@@ -10,5 +10,6 @@ pub mod memory;
 pub mod model;
 pub mod permission;
 pub mod prompt;
+pub mod rules;
 pub mod scene;
 pub mod settings;

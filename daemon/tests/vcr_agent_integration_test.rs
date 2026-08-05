@@ -127,7 +127,7 @@ fn build_agent(
             thinking_mode: ThinkingMode::Off, fallback_model: None,
         },
         paths: base::interface::settings::PathSettings {
-            user_data_dir: tmp.join("user"), local_data_dir: tmp.join("local"),
+            user_data_dir: tmp.join("user"), global_data_dir: tmp.join("global"), local_data_dir: tmp.join("local"),
             scope: "code".into(),
         },
         execution: Default::default(), compaction: Default::default(), sandbox: Default::default(),
@@ -135,7 +135,8 @@ fn build_agent(
         vcr: None, telemetry_url: None, session_dir: None,
         memory_enabled: false,
         permission_mode: PermissionMode::BypassPermissions,
-        permission_rules: vec![], hooks_config: None, mcp_servers: vec![],
+        permission_rules: vec![], hooks_config: None, mcp_servers: Default::default(),
+        providers: Default::default(), default_provider: None, task_models: Default::default(),
         language: None, feature_flags: Default::default(),
     });
 

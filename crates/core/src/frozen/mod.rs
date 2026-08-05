@@ -171,15 +171,15 @@ impl FrozenContext {
             (None, None, None, None, None)
         };
 
-        let memory_blocks = collect_memory_files_with(&cwd, opts.walk_up_claude_md, scope).await;
+        let memory_blocks = collect_memory_files_with(&cwd, opts.walk_up_claude_md).await;
         // P3c : 用 load_session_skills 而非 collect_skills -- 前者把 bundled
         // skills (simplify/verify/debug/batch/stuck) 也并入。否则
         // disk 没装 SKILL.md 时 system prompt 不暴露 bundled，模型不知道有这些
         // skill，/stuck /simplify 等 case 失败。
         let skills = load_session_skills(&cwd, scope).await;
 
-        // : memory_dir = ~/.atta/<scope>/memory/<sha256(canonical_cwd)[..16]>/
-        let (memory_dir, memory_index) = collect_memory(&cwd, scope).await;
+        // memory_dir = ~/.atta/memory/<sha256(canonical_cwd)[..16]>/（不分 scene）
+        let (memory_dir, memory_index) = collect_memory(&cwd).await;
 
         // P1.5: Pre-load all memory files from the project memory dir so they
         // are available for injection into the system prompt. Files are capped

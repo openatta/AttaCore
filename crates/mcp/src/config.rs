@@ -297,8 +297,11 @@ pub fn apply_policy(
 /// Load MCP server configurations from all scopes, merged with priority.
 ///
 /// Scopes (low to high priority):
-/// 1. Enterprise: `{data_dir}/policy/mcp.json`
-/// 2. User: `{user_data_dir}/mcp/servers.json`
+/// 1. Enterprise: `{global_data_dir}/policy/mcp.json`
+/// 2. Global: `{global_data_dir}/mcp/servers.json` — **not** scene-scoped
+///    (same reasoning as `memory`/`sessions`/`vcr`, see `base::paths` module
+///    docs: which scene a session runs under has no bearing on which MCP
+///    servers a project wants connected).
 /// 3. Project: `{local_data_dir}/mcp/servers.json`
 /// 4. Local: `{local_data_dir}/mcp.local.json` (highest priority)
 ///
@@ -342,8 +345,8 @@ pub fn load_mcp_configs(paths: &ConfigPaths) -> HashMap<String, McpServerConfig>
     // 2-4. File scopes (skip if plugin_only is active)
     let skip_file_scopes = policy.as_ref().map(|p| p.plugin_only).unwrap_or(false);
     if !skip_file_scopes {
-        // 2. User scope
-        let user_path = paths.user_mcp_dir().join("servers.json");
+        // 2. Global scope (not scene-scoped)
+        let user_path = paths.global_mcp_dir().join("servers.json");
         load_scoped_servers_file(&user_path, &mut merged);
 
         // 3. Project scope
@@ -372,15 +375,12 @@ pub fn load_mcp_configs(paths: &ConfigPaths) -> HashMap<String, McpServerConfig>
 
 // ── Private helpers ──
 
-/// Compute the enterprise policy file path.
-/// Uses parent of `user_data_dir` as the `data_dir` root
-/// (e.g., `$HOME/.atta/policy/mcp.json` when user_data_dir is `$HOME/.atta/<scope>/`).
+/// Compute the enterprise policy file path: `{global_data_dir}/policy/mcp.json`
+/// (e.g. `$HOME/.atta/policy/mcp.json`). Uses `global_data_dir` directly —
+/// **not** derived from `user_data_dir`'s parent, since `user_data_dir` is
+/// now nested two levels deep (`$HOME/.atta/scenes/<scope>/`).
 fn enterprise_policy_path(paths: &ConfigPaths) -> PathBuf {
-    paths
-        .user_data_dir
-        .parent()
-        .map(|p| p.join("policy").join("mcp.json"))
-        .unwrap_or_else(|| paths.user_data_dir.join("policy").join("mcp.json"))
+    paths.global_data_dir.join("policy").join("mcp.json")
 }
 
 /// Load an enterprise policy file. Returns `None` if the file doesn't exist
@@ -883,9 +883,10 @@ mod tests {
     // ── enterprise_policy_path tests ──
 
     #[test]
-    fn enterprise_policy_path_uses_parent_of_user_data_dir() {
+    fn enterprise_policy_path_uses_global_data_dir() {
         let paths = ConfigPaths {
-            user_data_dir: PathBuf::from("/home/user/.atta/code"),
+            user_data_dir: PathBuf::from("/home/user/.atta/scenes/code"),
+            global_data_dir: PathBuf::from("/home/user/.atta"),
             local_data_dir: PathBuf::from("/tmp/proj/.atta"),
         };
         let path = enterprise_policy_path(&paths);

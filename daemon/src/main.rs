@@ -112,12 +112,51 @@ async fn main() -> anyhow::Result<()> {
     let scene = resolve_scene(&cli.scene)?;
     let scope = scene.id().to_string();
 
-    // ── Resolve paths ──────────────────────────────────────────────────
+    // ── Resolve paths + load settings ────────────────────────────────────
+    // `load_daemon_config` delegates all settings.json parsing/merging to
+    // `Settings::load()` — the single canonical loader (global → scene →
+    // project). See `daemon::config` module docs for why this replaced a
+    // separate hand-rolled `Settings{}` literal that used to live in this
+    // function (that duplication is exactly how `permission_rules` ended up
+    // parsed nowhere despite being a real `Settings` field).
     let paths = DefaultDaemonPaths::from_env(&scope);
     let mut daemon_config =
-        load_daemon_config(&cli.model, cli.max_tokens, cli.socket.as_deref(), &paths);
+        load_daemon_config(&cli.model, cli.max_tokens, cli.socket.as_deref(), &scope, &paths);
     daemon_config.session_cap = cli.session_cap;
     daemon_config.session_idle_timeout_secs = cli.session_idle_timeout;
+    daemon_config.settings.session_dir = Some(daemon_config.settings.paths.local_data_dir.clone());
+
+    // Multi-provider LLM routing config is purely additive: if `providers`
+    // isn't configured, this is a no-op and the existing env-var-based
+    // Anthropic client below is unaffected. When it *is* configured, we
+    // validate + resolve it now so misconfiguration surfaces at startup
+    // rather than silently during a session. Actually dispatching requests
+    // through the resolved provider/model is a separate, not-yet-built
+    // feature — see `docs/design/2026-08-04-multi-provider-llm-migration.md`.
+    if !daemon_config.settings.providers.is_empty() {
+        match base::provider::resolve_task_models(
+            &daemon_config.settings.providers,
+            daemon_config.settings.default_provider.as_deref(),
+            &daemon_config.settings.task_models,
+        ) {
+            Ok((resolved, warnings)) => {
+                for w in &warnings {
+                    tracing::warn!("model routing: {w}");
+                }
+                for (task, r) in &resolved {
+                    tracing::info!(
+                        task = %task,
+                        provider = %r.provider_id,
+                        model = %r.model,
+                        "model routing resolved"
+                    );
+                }
+            }
+            Err(e) => {
+                anyhow::bail!("invalid multi-provider LLM config: {e}");
+            }
+        }
+    }
 
     // TCP listener config
     if let Some(ref addr_str) = cli.listen {
@@ -163,82 +202,27 @@ async fn main() -> anyhow::Result<()> {
         None => Arc::new(HttpAnthropicClient::new(auth)?),
     };
 
-    // ── Build settings ─────────────────────────────────────────────────
-    // Single source of truth for user/local roots — replaces what used to be
-    // three independent `.atta/code` literal constructions (here, plus
-    // `DefaultDaemonPaths::from_env` above, plus the project settings.json
-    // lookup in `load_daemon_config`). `local_data_dir` is intentionally flat
-    // (no scope segment) — see `base::paths::ConfigPaths` docs.
-    let config_paths = base::paths::ConfigPaths::from_env(std::path::Path::new("."), &scope);
-    let user_dir = config_paths.user_data_dir.clone();
-    let local_dir = config_paths.local_data_dir.clone();
-
-    use base::interface::settings::{
-        CompactionConfig, ExecutionSettings, ModelSettings, PathSettings, SandboxConfig,
-        Settings, ThinkingMode,
-    };
-
-    // Convert the settings.json-parsed server map into `Settings.mcp_servers`
-    // (previously silently discarded — hardcoded `Vec::new()` regardless of
-    // what settings.json configured). NOTE: this only stops the value from
-    // being thrown away; it does not yet make these servers actually connect.
-    // `Builder::build()` only wires MCP servers when the caller explicitly
-    // constructs an `McpManager` and passes it via `.mcp_manager(...)` —
-    // `SessionPool::create()` doesn't do that today, so configured servers
-    // are visible in `Settings` but still inert. Actually connecting them is
-    // a separate, larger feature (build an `McpManager` from this list at
-    // daemon startup), not done as part of this fix.
-    let mcp_servers: Vec<serde_json::Value> = daemon_config
-        .mcp_servers
-        .iter()
-        .filter_map(|(name, cfg)| {
-            let mut v = serde_json::to_value(cfg).ok()?;
-            if let serde_json::Value::Object(ref mut map) = v {
-                map.insert("name".to_string(), serde_json::Value::String(name.clone()));
-            }
-            Some(v)
-        })
-        .collect();
-
-    let settings = Arc::new(Settings {
-        model: ModelSettings {
-            api_type: base::provider::ApiType::Anthropic,
-            base_url: String::new(),
-            auth_token: String::new(),
-            model_name: daemon_config.model.clone(),
-            max_tokens: daemon_config.max_tokens,
-            thinking_mode: ThinkingMode::Auto,
-            fallback_model: None,
-        },
-        paths: PathSettings {
-            user_data_dir: user_dir.clone(),
-            local_data_dir: local_dir.clone(),
-            scope: scope.clone(),
-        },
-        execution: ExecutionSettings::default(),
-        compaction: CompactionConfig::default(),
-        sandbox: SandboxConfig::default(),
-        instruction_file: None,
-        prompt_append: None,
-        prompt_override: None,
-        vcr: None,
-        telemetry_url: None,
-        session_dir: Some(local_dir.clone()),
-        memory_enabled: true,
-        permission_mode: base::interface::settings::PermissionMode::default(),
-        permission_rules: Vec::new(),
-        hooks_config: None,
-        mcp_servers,
-        language: None,
-        feature_flags: Default::default(),
-    });
+    // `settings.paths` was already resolved correctly by `Settings::load()`
+    // (called from `load_daemon_config`) from `paths.{global_root,
+    // config_root, project_root}` — no separate `ConfigPaths::from_env` call
+    // needed here anymore. NOTE on `mcp_servers`: `Settings.mcp_servers` is
+    // now populated directly by `Settings::load()`'s generic JSON merge (no
+    // hand-written conversion needed) — but connecting to these servers is
+    // still a separate, larger feature (`Builder::build()` only wires MCP
+    // when the caller explicitly constructs an `McpManager` and passes it
+    // via `.mcp_manager(...)`; `SessionPool::create()` doesn't do that
+    // today), not done as part of this fix.
+    let global_dir = daemon_config.settings.paths.global_data_dir.clone();
+    let local_dir = daemon_config.settings.paths.local_data_dir.clone();
+    let settings = Arc::new(daemon_config.settings.clone());
 
     // ── Startup checkpoint: config_loaded ──────────────────────────────
     let _config_load_ms = perf.checkpoint("config_loaded");
     info!(elapsed_ms = _config_load_ms, "startup: config loaded");
 
+    // memory 不分 scene，只分全局/项目——见 base::paths 模块文档。
     let memory_store = Arc::new(base::interface::memory::MemoryStore::new(
-        user_dir.join("memory"),
+        global_dir.join("memory"),
         local_dir.join("memory"),
     ));
 
@@ -247,31 +231,12 @@ async fn main() -> anyhow::Result<()> {
     info!(elapsed_ms = _memory_load_ms, "startup: memory store initialised");
 
     // ── Engine config ──────────────────────────────────────────────────
-    let mut engine_config = EngineConfig::defaults_for(&daemon_config.model);
-    engine_config.max_tokens = daemon_config.max_tokens;
+    let mut engine_config = EngineConfig::defaults_for(&daemon_config.settings.model.model_name);
+    engine_config.max_tokens = daemon_config.settings.model.max_tokens;
     engine_config.permission_mode = base::permission::PermissionMode::BypassPermissions;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    // ── Cross-tool config import (process-level, once) ─────────────────
-    // `daemon` is headless — no client is connected yet at this point in
-    // startup, so there's nobody to synchronously ask "import from X?".
-    // v1 scope decision: daemon registers no `ImportCallback` (passes
-    // `None`), so this call is effectively a fast no-op today; the manual
-    // `/import` slash command (ImportTool) is the real user-facing path.
-    // Spawned so a future non-`None` callback here can never block startup.
-    // See docs/design/2026-08-03-agents-config-migration.md §3.3/§3.7.
-    {
-        let import_cwd = cwd.clone();
-        tokio::spawn(async move {
-            let _ = base::interface::import_callback::maybe_detect_and_import(
-                &import_cwd,
-                None,
-                std::time::Duration::from_secs(30),
-            )
-            .await;
-        });
-    }
+    let mcp_servers = daemon_config.settings.mcp_servers.clone();
 
     let permission: Arc<dyn base::interface::permission::Permission> =
         Arc::new(AllowAllPermission);
@@ -283,16 +248,34 @@ async fn main() -> anyhow::Result<()> {
     info!(elapsed_ms = _skills_scan_ms, "startup: skills scanned (noop)");
 
     // ── Startup checkpoint: mcp_connected ──────────────────────────────
-    // (No MCP servers are connected at startup in this minimal daemon —
-    //  placeholder checkpoint for future integration.)
+    // MCP servers connect in the background *after* the pool is built and
+    // serving (see below, `pool.connect_mcp_servers_in_background(...)`) —
+    // this checkpoint just marks "we decided how many servers there are to
+    // connect", not "connection finished"; connecting is intentionally
+    // async so a slow/unreachable server can never delay startup.
     let _mcp_connect_ms = perf.checkpoint("mcp_connected");
-    info!(elapsed_ms = _mcp_connect_ms, "startup: mcp connected (noop)");
+    info!(elapsed_ms = _mcp_connect_ms, n_configured = mcp_servers.len(), "startup: mcp connect kicked off in background");
 
     // ── Startup checkpoint: tools_registered ───────────────────────────
     // (Tools are registered implicitly via the session engine. Placeholder
     //  checkpoint for explicit registration timing.)
     let _tools_reg_ms = perf.checkpoint("tools_registered");
     info!(elapsed_ms = _tools_reg_ms, "startup: tools registered (noop)");
+
+    // ── Session transcript persistence ──────────────────────────────────
+    // `sessions/` follows the same "global + project, no scene" rule as
+    // memory/vcr/mcp (see `base::paths` module docs) — `JsonlHistoryStore`
+    // itself partitions by project under one shared root, so `global_dir`
+    // (not a scene-specific dir) is the right root here.
+    let history_store: Option<Arc<dyn history::store::HistoryStore>> =
+        match history::store::JsonlHistoryStore::with_root(&cwd, global_dir.join("sessions")).await
+        {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to initialize session history store; sessions will be in-memory only for this run");
+                None
+            }
+        };
 
     // ── Build SessionPool ──────────────────────────────────────────────
     let pool = Arc::new(SessionPool::new(
@@ -305,8 +288,53 @@ async fn main() -> anyhow::Result<()> {
         memory_store,
         cwd,
         engine_config,
-        None, // history_store: None = no persistence (TODO: wire up JSONL)
+        history_store,
+        daemon_config.paths.clone(),
     ));
+
+    // Connect configured MCP servers in the background — never blocks
+    // startup; failures warn + emit a `mcp_connect_failed` `daemon.event`
+    // (subscribe via `daemon.subscribeEvents`) rather than aborting.
+    // Plugin-declared MCP servers (`plugin.toml`'s `[mcp] servers`) are
+    // merged in here so they go through the exact same centrally-connected/
+    // shared-across-sessions path as user-configured ones — see
+    // `SessionPool::plugin_mcp_servers`.
+    let mut mcp_servers = mcp_servers;
+    mcp_servers.extend(pool.plugin_mcp_servers());
+    pool.connect_mcp_servers_in_background(mcp_servers);
+
+    // ── Cross-tool config import (process-level, once) ─────────────────
+    // `daemon` is headless — no client is connected yet at this point in
+    // startup, so there's nobody to synchronously ask "import from X?" the
+    // way `ImportCallback` expects. Rather than wire a callback with no
+    // sensible synchronous answer, detect directly and — if anything's
+    // found — emit an `import_detected` `daemon.event` notification instead
+    // of blocking for a decision; a subscribed client can act on it via the
+    // `import.list`/`import.run` RPCs whenever it's ready, no LLM turn
+    // required. Respects the same `.imported.json` marker the automatic
+    // path always has, so this doesn't nag on every restart. The manual
+    // `/import` slash command (`ImportTool`) remains available regardless
+    // and always re-detects. See docs/design/2026-08-03-agents-config-migration.md §3.3/§3.7.
+    {
+        let pool = pool.clone();
+        let import_cwd = pool.cwd().to_path_buf();
+        tokio::spawn(async move {
+            if base::frozen::import_already_decided(&import_cwd).await {
+                return;
+            }
+            let sources = base::frozen::detect_import_sources(&import_cwd).await;
+            if sources.is_empty() {
+                return;
+            }
+            pool.emit_event(serde_json::json!({
+                "kind": "import_detected",
+                "sources": sources.iter().map(|s| serde_json::json!({
+                    "source": s.kind().as_str(),
+                    "description": s.describe(),
+                })).collect::<Vec<_>>(),
+            }));
+        });
+    }
 
     // 启动后台回收
     pool.start_janitor();

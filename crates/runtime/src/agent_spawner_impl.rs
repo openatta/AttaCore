@@ -39,7 +39,11 @@ impl AgentSpawner for RuntimeAgentSpawner {
         let perm = self.agent_tool.sub_permission();
 
         self.agent_tool
-            .run_sub(prompt, tools, cwd, cancel, perm)
+            // No subagent_type here — `AgentSpawner` is the generic
+            // cross-crate spawning interface (team/skill-fork), it has no
+            // concept of a named agent type, so no per-type model override
+            // applies; the parent's model is used, matching prior behavior.
+            .run_sub(prompt, tools, cwd, cancel, perm, None)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)
     }

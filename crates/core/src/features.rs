@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Runtime-configurable feature flags (loaded from settings JSON or CLI args).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FeatureFlags {
     /// Enable multi-agent team coordination mode.
     #[serde(default)]

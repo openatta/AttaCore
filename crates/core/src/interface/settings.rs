@@ -1,37 +1,49 @@
 //! Configuration injected by the application layer.
 //!
-//! The AGENT receives fully-merged settings; it does not perform
-//! its own multi-layer config merging.
+//! `Settings::load()` is the single canonical settings.json loader (global →
+//! scene → project, generic recursive JSON merge — see its doc comment).
+//! Everything downstream (the AGENT itself, `Builder`) receives the already-
+//! merged result; it does not perform its own multi-layer config merging.
 
-use crate::provider::ApiType;
+use crate::provider::{ApiType, ProviderConfig, TaskModelOverride};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Complete AGENT configuration. Merged by the application layer before injection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Complete AGENT configuration. Merged by `Settings::load()` before injection.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Settings {
     pub model: ModelSettings,
     pub paths: PathSettings,
+    #[serde(default)]
     pub execution: ExecutionSettings,
+    #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
     pub sandbox: SandboxConfig,
 
     /// Path to an instruction file (e.g. AGENTS.md, CLAUDE.md).
     /// The AGENT reads the file at its discretion (every turn, on change, etc.).
+    #[serde(default)]
     pub instruction_file: Option<PathBuf>,
 
     /// Appended to the end of the system prompt.
+    #[serde(default)]
     pub prompt_append: Option<String>,
     /// Overrides the entire system prompt if set.
+    #[serde(default)]
     pub prompt_override: Option<String>,
 
     // ── Internal component configuration ──
     /// VCR record/replay configuration. None = pass-through.
+    #[serde(default)]
     pub vcr: Option<VcrConfig>,
     /// Telemetry endpoint URL. None = noop.
+    #[serde(default)]
     pub telemetry_url: Option<String>,
     /// Session persistence directory. None = no persistence.
     /// Default: `Some(user_data_dir/sessions/)`.
+    #[serde(default)]
     pub session_dir: Option<PathBuf>,
 
     /// Enable the file-based memory system (MEMORY.md + .md files).
@@ -48,13 +60,30 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permission_rules: Vec<PermissionRule>,
 
-    /// Hooks configuration (merged from user/project layers).
+    /// Hooks configuration (merged from global/scene/project layers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_config: Option<serde_json::Value>,
 
-    /// MCP server configurations (merged from user/project layers).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mcp_servers: Vec<serde_json::Value>,
+    /// MCP server configurations, keyed by server name (merged from
+    /// global/scene/project layers). Kept untyped (`serde_json::Value`
+    /// rather than `mcp::config::McpServerConfig`) — `core` cannot depend on
+    /// `mcp` (which already depends on `core`, for `base::paths::ConfigPaths`)
+    /// without a circular dependency; downstream consumers deserialize each
+    /// value into `McpServerConfig` themselves.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_servers: HashMap<String, serde_json::Value>,
+
+    /// Multi-provider LLM registry, keyed by provider id. See
+    /// `docs/LLM_PROVIDERS.md`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub providers: HashMap<String, ProviderConfig>,
+    /// Provider id used for any task with no `task_models` entry, and as the
+    /// fallback target when an entry's provider/model turns out invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Per-task-type provider/model routing — see `base::provider::resolve_task_models`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub task_models: HashMap<String, TaskModelOverride>,
 
     /// User language preference (e.g. "zh-CN", "ja").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,7 +100,7 @@ fn default_memory_enabled() -> bool {
 }
 
 /// Permission mode for tool execution (TS parity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
     /// Prompt user for each tool call that isn't explicitly allowed.
@@ -107,7 +136,7 @@ impl PermissionMode {
 }
 
 /// A single permission rule: allow/deny/ask a tool matching a pattern.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PermissionRule {
     /// Tool name pattern (e.g. "Bash", "Bash(git push:*)", "FileWrite").
     pub tool: String,
@@ -115,7 +144,7 @@ pub struct PermissionRule {
     pub action: PermissionAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionAction {
     Allow,
@@ -123,22 +152,8 @@ pub enum PermissionAction {
     Ask,
 }
 
-/// Multi-layer config merge: user → project → local → flags → policy.
-/// TS parity: 5-layer merge in `settings/constants.ts`.
-///
-/// Currently implements user + local; other layers are stubs for future use.
-#[derive(Debug, Clone, Default)]
-pub struct SettingsMerge {
-    pub user: Option<Settings>,
-    pub project: Option<Settings>,
-    /// CLI flags / env var overrides (highest priority).
-    pub flags: Option<Settings>,
-    /// Organization policy layer (lowest priority, foundation).
-    pub policy: Option<Settings>,
-}
-
 /// LLM model configuration for a single provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelSettings {
     pub api_type: ApiType,
     pub base_url: String,
@@ -154,10 +169,17 @@ pub struct ModelSettings {
 }
 
 /// Path configuration for data directories.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PathSettings {
-    /// User-level data root (e.g. `~/.atta/<scope>/`)
+    /// User-level, scene-specific override root (e.g. `~/.atta/scenes/<scope>/`).
     pub user_data_dir: PathBuf,
+    /// User-level, cross-scene global root — flat, shared by every scene
+    /// (e.g. `~/.atta/`). Used by resources that don't have a scene tier
+    /// (`memory`/`sessions`/`vcr`/`mcp`) and as the base layer for resources
+    /// that do (`settings.json`/`skills`/`plugins`/`agents`/`rules`/`hooks`).
+    /// See `base::paths::ConfigPaths` module docs for the full breakdown.
+    #[serde(default)]
+    pub global_data_dir: PathBuf,
     /// Local/project data root (e.g. `<cwd>/.atta/`)
     pub local_data_dir: PathBuf,
     /// Which product instance's user-level state `user_data_dir` was built
@@ -195,7 +217,7 @@ impl PathSettings {
 }
 
 /// Execution constraints.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionSettings {
     pub max_parallelism: usize,
     pub max_api_calls_per_turn: u32,
@@ -214,7 +236,7 @@ impl Default for ExecutionSettings {
 }
 
 /// Context compaction configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CompactionConfig {
     pub threshold_tokens: usize,
     pub keep_recent: usize,
@@ -230,7 +252,7 @@ impl Default for CompactionConfig {
 }
 
 /// Sandbox/security configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SandboxConfig {
     pub deny_read: Vec<PathBuf>,
     pub allowed_domains: Vec<String>,
@@ -241,7 +263,7 @@ pub struct SandboxConfig {
 }
 
 /// VCR (record/replay) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VcrConfig {
     /// "record" or "replay"
     pub mode: VcrMode,
@@ -252,7 +274,7 @@ pub struct VcrConfig {
     pub fallback_on_miss: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VcrMode {
     Record,
@@ -264,7 +286,7 @@ fn default_true() -> bool {
 }
 
 /// Model thinking/reasoning mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingMode {
     Auto,
@@ -275,50 +297,102 @@ pub enum ThinkingMode {
 
 impl Settings {
     /// Load settings from user and local directories, with ENV override.
-    /// Priority (low→high): user_dir/settings.json → local_dir/settings.json → ENV
+    /// Priority (low → high): `global_dir/settings.json` (shared by every
+    /// scene) → `scene_dir/settings.json` → `local_dir/settings.json`
+    /// (project). This is the **single canonical settings.json loader** —
+    /// `daemon` and any other embedder should call this rather than parsing
+    /// settings.json themselves. See `docs/CONFIG_LAYOUT.md`.
     ///
-    /// `scope` identifies which product instance `user_dir` belongs to (see
+    /// Merging is a **generic recursive JSON merge** (later layer's object
+    /// keys override/extend the earlier layer's, non-object values fully
+    /// replace) applied directly to the JSON representation, not a
+    /// hand-written field-by-field `Settings` merge — this is why adding a
+    /// new field to `Settings` needs no changes here: it flows through
+    /// automatically. `paths` is deliberately excluded from every layer
+    /// before merging — a settings.json file cannot override where its own
+    /// layers live, that's decided by the caller's `global_dir`/`scene_dir`/
+    /// `local_dir`/`scope` arguments alone.
+    ///
+    /// **Never fails** — a layer that doesn't exist is skipped; a layer that
+    /// fails to parse is skipped with a `tracing::warn!` (path + error)
+    /// rather than aborting startup or silently losing the problem. If the
+    /// fully-merged JSON somehow doesn't deserialize into `Settings` (e.g. a
+    /// layer put a string where an object was expected), the merge is
+    /// discarded with a warning and plain defaults are returned instead.
+    ///
+    /// `scope` identifies which product instance `scene_dir` belongs to (see
     /// `base::paths::ConfigPaths`) — no default at this layer; callers decide.
-    pub fn load(user_dir: PathBuf, local_dir: PathBuf, scope: &str) -> Result<Self, SettingsError> {
-        let mut base = Self::defaults_for("claude-sonnet-4-6");
-        base.paths = PathSettings {
-            user_data_dir: user_dir.clone(),
-            local_data_dir: local_dir.clone(),
+    ///
+    /// `default_model` seeds `model.model_name` **before** any layer is
+    /// merged in — same priority tier as `defaults_for`'s own hardcoded
+    /// default, i.e. lower priority than every settings.json layer. This
+    /// lets a caller's CLI `--model` flag act as a fallback (only takes
+    /// effect when no settings.json layer specifies one) rather than a hard
+    /// override.
+    pub fn load(
+        global_dir: PathBuf,
+        scene_dir: PathBuf,
+        local_dir: PathBuf,
+        scope: &str,
+        default_model: &str,
+    ) -> Self {
+        let base = Self::defaults_for(default_model);
+        let mut merged_json = serde_json::to_value(&base).unwrap_or_else(|_| serde_json::json!({}));
+
+        for (layer_name, dir) in [
+            ("global", &global_dir),
+            ("scene", &scene_dir),
+            ("project", &local_dir),
+        ] {
+            let path = dir.join("settings.json");
+            if !path.exists() {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to read settings.json, skipping this layer");
+                    continue;
+                }
+            };
+            let mut layer_json: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to parse settings.json, skipping this layer");
+                    continue;
+                }
+            };
+            // `paths` is resolved from this function's own arguments, never
+            // from settings.json content.
+            if let Some(obj) = layer_json.as_object_mut() {
+                obj.remove("paths");
+            }
+            merge_json_values(&mut merged_json, layer_json);
+        }
+
+        let mut settings: Settings = match serde_json::from_value(merged_json) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "merged settings.json failed to deserialize into Settings; falling back to defaults");
+                base
+            }
+        };
+
+        settings.paths = PathSettings {
+            user_data_dir: scene_dir,
+            global_data_dir: global_dir,
+            local_data_dir: local_dir,
             scope: scope.to_string(),
         };
 
-        // 1. Load user settings
-        let user_path = user_dir.join("settings.json");
-        if user_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&user_path) {
-                if let Ok(s) = serde_json::from_str::<Settings>(&content) {
-                    base = base.merge(s);
-                }
-            }
-        }
-
-        // 2. Override with local settings
-        let local_path = local_dir.join("settings.json");
-        if local_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&local_path) {
-                if let Ok(s) = serde_json::from_str::<Settings>(&content) {
-                    base = base.merge(s);
-                }
-            }
-        }
-
-        // 3. ENV override: ATTA_MODEL or ANTHROPIC_MODEL
-        if let Ok(m) = std::env::var("ATTA_MODEL").or_else(|_| std::env::var("ANTHROPIC_MODEL")) {
-            base.model.model_name = m;
-        }
-
-        // 4. Validate: reject program-only permission modes from user config.
+        // Validate: reject program-only permission modes from user config.
         // TS parity: EXTERNAL_PERMISSION_MODES vs INTERNAL in types/permissions.ts.
-        if let Err(reason) = base.validate() {
+        if let Err(reason) = settings.validate() {
             tracing::warn!("Settings validation: {reason}");
+            settings.permission_mode = PermissionMode::default();
         }
 
-        Ok(base)
+        settings
     }
 
     /// Validate settings consistency. Returns Err on invalid combinations.
@@ -346,7 +420,8 @@ impl Settings {
                 fallback_model: None,
             },
             paths: PathSettings {
-                user_data_dir: PathBuf::from("~/.atta/agent"),
+                user_data_dir: PathBuf::from("~/.atta/scenes/agent"),
+                global_data_dir: PathBuf::from("~/.atta"),
                 local_data_dir: PathBuf::from("."),
                 scope: default_scope(),
             },
@@ -363,47 +438,51 @@ impl Settings {
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,
-            mcp_servers: Vec::new(),
+            mcp_servers: HashMap::new(),
+            providers: HashMap::new(),
+            default_provider: None,
+            task_models: HashMap::new(),
             language: None,
             feature_flags: crate::features::FeatureFlags::default(),
         }
     }
-
-    fn merge(mut self, other: Settings) -> Self {
-        if !other.model.model_name.is_empty() {
-            self.model.model_name = other.model.model_name;
-        }
-        if other.model.max_tokens != 2000 {
-            self.model.max_tokens = other.model.max_tokens;
-        }
-        if !other.model.base_url.is_empty() {
-            self.model.base_url = other.model.base_url;
-        }
-        if !other.model.auth_token.is_empty() {
-            self.model.auth_token = other.model.auth_token;
-        }
-        if other.instruction_file.is_some() {
-            self.instruction_file = other.instruction_file;
-        }
-        if other.prompt_append.is_some() {
-            self.prompt_append = other.prompt_append;
-        }
-        if other.prompt_override.is_some() {
-            self.prompt_override = other.prompt_override;
-        }
-        if other.telemetry_url.is_some() {
-            self.telemetry_url = other.telemetry_url;
-        }
-        self
-    }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum SettingsError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Parse error: {0}")]
-    Parse(#[from] serde_json::Error),
+/// JSON Schema for settings.json, generated from `Settings`'s own type
+/// definitions (`#[derive(schemars::JsonSchema)]` on `Settings` and every
+/// nested type) — not hand-maintained, so it can never drift from what
+/// `Settings::load()` actually accepts. Published as `docs/schemas/settings.schema.json`
+/// for editor autocomplete/validation (reference it from a settings.json file
+/// via a `"$schema"` key). Regenerate with:
+/// `cargo test -p base settings_schema_matches_committed_file -- --ignored`
+/// after changing any `Settings`-reachable type (see that test for the exact
+/// write-back invocation).
+pub fn settings_json_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(Settings)).unwrap_or(serde_json::Value::Null)
+}
+
+/// Recursively merge `over` into `base` in place: objects merge key-by-key
+/// (recursing into shared keys), anything else (arrays, scalars, null) fully
+/// replaces the corresponding `base` value. This is the same algorithm
+/// `Settings::load()` uses to merge global/scene/project tiers, exposed here
+/// so other crates (e.g. `daemon`'s `config.setProvider` RPC) can apply a
+/// partial patch to a single settings.json tier with identical semantics.
+pub fn merge_json_values(base: &mut serde_json::Value, over: serde_json::Value) {
+    match (base, over) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(over_map)) => {
+            for (k, v) in over_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => merge_json_values(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (base_slot, over_val) => {
+            *base_slot = over_val;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,5 +520,159 @@ mod tests {
         // Validation: Auto in settings is rejected.
         let s = Settings { permission_mode: PermissionMode::Auto, ..Settings::defaults_for("test") };
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn merge_json_values_recurses_into_nested_objects() {
+        let mut base = serde_json::json!({
+            "providers": {
+                "deepseek": { "api_key": "old-key", "default_model": "deepseek-pro" }
+            }
+        });
+        let over = serde_json::json!({
+            "providers": {
+                "deepseek": { "api_key": "new-key" }
+            }
+        });
+        merge_json_values(&mut base, over);
+        assert_eq!(base["providers"]["deepseek"]["api_key"], "new-key");
+        // Untouched sibling field survives — this is the whole point of a
+        // recursive merge over a whole-value replace.
+        assert_eq!(base["providers"]["deepseek"]["default_model"], "deepseek-pro");
+    }
+
+    #[test]
+    fn merge_json_values_non_object_values_fully_replace() {
+        let mut base = serde_json::json!({ "mcp_servers": {"a": 1} });
+        let over = serde_json::json!({ "mcp_servers": {"b": 2} });
+        merge_json_values(&mut base, over);
+        // Both are objects, so this recurses (keeps "a", adds "b") — objects
+        // always merge key-by-key, never fully replace each other.
+        assert_eq!(base["mcp_servers"]["a"], 1);
+        assert_eq!(base["mcp_servers"]["b"], 2);
+
+        let mut base2 = serde_json::json!({ "language": "en" });
+        let over2 = serde_json::json!({ "language": "zh-CN" });
+        merge_json_values(&mut base2, over2);
+        assert_eq!(base2["language"], "zh-CN");
+    }
+
+    fn write_settings(dir: &std::path::Path, content: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("settings.json"), content).unwrap();
+    }
+
+    #[test]
+    fn load_merges_three_tiers_low_to_high() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        let scene = root.path().join("scene");
+        let project = root.path().join("project");
+        write_settings(&global, r#"{"model": {"model_name": "global-model"}}"#);
+        write_settings(&scene, r#"{"model": {"model_name": "scene-model"}}"#);
+        write_settings(&project, r#"{}"#);
+
+        let settings = Settings::load(global, scene, project, "code", "cli-default");
+        assert_eq!(settings.model.model_name, "scene-model");
+    }
+
+    #[test]
+    fn load_falls_back_to_cli_default_model_when_no_layer_sets_it() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = Settings::load(
+            root.path().join("global"),
+            root.path().join("scene"),
+            root.path().join("project"),
+            "code",
+            "cli-default-model",
+        );
+        assert_eq!(settings.model.model_name, "cli-default-model");
+    }
+
+    #[test]
+    fn load_lets_project_override_just_one_provider_field() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        let project = root.path().join("project");
+        write_settings(
+            &global,
+            r#"{"providers": {"deepseek": {"api_key": "global-key", "default_model": "deepseek-pro"}}}"#,
+        );
+        write_settings(&project, r#"{"providers": {"deepseek": {"api_key": "project-key"}}}"#);
+
+        let settings = Settings::load(global, root.path().join("scene"), project, "code", "m");
+        let deepseek = &settings.providers["deepseek"];
+        assert_eq!(deepseek.api_key.as_deref(), Some("project-key"));
+        assert_eq!(deepseek.default_model.as_deref(), Some("deepseek-pro"));
+    }
+
+    #[test]
+    fn load_never_lets_settings_json_override_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        write_settings(&global, r#"{"paths": {"scope": "hijacked"}}"#);
+
+        let settings = Settings::load(global, root.path().join("scene"), root.path().join("project"), "real-scope", "m");
+        assert_eq!(settings.paths.scope, "real-scope");
+    }
+
+    #[test]
+    fn load_malformed_layer_warns_and_is_skipped_not_fatal() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        write_settings(&global, "not valid json {{{");
+        // Must not panic — malformed layer is skipped, defaults are used.
+        let settings = Settings::load(global, root.path().join("scene"), root.path().join("project"), "code", "fallback-model");
+        assert_eq!(settings.model.model_name, "fallback-model");
+    }
+
+    #[test]
+    fn settings_json_schema_has_expected_top_level_properties() {
+        let schema = settings_json_schema();
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema should have a top-level `properties` object");
+        for key in ["model", "paths", "providers", "default_provider", "task_models", "hooks_config"] {
+            assert!(props.contains_key(key), "schema missing property `{key}`");
+        }
+    }
+
+    /// Regenerates `docs/schemas/settings.schema.json` from the current
+    /// `Settings` type definitions and asserts it matches what's committed —
+    /// fails (rather than silently drifting) if a `Settings`-reachable type
+    /// changed without regenerating the schema. `#[ignore]`d because it
+    /// writes to the repo tree; not run by default `cargo test`.
+    ///
+    /// To regenerate after a real schema change: run this test once with
+    /// `cargo test -p base settings_schema_matches_committed_file -- --ignored`
+    /// (it writes the file even on "mismatch" before asserting), then commit
+    /// the updated `docs/schemas/settings.schema.json`.
+    #[test]
+    #[ignore]
+    fn settings_schema_matches_committed_file() {
+        let schema = settings_json_schema();
+        let pretty = serde_json::to_string_pretty(&schema).unwrap() + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/schemas/settings.schema.json");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing != pretty {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &pretty).unwrap();
+        }
+        assert_eq!(existing, pretty, "docs/schemas/settings.schema.json was out of date and has been regenerated — review the diff and commit it");
+    }
+
+    #[test]
+    fn load_missing_directories_returns_plain_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = Settings::load(
+            root.path().join("nonexistent-global"),
+            root.path().join("nonexistent-scene"),
+            root.path().join("nonexistent-project"),
+            "code",
+            "fallback-model",
+        );
+        assert_eq!(settings.model.model_name, "fallback-model");
+        assert!(settings.providers.is_empty());
     }
 }

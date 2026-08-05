@@ -1,6 +1,7 @@
 //! Prompt assembly — pure function that stitches together multi-source content.
 
 use crate::interface::memory::{build_memory_prompt, MemoryStore};
+use crate::interface::rules::build_rules_prompt;
 use crate::interface::scene::{AgentScene, ScenePromptContext};
 use crate::interface::settings::Settings;
 
@@ -61,6 +62,7 @@ impl PromptBlock {
 /// 1. Scene skeleton (AgentScene::build_system_prompt)
 /// 2. Skills loaded from skills/ directories
 /// 3. Memory loaded from MemoryStore
+///    3b. Rules discovery index (filenames + first line only; see `crate::interface::rules`)
 /// 4. Runtime state (plan, todos, current turn info)
 /// 5. settings.prompt_append
 /// 6. [if set] settings.prompt_override → replaces all of the above
@@ -97,8 +99,16 @@ pub fn assemble_prompt(
     // Actual memory content is loaded via MEMORY.md by the system reminder mechanism.
     // Gated by settings.memory_enabled (default: true).
     if settings.memory_enabled {
-        let mem_dir = &settings.paths.user_data_dir.join("memory");
+        let mem_dir = &settings.paths.global_data_dir.join("memory");
         blocks.push(PromptBlock::system(build_memory_prompt(mem_dir)));
+    }
+
+    // 3b. Rules — lightweight discovery index only (filenames + first-line
+    // description), not full content. Omitted entirely when no `.atta/rules/`
+    // files exist anywhere, so sessions that don't use this feature pay zero
+    // extra tokens. See `crate::interface::rules` module docs.
+    if let Some(text) = build_rules_prompt(&settings.paths) {
+        blocks.push(PromptBlock::system(text));
     }
 
     // 4. MCP instructions
@@ -165,7 +175,8 @@ mod tests {
                 fallback_model: None,
             },
             paths: PathSettings {
-                user_data_dir: "/tmp/atta/user".into(),
+                user_data_dir: "/tmp/atta/scenes/code".into(),
+                global_data_dir: "/tmp/atta".into(),
                 local_data_dir: "/tmp/atta/local".into(),
                 scope: "code".into(),
             },
@@ -181,7 +192,10 @@ mod tests {
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,
-            mcp_servers: Vec::new(),
+            mcp_servers: Default::default(),
+            providers: Default::default(),
+            default_provider: None,
+            task_models: Default::default(),
             language: None,
             feature_flags: Default::default(),
             session_dir: None,

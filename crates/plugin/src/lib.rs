@@ -3,6 +3,7 @@
 
 pub mod agent_registry;
 pub mod bundled;
+pub mod discovery;
 pub mod homograph;
 pub mod manifest;
 pub mod marketplace;
@@ -10,6 +11,7 @@ pub mod resolver;
 pub mod cache;
 pub mod cli;
 
+pub use discovery::discover_plugins;
 pub use manifest::{Plugin, PluginError, PluginManifest, SlashEntry};
 
 /// Initialize all built-in plugins and install them into the runtime.

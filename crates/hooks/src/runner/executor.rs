@@ -111,6 +111,19 @@ impl HookRunner {
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
+        // Let `command` reference a bare script name (e.g. `check.sh`) that
+        // lives in `.atta/hooks/` by prepending the configured search dirs
+        // to this subprocess's PATH — normal shell command lookup does the
+        // rest, no custom resolution syntax needed.
+        if !self.hooks_search_dirs.is_empty() {
+            let existing = std::env::var_os("PATH").unwrap_or_default();
+            let mut search: Vec<std::path::PathBuf> = self.hooks_search_dirs.clone();
+            search.extend(std::env::split_paths(&existing));
+            if let Ok(joined) = std::env::join_paths(search) {
+                cmd.env("PATH", joined);
+            }
+        }
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return HookOutcome::Error(format!("hook spawn failed: {e}")),

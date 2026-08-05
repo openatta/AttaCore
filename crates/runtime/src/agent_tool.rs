@@ -124,6 +124,13 @@ pub fn builtin_agent_types() -> Vec<AgentTypeDefinition> {
             model: None,
             system_prompt: CODE_REVIEWER_PROMPT.into(),
         },
+        AgentTypeDefinition {
+            name: "worker".into(),
+            description: "Worker agent executing a precisely-scoped task within a team".into(),
+            allowed_tools: vec![], // empty = all tools, matches pre-refactor behavior
+            model: None,
+            system_prompt: WORKER_PROMPT.into(),
+        },
     ]
 }
 
@@ -147,18 +154,22 @@ pub fn builtin_agent_types() -> Vec<AgentTypeDefinition> {
 ///
 /// Returns all successfully parsed definitions. Malformed files are silently
 /// skipped with a `tracing::warn!` message.
-pub async fn load_agent_types_from_dir(dir: &Path) -> Vec<AgentTypeDefinition> {
+///
+/// Sync (`std::fs`), not async — matches `skills::manager::SkillManager::load_dir`,
+/// which is called from the same sync `Builder::build()` context this
+/// function is meant to be called from (see `merge_agent_types`).
+pub fn load_agent_types_from_dir(dir: &Path) -> Vec<AgentTypeDefinition> {
     let mut types = Vec::new();
-    let mut entries = match tokio::fs::read_dir(dir).await {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return types, // directory doesn't exist yet
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        let content = match tokio::fs::read_to_string(&path).await {
+        let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "agent type: failed to read file");
@@ -173,6 +184,89 @@ pub async fn load_agent_types_from_dir(dir: &Path) -> Vec<AgentTypeDefinition> {
         }
     }
     types
+}
+
+/// Merge the built-in agent types with disk-loaded ones from up to three
+/// tiers (pass fewer to skip a tier — e.g. tests often only want one dir).
+///
+/// Precedence low → high: built-in defaults < `plugin_types` (plugin-declared
+/// `[[agents]]`) < `dirs[0]` (global) < `dirs[1]` (scene) < `dirs[2]`
+/// (project) — same override order as skills (`crates/core/src/frozen/skill.rs`).
+/// A definition with the same `name` as a lower-tier one replaces it
+/// entirely (not field-merged — a type definition is one atomic unit,
+/// same convention as `task_models` overrides in the multi-provider LLM
+/// config). This means `.atta/agents/*.md` customization always wins over a
+/// plugin's default, but a plugin's agent type still overrides the bare
+/// built-in of the same name.
+pub fn merge_agent_types(
+    dirs: &[&Path],
+    plugin_types: &[AgentTypeDefinition],
+) -> std::collections::HashMap<String, AgentTypeDefinition> {
+    let mut merged: std::collections::HashMap<String, AgentTypeDefinition> = builtin_agent_types()
+        .into_iter()
+        .map(|d| (d.name.clone(), d))
+        .collect();
+    for def in plugin_types {
+        merged.insert(def.name.clone(), def.clone());
+    }
+    for dir in dirs {
+        for def in load_agent_types_from_dir(dir) {
+            merged.insert(def.name.clone(), def);
+        }
+    }
+    merged
+}
+
+/// Convert a plugin-declared [`plugin::manifest::AgentDef`] into a runtime
+/// [`AgentTypeDefinition`], reading its system prompt file relative to the
+/// plugin's root.
+///
+/// Returns `None` (with a `tracing::warn!`) if the prompt file can't be
+/// read — e.g. a built-in plugin's synthetic `(builtin:...)` root, or a disk
+/// plugin whose declared path doesn't exist — so one bad plugin definition
+/// doesn't break agent type resolution for everyone else.
+pub fn agent_def_to_type(
+    def: &plugin::manifest::AgentDef,
+    plugin_root: &Path,
+) -> Option<AgentTypeDefinition> {
+    let prompt_path = plugin_root.join(&def.system_prompt_path);
+    match std::fs::read_to_string(&prompt_path) {
+        Ok(system_prompt) => Some(AgentTypeDefinition {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            allowed_tools: def.allowed_tools.clone(),
+            model: def.model.clone(),
+            system_prompt,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                agent = %def.name,
+                path = %prompt_path.display(),
+                error = %e,
+                "plugin agent type: failed to read system prompt, skipping"
+            );
+            None
+        }
+    }
+}
+
+/// Render the one-line-per-type catalog injected into `AgentTool::description()`
+/// so the model can see what `subagent_type` values are actually available
+/// (built-in + any custom types loaded from `.atta/agents/`) without a
+/// separate discovery call. Sorted by name for stable output.
+fn describe_agent_types(agent_types: &std::collections::HashMap<String, AgentTypeDefinition>) -> String {
+    let mut names: Vec<&String> = agent_types.keys().collect();
+    names.sort();
+    let mut lines = vec![
+        "Launch a sub-agent to handle complex, multi-step tasks independently.".to_string(),
+        String::new(),
+        "Available subagent_type values:".to_string(),
+    ];
+    for name in names {
+        let d = &agent_types[name];
+        lines.push(format!("- {name}: {}", d.description));
+    }
+    lines.join("\n")
 }
 
 /// Parse a single agent type definition from a markdown file with YAML
@@ -316,26 +410,6 @@ Do NOT make any edits.";
 
 const WORKER_PROMPT: &str = "\nYou are a worker agent in a team. Execute the assigned task precisely.\nReport results concisely. Do not deviate from the assigned scope.";
 
-fn type_prompt(t: Option<&str>) -> Option<&'static str> {
-    match t {
-        Some("explore") => Some(EXPLORE_PROMPT),
-        Some("plan") => Some(PLAN_PROMPT),
-        Some("general-purpose") => Some(GENERAL_PURPOSE_PROMPT),
-        Some("claude") => Some(CLAUDE_PROMPT),
-        Some("code-reviewer") => Some(CODE_REVIEWER_PROMPT),
-        Some("worker") => Some(WORKER_PROMPT),
-        _ => None,
-    }
-}
-
-fn build_prompt(input: &AgentInput) -> String {
-    if let Some(p) = type_prompt(input.subagent_type.as_deref()) {
-        format!("{p}\n\nTask: {}", input.prompt)
-    } else {
-        input.prompt.clone()
-    }
-}
-
 fn bg_task_id() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -349,9 +423,84 @@ fn bg_task_id() -> String {
     s
 }
 
+/// Build a sub-agent's `Settings` by cloning the parent's real settings and
+/// overriding only the model-selection fields — the sub-agent inherits the
+/// parent's actual scope/paths (skills/hooks/agents/memory all resolve
+/// correctly), auth, sandbox policy, etc.
+fn settings_from_parent(
+    parent: &Settings,
+    model_name: String,
+    max_tokens: u32,
+    fallback_model: Option<String>,
+) -> Settings {
+    let mut settings = parent.clone();
+    settings.model.model_name = model_name;
+    settings.model.max_tokens = max_tokens;
+    settings.model.fallback_model = fallback_model;
+    settings
+}
+
+/// Fallback used when no parent `Settings` is available (`AgentTool`
+/// constructed without `.with_settings(...)` — tests, or the generic
+/// `AgentSpawner` bridge which doesn't carry one). Scope is a fixed
+/// `"code"` stand-in since there's no real one to thread through.
+fn fallback_settings(
+    model_name: String,
+    max_tokens: u32,
+    fallback_model: Option<String>,
+    local_data_dir: std::path::PathBuf,
+) -> Settings {
+    Settings {
+        model: ModelSettings {
+            api_type: base::provider::ApiType::Anthropic,
+            base_url: String::new(), auth_token: String::new(),
+            model_name, max_tokens, thinking_mode: ThinkingMode::Auto,
+            fallback_model,
+        },
+        paths: PathSettings {
+            user_data_dir: std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".atta/scenes/code"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta/scenes/code")),
+            global_data_dir: std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".atta"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta")),
+            local_data_dir,
+            scope: "code".to_string(),
+        },
+        execution: ExecutionSettings::default(),
+        compaction: Default::default(),
+        sandbox: SandboxConfig::default(),
+        instruction_file: None, prompt_append: None, prompt_override: None,
+        vcr: None, telemetry_url: None, session_dir: None,
+        memory_enabled: true,
+        permission_mode: PermissionMode::default(),
+        permission_rules: Vec::new(),
+        hooks_config: None,
+        mcp_servers: Default::default(),
+        providers: Default::default(),
+        default_provider: None,
+        task_models: Default::default(),
+        language: None,
+        feature_flags: Default::default(),
+    }
+}
+
 // ═══════════════════════════════════════════════════════
 // Inner state
 // ═══════════════════════════════════════════════════════
+
+/// Sub-agents are not allowed to spawn further sub-agents — a "full access"
+/// tool set (general-purpose/claude/any custom type with an empty
+/// `allowed_tools`) still excludes this tool by name. Without this, a
+/// sub-agent that inherits the parent's complete tool set (which includes
+/// "Agent" itself) could recursively spawn more sub-agents with no depth
+/// limit — `EngineConfig.max_agent_depth` exists as a documented intent but
+/// isn't threaded through `Builder`/`Agent` today (see
+/// `docs/design/2026-08-04-multi-provider-llm-migration.md`-adjacent notes
+/// on `EngineConfig` not being wired end-to-end), so this is a cheap,
+/// self-contained substitute: cap recursion at depth 1 by construction
+/// instead of by counting.
+const AGENT_TOOL_NAME: &str = "Agent";
 
 #[derive(Clone)]
 struct Inner {
@@ -360,6 +509,20 @@ struct Inner {
     fallback_tools: Arc<InMemoryToolRegistry>,
     parent_tools: Arc<InMemoryToolRegistry>,
     mailbox: Option<(std::sync::Arc<team::mailbox::MailboxStore>, String)>,
+    /// Built-in types merged with any disk-loaded custom types (see
+    /// `merge_agent_types`). Keyed by `subagent_type` name.
+    agent_types: Arc<std::collections::HashMap<String, AgentTypeDefinition>>,
+    /// Precomputed from `agent_types` — see `describe_agent_types`. Owned
+    /// (not `&'static str`) because the catalog is now dynamic.
+    description: Arc<str>,
+    /// The parent `Agent`'s own settings, when known (set via
+    /// `.with_settings(...)`) — `sub_settings()`/`run_sub_inner()` clone this
+    /// (overriding only the model fields) instead of a hardcoded
+    /// `scope: "code"` stand-in, so a sub-agent's skills/hooks/agents
+    /// lookups resolve against the parent's *real* scope, not a guess.
+    /// `None` when unset (e.g. in tests, or the generic `AgentSpawner`
+    /// bridge) falls back to the previous hardcoded-`"code"` behavior.
+    parent_settings: Option<Arc<Settings>>,
 }
 
 pub struct AgentTool {
@@ -368,20 +531,31 @@ pub struct AgentTool {
 }
 
 impl AgentTool {
+    /// Construct with only the built-in agent types (no `.atta/agents/`
+    /// scan) — convenience for callers that don't need custom types (e.g.
+    /// tests, or embedders that manage their own catalog).
     pub fn new(
         model: Arc<dyn Model>,
         config: Arc<EngineConfig>,
         fallback_tools: Arc<InMemoryToolRegistry>,
     ) -> Self {
-        Self::with_parent_tools(model, config, fallback_tools.clone(), fallback_tools)
+        Self::with_parent_tools(model, config, fallback_tools.clone(), fallback_tools, &[], &[])
     }
 
+    /// `agent_dirs` are scanned low → high priority (see `merge_agent_types`)
+    /// for `.atta/agents/*.md` custom type definitions, on top of the 6
+    /// built-in types and any `plugin_agent_types`. Pass `&[]` for either to
+    /// skip that tier.
     pub fn with_parent_tools(
         model: Arc<dyn Model>,
         config: Arc<EngineConfig>,
         parent_tools: Arc<InMemoryToolRegistry>,
         fallback_tools: Arc<InMemoryToolRegistry>,
+        agent_dirs: &[&Path],
+        plugin_agent_types: &[AgentTypeDefinition],
     ) -> Self {
+        let agent_types = merge_agent_types(agent_dirs, plugin_agent_types);
+        let description: Arc<str> = describe_agent_types(&agent_types).into();
         Self {
             inner: Arc::new(Inner {
                 model,
@@ -389,9 +563,22 @@ impl AgentTool {
                 fallback_tools,
                 parent_tools,
                 mailbox: None,
+                agent_types: Arc::new(agent_types),
+                description,
+                parent_settings: None,
             }),
             remote: Arc::new(NoopRemoteTransport),
         }
+    }
+
+    /// Attach the parent `Agent`'s own settings so sub-agents inherit its
+    /// real scope/paths instead of a hardcoded stand-in. See the
+    /// `Inner::parent_settings` doc comment.
+    pub fn with_settings(mut self, settings: Arc<Settings>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.parent_settings = Some(settings);
+        self.inner = Arc::new(inner);
+        self
     }
 
     pub fn with_mailbox(
@@ -415,27 +602,49 @@ impl AgentTool {
         self.permission_handler()
     }
 
+    /// System prompt injected into the sub-agent's context for the given
+    /// `subagent_type`, looked up from the merged built-in + disk catalog.
+    fn type_prompt(&self, t: Option<&str>) -> Option<&str> {
+        t.and_then(|name| self.inner.agent_types.get(name))
+            .map(|d| d.system_prompt.as_str())
+    }
+
+    fn build_prompt(&self, input: &AgentInput) -> String {
+        if let Some(p) = self.type_prompt(input.subagent_type.as_deref()) {
+            format!("{p}\n\nTask: {}", input.prompt)
+        } else {
+            input.prompt.clone()
+        }
+    }
+
     /// Resolve the tool set for a given subagent type.
     ///
     /// Returns a filtered [`InMemoryToolRegistry`] containing only the tools
-    /// that the named agent type is allowed to use. Unknown types fall back
-    /// to the full `fallback_tools` set.
+    /// that the named agent type is allowed to use. Unknown types, and types
+    /// whose `allowed_tools` is empty (the "full access" convention — see
+    /// `general-purpose`/`claude`), fall back to the full tool set **minus
+    /// "Agent" itself** — see `AGENT_TOOL_NAME` doc comment for why.
     fn resolve_tools(&self, subagent_type: Option<&str>) -> Arc<InMemoryToolRegistry> {
-        let allowed_names: Option<Vec<&str>> = match subagent_type {
-            Some("explore") => Some(vec![
-                "Read", "Grep", "Glob", "WebSearch", "WebFetch", "LSP",
-            ]),
-            Some("plan") => Some(vec![
-                "Read", "Grep", "Glob", "WebSearch", "WebFetch", "Write",
-            ]),
-            Some("general-purpose") | Some("claude") => None,
-            Some("code-reviewer") => Some(vec!["Read", "Grep", "Glob", "LSP", "Bash"]),
-            _ => None,
-        };
+        let allowed_names: Option<&[String]> = subagent_type
+            .and_then(|name| self.inner.agent_types.get(name))
+            .map(|d| d.allowed_tools.as_slice())
+            .filter(|tools| !tools.is_empty());
 
-        let Some(ref allowed) = allowed_names else {
-            // Full access — return the parent's tool set (which includes all tools).
-            return self.inner.parent_tools.clone();
+        let Some(allowed) = allowed_names else {
+            // Full access — every tool except "Agent" (no recursive spawning).
+            let registry = InMemoryToolRegistry::new();
+            for tool in self
+                .inner
+                .parent_tools
+                .all()
+                .iter()
+                .chain(self.inner.fallback_tools.all().iter())
+            {
+                if tool.name() != AGENT_TOOL_NAME {
+                    registry.register(tool.clone());
+                }
+            }
+            return Arc::new(registry);
         };
 
         let registry = InMemoryToolRegistry::new();
@@ -447,47 +656,19 @@ impl AgentTool {
             .iter()
             .chain(self.inner.fallback_tools.all().iter())
         {
-            if allowed.iter().any(|n| tool.name() == *n) {
+            if tool.name() != AGENT_TOOL_NAME && allowed.iter().any(|n| tool.name() == n.as_str()) {
                 registry.register(tool.clone());
             }
         }
         Arc::new(registry)
     }
 
-    fn sub_settings(&self, model_name: Option<&str>) -> Settings {
+    fn sub_settings(&self, model_name: Option<&str>, cwd: std::path::PathBuf) -> Settings {
         let c = &self.inner.config;
-        Settings {
-            model: ModelSettings {
-                api_type: base::provider::ApiType::Anthropic,
-                base_url: String::new(), auth_token: String::new(),
-                model_name: model_name.unwrap_or(&c.model).to_string(),
-                max_tokens: c.max_tokens, thinking_mode: ThinkingMode::Auto,
-                fallback_model: c.fallback_model.clone(),
-            },
-            paths: PathSettings {
-                // NOTE: this `AgentTool` (runtime crate) currently has no
-                // production construction site (verified during the
-                // 2026-08-03 AGENTS.md/.agents migration) — no live caller
-                // supplies a real scope, so this stays a fixed literal
-                // rather than threading scope through an unreachable path.
-                user_data_dir: std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".atta/code"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta/code")),
-                local_data_dir: std::path::PathBuf::from("."),
-                scope: "code".to_string(),
-            },
-            execution: ExecutionSettings::default(),
-            compaction: Default::default(),
-            sandbox: SandboxConfig::default(),
-            instruction_file: None, prompt_append: None, prompt_override: None,
-            vcr: None, telemetry_url: None, session_dir: None,
-            memory_enabled: true,
-            permission_mode: PermissionMode::default(),
-            permission_rules: Vec::new(),
-            hooks_config: None,
-            mcp_servers: Vec::new(),
-            language: None,
-            feature_flags: Default::default(),
+        let model_name = model_name.unwrap_or(&c.model).to_string();
+        match &self.inner.parent_settings {
+            Some(parent) => settings_from_parent(parent, model_name, c.max_tokens, c.fallback_model.clone()),
+            None => fallback_settings(model_name, c.max_tokens, c.fallback_model.clone(), cwd),
         }
     }
 
@@ -510,16 +691,26 @@ impl AgentTool {
     }
 
     /// Core: run sub-agent and collect text output.
+    ///
+    /// `subagent_type` — when it names a type in the merged catalog (built-in
+    /// or `.atta/agents/*.md`) that declares a `model` override, that model
+    /// is used instead of the parent's. `None` (or an unknown/type-less
+    /// call, e.g. from the generic `AgentSpawner` bridge used by team/skill-fork)
+    /// keeps the parent's model, matching prior behavior.
     pub(crate) async fn run_sub(
         &self,
         prompt: String,
         tools: Arc<InMemoryToolRegistry>,
-        _cwd: std::path::PathBuf,
+        cwd: std::path::PathBuf,
         cancel: tokio_util::sync::CancellationToken,
         perm: Arc<dyn Permission>,
+        subagent_type: Option<&str>,
     ) -> Result<String, base::error::ToolError> {
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
-        let settings = Arc::new(self.sub_settings(None));
+        let model_override = subagent_type
+            .and_then(|t| self.inner.agent_types.get(t))
+            .and_then(|d| d.model.as_deref());
+        let settings = Arc::new(self.sub_settings(model_override, cwd));
         let _ = &perm; // used below in Builder
 
         let sid = uuid::Uuid::new_v4().to_string();
@@ -577,7 +768,8 @@ impl AgentTool {
             None => ctx.session.cwd.clone(),
         };
         let tools = self.resolve_tools(input.subagent_type.as_deref());
-        let prompt = build_prompt(input);
+        let prompt = self.build_prompt(input);
+        let subagent_type = input.subagent_type.clone();
         let inner = self.inner.clone();
         let tc = task.clone();
         let tid_c = tid.clone();
@@ -587,7 +779,7 @@ impl AgentTool {
 
         tokio::spawn(async move {
             let r = Self::run_sub_inner(
-                &inner, prompt, tools, cwd, outer_cancel,
+                &inner, prompt, tools, cwd, outer_cancel, subagent_type.as_deref(),
             ).await;
             let mut s = tc.status.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(*s, base::context::RunningStatus::Running) {
@@ -605,43 +797,32 @@ impl AgentTool {
         Ok(bg_result(&tid, "spawned"))
     }
 
-    /// Static helper for background execution.
+    /// Static helper for background execution. `subagent_type` — see
+    /// `run_sub`'s doc comment; resolved the same way against `inner.agent_types`.
     async fn run_sub_inner(
         inner: &Inner, prompt: String, tools: Arc<InMemoryToolRegistry>,
         cwd: std::path::PathBuf, cancel: tokio_util::sync::CancellationToken,
+        subagent_type: Option<&str>,
     ) -> Result<String, base::error::ToolError> {
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
         let perm: Arc<dyn Permission> = Arc::new(AlwaysPermit);
-        let settings = Arc::new(Settings {
-            model: ModelSettings {
-                api_type: base::provider::ApiType::Anthropic,
-                base_url: String::new(), auth_token: String::new(),
-                model_name: inner.config.model.clone(),
-                max_tokens: inner.config.max_tokens,
-                thinking_mode: ThinkingMode::Auto,
-                fallback_model: inner.config.fallback_model.clone(),
-            },
-            paths: PathSettings {
-                // Same caveat as `sub_settings` above: unreachable in
-                // production today, so no real scope source to thread.
-                user_data_dir: std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".atta/code"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta/code")),
-                local_data_dir: cwd,
-                scope: "code".to_string(),
-            },
-            execution: ExecutionSettings::default(),
-            compaction: Default::default(),
-            sandbox: SandboxConfig::default(),
-            instruction_file: None, prompt_append: None, prompt_override: None,
-            vcr: None, telemetry_url: None, session_dir: None,
-            memory_enabled: true,
-            permission_mode: PermissionMode::default(),
-            permission_rules: Vec::new(),
-            hooks_config: None,
-            mcp_servers: Vec::new(),
-            language: None,
-            feature_flags: Default::default(),
+        let model_name = subagent_type
+            .and_then(|t| inner.agent_types.get(t))
+            .and_then(|d| d.model.clone())
+            .unwrap_or_else(|| inner.config.model.clone());
+        let settings = Arc::new(match &inner.parent_settings {
+            Some(parent) => settings_from_parent(
+                parent,
+                model_name,
+                inner.config.max_tokens,
+                inner.config.fallback_model.clone(),
+            ),
+            None => fallback_settings(
+                model_name,
+                inner.config.max_tokens,
+                inner.config.fallback_model.clone(),
+                cwd,
+            ),
         });
 
         let sid = uuid::Uuid::new_v4().to_string();
@@ -692,7 +873,7 @@ impl AgentTool {
         history_store: Arc<dyn HistoryStore>,
         prompt: String,
         tools: Arc<InMemoryToolRegistry>,
-        _cwd: std::path::PathBuf,
+        cwd: std::path::PathBuf,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<String, base::error::ToolError> {
         let start = std::time::Instant::now();
@@ -752,7 +933,7 @@ impl AgentTool {
 
         // 4. Build and run sub-agent with pre-loaded messages
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
-        let settings = Arc::new(self.sub_settings(None));
+        let settings = Arc::new(self.sub_settings(None, cwd));
         let perm: Arc<dyn Permission> = Arc::new(AlwaysPermit);
 
         let new_sid = uuid::Uuid::new_v4().to_string();
@@ -882,9 +1063,9 @@ fn bg_result(task_id: &str, status: &str) -> base::tool::ToolResult {
 
 #[async_trait]
 impl base::tool::Tool for AgentTool {
-    fn name(&self) -> &str { "Agent" }
+    fn name(&self) -> &str { AGENT_TOOL_NAME }
     fn description(&self) -> &str {
-        "Launch a sub-agent to handle complex, multi-step tasks independently"
+        &self.inner.description
     }
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(AgentInput)).unwrap_or(Value::Null)
@@ -941,10 +1122,13 @@ impl base::tool::Tool for AgentTool {
             None => ctx.session.cwd.clone(),
         };
         let tools = self.resolve_tools(inp.subagent_type.as_deref());
-        let prompt = build_prompt(&inp);
+        let prompt = self.build_prompt(&inp);
         let perm = self.permission_handler();
 
-        match self.run_sub(prompt, tools, cwd, ctx.cancel.child_token(), perm).await {
+        match self
+            .run_sub(prompt, tools, cwd, ctx.cancel.child_token(), perm, inp.subagent_type.as_deref())
+            .await
+        {
             Ok(text) => Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(text),
                 is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
@@ -958,3 +1142,361 @@ impl base::tool::Tool for AgentTool {
 }
 
 // Only base::tool::Tool impl — legacy bridge removed.
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_agent_md(dir: &Path, filename: &str, content: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut f = std::fs::File::create(dir.join(filename)).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn merge_agent_types_with_no_dirs_returns_only_builtins() {
+        let merged = merge_agent_types(&[], &[]);
+        assert_eq!(merged.len(), builtin_agent_types().len());
+        assert!(merged.contains_key("explore"));
+        assert!(merged.contains_key("code-reviewer"));
+        assert!(merged.contains_key("worker"));
+    }
+
+    #[test]
+    fn load_agent_types_from_dir_parses_frontmatter() {
+        let dir = std::env::temp_dir().join(format!(
+            "atta-agent-types-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_agent_md(
+            &dir,
+            "security-auditor.md",
+            "---\nname: security-auditor\ndescription: Finds security issues\nallowed_tools: [Read, Grep, Glob]\nmodel: claude-opus-4-8\n---\nYou are a security auditor.",
+        );
+        let types = load_agent_types_from_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(types.len(), 1);
+        let t = &types[0];
+        assert_eq!(t.name, "security-auditor");
+        assert_eq!(t.description, "Finds security issues");
+        assert_eq!(t.allowed_tools, vec!["Read", "Grep", "Glob"]);
+        assert_eq!(t.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(t.system_prompt, "You are a security auditor.");
+    }
+
+    #[test]
+    fn merge_agent_types_disk_definition_overrides_builtin_by_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "atta-agent-types-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_agent_md(
+            &dir,
+            "explore.md",
+            "---\ndescription: Custom explore override\n---\nCustom body.",
+        );
+        let merged = merge_agent_types(&[&dir], &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(merged["explore"].description, "Custom explore override");
+        assert_eq!(merged["explore"].system_prompt, "Custom body.");
+        // Untouched built-ins survive.
+        assert!(merged.contains_key("code-reviewer"));
+    }
+
+    #[test]
+    fn merge_agent_types_precedence_is_low_to_high_across_dirs() {
+        let base = std::env::temp_dir().join(format!(
+            "atta-agent-types-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global_dir = base.join("global");
+        let scene_dir = base.join("scene");
+        let project_dir = base.join("project");
+        write_agent_md(&global_dir, "reviewer.md", "---\ndescription: from global\n---\nbody");
+        write_agent_md(&scene_dir, "reviewer.md", "---\ndescription: from scene\n---\nbody");
+        write_agent_md(&project_dir, "reviewer.md", "---\ndescription: from project\n---\nbody");
+
+        let merged = merge_agent_types(&[&global_dir, &scene_dir, &project_dir], &[]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(merged["reviewer"].description, "from project");
+    }
+
+    #[test]
+    fn merge_agent_types_plugin_definition_overrides_builtin_by_name() {
+        let plugin_types = vec![AgentTypeDefinition {
+            name: "explore".into(),
+            description: "Plugin-provided explore override".into(),
+            allowed_tools: vec!["Read".into()],
+            model: None,
+            system_prompt: "Plugin explore body.".into(),
+        }];
+        let merged = merge_agent_types(&[], &plugin_types);
+        assert_eq!(merged["explore"].description, "Plugin-provided explore override");
+        assert_eq!(merged["explore"].system_prompt, "Plugin explore body.");
+        // Untouched built-ins survive.
+        assert!(merged.contains_key("code-reviewer"));
+    }
+
+    #[test]
+    fn merge_agent_types_dirs_override_plugin_definition_of_same_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "atta-agent-types-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_agent_md(
+            &dir,
+            "explore.md",
+            "---\ndescription: from disk dir\n---\nDisk body.",
+        );
+        let plugin_types = vec![AgentTypeDefinition {
+            name: "explore".into(),
+            description: "from plugin".into(),
+            allowed_tools: vec![],
+            model: None,
+            system_prompt: "Plugin body.".into(),
+        }];
+        // Confirm priority order: built-in < plugin < dirs.
+        let merged_plugin_only = merge_agent_types(&[], &plugin_types);
+        assert_eq!(merged_plugin_only["explore"].description, "from plugin");
+
+        let merged = merge_agent_types(&[&dir], &plugin_types);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(merged["explore"].description, "from disk dir");
+        assert_eq!(merged["explore"].system_prompt, "Disk body.");
+    }
+
+    #[test]
+    fn agent_def_to_type_returns_none_when_prompt_file_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "atta-agent-def-missing-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let def = plugin::manifest::AgentDef {
+            name: "ghost".into(),
+            description: "A ghost agent".into(),
+            system_prompt_path: std::path::PathBuf::from("does-not-exist.md"),
+            allowed_tools: vec![],
+            model: None,
+        };
+        let result = agent_def_to_type(&def, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn agent_def_to_type_reads_system_prompt_from_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "atta-agent-def-ok-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prompt.md"), "You are a specialized plugin agent.").unwrap();
+        let def = plugin::manifest::AgentDef {
+            name: "plugin-agent".into(),
+            description: "A plugin-declared agent".into(),
+            system_prompt_path: std::path::PathBuf::from("prompt.md"),
+            allowed_tools: vec!["Read".into()],
+            model: Some("claude-opus-4-8".into()),
+        };
+        let result = agent_def_to_type(&def, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let def_out = result.expect("prompt file should be read successfully");
+        assert_eq!(def_out.name, "plugin-agent");
+        assert_eq!(def_out.description, "A plugin-declared agent");
+        assert_eq!(def_out.system_prompt, "You are a specialized plugin agent.");
+        assert_eq!(def_out.allowed_tools, vec!["Read"]);
+        assert_eq!(def_out.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn describe_agent_types_lists_every_type_sorted_by_name() {
+        let merged = merge_agent_types(&[], &[]);
+        let text = describe_agent_types(&merged);
+        assert!(text.contains("- code-reviewer: "));
+        assert!(text.contains("- explore: "));
+        // Sorted: "claude" sorts before "code-reviewer" before "explore".
+        let claude_pos = text.find("- claude:").unwrap();
+        let explore_pos = text.find("- explore:").unwrap();
+        assert!(claude_pos < explore_pos);
+    }
+
+    struct DummyModel;
+    #[async_trait]
+    impl Model for DummyModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    struct NamedTool(&'static str);
+    #[async_trait]
+    impl base::tool::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        fn is_read_only(&self, _: &Value) -> bool {
+            true
+        }
+        fn is_concurrency_safe(&self, _: &Value) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _input: Value,
+            _ctx: ToolContext,
+            _progress: ProgressSender,
+        ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+            Ok(base::tool::ToolResult {
+                content: ToolResultContent::Text("ok".into()),
+                is_error: false,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
+            })
+        }
+    }
+
+    fn test_agent_tool() -> AgentTool {
+        let tools = InMemoryToolRegistry::new();
+        tools.register(Arc::new(NamedTool("Read")));
+        tools.register(Arc::new(NamedTool("Bash")));
+        let tools = Arc::new(tools);
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let config = Arc::new(EngineConfig::defaults_for("test-model"));
+        let agent_tool =
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[], &[]);
+        // Register self into the same registry it holds, matching how
+        // `Builder::build()` wires it — needed so `resolve_tools()`'s
+        // recursion guard has something to actually filter out.
+        agent_tool
+    }
+
+    #[test]
+    fn resolve_tools_full_access_excludes_agent_itself() {
+        let agent_tool = test_agent_tool();
+        // Register "Agent" into the same registry the tool was built with,
+        // simulating `Builder::build()`'s self-registration.
+        let self_arc = Arc::new(AgentTool::with_parent_tools(
+            agent_tool.inner.model.clone(),
+            agent_tool.inner.config.clone(),
+            agent_tool.inner.parent_tools.clone(),
+            agent_tool.inner.fallback_tools.clone(),
+            &[],
+            &[],
+        ));
+        agent_tool.inner.parent_tools.register(self_arc);
+
+        // "general-purpose" is a full-access type (empty allowed_tools).
+        let resolved = agent_tool.resolve_tools(Some("general-purpose"));
+        let names: Vec<String> = resolved.all().iter().map(|t| t.name().to_string()).collect();
+        assert!(names.iter().any(|n| n == "Read"));
+        assert!(names.iter().any(|n| n == "Bash"));
+        assert!(!names.iter().any(|n| n == AGENT_TOOL_NAME), "sub-agent must not be able to spawn further sub-agents");
+    }
+
+    #[test]
+    fn resolve_tools_restricted_type_filters_to_allowed_list() {
+        let agent_tool = test_agent_tool();
+        let resolved = agent_tool.resolve_tools(Some("explore"));
+        let names: Vec<String> = resolved.all().iter().map(|t| t.name().to_string()).collect();
+        assert!(names.iter().any(|n| n == "Read")); // explore allows Read
+        assert!(!names.iter().any(|n| n == "Bash")); // explore doesn't allow Bash
+    }
+
+    #[test]
+    fn custom_agent_type_model_override_is_applied_to_sub_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "atta-agent-model-override-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_agent_md(
+            &dir,
+            "opus-reviewer.md",
+            "---\ndescription: Reviewer pinned to a specific model\nmodel: claude-opus-4-8\n---\nbody",
+        );
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
+        let agent_tool = AgentTool::with_parent_tools(
+            model,
+            config,
+            tools.clone(),
+            tools,
+            &[&dir],
+            &[],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Same lookup `run_sub`/`run_sub_inner` perform: resolve the type's
+        // `model` override, then thread it into `sub_settings()`.
+        let model_override = agent_tool
+            .inner
+            .agent_types
+            .get("opus-reviewer")
+            .and_then(|d| d.model.as_deref());
+        assert_eq!(model_override, Some("claude-opus-4-8"));
+
+        let settings = agent_tool.sub_settings(model_override, std::path::PathBuf::from("/tmp/cwd"));
+        assert_eq!(settings.model.model_name, "claude-opus-4-8");
+
+        // A call with no override (or an unknown type) still falls back to
+        // the parent's configured model — this must not regress.
+        let settings_default = agent_tool.sub_settings(None, std::path::PathBuf::from("/tmp/cwd"));
+        assert_eq!(settings_default.model.model_name, "parent-default-model");
+    }
+
+    #[test]
+    fn sub_settings_without_parent_settings_uses_the_passed_cwd() {
+        // `test_agent_tool()` never calls `.with_settings(...)`, so this
+        // exercises the `fallback_settings()` branch — `local_data_dir` must
+        // reflect the `cwd` argument, not a hardcoded `"."`.
+        let agent_tool = test_agent_tool();
+        let cwd = std::path::PathBuf::from("/tmp/some-real-project");
+        let settings = agent_tool.sub_settings(None, cwd.clone());
+        assert_eq!(settings.paths.local_data_dir, cwd);
+    }
+}

@@ -1,7 +1,9 @@
 //! Skill loading, expansion, and activation.
 //!
-//! Skills are loaded from `~/.atta/<scope>/skills/<name>/SKILL.md` (user-level;
-//! `scope` identifies the product instance, no default) and
+//! Skills are loaded from three tiers: `~/.atta/skills/<name>/SKILL.md`
+//! (global default, shared by every scene), `~/.atta/scenes/<scope>/skills/<name>/SKILL.md`
+//! (scene-specific override — same name wins over the global default; `scope`
+//! identifies the product instance, no default), and
 //! `<cwd>/.agents/skills/<name>/SKILL.md` (project-level — this is the
 //! external fact standard also scanned by Codex). They can be invoked via
 //! slash commands (`/<name> [args]`) or conditionally activated when
@@ -101,34 +103,42 @@ impl SkillEntry {
     }
 }
 
-/// Skill 来源 -- user / project；同名时 project 后入但保留两者
+/// Skill 来源 -- user / project；同名时后入者覆盖先入者（见下方扫描顺序）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
-    /// `~/.atta/<scope>/skills/`
+    /// `~/.atta/skills/`（全局默认）或 `~/.atta/scenes/<scope>/skills/`（scene 覆盖）
     User,
     /// `<cwd>/.agents/skills/`（外部事实标准，Codex 也扫描这个路径）
     Project,
-    /// Loaded from a plugin's manifest (`~/.atta/<scope>/plugins/<name>/SKILL.md`)
+    /// Loaded from a plugin's manifest (`~/.atta/plugins/<name>/SKILL.md` or
+    /// `~/.atta/scenes/<scope>/plugins/<name>/SKILL.md`)
     Plugin,
 }
 
-/// 从两个来源扫 SKILL.md：用户级 `~/.atta/<scope>/skills/<name>/SKILL.md` + 项目级
-/// `<cwd>/.agents/skills/<name>/SKILL.md`（外部事实标准）。返回顺序：用户在前 ->
-/// 项目在后。同来源内按目录名字母序。
+/// 从三层扫 SKILL.md：全局 `~/.atta/skills/` -> scene 覆盖
+/// `~/.atta/scenes/<scope>/skills/` -> 项目级 `<cwd>/.agents/skills/`（外部事实标准）。
+/// 同名时后扫到的覆盖先扫到的（`scan_skills_dir` 结果直接 extend 进 `Vec`，
+/// 调用方按"先入者优先"处理 slash 分发，所以顺序是：scene 覆盖需要排在它要
+/// 覆盖的全局条目**之前**，让 scene 版本先命中）。
 async fn collect_skills(home: &Path, cwd: &Path, scope: &str) -> Vec<SkillEntry> {
-    let user_dir = home.join(".atta").join(scope).join("skills");
+    let global_dir = home.join(".atta").join("skills");
+    let scene_dir = home.join(".atta").join("scenes").join(scope).join("skills");
     let project_dir = cwd.join(".agents").join("skills");
-    let plugin_skills_dir = home.join(".atta").join(scope).join("plugins");
+    let global_plugins_dir = home.join(".atta").join("plugins");
+    let scene_plugins_dir = home.join(".atta").join("scenes").join(scope).join("plugins");
     let mut all = Vec::new();
-    all.extend(scan_skills_dir(&user_dir, SkillSource::User).await);
+    all.extend(scan_skills_dir(&scene_dir, SkillSource::User).await);
+    all.extend(scan_skills_dir(&global_dir, SkillSource::User).await);
     all.extend(scan_skills_dir(&project_dir, SkillSource::Project).await);
 
-    // Scan plugin skill directories
-    if let Ok(mut plugins) = tokio::fs::read_dir(&plugin_skills_dir).await {
-        while let Ok(Some(entry)) = plugins.next_entry().await {
-            let plugin_skills = entry.path().join("skills");
-            if plugin_skills.is_dir() {
-                all.extend(scan_skills_dir(&plugin_skills, SkillSource::Plugin).await);
+    // Scan plugin skill directories (scene tier first, same override intent).
+    for plugins_dir in [&scene_plugins_dir, &global_plugins_dir] {
+        if let Ok(mut plugins) = tokio::fs::read_dir(plugins_dir).await {
+            while let Ok(Some(entry)) = plugins.next_entry().await {
+                let plugin_skills = entry.path().join("skills");
+                if plugin_skills.is_dir() {
+                    all.extend(scan_skills_dir(&plugin_skills, SkillSource::Plugin).await);
+                }
             }
         }
     }
@@ -441,8 +451,8 @@ mod tests {
     async fn collect_skills_loads_user_and_project() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        // user skill
-        let u_dir = home.path().join(".atta/code/skills/u-skill");
+        // scene-specific skill
+        let u_dir = home.path().join(".atta/scenes/code/skills/u-skill");
         tokio::fs::create_dir_all(&u_dir).await.unwrap();
         tokio::fs::write(
             u_dir.join("SKILL.md"),
@@ -461,7 +471,7 @@ mod tests {
         .unwrap();
         let skills = collect_skills(home.path(), cwd.path(), "code").await;
         assert_eq!(skills.len(), 2);
-        // user 在前
+        // user (scene) 在前
         assert_eq!(skills[0].name, "u-skill");
         assert_eq!(skills[0].source, SkillSource::User);
         assert_eq!(skills[1].name, "p-skill");
@@ -469,11 +479,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_skills_scene_overrides_global_default_by_name() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let global_dir = home.path().join(".atta/skills/shared");
+        tokio::fs::create_dir_all(&global_dir).await.unwrap();
+        tokio::fs::write(
+            global_dir.join("SKILL.md"),
+            "---\ndescription: global version\n---\nbody",
+        )
+        .await
+        .unwrap();
+        let scene_dir = home.path().join(".atta/scenes/code/skills/shared");
+        tokio::fs::create_dir_all(&scene_dir).await.unwrap();
+        tokio::fs::write(
+            scene_dir.join("SKILL.md"),
+            "---\ndescription: scene override\n---\nbody",
+        )
+        .await
+        .unwrap();
+
+        let skills = collect_skills(home.path(), cwd.path(), "code").await;
+        let shared: Vec<_> = skills.iter().filter(|s| s.name == "shared").collect();
+        // Both entries are present in the raw list (same-name-both-kept
+        // convention, see `SkillSource` docs) but the scene one comes first,
+        // so callers that pick "first match wins" for slash dispatch get the
+        // scene-specific version.
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared[0].description, "scene override");
+    }
+
+    #[tokio::test]
     async fn collect_skills_skips_dir_without_skill_md() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         // 目录存在但没有 SKILL.md
-        let d = home.path().join(".atta/code/skills/empty");
+        let d = home.path().join(".atta/scenes/code/skills/empty");
         tokio::fs::create_dir_all(&d).await.unwrap();
         let skills = collect_skills(home.path(), cwd.path(), "code").await;
         assert!(skills.is_empty());

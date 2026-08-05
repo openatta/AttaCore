@@ -118,6 +118,17 @@ impl StreamFrame {
             params: serde_json::json!({"session_id": session_id, "turn_id": turn_id, "event": event}),
         }
     }
+
+    /// A daemon-level async notification (MCP connect outcome, import
+    /// auto-detection, ...) pushed to any connection subscribed via
+    /// `daemon.subscribeEvents` — not tied to any particular session/turn.
+    pub fn daemon_event(event: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: "daemon.event",
+            params: event,
+        }
+    }
 }
 
 #[cfg(test)]

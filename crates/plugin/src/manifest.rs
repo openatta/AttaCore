@@ -211,7 +211,13 @@ impl Plugin {
         Ok(())
     }
 
-    fn install_hooks(
+    /// Register this plugin's hooks with `hook_runner`. Exposed as `pub` (not
+    /// just called from `install()`) so callers that build a `HookRunner`
+    /// before it's wrapped in an `Arc` — e.g. `runtime::agent::build_hook_runner`
+    /// — can register plugin hooks in the same pass, without needing the
+    /// `SlashCommandRegistrar`/`McpManager`/`AgentRegistry` that a full
+    /// `install()` call requires.
+    pub fn install_hooks(
         &self,
         hook_runner: &mut hooks::HookRunner,
         root: &Path,
@@ -382,7 +388,12 @@ impl Plugin {
         Ok(())
     }
 
-    fn install_slash_commands(
+    /// Register this plugin's slash commands with `command_registrar`.
+    /// Exposed as `pub` so a caller that wants a single shared command
+    /// catalog across many sessions (e.g. `daemon::SessionPool`) can build
+    /// it once at startup, independent of any particular session's
+    /// `HookRunner`/`McpManager`/`AgentRegistry`.
+    pub fn install_slash_commands(
         &self,
         command_registrar: &mut impl SlashCommandRegistrar,
         plugin_name: &str,
@@ -420,7 +431,11 @@ impl Plugin {
         }
     }
 
-    async fn install_mcp_servers(
+    /// Register this plugin's MCP server configs with `mcp_manager`. Exposed
+    /// as `pub` so a caller can merge plugin-declared MCP servers into a
+    /// centrally-connected manager (e.g. alongside `settings.mcp_servers`)
+    /// instead of connecting them again per session.
+    pub async fn install_mcp_servers(
         &self,
         mcp_manager: &mut mcp::manager::McpManager,
         plugin_name: &str,
@@ -457,7 +472,11 @@ impl Plugin {
         }
     }
 
-    fn install_agents(&self, agent_registry: &mut crate::agent_registry::AgentRegistry) {
+    /// Register this plugin's agent type definitions with `agent_registry`.
+    /// Exposed as `pub` so a caller (e.g. `runtime::agent::Builder::build`)
+    /// can collect plugin-declared agent types before converting them into
+    /// its own runtime agent-type representation.
+    pub fn install_agents(&self, agent_registry: &mut crate::agent_registry::AgentRegistry) {
         for def in &self.manifest.agents {
             agent_registry.register(def.clone());
         }

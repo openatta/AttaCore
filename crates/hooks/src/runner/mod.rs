@@ -148,6 +148,13 @@ pub struct HookRunner {
     /// associated sender to signal that background work has completed,
     /// triggering re-execution of pending rewake hooks.
     wake_receiver: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>,
+    /// Directories prepended to a `Command` hook's subprocess `PATH`, highest
+    /// priority first (typically project > scene > global `.atta/hooks/`).
+    /// Lets `command` reference a bare script name (e.g. `check.sh`) that
+    /// lives in one of these directories via normal shell `PATH` lookup,
+    /// without inventing a second hook-script resolution scheme — `command`
+    /// is still just a shell string, only the search path changes.
+    hooks_search_dirs: Vec<std::path::PathBuf>,
 }
 
 impl HookRunner {
@@ -163,7 +170,15 @@ impl HookRunner {
             file_watcher: std::sync::Mutex::new(None),
             pending_rewakes: std::sync::Mutex::new(std::collections::HashSet::new()),
             wake_receiver: std::sync::Mutex::new(None),
+            hooks_search_dirs: Vec::new(),
         }
+    }
+
+    /// Builder: set the directories searched (in order, highest priority
+    /// first) when resolving a bare script name in a `Command` hook's `PATH`.
+    pub fn with_hooks_search_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.hooks_search_dirs = dirs;
+        self
     }
 
     /// Read-only access to the current settings (for merging plugin hooks etc.).
@@ -795,6 +810,73 @@ mod tests {
             )
             .await;
         assert!(r2.blocked().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_hook_resolves_bare_script_name_via_hooks_search_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "atta-hooks-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("greet.sh");
+        std::fs::write(&script, "#!/bin/sh\necho '{\"message\":\"hi from greet.sh\"}'\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let mut s: HooksSettings = HashMap::new();
+        s.insert(
+            HookEvent::PreToolUse,
+            vec![HookConfig::Command {
+                // Bare filename, no path — must resolve via PATH.
+                command: "greet.sh".into(),
+                shell: None,
+                timeout: None,
+                if_pattern: None,
+                only_on_error: None,
+                once: None,
+                async_rewake: None,
+            }],
+        );
+        let r = HookRunner::new(s).with_hooks_search_dirs(vec![dir.clone()]);
+        let result = r.run(HookEvent::PreToolUse, &input_for_bash("ls")).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match &result.outcomes[0] {
+            HookOutcome::Ran { stdout, .. } => assert!(stdout.contains("hi from greet.sh")),
+            other => panic!("expected the bare script name to resolve via PATH, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_hook_without_search_dirs_does_not_resolve_bare_script_name() {
+        let mut s: HooksSettings = HashMap::new();
+        s.insert(
+            HookEvent::PreToolUse,
+            vec![HookConfig::Command {
+                command: "definitely-not-a-real-command-xyz".into(),
+                shell: None,
+                timeout: None,
+                if_pattern: None,
+                only_on_error: None,
+                once: None,
+                async_rewake: None,
+            }],
+        );
+        let r = HookRunner::new(s); // no hooks_search_dirs configured
+        let result = r.run(HookEvent::PreToolUse, &input_for_bash("ls")).await;
+        match &result.outcomes[0] {
+            HookOutcome::Ran { exit_code, .. } => assert_ne!(*exit_code, Some(0)),
+            other => panic!("expected a failing exit code, got {other:?}"),
+        }
     }
 
     #[tokio::test]

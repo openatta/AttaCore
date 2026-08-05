@@ -24,14 +24,6 @@ pub fn initialize_settings(settings: Value) {
     SETTINGS_STORE.get_or_init(|| Mutex::new(settings));
 }
 
-/// Global model registry for model name validation.
-pub static MODEL_REGISTRY: OnceLock<model::registry::ModelRegistry> = OnceLock::new();
-
-/// Initialize the global model registry for model validation.
-/// Optional — if not set, model names are accepted without validation.
-pub fn initialize_model_registry(registry: model::registry::ModelRegistry) {
-    MODEL_REGISTRY.get_or_init(|| registry);
-}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConfigInput {
@@ -254,20 +246,6 @@ fn apply_setting(setting: &str, value: &str, ctx: &ToolContext) -> Result<(), St
         "model" => {
             if value.is_empty() {
                 return Err("model must not be empty".into());
-            }
-            // Optional validation against model registry
-            if let Some(registry) = MODEL_REGISTRY.get() {
-                if registry.find(value).is_none() {
-                    let available: Vec<String> = registry
-                        .list()
-                        .iter()
-                        .map(|m| m.model_name.clone())
-                        .collect();
-                    return Err(format!(
-                        "'{value}' is not a known model. Available models: [{}]",
-                        available.join(", ")
-                    ));
-                }
             }
             Ok(())
         }

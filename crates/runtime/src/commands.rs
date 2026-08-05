@@ -101,10 +101,15 @@ impl CommandRegistry {
         Self { commands: HashMap::new() }
     }
 
-    /// Build a registry from a skill manager (disk + bundled skills).
-    /// Each skill becomes a `prompt` command.
+    /// Build a registry from a skill manager (disk + bundled skills), on
+    /// top of the 5 built-in local commands (see `Default`). Each skill
+    /// becomes a `prompt` command. Starting from `Self::default()` (not
+    /// `Self::new()`) matters — this is the constructor the real per-session
+    /// registry is built from (`Builder::build()`), so `Self::new()` here
+    /// previously meant `/help`/`/skills`/`/clear`/`/compact`/`/cost` were
+    /// silently unresolvable and fell through to the LLM as plain text.
     pub fn from_skill_manager(skill_mgr: &::skills::manager::SkillManager) -> Self {
-        let mut registry = Self::new();
+        let mut registry = Self::default();
         for skill in skill_mgr.list() {
             // Only register user-invocable skills as slash commands
             if skill.user_invocable {
@@ -181,6 +186,53 @@ impl CommandRegistry {
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
+
+    /// Full command catalog with kind/source metadata (see [`CommandInfo`]) —
+    /// unlike `list()` (name+description only, meant for the in-turn
+    /// `/help` text), this is for callers outside the LLM loop, e.g.
+    /// daemon's `commands.list` RPC.
+    pub fn list_detailed(&self) -> Vec<CommandInfo> {
+        let mut entries: Vec<CommandInfo> = self
+            .commands
+            .iter()
+            .map(|(name, cmd)| match cmd {
+                Command::Local { description, .. } => CommandInfo {
+                    name: name.clone(),
+                    description: description.clone(),
+                    kind: "local",
+                    source: "builtin",
+                },
+                Command::Prompt { entry } => CommandInfo {
+                    name: name.clone(),
+                    description: entry.description.clone(),
+                    kind: "prompt",
+                    source: match entry.source {
+                        base::frozen::SkillSource::User => "user",
+                        base::frozen::SkillSource::Project => "project",
+                        base::frozen::SkillSource::Plugin => "plugin",
+                    },
+                },
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+}
+
+/// Metadata about one registered command, for callers that need to display
+/// or enumerate the command catalog without executing anything (e.g. an
+/// application layer rendering a command palette via daemon's
+/// `commands.list` RPC — see `CommandRegistry::list_detailed`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    /// `"prompt"` (expands a skill body, continues to the LLM) or `"local"`
+    /// (executes immediately, no LLM turn).
+    pub kind: &'static str,
+    /// Where the command came from: `"builtin"`, `"user"`, `"project"`, or
+    /// `"plugin"`.
+    pub source: &'static str,
 }
 
 impl plugin::manifest::SlashCommandRegistrar for CommandRegistry {
@@ -351,9 +403,53 @@ mod tests {
     }
 
     #[test]
+    fn from_skill_manager_also_has_builtins() {
+        // Regression test: `from_skill_manager` previously started from
+        // `Self::new()` (empty), so the production registry (built via this
+        // constructor in `Builder::build()`) never actually contained the 5
+        // built-in local commands — `/help` et al. silently fell through to
+        // the LLM instead of executing.
+        let skill_mgr = ::skills::manager::SkillManager::new();
+        let registry = CommandRegistry::from_skill_manager(&skill_mgr);
+        assert!(registry.resolve("help").is_some());
+        assert!(registry.resolve("skills").is_some());
+        assert!(registry.resolve("clear").is_some());
+        assert!(registry.resolve("compact").is_some());
+        assert!(registry.resolve("cost").is_some());
+    }
+
+    #[test]
     fn resolve_unknown_returns_none() {
         let registry = CommandRegistry::default();
         assert!(registry.resolve("nonexistent").is_none());
+    }
+
+    #[test]
+    fn list_detailed_reports_kind_and_source() {
+        let mut registry = CommandRegistry::default();
+        registry.insert_prompt(SkillEntry {
+            name: "review".into(),
+            description: "Review a diff".into(),
+            source: base::frozen::SkillSource::Plugin,
+            path: std::path::PathBuf::from("(plugin:code-review:review)"),
+            user_invocable: true,
+            ..Default::default()
+        });
+        let entries = registry.list_detailed();
+
+        let help = entries.iter().find(|e| e.name == "help").unwrap();
+        assert_eq!(help.kind, "local");
+        assert_eq!(help.source, "builtin");
+
+        let review = entries.iter().find(|e| e.name == "review").unwrap();
+        assert_eq!(review.kind, "prompt");
+        assert_eq!(review.source, "plugin");
+
+        // Sorted by name.
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 
     #[test]

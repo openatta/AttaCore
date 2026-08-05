@@ -9,5 +9,4 @@ pub mod parser;
 pub mod stream;
 pub mod tokens;
 pub mod types;
-pub mod registry;
 pub mod mock;

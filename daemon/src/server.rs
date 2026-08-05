@@ -2,6 +2,18 @@
 //!
 //! Accepts newline-delimited JSON-RPC 2.0 requests, dispatches them
 //! to the agent engine, and streams events back as `StreamFrame` lines.
+//!
+//! **Trust boundary**: every RPC method here — including `config.setProvider`
+//! (writes `providers.<id>.api_key`/`base_url` into settings.json) and
+//! `session.run_turn` (already runs with `PermissionMode::BypassPermissions`,
+//! "IDE plugins manage their own sandbox") — trusts whoever can reach this
+//! socket. There is no per-method authorization on top of that: Unix socket
+//! file permissions are the entire access-control story locally, and the TCP
+//! listener's shared token (`--token`/`ATTACORE_DAEMON_TOKEN`) is the entire
+//! story remotely. In particular, `config.setProvider` lets any caller who
+//! can reach this socket point future LLM traffic at an attacker-controlled
+//! `base_url`/`api_key` — treat socket/token exposure with the same care as
+//! exposing the LLM credentials themselves.
 
 use crate::rpc::{codes, RpcRequest, RpcResponse};
 use crate::session_pool::SessionPool;
@@ -144,6 +156,18 @@ impl DaemonServer {
                     }),
                 )
             }
+            "daemon.doctor" => RpcResponse::ok(id, self.pool.doctor_report().await),
+            "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, writer).await,
+            "config.setProvider" => self.method_config_set_provider(id, req.params).await,
+            "config.getProvider" => self.method_config_get_provider(id, req.params).await,
+            "mcp.status" => RpcResponse::ok(id, serde_json::json!({"servers": self.pool.mcp_status().await})),
+            "mcp.addServer" => self.method_mcp_add_server(id, req.params).await,
+            "commands.list" => RpcResponse::ok(id, serde_json::json!({"commands": self.pool.list_commands()})),
+            "import.list" => {
+                let sources = self.pool.list_import_sources().await;
+                RpcResponse::ok(id, serde_json::json!({"sources": sources}))
+            }
+            "import.run" => self.method_import_run(id, req.params).await,
             "daemon.shutdown" => {
                 self.pool.shutdown_all().await;
                 self.shutdown_token.cancel();
@@ -153,12 +177,128 @@ impl DaemonServer {
                 let sessions = self.pool.list_all().await;
                 RpcResponse::ok(id, serde_json::json!({"sessions": sessions}))
             }
+            "session.close" => {
+                let session_id = match req.params.get("session_id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id"),
+                };
+                self.pool.shutdown_session(&session_id).await;
+                RpcResponse::ok(id, serde_json::json!({"closed": session_id}))
+            }
             "session.run_turn" => self.method_session_run_turn(id, req.params, writer).await,
             _ => RpcResponse::err(
                 id,
                 codes::METHOD_NOT_FOUND,
                 format!("unknown: {}", req.method),
             ),
+        }
+    }
+
+    /// `daemon.subscribeEvents` — no params. Returns an immediate ack
+    /// (`{"subscribed": true}`) and, from then on, pushes every future
+    /// `daemon.event` notification (see `SessionPool::emit_event`) to this
+    /// same connection as a `StreamFrame` — indefinitely, until the
+    /// connection closes. Does not replay past events; subscribe before the
+    /// event you care about can happen (e.g. right after startup, before
+    /// relying on `mcp_connected`/`import_detected`).
+    async fn method_daemon_subscribe_events(&self, id: serde_json::Value, writer: Writer) -> RpcResponse {
+        let mut rx = self.pool.subscribe_events();
+        let forward_writer = writer.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let frame = crate::rpc::StreamFrame::daemon_event(event);
+                        let Ok(mut b) = serde_json::to_vec(&frame) else { continue };
+                        b.push(b'\n');
+                        if forward_writer.lock().await.write_all(&b).await.is_err() {
+                            break; // connection closed
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        RpcResponse::ok(id, serde_json::json!({"subscribed": true}))
+    }
+
+    /// `config.getProvider` params: `{"include_secrets": false}` (optional,
+    /// default `false`). Read-side counterpart to `config.setProvider` — see
+    /// `SessionPool::get_providers` doc comment for the redaction default.
+    async fn method_config_get_provider(&self, id: serde_json::Value, params: serde_json::Value) -> RpcResponse {
+        let include_secrets = params.get("include_secrets").and_then(|v| v.as_bool()).unwrap_or(false);
+        RpcResponse::ok(id, self.pool.get_providers(include_secrets).await)
+    }
+
+    /// `mcp.addServer` params: `{"name": "...", "config": {"type": "stdio", ...}}`
+    /// (`config` is an `mcp::config::McpServerConfig`, tagged by `type`).
+    async fn method_mcp_add_server(&self, id: serde_json::Value, params: serde_json::Value) -> RpcResponse {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing name"),
+        };
+        let config = match params.get("config").cloned() {
+            Some(c) => c,
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing config"),
+        };
+        match self.pool.add_mcp_server(&name, config).await {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, codes::INVALID_PARAMS, e),
+        }
+    }
+
+    /// `import.run` params: `{"source": "claude_code" | "codex" | "cursor"}`
+    /// (one of the `source` values `import.list` returned).
+    async fn method_import_run(&self, id: serde_json::Value, params: serde_json::Value) -> RpcResponse {
+        let source = match params.get("source").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing source"),
+        };
+        match self.pool.run_import(&source).await {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, codes::INVALID_PARAMS, e),
+        }
+    }
+
+    /// `config.setProvider` params:
+    /// ```json
+    /// {
+    ///   "provider_id": "deepseek",
+    ///   "config": { "api_type": "openai_compatible", "base_url": "...", "api_key": "...", "default_model": "..." },
+    ///   "default_provider": "deepseek",       // optional
+    ///   "task_models": { "subagent": "deepseek" }, // optional, merged
+    ///   "delete": false                        // optional, default false
+    /// }
+    /// ```
+    /// `config`/`task_models` are partial patches (see `SessionPool::set_provider`
+    /// doc comment for why they're raw JSON, not typed structs). Writes to the
+    /// project-tier `settings.json` and returns the reloaded effective config
+    /// plus routing validation.
+    async fn method_config_set_provider(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing provider_id"),
+        };
+        let delete = params.get("delete").and_then(|v| v.as_bool()).unwrap_or(false);
+        let config_patch = params.get("config").cloned();
+        let default_provider = params
+            .get("default_provider")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let task_models_patch = params.get("task_models").cloned();
+
+        match self
+            .pool
+            .set_provider(&provider_id, delete, config_patch, default_provider, task_models_patch)
+            .await
+        {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, codes::INVALID_PARAMS, e),
         }
     }
 

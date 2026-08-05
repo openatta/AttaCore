@@ -248,7 +248,11 @@ impl Agent {
         // is `<project_root>/.atta` — see `PathSettings::project_root` docs).
         let cwd = self.settings.paths.project_root();
         let scope = self.settings.paths.scope.clone();
-        let user_skills_dir = self.settings.paths.user_data_dir.join("skills");
+        // Skills: global default (flat, cross-scene) + scene-specific override
+        // (same name wins — `SkillManager::load_dir` overwrites by name, so
+        // loading global first then scene lets the scene tier win).
+        let global_skills_dir = self.settings.paths.global_data_dir.join("skills");
+        let scene_skills_dir = self.settings.paths.user_data_dir.join("skills");
         // Project-level skills live in `.agents/skills/` (sibling of `.atta/`,
         // not inside it) — the external fact standard Codex also scans.
         let local_skills_dir = cwd.join(".agents").join("skills");
@@ -260,9 +264,10 @@ impl Agent {
             base::frozen::FrozenContext::collect(cwd.clone(), &scope),
             // 2. Re-scan skills directories for newly added skills.
             async move {
-                let count1 = skills.load_dir(&user_skills_dir, skills::manager::SkillSource::User);
+                let count0 = skills.load_dir(&global_skills_dir, skills::manager::SkillSource::User);
+                let count1 = skills.load_dir(&scene_skills_dir, skills::manager::SkillSource::User);
                 let count2 = skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
-                (count1.ok(), count2.ok())
+                (count0.ok(), count1.ok(), count2.ok())
             },
             // 3. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
             async move {
@@ -541,6 +546,10 @@ pub struct Builder {
     memory_store: Option<Arc<MemoryStore>>,
     compactor: Option<Arc<dyn Compactor>>,
     hooks: Option<Arc<HookRunner>>,
+    /// Backing store for session transcript persistence (JSONL append/resume).
+    /// `None` = in-memory only, matching prior behavior — this is purely
+    /// additive, existing callers that don't set it are unaffected.
+    history_store: Option<Arc<dyn history::store::HistoryStore>>,
     mcp_servers: Option<Vec<String>>,
     mcp_manager_override: Option<McpManager>,
     telemetry_url: Option<String>,
@@ -553,6 +562,73 @@ pub struct Builder {
     /// `FrozenContext::collect()`. Essential for deterministic VCR replay.
     frozen: Option<base::frozen::FrozenContext>,
     wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    /// Plugins available to this session (built-ins + installed, discovered
+    /// once per daemon instance — see `plugin::discover_plugins`). `None`
+    /// (the default) means no plugins are wired in, matching prior
+    /// behavior for non-daemon callers (tests, single-process CLI mode).
+    plugins: Option<Arc<Vec<plugin::manifest::Plugin>>>,
+    /// Pre-built command registry shared across many sessions instead of
+    /// re-scanning skill dirs per session — see `Builder::commands_override`.
+    commands_override: Option<Arc<crate::commands::CommandRegistry>>,
+}
+
+/// Build a `HookRunner` from `settings.hooks_config` (raw JSON from
+/// settings.json's `hooks` section) when the caller didn't inject one
+/// explicitly via `Builder::hooks(...)`.
+///
+/// A malformed value degrades to no hooks + a `tracing::warn!` rather than
+/// failing the build — same soft-degrade philosophy as the rest of
+/// settings.json. Also wires the `.atta/hooks/` three-tier search path
+/// (project > scene > global) so `Command` hooks can reference a bare
+/// script name — see `hooks::HookRunner::with_hooks_search_dirs` docs.
+///
+/// `model`/`agent_tool` back the `"type": "prompt"` / `"type": "agent"`
+/// hook executors (`crate::hook_executors`) — previously neither was ever
+/// injected anywhere in the app, so those two hook types always fell
+/// through to `HookOutcome::Skipped` with "no executor configured".
+fn build_hook_runner(
+    settings: &Settings,
+    model: Arc<dyn Model>,
+    agent_tool: Arc<crate::agent_tool::AgentTool>,
+    plugins: &[plugin::manifest::Plugin],
+) -> Arc<HookRunner> {
+    let parsed: hooks::HooksSettings = match &settings.hooks_config {
+        Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "settings.json `hooks` section failed to parse, ignoring");
+            Default::default()
+        }),
+        None => Default::default(),
+    };
+    let hooks_search_dirs = vec![
+        settings.paths.project_root().join(".atta").join("hooks"),
+        settings.paths.user_data_dir.join("hooks"),
+        settings.paths.global_data_dir.join("hooks"),
+    ];
+    let prompt_executor = Arc::new(crate::hook_executors::ModelPromptHookExecutor::new(
+        model,
+        settings.model.model_name.clone(),
+        settings.model.max_tokens,
+    ));
+    let agent_spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner> =
+        Arc::new(crate::agent_spawner_impl::RuntimeAgentSpawner::new(agent_tool));
+    let agent_executor = Arc::new(crate::hook_executors::AgentSpawnerHookExecutor::new(
+        agent_spawner,
+        settings.paths.project_root(),
+    ));
+    let mut runner = HookRunner::new(parsed)
+        .with_hooks_search_dirs(hooks_search_dirs)
+        .with_prompt_executor(prompt_executor)
+        .with_agent_executor(agent_executor);
+    for plugin in plugins {
+        if let Err(e) = plugin.install_hooks(&mut runner, &plugin.root) {
+            tracing::warn!(
+                plugin = %plugin.manifest.plugin.name,
+                error = %e,
+                "failed to install plugin hooks, skipping"
+            );
+        }
+    }
+    Arc::new(runner)
 }
 
 impl Builder {
@@ -566,6 +642,7 @@ impl Builder {
             memory_store: None,
             compactor: None,
             hooks: None,
+            history_store: None,
             mcp_servers: None,
             mcp_manager_override: None,
             telemetry_url: None,
@@ -575,6 +652,8 @@ impl Builder {
             skip_warmup: false,
             frozen: None,
             wake_rx: None,
+            plugins: None,
+            commands_override: None,
         }
     }
 
@@ -610,6 +689,14 @@ impl Builder {
         self.hooks = Some(h);
         self
     }
+    /// Inject a backing store for session transcript persistence. When set,
+    /// the session's messages are incrementally appended to disk once per
+    /// turn (see `session::session::SessionManager::persist`); `None` (the
+    /// default) keeps sessions purely in-memory.
+    pub fn history_store(mut self, store: Arc<dyn history::store::HistoryStore>) -> Self {
+        self.history_store = Some(store);
+        self
+    }
     /// P2: Inject a wake channel receiver for async rewake support.
     /// When background work completes, something sends `()` on the
     /// associated sender; the hooks runner picks up the signal and
@@ -636,7 +723,12 @@ impl Builder {
         self.telemetry_handle_override = Some(h);
         self
     }
-    /// Inject a pre-built MCP manager with live connections.
+    /// Inject a pre-built MCP manager with live connections. To share one
+    /// centrally-connected set of MCP servers across many sessions without
+    /// reconnecting per session, build this from the shared connection's
+    /// `McpClientHandle`s via `McpManager::from_clients(...)` +
+    /// `refresh_tools()` (see `daemon::SessionPool::create()`), rather than
+    /// re-running `McpManager::connect_all(...)` for every session.
     pub fn mcp_manager(mut self, m: McpManager) -> Self {
         self.mcp_servers = None;
         self.mcp_manager_override = Some(m);
@@ -657,6 +749,27 @@ impl Builder {
     /// Disable startup warmup (for tests).
     pub fn skip_warmup(mut self, val: bool) -> Self {
         self.skip_warmup = val;
+        self
+    }
+
+    /// Inject the daemon-discovered plugin list (see
+    /// `plugin::discover_plugins`) so this session's hooks and agent types
+    /// include plugin-declared ones. Defaults to none — non-daemon callers
+    /// (tests, single-process CLI mode) are unaffected. Plugin-contributed
+    /// slash commands are *not* installed from this list — see
+    /// `commands_override` — since daemon builds one shared command
+    /// registry up front instead of per session.
+    pub fn plugins(mut self, p: Arc<Vec<plugin::manifest::Plugin>>) -> Self {
+        self.plugins = Some(p);
+        self
+    }
+
+    /// Inject a pre-built command registry (built once, shared across many
+    /// sessions — see `daemon::SessionPool`) instead of scanning skill dirs
+    /// fresh for every session. Falls back to the existing per-session
+    /// `CommandRegistry::from_skill_manager` scan when not set.
+    pub fn commands_override(mut self, c: Arc<crate::commands::CommandRegistry>) -> Self {
+        self.commands_override = Some(c);
         self
     }
 
@@ -708,18 +821,80 @@ impl Builder {
         });
         let memory_store = self.memory_store.unwrap_or_else(|| {
             let p = &settings.paths;
+            // memory 不分 scene，只分全局/项目——见 base::paths 模块文档。
             Arc::new(MemoryStore::new(
-                p.user_data_dir.join("memory"),
+                p.global_data_dir.join("memory"),
                 p.local_data_dir.join("memory"),
             ))
         });
-        // Session: create in-memory manager. Persistence is handled externally
-        // via history::HistoryStore injected by CLI.
-        let session = SessionManager::in_memory(self.session_id);
+        // Session: `self.history_store` (set via `Builder::history_store(...)`)
+        // makes this incrementally persisted to disk once per turn; `None`
+        // (the default) keeps it in-memory only, matching prior behavior.
+        let session = SessionManager::new(self.history_store.clone(), self.session_id, None);
         let compactor = self
             .compactor
             .unwrap_or_else(|| Arc::new(DefaultCompactor) as Arc<dyn Compactor>);
-        let hooks = self.hooks.unwrap_or_else(|| Arc::new(HookRunner::noop()));
+        // Plugins wired into this session — see `Builder::plugins` doc
+        // comment. Cheap `Arc` clone; empty by default for non-daemon
+        // callers.
+        let plugins: Arc<Vec<plugin::manifest::Plugin>> = self.plugins.clone().unwrap_or_default();
+        // Plugin-declared agent types, converted to the runtime's
+        // `AgentTypeDefinition` (reads each plugin's `system_prompt_path`
+        // relative to its own root — see `agent_tool::agent_def_to_type`).
+        // A plugin whose prompt file can't be read (e.g. a built-in
+        // plugin's synthetic `(builtin:...)` root) is skipped with a
+        // warning rather than failing the whole build.
+        let plugin_agent_types: Vec<crate::agent_tool::AgentTypeDefinition> = plugins
+            .iter()
+            .flat_map(|p| {
+                p.manifest
+                    .agents
+                    .iter()
+                    .filter_map(move |def| crate::agent_tool::agent_def_to_type(def, &p.root))
+            })
+            .collect();
+        // AgentTool ("Agent") — lets the model spawn sub-agents. Previously
+        // had zero production construction sites despite the CodingScene
+        // system prompt instructing the model to use it (see
+        // `render_session_guidance`'s `has_agent` check). Catalog is built
+        // from the 6 built-in types + any custom `.atta/agents/*.md`
+        // definitions, project > scene > global (same override order as
+        // skills). `EngineConfig` isn't threaded through `Builder` today, so
+        // this derives a minimal one from `settings.model` — just enough for
+        // `AgentTool::sub_settings()`'s needs (model name/max_tokens/fallback).
+        // Constructed here (before `hooks`, not at its registration point
+        // further down) so its `AgentSpawner` wrapper can be handed to the
+        // "agent"-type hook executor below — `tools.register(...)` for it
+        // happens later, but `InMemoryToolRegistry` is a shared `Arc`, so
+        // construction order doesn't affect which tools end up visible to
+        // sub-agents (`resolve_tools()` reads the registry at call time).
+        let agent_tool_arc = {
+            let agent_engine_config = Arc::new({
+                let mut c = base::context::EngineConfig::defaults_for(settings.model.model_name.clone());
+                c.max_tokens = settings.model.max_tokens;
+                c.fallback_model = settings.model.fallback_model.clone();
+                c
+            });
+            let project_agents_dir = settings.paths.project_root().join(".atta").join("agents");
+            let scene_agents_dir = settings.paths.user_data_dir.join("agents");
+            let global_agents_dir = settings.paths.global_data_dir.join("agents");
+            let agent_dirs: [&std::path::Path; 3] =
+                [&global_agents_dir, &scene_agents_dir, &project_agents_dir];
+            Arc::new(
+                crate::agent_tool::AgentTool::with_parent_tools(
+                    model.clone(),
+                    agent_engine_config,
+                    tools.clone(),
+                    tools.clone(),
+                    &agent_dirs,
+                    &plugin_agent_types,
+                )
+                .with_settings(settings.clone()),
+            )
+        };
+        let hooks = self.hooks.unwrap_or_else(|| {
+            build_hook_runner(&settings, model.clone(), agent_tool_arc.clone(), &plugins)
+        });
         // P2: Wire the wake receiver into hooks for async rewake support.
         if let Some(rx) = self.wake_rx {
             hooks.set_wake_receiver(rx);
@@ -733,12 +908,17 @@ impl Builder {
             });
         // MCP: use pre-built manager if injected, else empty (no servers).
         let mcp = self.mcp_manager_override.unwrap_or_else(McpManager::empty);
-        // Skill auto-loading: scan ~/.atta/<scope>/skills/ (user) and
-        // project/.agents/skills/ (project — external fact standard, also
-        // scanned by Codex).
+        // Skill auto-loading: scan ~/.atta/skills/ (global default), then
+        // ~/.atta/scenes/<scope>/skills/ (scene override — same name wins,
+        // `load_dir` overwrites by name), then project/.agents/skills/
+        // (project — external fact standard, also scanned by Codex).
         let skill_mgr = skills::manager::SkillManager::new();
         let project_skills_dir = settings.paths.project_root().join(".agents").join("skills");
         let skill_load_results = [
+            skill_mgr.load_dir(
+                &settings.paths.global_data_dir.join("skills"),
+                skills::manager::SkillSource::User,
+            ),
             skill_mgr.load_dir(
                 &settings.paths.user_data_dir.join("skills"),
                 skills::manager::SkillSource::User,
@@ -755,10 +935,16 @@ impl Builder {
         tracing::info!(loaded_count, total_skills, "skills loaded (incl. bundled)");
 
         // Build command registry from skill manager + built-in local commands
+        // — unless the caller already built one to share across many
+        // sessions (see `Builder::commands_override`), which also carries
+        // any plugin-contributed slash commands (daemon builds that catalog
+        // once at startup, not per session).
         let skill_mgr_arc = std::sync::Arc::new(skill_mgr);
-        let command_registry = std::sync::Arc::new(
-            crate::commands::CommandRegistry::from_skill_manager(&skill_mgr_arc)
-        );
+        let command_registry = self.commands_override.clone().unwrap_or_else(|| {
+            std::sync::Arc::new(
+                crate::commands::CommandRegistry::from_skill_manager(&skill_mgr_arc)
+            )
+        });
         // Register SkillTool using the populated skill manager
         tools::register_skill_tool(&tools, Arc::clone(&skill_mgr_arc), scene.default_skills());
         // Register TaskStopTool — stop running background tasks by ID
@@ -769,6 +955,11 @@ impl Builder {
         // config import from Claude Code/Codex/Cursor). See
         // docs/design/2026-08-03-agents-config-migration.md §3.8.
         tools.register(std::sync::Arc::new(tools::import_tool::ImportTool));
+        // Register AgentTool ("Agent") into the tool registry the model calls
+        // (`agent_tool_arc` itself was constructed earlier, before `hooks`,
+        // so its `AgentSpawner` wrapper could be handed to the "agent"-type
+        // hook executor — see the `hooks` construction above).
+        tools.register(agent_tool_arc);
         // Register MCP resource tools if clients are available
         if !mcp.clients().is_empty() {
             tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(mcp.clients().to_vec())));
@@ -845,7 +1036,6 @@ impl Default for Builder {
 mod tests {
     use super::*;
 
-    #[allow(dead_code)]
     fn test_settings() -> base::interface::settings::Settings {
         use base::interface::settings::*;
         Settings {
@@ -857,6 +1047,7 @@ mod tests {
             },
             paths: PathSettings {
                 user_data_dir: "/tmp".into(),
+                global_data_dir: "/tmp".into(),
                 local_data_dir: "/tmp".into(),
                 scope: "code".into(),
             },
@@ -868,7 +1059,10 @@ mod tests {
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,
-            mcp_servers: Vec::new(),
+            mcp_servers: Default::default(),
+            providers: Default::default(),
+            default_provider: None,
+            task_models: Default::default(),
             language: None,
             feature_flags: Default::default(),
         }
@@ -878,6 +1072,91 @@ mod tests {
     fn builder_requires_scene() {
         assert!(Builder::new().build().is_err());
     }
+
+    struct DummyModel;
+    #[async_trait::async_trait]
+    impl Model for DummyModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    fn dummy_agent_tool() -> Arc<crate::agent_tool::AgentTool> {
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let config = Arc::new(base::context::EngineConfig::defaults_for("test-model"));
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        Arc::new(crate::agent_tool::AgentTool::new(model, config, tools))
+    }
+
+    #[test]
+    fn build_hook_runner_defaults_to_empty_without_hooks_config() {
+        let settings = test_settings();
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[]);
+        assert!(runner.is_empty());
+    }
+
+    #[test]
+    fn build_hook_runner_parses_hooks_config_into_real_hooks() {
+        let mut settings = test_settings();
+        settings.hooks_config = Some(serde_json::json!({
+            "PreToolUse": [
+                { "type": "command", "command": "echo hi" }
+            ]
+        }));
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[]);
+        assert!(!runner.is_empty());
+        assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
+    }
+
+    #[test]
+    fn build_hook_runner_degrades_to_empty_on_malformed_hooks_config() {
+        let mut settings = test_settings();
+        // Wrong shape: hooks value must be a map of event -> Vec<HookConfig>.
+        settings.hooks_config = Some(serde_json::json!("not-a-hooks-map"));
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[]);
+        assert!(runner.is_empty());
+    }
+
+    #[test]
+    fn build_hook_runner_installs_plugin_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+[plugin]
+name = "test-hook-plugin"
+version = "1.0.0"
+
+[hooks]
+pre_tool_use = "hooks/pre.sh"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
+        std::fs::write(dir.path().join("hooks/pre.sh"), "echo plugin-hook").unwrap();
+        let plugin = plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml"))
+            .unwrap();
+
+        let settings = test_settings();
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[plugin]);
+        assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
+    }
+
 
     #[test]
     fn channel_types_construct() {

@@ -2,9 +2,15 @@
 //!
 //! TS parity: claude-code's versioned plugin cache at `~/.claude/plugins/cache/`.
 //!
-//! Layout:
+//! Plugins have both a global tier (`~/.atta/plugins/cache/`, shared by every
+//! scene) and a scene-specific tier (`~/.atta/scenes/<scope>/plugins/cache/`)
+//! — see `base::paths::ConfigPaths::{global_plugins_dir, user_plugins_dir}`.
+//! This type itself is root-agnostic (caller resolves which tier's root to
+//! pass in).
+//!
+//! Layout (either tier):
 //! ```text
-//! ~/.atta/<scope>/plugins/cache/
+//! .../plugins/cache/
 //! ├── {name}/
 //! │   ├── {version}/
 //! │   │   ├── plugin.toml
@@ -23,8 +29,9 @@ pub struct PluginCache {
 }
 
 impl PluginCache {
-    /// Create a cache rooted at `~/.atta/<scope>/plugins/cache/` (caller
-    /// resolves `root`; this type doesn't construct the path itself).
+    /// Create a cache rooted at either the global or scene-specific plugins
+    /// tier (caller resolves `root`; this type doesn't construct the path
+    /// itself — see module docs).
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }

@@ -215,15 +215,22 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
     ));
     if let Some(home) = std::env::var_os("HOME") {
         let home_str = std::path::Path::new(&home).display().to_string();
-        // User-level settings.json lives at `~/.atta/<scene>/settings.json`,
-        // where `<scene>` is one of the small, closed set of scenes this
-        // engine registers (see `daemon::resolve_scene` / `KNOWN_SCENES`
-        // below) — not an arbitrary string, so we can just enumerate all of
-        // them rather than needing to know which one the current session
-        // actually uses.
+        // Cross-scene global settings.json — flat, single file (2026-08-04
+        // personal-`.atta`-flattening round, see
+        // `docs/design/2026-08-03-agents-config-migration.md` §10).
+        s.push_str(&format!(
+            "(deny file-write* (literal \"{}/.atta/settings.json\"))\n",
+            sandbox_escape(&home_str)
+        ));
+        // Scene-specific settings.json lives at
+        // `~/.atta/scenes/<scene>/settings.json`, where `<scene>` is one of
+        // the small, closed set of scenes this engine registers (see
+        // `daemon::resolve_scene` / `KNOWN_SCENES` below) — not an arbitrary
+        // string, so we can just enumerate all of them rather than needing
+        // to know which one the current session actually uses.
         for scene in KNOWN_SCENES {
             s.push_str(&format!(
-                "(deny file-write* (literal \"{}/.atta/{}/settings.json\"))\n",
+                "(deny file-write* (literal \"{}/.atta/scenes/{}/settings.json\"))\n",
                 sandbox_escape(&home_str),
                 scene
             ));
@@ -289,6 +296,41 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
         let s = p.display().to_string();
         args.push(s.clone());
         args.push(s);
+    }
+
+    // **Hardening **: re-deny writes to settings.json even though it sits
+    // inside `cwd`'s read-write bind — same rationale/paths as
+    // `build_macos_profile`'s deny-write rules (stops a sandboxed Bash
+    // command from overwriting its own permission rules, or injecting a
+    // malicious multi-provider LLM config with an attacker-controlled
+    // `base_url`/`api_key`). bwrap applies binds in argument order, so a
+    // `--ro-bind-try` here remounts just this one path read-only on top of
+    // the read-write `cwd` bind above — `--ro-bind-try` is a no-op (not an
+    // error) when the source doesn't exist yet.
+    let cwd_str = opts.cwd.display().to_string();
+    for name in ["settings.json", "settings.local.json"] {
+        let p = format!("{cwd_str}/.atta/{name}");
+        args.push("--ro-bind-try".into());
+        args.push(p.clone());
+        args.push(p);
+    }
+    // Global/scene settings.json normally already sit outside any writable
+    // bind (the read-only `/` bind above covers all of `$HOME` unless `cwd`
+    // or an `additional_writable` entry happens to overlap it) — these are
+    // defense-in-depth for that overlap case, mirroring the macOS profile's
+    // unconditional deny rules for the same paths.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_str = std::path::Path::new(&home).display().to_string();
+        let global_settings = format!("{home_str}/.atta/settings.json");
+        args.push("--ro-bind-try".into());
+        args.push(global_settings.clone());
+        args.push(global_settings);
+        for scene in KNOWN_SCENES {
+            let p = format!("{home_str}/.atta/scenes/{scene}/settings.json");
+            args.push("--ro-bind-try".into());
+            args.push(p.clone());
+            args.push(p);
+        }
     }
 
     // **Hardening **: deny-read via tmpfs over the path. Each entry gets
@@ -453,6 +495,44 @@ mod tests {
                 assert_eq!(cmd.args, vec!["-c", "ls"]);
             }
             other => panic!("unexpected mode on linux: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wrap_re_denies_writes_to_project_settings_json() {
+        let cmd = wrap(opts("ls", Path::new("/tmp/work")));
+        if cmd.mode != SandboxMode::LinuxBwrap {
+            return; // bwrap not installed in this environment — nothing to assert
+        }
+        let needle = "/tmp/work/.atta/settings.json".to_string();
+        let pos = cmd
+            .args
+            .iter()
+            .position(|a| a == &needle)
+            .expect("expected a --ro-bind-try re-mount for the project settings.json");
+        assert_eq!(cmd.args[pos - 1], "--ro-bind-try");
+        // Source == dest for a self-remount, and settings.local.json gets the same treatment.
+        assert_eq!(cmd.args[pos + 1], needle);
+        assert!(cmd.args.iter().any(|a| a == "/tmp/work/.atta/settings.local.json"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wrap_re_denies_writes_to_global_and_scene_settings_json() {
+        let cmd = wrap(opts("ls", Path::new("/tmp/work")));
+        if cmd.mode != SandboxMode::LinuxBwrap {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let home_str = std::path::Path::new(&home).display().to_string();
+        assert!(cmd.args.iter().any(|a| a == &format!("{home_str}/.atta/settings.json")));
+        for scene in KNOWN_SCENES {
+            let needle = format!("{home_str}/.atta/scenes/{scene}/settings.json");
+            assert!(
+                cmd.args.iter().any(|a| a == &needle),
+                "expected a --ro-bind-try re-mount for scene `{scene}`'s settings.json"
+            );
         }
     }
 
@@ -667,12 +747,33 @@ mod tests {
         let profile = &cmd.args[1];
         assert!(!KNOWN_SCENES.is_empty(), "sanity: scene list must not be empty");
         for scene in KNOWN_SCENES {
-            let needle = format!(".atta/{scene}/settings.json\"))");
+            let needle = format!(".atta/scenes/{scene}/settings.json\"))");
             assert!(
                 profile.contains(&needle),
                 "expected a deny-write rule for scene `{scene}`'s settings.json, profile:\n{profile}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_profile_protects_global_settings_json() {
+        let o = SandboxOptions {
+            command: "ls",
+            cwd: Path::new("/tmp/work"),
+            additional_writable: &[],
+            disable: false,
+            policy: SandboxPolicy::default(),
+        };
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let home_str = std::path::Path::new(&home).display().to_string();
+        let needle = format!("(deny file-write* (literal \"{home_str}/.atta/settings.json\"))");
+        assert!(
+            profile.contains(&needle),
+            "expected a deny-write rule for the cross-scene global settings.json, profile:\n{profile}"
+        );
     }
 
     #[cfg(target_os = "macos")]

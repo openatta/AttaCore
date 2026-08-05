@@ -1,9 +1,10 @@
 //! 内置 skills —— 15 个常用 prompt 模板。
 //!
 //! 不写盘、不需要用户设置；每 session 自动注入到 skill 列表。用户在
-//! `~/.atta/<scope>/skills/<name>/SKILL.md`（用户级）或 `<cwd>/.agents/skills/<name>/SKILL.md`
-//! （项目级）创建同名 skill 即覆盖（disk 优先，因为 collect_skills 把 disk 后入但 dedup
-//! 不存在；同名时 `/<name>` slash 命中第一个 —— 即用户的）。
+//! `~/.atta/skills/<name>/SKILL.md`（全局默认）、`~/.atta/scenes/<scene>/skills/<name>/SKILL.md`
+//! （scene 覆盖）或 `<cwd>/.agents/skills/<name>/SKILL.md`（项目级）创建同名 skill 即覆盖
+//! （disk 优先，因为 collect_skills 把 disk 后入但 dedup 不存在；同名时 `/<name>` slash 命中
+//! 第一个 —— 即用户的）。
 //!
 //! # 技能列表
 //!
@@ -100,7 +101,7 @@ pub fn bundled_skills() -> Vec<SkillEntry> {
         },
         SkillEntry {
             name: "remember".into(),
-            description: "Save a fact / preference / decision to cross-session memory (~/.atta/<scope>/memory).".into(),
+            description: "Save a fact / preference / decision to cross-session memory (~/.atta/memory).".into(),
             when_to_use: Some(
                 "When the user explicitly asks to remember something, or you learn a stable preference."
                     .into(),
@@ -445,7 +446,7 @@ Persist a fact / decision / preference to the per-project memory directory so fu
 
 ## Where things go
 
-The memory dir is `~/.atta/<scope>/memory/<sha256(canonical_cwd)[..16]>/` — already created and surfaced via the `# memory (cross-session)` system prompt block.
+The memory dir is `~/.atta/memory/<sha256(canonical_cwd)[..16]>/` (global, not scene-scoped) — already created and surfaced via the `# memory (cross-session)` system prompt block.
 
 - **`MEMORY.md`** — one-line index. Each entry like:
   `- [Title](file.md) — short hook (under ~150 chars)`
@@ -505,16 +506,17 @@ Body sections — keep terse:
 
 const UPDATE_CONFIG: &str = r#"# UpdateConfig: Edit settings.json safely
 
-Make a precise change to `~/.atta/<scope>/settings.json` (or `<cwd>/.atta/settings.json` / `.atta/settings.local.json`) without nuking adjacent fields.
+Make a precise change to one of the settings.json layers without nuking adjacent fields.
 
 ## Pre-flight
 
 1. Read the target file first. If absent, create with `{}` and proceed.
-2. Identify which layer to change:
-   - User-level (apply broadly): `~/.atta/<scope>/settings.json`
+2. Identify which layer to change (low → high priority, higher wins):
+   - Global (applies to every scene): `~/.atta/settings.json`
+   - Scene-specific override: `~/.atta/scenes/<scene>/settings.json`
    - Project (committed): `<cwd>/.atta/settings.json`
    - Local override (gitignored): `<cwd>/.atta/settings.local.json`
-3. Preserve `$schema` and any unknown fields verbatim — Claude Code writes fields we don't model.
+3. Preserve `$schema` and any unknown fields verbatim — other tools may write fields we don't model.
 
 ## Common edits
 

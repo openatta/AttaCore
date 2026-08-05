@@ -51,7 +51,7 @@ user_data_dir  = $HOME/.atta/code/     (可用 ATTA_DATA_DIR 覆盖)
 local_data_dir = <cwd>/.atta/code/     (可用 ATTA_LOCAL_DATA_DIR 覆盖)
 ```
 
-下辖：`skills/`、`memory/`、`mcp/`、`sessions/`、`vcr/`、`settings.json`；另有 `crates/plugin/src/cache.rs` 里的 `~/.atta/code/plugins/`。这是 AttaCore **运行时私有状态**的统一根，settings 分层顺序（内置默认 < 用户级 < 项目级 < CLI 参数）不变。
+下辖：`skills/`、`memory/`、`mcp/`、`sessions/`、`vcr/`、`settings.json`；另有 `crates/plugin/src/cache.rs` 里的 `~/.atta/code/plugins/`。这是 AttaCore **运行时私有状态**的统一根，settings 分层顺序（内置默认 < 用户级 < 项目级 < CLI 参数）不变。**2026-08-04 更新**：用户级这一层进一步拆成"跨 scene 全局"和"scene 级"两层，见 §10。
 
 ### 1.5 现状小结
 
@@ -368,6 +368,41 @@ pub async fn maybe_detect_and_import(
 - `crates/runtime/src/agent_tool.rs` 里 `runtime::agent_tool::AgentTool`（区别于 `crates/tools::agent_tool::AgentTool`）的两处硬编码——生产代码里没有真实构造点。
 - ~~`crates/runtime/src/turn.rs` 里 `FrozenContext::collect` 拿到错误的 cwd~~ ——**第六轮已修复**，见 §9.3。
 
+---
+
+## 10. 第七轮：新增跨 scene 全局配置层（2026-08-04，已实施）
+
+### 10.1 背景
+
+原有用户级配置只有 scene 一层（`~/.atta/<scene>/settings.json`），不同 scene（`coding`/`chat`/`demo`）之间的配置完全独立，无法共享"不管哪个 scene 都通用"的设置。这次是在 `docs/design/2026-08-04-multi-provider-llm-migration.md` 的多供应商 LLM 配置工作中提出的关联需求（多供应商 API key 这类信息通常是跨 scene 通用的），但实现上是通用的配置分层能力，与多供应商本身正交，记在这里。
+
+### 10.2 决策
+
+新增一层**跨 scene 全局配置**，路径 `~/.atta/settings.json`（即 scene 目录的上一级），**优先级低于 scene 级**，即：
+
+```
+~/.atta/settings.json          （新增，全局，最低优先级）
+    ↓ 被下面覆盖
+~/.atta/<scene>/settings.json  （scene 级，不变）
+    ↓ 被下面覆盖
+<repo>/.atta/settings.json     （项目级，不变，最高优先级）
+```
+
+### 10.3 实施位置的勘误
+
+**这一层不是加在 `crates/core::paths::ConfigPaths` / `crates/core::interface::settings::Settings::load()` 里**——起初以为后者是"现有的分层合并机制"，实现过程中核对代码才发现 `Settings::load()` 全仓库零调用点，是死代码（daemon 实际用结构体字面量直接构造 `Settings`，见 `daemon/src/main.rs:203`）。真正生效的分层合并逻辑是 `daemon/src/config.rs::load_daemon_config()` + `SettingsFile`/`merge_settings()`，本次改动落在这里。详见 `docs/design/2026-08-04-multi-provider-llm-migration.md` §1.2、§2。
+
+### 10.4 实施摘要
+
+- `daemon/src/config.rs::DaemonPaths` trait 新增 `global_root()` 方法，默认实现取 `config_root()` 的文件系统 parent。
+- `DefaultDaemonPaths`（daemon 真实路径）直接吃默认实现；`StaticDaemonPaths`（测试用）改为显式 `Option<PathBuf>` 字段，不设置时等于 `config_root()`（避免测试用的 tempdir parent 意外读到宿主机真实文件）。
+- `load_daemon_config()` 合并顺序：`global_root()/settings.json` → `config_root()/settings.json` → `project_root/.atta/settings.json`。
+- 测试：`load_daemon_config_global_is_lowest_priority` 等 5 个新增用例，`cargo test -p daemon --lib` 全过。
+
+不影响本文档 §1-§9 记录的其余目录布局决定（`AGENTS.md`/`.agents/`/scope→scene 等）——这一轮只新增了一层配置文件优先级，没有新增/改动任何目录名。
+
+> **勘误（第二轮，见 §11）**：本节及 §10.1-10.3 里写的 `config_root()`/`user_data_dir` 物理路径（`$HOME/.atta/<scene>/`）已在同日第二轮改造中进一步下沉为 `$HOME/.atta/scenes/<scene>/`（`global_root()` 不再靠"取 config_root 的 parent"推导，因为现在要跳两层）。本节记录的"新增全局层、scene 覆盖它"这个**优先级关系**依然成立，只是 scene 层的物理落点变了——最新准确路径以 §11 和 `docs/CONFIG_LAYOUT.md` 为准。
+
 ### 8.8 导入功能（Phase 3+4）实施结果 [2026-08-03 第五轮]
 
 按 §3.0 的四条决策落地，全部新增代码，未改动任何既有分发逻辑：
@@ -432,3 +467,42 @@ pub async fn maybe_detect_and_import(
 ### 9.7 验证
 
 `cargo build --workspace` + `cargo test --workspace --no-fail-fast` 全绿（除了两组确认与本次改动无关的既有环境问题：`team::remote_agent` 17 个 + `tools::web_fetch`/`ping` 3 个，均为本地网络请求在这台机器的沙盒环境下返回异常响应，`git diff` 确认这些文件本轮未改动，失败数量与改动前完全一致）。
+
+---
+
+## 11. 第二轮：用户级 `.atta/` 扁平化 + `scenes/` 子目录（2026-08-04，已实施）
+
+> 编号说明：本节在文件里追加于末尾，但决策时间线上紧接 §10（同日、同一多供应商 LLM 配置工作的延伸需求）——§10 先加了一层全局配置，本节把这个思路从"只有 settings.json"扩展到"整个用户级目录树"。稳定参考版本（含完整目录树示例）在 `docs/CONFIG_LAYOUT.md` §11，本节只记决策与实施摘要。
+
+### 11.1 决策
+
+用户提出：个人配置目录 `~/.atta/` 应该和项目级 `.atta/` 同构——**扁平**，只多一个 `scenes/` 子目录承载"确实需要按 scene 特化"的部分；项目级和用户级的差异应该只剩两条：项目没有 `skills/`（转去 `.agents/`）、没有 `scenes/`。具体拍板：
+
+1. **`workflows/` 直接删除**，这个功能从未有 loader，不再是待办，是砍掉。
+2. **`sessions/`/`vcr/` 不分 scene**，只分"项目"与"全局"（全局是给以后没有具体项目的场景用的，比如桌面端）。
+3. **`memory/` 同 2**，不分 scene，只分项目/全局。
+4. **`plugins/` 保留 scene 覆盖**（"有全局与 scene 的"）——这是唯一一个从"现状本来就是纯 scene 级、没有全局"变成"新增全局层"的资源，不是简单地"去掉 scene 层"。
+5. `agents/`/`rules/`/`hooks/` 的 loader 推到下一次实现，本轮只调整路径形状。
+
+### 11.2 与 §10 的关系
+
+§10 只新增了 `settings.json` 一层全局配置，物理落点当时是 `~/.atta/settings.json`（全局）+ `~/.atta/<scene>/settings.json`（scene，直接挂在 `.atta/` 下一层）。本轮把 scene 层整体挪到 `~/.atta/scenes/<scene>/` 下（不再直接挂 `.atta/` 下一层），是因为 `.atta/` 顶层现在要腾出来放扁平的全局资源（`skills/`/`memory/`/... 都要挂在 `.atta/` 正下方，不能再跟 scene 目录同级混在一起）。`DaemonPaths::global_root()` 因此从"取 `config_root` 的 parent"改成显式存储——parent 已经不够用了（现在要跳两层）。
+
+### 11.3 实施摘要
+
+- `crates/core/src/paths.rs::ConfigPaths`：重构为 `user_data_dir`（scene 覆盖根 = `{global_data_dir}/scenes/<scope>/`）+ `global_data_dir`（扁平全局根）两个字段；新增 `global_*`/`local_*` 系列便捷方法（`skills`/`plugins`/`agents`/`rules`/`hooks`/`memory`/`sessions`/`vcr`/`mcp`/`settings_path`），删除 `user_workflows_dir()`；`atta_scope_dir(scope)` 改返回 `scenes/<scope>` 路径，新增 `atta_global_dir()`。
+- `crates/core/src/interface/settings.rs::PathSettings`：新增 `global_data_dir` 字段。
+- `daemon/src/config.rs::DefaultDaemonPaths`：`global_root`/`config_root`/`project_root` 三个字段独立存储；`ATTA_CONFIG_HOME` 现在覆盖的是全局根（此前覆盖的是 scene 根）。
+- 接线：
+  - `crates/runtime/src/agent.rs`（`Builder::build()` + `warmup()`）：skills 加载新增全局层扫描（`load_dir` 覆盖语义：后加载者同名覆盖先加载者，scene 层排在全局层之后加载）；`MemoryStore` 构造改用 `global_data_dir`。
+  - `crates/core/src/frozen/skill.rs::collect_skills()`：三层扫描（scene → 全局 → 项目），plugin skills 目录同样扫两层。
+  - `crates/core/src/frozen/memory.rs`：`collect_memory`/`collect_memdir_files`/`collect_memory_files_with` 去掉 `scope` 参数，路径改用 `atta_global_dir()`。
+  - `crates/mcp/src/config.rs`：`load_mcp_configs` 的"user scope"改用 `global_mcp_dir()`；`enterprise_policy_path` 改用 `global_data_dir` 直接拼接（不再靠"取 user_data_dir 的 parent"——那条路径现在要跳两层，parent 不够用）。
+  - `crates/tools/src/bash/sandbox.rs`：sandbox 写保护新增一条全局 `settings.json` 规则；`KNOWN_SCENES` 循环生成的规则路径加上 `scenes/` 段。
+  - `daemon/src/main.rs`：`MemoryStore` 构造改用 `global_data_dir`；`Settings.paths` 构造补 `global_data_dir` 字段。
+  - `crates/core/src/interface/prompt.rs`：memory 提示文案里的目录改用 `global_data_dir`。
+- **未做**：`agents/`/`rules/`/`hooks/` 仍然零调用点（只有路径方法，无 loader），本轮不新增任何加载逻辑，纯路径形状调整。`crates/team/src/team_memory.rs` 引用的 `atta_scope_dir()` 未做语义确认——该文件未被 `crates/team/src/lib.rs` 声明为模块，不参与编译，本轮不受影响也不影响本轮。
+
+### 11.4 验证
+
+`cargo build --workspace`、`cargo clippy --workspace --lib --tests`、`cargo test --workspace --no-fail-fast` 均已跑过并全绿，唯一的失败集合与 §9.7 记录的一致（`team::remote_agent` HTTP 测试 + `tools::web_fetch`/`ping` 本地网络异常），均确认与本轮改动无关。新增/调整的测试覆盖：`crates/core/src/paths.rs`（scene 根嵌套关系、全局根独立）、`crates/core/src/frozen/skill.rs`（新增 `collect_skills_scene_overrides_global_default_by_name`）、`crates/core/src/frozen/memory.rs`（路径断言更新）、`crates/mcp/src/config.rs`（`enterprise_policy_path` 断言更新）、`crates/tools/src/bash/sandbox.rs`（新增全局 settings.json 保护断言，scene 断言路径更新）、`daemon/src/config.rs`（`global_root`/`config_root` 嵌套关系断言更新）。
