@@ -978,6 +978,20 @@ impl Builder {
             tools.register(std::sync::Arc::new(mcp::tools::DispatchMcpTool::new(
                 mcp.clients().to_vec(),
             )));
+            // Register each individual MCP tool adapter (mcp__<server>__<tool>)
+            // so the model can actually call the names `build_tool_defs()`
+            // (turn.rs) already advertises to it — previously these were
+            // only ever advertised, never executable: `execute_tool_inner`
+            // looks up this same `tools` registry, which had no per-tool
+            // adapters in it, only the 3 generic ones above. A caveat this
+            // doesn't address: this is a build-time snapshot, so a tool that
+            // only appears via a later `refresh_tools()` call (e.g. a
+            // reconnect that surfaces a genuinely new tool, not just the
+            // same set again) won't be registered here — closing that gap
+            // needs dispatch-time fallback to `self.mcp`, a bigger change.
+            for adapter in mcp.tool_adapters() {
+                tools.register(adapter.clone());
+            }
         }
 
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1116,6 +1130,52 @@ mod tests {
         let config = Arc::new(base::context::EngineConfig::defaults_for("test-model"));
         let tools = Arc::new(InMemoryToolRegistry::new());
         Arc::new(crate::agent_tool::AgentTool::new(model, config, tools))
+    }
+
+    #[tokio::test]
+    async fn build_registers_mcp_tool_adapters_into_the_executable_tool_registry() {
+        // Regression test: `build_tool_defs()` (turn.rs) advertises every
+        // `mcp.tool_adapters()` entry to the model as a callable tool, but
+        // `Builder::build()` previously only registered the 3 generic
+        // List/Read/Dispatch MCP tools into `self.tools` — never the
+        // individual per-tool adapters. The model would see
+        // `mcp__test-server__do-thing` in its tool list and calling it would
+        // always fail with "Tool not found" (`turn.rs::execute_tool_inner`
+        // looks up `ctx.tools`, a clone of this same registry).
+        let settings = Arc::new(test_settings());
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+
+        let mock_client = Arc::new(mcp::client::MockMcpClient::new(
+            "test-server",
+            vec![mcp::client::McpToolMeta {
+                name: "do-thing".into(),
+                description: Some("does a thing".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        ));
+        let mut mcp_manager = McpManager::from_clients(vec![mock_client]);
+        mcp_manager.refresh_tools().await;
+        assert_eq!(
+            mcp_manager.tool_adapters().len(),
+            1,
+            "sanity check: mock client should have produced one adapter"
+        );
+
+        let (agent, _event_rx, _input_tx) = Builder::new()
+            .scene(scene)
+            .model(model)
+            .settings(settings)
+            .mcp_manager(mcp_manager)
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        assert!(
+            agent.tools.get("mcp__test-server__do-thing").is_some(),
+            "MCP tool adapter should be registered in the executable tool registry, found: {:?}",
+            agent.tools.names()
+        );
     }
 
     #[test]

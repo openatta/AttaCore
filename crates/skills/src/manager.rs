@@ -178,32 +178,37 @@ impl SkillManager {
             let mut current = if path.is_dir() {
                 path.clone()
             } else {
-                path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
             };
             // Walk up to filesystem root
             loop {
                 let candidate = current.join("skills");
                 if candidate.is_dir() && seen_dirs.insert(candidate.clone()) {
-                        if let Ok(entries) = std::fs::read_dir(&candidate) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_dir() {
-                                    let skill_md = p.join("SKILL.md");
-                                    if skill_md.is_file() {
-                                        let dir_name = p
-                                            .file_name()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let info =
-                                            Self::load_skill_at_path(&skill_md, &dir_name, SkillSource::Project);
-                                        if let Some(info) = info {
-                                            discovered.push(info);
-                                        }
+                    if let Ok(entries) = std::fs::read_dir(&candidate) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                let skill_md = p.join("SKILL.md");
+                                if skill_md.is_file() {
+                                    let dir_name = p
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let info = Self::load_skill_at_path(
+                                        &skill_md,
+                                        &dir_name,
+                                        SkillSource::Project,
+                                    );
+                                    if let Some(info) = info {
+                                        discovered.push(info);
                                     }
                                 }
                             }
                         }
+                    }
                 }
                 match current.parent() {
                     Some(parent) if parent != current => current = parent.to_path_buf(),
@@ -225,8 +230,23 @@ impl SkillManager {
     }
 
     /// Get the full content of a skill file (for prompt expansion at invocation time).
+    ///
+    /// Bundled and MCP-derived skills use sentinel `path` values —
+    /// `(bundled:name)` / `(mcp:server:tool)` — not real filesystem paths;
+    /// their bodies live in-memory instead (see `crate::bundled::bundled_body`
+    /// / `crate::mcp_builder::mcp_skill_body`). Mirrors the same special-
+    /// casing `runtime::commands::expand_skill_for_command` already does for
+    /// the slash-command path — this is the counterpart for the model-facing
+    /// `Skill` tool, which was previously always `None` for both cases.
     pub fn get_skill_content(&self, name: &str) -> Option<String> {
         let info = self.get(name)?;
+        let path_str = info.path.to_string_lossy();
+        if path_str.starts_with("(bundled:") {
+            return crate::bundled::bundled_body(name).map(|s| s.to_string());
+        }
+        if path_str.starts_with("(mcp:") {
+            return crate::mcp_builder::mcp_skill_body(name);
+        }
         std::fs::read_to_string(&info.path).ok()
     }
 
@@ -250,10 +270,7 @@ impl SkillManager {
     /// - `?`  matches any single character except `/`
     /// - Leading `/` anchors the pattern to the root of the path
     /// - Trailing `/` is ignored for file-path matching
-    pub fn activate_conditional_skills_for_paths(
-        &self,
-        file_paths: &[PathBuf],
-    ) -> Vec<SkillInfo> {
+    pub fn activate_conditional_skills_for_paths(&self, file_paths: &[PathBuf]) -> Vec<SkillInfo> {
         if file_paths.is_empty() {
             return Vec::new();
         }
@@ -262,7 +279,9 @@ impl SkillManager {
         let mut activated = Vec::new();
 
         'skill: for info in skills.values() {
-            let Some(patterns) = &info.paths else { continue };
+            let Some(patterns) = &info.paths else {
+                continue;
+            };
             if patterns.is_empty() {
                 continue;
             }
@@ -389,8 +408,7 @@ impl SkillManager {
         }
 
         // Determine skill name from path
-        let (name, _file_name) = if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md")
-        {
+        let (name, _file_name) = if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
             // Subdirectory format: skills/<name>/SKILL.md
             let name = path
                 .parent()
@@ -432,9 +450,8 @@ impl SkillManager {
 
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("Failed to read skill: {e}"))?;
-        let entry = parse_skill_file(&content, name.clone(), path, frozen_source).ok_or_else(
-            || format!("Failed to parse skill file: {}", path.display()),
-        )?;
+        let entry = parse_skill_file(&content, name.clone(), path, frozen_source)
+            .ok_or_else(|| format!("Failed to parse skill file: {}", path.display()))?;
 
         let mut skills = self.skills.write().unwrap();
         skills.insert(name, SkillInfo::from(entry));
@@ -452,6 +469,45 @@ impl Default for SkillManager {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn get_skill_content_resolves_bundled_sentinel_path() {
+        // Regression test: a bundled skill's `path` is a `(bundled:name)`
+        // sentinel, not a real filesystem path. `get_skill_content` used to
+        // blindly `fs::read_to_string` it, which always failed — meaning
+        // the model-facing Skill tool could never actually invoke any
+        // bundled skill (e.g. "simplify"), even though it's explicitly
+        // allowlisted as model-invocable.
+        let mgr = SkillManager::new();
+        for bundled in crate::bundled::bundled_skills() {
+            mgr.register_bundled(bundled);
+        }
+        let content = mgr.get_skill_content("simplify");
+        assert!(
+            content.is_some(),
+            "expected bundled skill content, got None"
+        );
+        let expected = crate::bundled::bundled_body("simplify").unwrap();
+        assert_eq!(content.unwrap(), expected);
+    }
+
+    #[test]
+    fn get_skill_content_resolves_mcp_sentinel_path() {
+        let tool = base::interface::model::ToolDef {
+            name: "search".into(),
+            description: "search things".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let entries =
+            crate::mcp_builder::build_skills_from_mcp("test-server-get-skill-content", &[tool]);
+        let mgr = SkillManager::new();
+        for entry in entries {
+            mgr.register_bundled(entry);
+        }
+        let content = mgr.get_skill_content("mcp__test-server-get-skill-content__search");
+        assert!(content.is_some(), "expected mcp skill content, got None");
+        assert!(content.unwrap().contains("search"));
+    }
 
     #[test]
     fn parse_skill_delegates_to_core_parser() {
@@ -527,7 +583,10 @@ mod tests {
             ..Default::default()
         };
         mgr.register_bundled(bundled);
-        assert_eq!(mgr.get("test-skill").unwrap().description, "bundled version");
+        assert_eq!(
+            mgr.get("test-skill").unwrap().description,
+            "bundled version"
+        );
 
         // Load a disk skill with the same name — should override
         let dir = tempfile::tempdir().unwrap();
@@ -581,23 +640,20 @@ mod tests {
         mgr.register_bundled(skill_empty_paths);
 
         // Matching .rs files
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/tmp/project/src/main.rs"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/tmp/project/src/main.rs")]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "rust-helper");
 
         // Matching Cargo.toml files
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/tmp/project/Cargo.toml"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/tmp/project/Cargo.toml")]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "rust-helper");
 
         // Non-matching paths
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/tmp/project/README.md"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/tmp/project/README.md")]);
         assert_eq!(result.len(), 0);
 
         // Empty file_paths returns empty
@@ -623,21 +679,19 @@ mod tests {
         // with literal_separator expects .claude as an immediate child of the
         // path root. Paths like /.claude/settings.json match because .claude
         // sits at the root of the path string.
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from(".claude/settings.json"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from(".claude/settings.json")]);
         assert_eq!(result.len(), 1);
 
         // No match: file not under .claude/
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/project/src/main.rs"),
-        ]);
+        let result =
+            mgr.activate_conditional_skills_for_paths(&[PathBuf::from("/project/src/main.rs")]);
         assert_eq!(result.len(), 0);
 
         // Deep path with .claude is not matched by /.claude/* anchoring
-        let result = mgr.activate_conditional_skills_for_paths(&[
-            PathBuf::from("/project/.claude/settings.json"),
-        ]);
+        let result = mgr.activate_conditional_skills_for_paths(&[PathBuf::from(
+            "/project/.claude/settings.json",
+        )]);
         assert_eq!(result.len(), 0);
     }
 

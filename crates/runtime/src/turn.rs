@@ -87,14 +87,12 @@ impl Agent {
                 // Parse directives like "+500k", "spend 2M tokens", "use 1B tokens"
                 // from the user message, set the budget on Agent state, and strip
                 // the directive before passing content to the turn loop.
-                let processed_content = if let Some(target) = parse_token_budget_directive(&content) {
+                let processed_content = if let Some(target) = parse_token_budget_directive(&content)
+                {
                     self.output_token_target = Some(target);
                     self.accumulated_output_tokens = 0;
                     self.token_budget_continuation_count = 0;
-                    tracing::info!(
-                        target,
-                        "Token budget directive parsed — set output target"
-                    );
+                    tracing::info!(target, "Token budget directive parsed — set output target");
                     strip_token_budget_directive(&content)
                 } else {
                     content
@@ -238,7 +236,9 @@ impl Agent {
             let store = self.memory_store.clone();
             let model = self.model.clone();
             let query = content.clone();
-            let already_surfaced: HashSet<String> = self.frozen.as_ref()
+            let already_surfaced: HashSet<String> = self
+                .frozen
+                .as_ref()
                 .map(|f| f.already_surfaced.clone())
                 .unwrap_or_default();
             let recent_tools = self.tools.names();
@@ -252,7 +252,8 @@ impl Agent {
                     &already_surfaced,
                     &recent_tools,
                     &model_name,
-                ).await
+                )
+                .await
             }))
         };
         let prefetch_started_at: std::time::Instant = std::time::Instant::now();
@@ -364,14 +365,18 @@ impl Agent {
                     let threshold = self.scene.token_budget().compact_threshold.max(50000);
                     let keep = self.scene.token_budget().compact_keep_recent.min(5);
                     let messages_before = self.session.messages.len();
-                    if let Ok((compacted, _result)) = self
-                        .compactor
-                        .compact(messages, threshold, keep)
-                        .await
+                    if let Ok((compacted, _result)) =
+                        self.compactor.compact(messages, threshold, keep).await
                     {
                         if compacted.len() < messages_before {
                             self.session.messages = compacted;
-                            let fb_ctx = build_prompt_context(&self.settings, &self.session, self.frozen.as_ref(), None, None);
+                            let fb_ctx = build_prompt_context(
+                                &self.settings,
+                                &self.session,
+                                self.frozen.as_ref(),
+                                None,
+                                None,
+                            );
                             let fb_prompt = assemble_prompt(
                                 self.scene.as_ref(),
                                 &self.settings,
@@ -434,6 +439,7 @@ impl Agent {
             let th = self.telemetry_handle.clone();
             let tid = self.current_turn_id.clone();
             let cancel_for_exec = cancel.clone();
+            let hooks_for_exec = Arc::clone(&self.hooks);
             let stream_result = crate::streaming::execute_stream(
                 stream,
                 &mut self.session,
@@ -448,10 +454,9 @@ impl Agent {
                         telemetry_handle: th.clone(),
                         turn_id: tid.clone(),
                         cancel: cancel_for_exec.clone(),
+                        hooks: Arc::clone(&hooks_for_exec),
                     };
-                    async move {
-                        execute_tool_with_telemetry(&exec_ctx, &name, input).await
-                    }
+                    async move { execute_tool_with_telemetry(&exec_ctx, &name, input).await }
                 },
                 move |name: &str, input: &serde_json::Value| {
                     tools_for_safety
@@ -503,9 +508,13 @@ impl Agent {
                 };
                 let relevant: Vec<base::interface::memory::DurableMemory> = {
                     let all = self.memory_store.load_all();
-                    let surfaced: &std::collections::HashSet<String> =
-                        self.frozen.as_ref().map(|f| &f.already_surfaced).unwrap_or(&EMPTY);
-                    prefetch_names.iter()
+                    let surfaced: &std::collections::HashSet<String> = self
+                        .frozen
+                        .as_ref()
+                        .map(|f| &f.already_surfaced)
+                        .unwrap_or(&EMPTY);
+                    prefetch_names
+                        .iter()
                         .filter_map(|name| all.iter().find(|m| &m.name == name).cloned())
                         .filter(|m| !surfaced.contains(&m.name))
                         .collect()
@@ -543,8 +552,11 @@ Relevant memories for this query:
 ",
                         );
                         for m in relevant.iter().take(5) {
-                            mem_text.push_str(&format!("- **{}**: {}
-", m.name, m.description));
+                            mem_text.push_str(&format!(
+                                "- **{}**: {}
+",
+                                m.name, m.description
+                            ));
                         }
                         mem_text.push_str(
                             "
@@ -565,7 +577,10 @@ Use these memories to inform your response.
                 structured_output_calls = so_calls_this_turn;
             }
             if structured_output_calls >= MAX_STRUCTURED_OUTPUT_RETRIES {
-                tracing::warn!(structured_output_calls, "structured output retry limit exceeded");
+                tracing::warn!(
+                    structured_output_calls,
+                    "structured output retry limit exceeded"
+                );
                 self.last_had_tool_uses = had_tool_uses_this_turn;
                 return Ok(TurnOutcome {
                     stop_reason: "max_structured_output_retries".into(),
@@ -588,13 +603,19 @@ Use these memories to inform your response.
                         self.last_had_tool_uses = had_tool_uses_this_turn;
                         return Ok(TurnOutcome {
                             stop_reason: "budget_exceeded".into(),
-                            api_calls, tool_calls, usage: Usage::default(),
+                            api_calls,
+                            tool_calls,
+                            usage: Usage::default(),
                         });
                     }
                     if total_cost_usd >= budget * 0.9 {
                         // TS parity: checkTokenBudget "continue" mode in query.ts:1308.
                         // Inject a reminder so the model wraps up before hitting the hard cap.
-                        tracing::warn!(total_cost_usd, budget, "approaching USD budget limit; injecting continue reminder");
+                        tracing::warn!(
+                            total_cost_usd,
+                            budget,
+                            "approaching USD budget limit; injecting continue reminder"
+                        );
                         self.session.push_message(ModelMessage {
                             role: MessageRole::User,
                             content: vec![ModelContentBlock::Text {
@@ -613,11 +634,7 @@ Use these memories to inform your response.
                     // Time-bounded wait: if discovery hasn't completed after
                     // tool execution, skip it this turn (it'll run next turn).
                     if let Ok(Ok((_discovered, new_names))) =
-                        tokio::time::timeout(
-                            std::time::Duration::from_millis(500),
-                            handle,
-                        )
-                        .await
+                        tokio::time::timeout(std::time::Duration::from_millis(500), handle).await
                     {
                         if !new_names.is_empty() {
                             let skills_text = format!(
@@ -641,18 +658,14 @@ Use these memories to inform your response.
                 // files accessed by Read/Write/Edit tool operations this turn.
                 // TS parity: conditional skills activation from skill frontmatter.
                 {
-                    let file_paths = Self::extract_tool_file_paths(
-                        self.session.messages(),
-                    );
+                    let file_paths = Self::extract_tool_file_paths(self.session.messages());
                     if !file_paths.is_empty() {
                         let activated = self
                             .skills
                             .activate_conditional_skills_for_paths(&file_paths);
                         if !activated.is_empty() {
-                            let names: Vec<&str> = activated
-                                .iter()
-                                .map(|s| s.name.as_str())
-                                .collect();
+                            let names: Vec<&str> =
+                                activated.iter().map(|s| s.name.as_str()).collect();
                             let skills_text = format!(
                                 "<system-reminder>\nConditional skills activated for \
                                  current context: {}. Use /<skill-name> to invoke.\n\
@@ -661,9 +674,7 @@ Use these memories to inform your response.
                             );
                             self.session.push_message(ModelMessage {
                                 role: MessageRole::User,
-                                content: vec![ModelContentBlock::Text {
-                                    text: skills_text,
-                                }],
+                                content: vec![ModelContentBlock::Text { text: skills_text }],
                             });
                             for s in &activated {
                                 if !self.invoked_skills.contains(&s.name) {
@@ -732,38 +743,57 @@ Use these memories to inform your response.
                     session_id: self.session.session_id.to_string(),
                     cwd: self.settings.paths.local_data_dir.display().to_string(),
                     permission_mode: "default".into(),
-                    tool_name: None, tool_input: None, tool_use_id: None,
-                    tool_result: None, is_error: None, user_prompt: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_use_id: None,
+                    tool_result: None,
+                    is_error: None,
+                    user_prompt: None,
                 };
-                let hook_result = self.hooks.run(hooks::HookEvent::Stop, &stop_hook_input).await;
+                let hook_result = self
+                    .hooks
+                    .run(hooks::HookEvent::Stop, &stop_hook_input)
+                    .await;
                 if hook_result.discontinued() {
                     tracing::info!("Stop hook discontinued the turn");
                     let tid = self.current_turn_id.clone();
-                    let _ = self.telemetry_handle.record(
-                        telemetry::TelemetryEvent::turn_complete(
-                            &self.session.session_id, self.session.turn_count,
+                    let _ = self
+                        .telemetry_handle
+                        .record(telemetry::TelemetryEvent::turn_complete(
+                            &self.session.session_id,
+                            self.session.turn_count,
                             Some(tid.clone()),
                             telemetry::TurnCompletePayload {
                                 turn_no: self.session.turn_count,
                                 turn_id: Some(tid),
                                 stop_reason: "stopped_by_hook".into(),
-                                api_calls, tool_calls,
+                                api_calls,
+                                tool_calls,
                                 permission_denials: self.permission_denial_count,
-                                last_tool_name: None, last_tool_was_error: false,
+                                last_tool_name: None,
+                                last_tool_was_error: false,
                                 turn_duration_ms: start.elapsed().as_millis() as u64,
                             },
                         ));
                     self.last_had_tool_uses = had_tool_uses_this_turn;
                     return Ok(TurnOutcome {
                         stop_reason: "stopped_by_hook".into(),
-                        api_calls, tool_calls, usage,
+                        api_calls,
+                        tool_calls,
+                        usage,
                     });
                 }
                 // Teammate lifecycle hooks (TS parity: TaskCompleted + TeammateIdle
                 // in stopHooks.ts:335-453). Only run if agent is part of a team.
                 if self.team_id.is_some() {
-                    let _ = self.hooks.run(hooks::HookEvent::TaskCompleted, &stop_hook_input).await;
-                    let _ = self.hooks.run(hooks::HookEvent::TeammateIdle, &stop_hook_input).await;
+                    let _ = self
+                        .hooks
+                        .run(hooks::HookEvent::TaskCompleted, &stop_hook_input)
+                        .await;
+                    let _ = self
+                        .hooks
+                        .run(hooks::HookEvent::TeammateIdle, &stop_hook_input)
+                        .await;
                 }
             }
 
@@ -1053,7 +1083,8 @@ or project context that should survive across sessions.
             let context_limit = self.scene.token_budget().compact_threshold;
             if context_limit > 0 {
                 let current = self.session.token_count();
-                let velocity = compaction::reactive::estimate_token_velocity(&self.session.messages);
+                let velocity =
+                    compaction::reactive::estimate_token_velocity(&self.session.messages);
                 // Check circuit breaker before attempting compaction
                 if self.compaction_state.circuit_open {
                     tracing::warn!(
@@ -1061,7 +1092,10 @@ or project context that should survive across sessions.
                         "compaction circuit breaker open — skipping reactive compact"
                     );
                 } else if compaction::reactive::should_compact_with_state(
-                    current, context_limit, velocity, &self.compaction_state,
+                    current,
+                    context_limit,
+                    velocity,
+                    &self.compaction_state,
                 ) {
                     tracing::info!(
                         current_tokens = current,
@@ -1073,7 +1107,9 @@ or project context that should survive across sessions.
                         .micro_compact(self.session.messages().to_vec(), keep);
                     if compacted.len() < self.session.messages.len() {
                         self.session.messages = compacted;
-                        self.session.message_timestamps.truncate(self.session.messages.len());
+                        self.session
+                            .message_timestamps
+                            .truncate(self.session.messages.len());
                         self.compaction_state.record_success();
                         // P1-6: Run post-compact cleanup callbacks (cache clearing, etc.)
                         // TS parity: postCompactCleanup.ts
@@ -1114,23 +1150,32 @@ or project context that should survive across sessions.
         }
         if threshold > 0 && self.session.token_count() > threshold {
             // P1: Fire PreCompact hook (TS parity: executePreCompactHooks)
-            if self.hooks.has_hooks_for(hooks::config::HookEvent::PreCompact) {
-                let hook_result = self.hooks.run(
-                    hooks::config::HookEvent::PreCompact,
-                    &hooks::HookInput {
-                        hook_event_name: "PreCompact".into(),
-                        session_id: self.session.session_id.clone(),
-                        cwd: self.settings.paths.local_data_dir.display().to_string(),
-                        permission_mode: "default".into(),
-                        tool_input: Some(serde_json::json!({
-                            "messages_before": self.session.messages.len(),
-                            "token_count": self.session.token_count(),
-                            "threshold": threshold,
-                        })),
-                        tool_name: None, tool_use_id: None,
-                        tool_result: None, is_error: None, user_prompt: None,
-                    },
-                ).await;
+            if self
+                .hooks
+                .has_hooks_for(hooks::config::HookEvent::PreCompact)
+            {
+                let hook_result = self
+                    .hooks
+                    .run(
+                        hooks::config::HookEvent::PreCompact,
+                        &hooks::HookInput {
+                            hook_event_name: "PreCompact".into(),
+                            session_id: self.session.session_id.clone(),
+                            cwd: self.settings.paths.local_data_dir.display().to_string(),
+                            permission_mode: "default".into(),
+                            tool_input: Some(serde_json::json!({
+                                "messages_before": self.session.messages.len(),
+                                "token_count": self.session.token_count(),
+                                "threshold": threshold,
+                            })),
+                            tool_name: None,
+                            tool_use_id: None,
+                            tool_result: None,
+                            is_error: None,
+                            user_prompt: None,
+                        },
+                    )
+                    .await;
                 // P0-3: Respect hook decisions — discontinue or block compaction.
                 if hook_result.discontinued() {
                     tracing::info!("PreCompact hook discontinued — skipping compaction");
@@ -1175,7 +1220,11 @@ or project context that should survive across sessions.
                     self.session.message_timestamps.truncate(messages_after);
                     let (dropped_rounds, dropped_messages, estimated_tokens_saved) =
                         if let Some(ref proj) = result.projection {
-                            (Some(proj.dropped_rounds), Some(proj.dropped_messages), Some(proj.estimated_tokens_saved))
+                            (
+                                Some(proj.dropped_rounds),
+                                Some(proj.dropped_messages),
+                                Some(proj.estimated_tokens_saved),
+                            )
                         } else {
                             (None, None, None)
                         };
@@ -1211,25 +1260,34 @@ or project context that should survive across sessions.
                     }
 
                     // P1: Fire PostCompact hook (TS parity: executePostCompactHooks)
-                    if self.hooks.has_hooks_for(hooks::config::HookEvent::PostCompact) {
-                        let _ = self.hooks.run(
-                            hooks::config::HookEvent::PostCompact,
-                            &hooks::HookInput {
-                                hook_event_name: "PostCompact".into(),
-                                session_id: self.session.session_id.clone(),
-                                cwd: self.settings.paths.local_data_dir.display().to_string(),
-                                permission_mode: "default".into(),
-                                tool_input: Some(serde_json::json!({
-                                    "strategy": format!("{:?}", result.strategy),
-                                    "messages_before": messages_before,
-                                    "messages_after": messages_after,
-                                    "tokens_before": result.tokens_before,
-                                    "tokens_after": result.tokens_after,
-                                })),
-                                tool_name: None, tool_use_id: None,
-                                tool_result: None, is_error: None, user_prompt: None,
-                            },
-                        ).await;
+                    if self
+                        .hooks
+                        .has_hooks_for(hooks::config::HookEvent::PostCompact)
+                    {
+                        let _ = self
+                            .hooks
+                            .run(
+                                hooks::config::HookEvent::PostCompact,
+                                &hooks::HookInput {
+                                    hook_event_name: "PostCompact".into(),
+                                    session_id: self.session.session_id.clone(),
+                                    cwd: self.settings.paths.local_data_dir.display().to_string(),
+                                    permission_mode: "default".into(),
+                                    tool_input: Some(serde_json::json!({
+                                        "strategy": format!("{:?}", result.strategy),
+                                        "messages_before": messages_before,
+                                        "messages_after": messages_after,
+                                        "tokens_before": result.tokens_before,
+                                        "tokens_after": result.tokens_after,
+                                    })),
+                                    tool_name: None,
+                                    tool_use_id: None,
+                                    tool_result: None,
+                                    is_error: None,
+                                    user_prompt: None,
+                                },
+                            )
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -1262,7 +1320,8 @@ or project context that should survive across sessions.
     fn build_skills_text(&self) -> String {
         let skills = self.skills.list();
         // Filter out skills with disable_model_invocation: true
-        let llm_skills: Vec<_> = skills.iter()
+        let llm_skills: Vec<_> = skills
+            .iter()
             .filter(|s| !s.disable_model_invocation)
             .collect();
         if llm_skills.is_empty() {
@@ -1282,7 +1341,8 @@ or project context that should survive across sessions.
         const MAX_DESC_CHARS: usize = 250;
 
         let available_budget = budget_chars.saturating_sub(HEADER_CHARS);
-        let per_entry = (available_budget / llm_skills.len().max(1)).saturating_sub(PER_ENTRY_OVERHEAD);
+        let per_entry =
+            (available_budget / llm_skills.len().max(1)).saturating_sub(PER_ENTRY_OVERHEAD);
         let desc_cap = per_entry.min(MAX_DESC_CHARS);
 
         let mut text = String::from("## Available Skills\n\n");
@@ -1311,18 +1371,42 @@ or project context that should survive across sessions.
     /// Build prompt blocks, tool definitions, and clone messages for the model call.
     fn build_prompt_for_turn(&self) -> (Vec<PromptBlock>, Vec<ToolDef>, Vec<ModelMessage>) {
         let mcp_instructions = self.build_mcp_instructions();
-        let mcp_ref: Option<&str> = if mcp_instructions.is_empty() { None } else { Some(&mcp_instructions) };
+        let mcp_ref: Option<&str> = if mcp_instructions.is_empty() {
+            None
+        } else {
+            Some(&mcp_instructions)
+        };
         let skills_text = self.build_skills_text();
-        let skills_ref: Option<&str> = if skills_text.is_empty() { None } else { Some(&skills_text) };
+        let skills_ref: Option<&str> = if skills_text.is_empty() {
+            None
+        } else {
+            Some(&skills_text)
+        };
         // Build comma-separated tool names for dynamic session guidance
-        let tool_names: String = self.tools.list().iter()
+        let tool_names: String = self
+            .tools
+            .list()
+            .iter()
             .map(|t| t.name().to_string())
-            .chain(self.mcp.tool_adapters().iter().map(|t| t.name().to_string()))
+            .chain(
+                self.mcp
+                    .tool_adapters()
+                    .iter()
+                    .map(|t| t.name().to_string()),
+            )
             .collect::<Vec<_>>()
             .join(",");
-        let tools_ref: Option<Cow<'_, str>> = if tool_names.is_empty() { None } else { Some(Cow::Owned(tool_names)) };
+        let tools_ref: Option<Cow<'_, str>> = if tool_names.is_empty() {
+            None
+        } else {
+            Some(Cow::Owned(tool_names))
+        };
         let mut ctx = build_prompt_context(
-            &self.settings, &self.session, self.frozen.as_ref(), mcp_ref, skills_ref,
+            &self.settings,
+            &self.session,
+            self.frozen.as_ref(),
+            mcp_ref,
+            skills_ref,
         );
         ctx.available_tools = tools_ref;
         let prompt_blocks = assemble_prompt(
@@ -1330,8 +1414,8 @@ or project context that should survive across sessions.
             &self.settings,
             &self.memory_store,
             &ctx,
-            skills_ref,  // skills_text
-            mcp_ref,     // mcp_instructions
+            skills_ref, // skills_text
+            mcp_ref,    // mcp_instructions
         );
         let tool_defs = self.build_tool_defs();
         let messages = self.session.messages().to_vec();
@@ -1354,7 +1438,13 @@ or project context that should survive across sessions.
                 "model overloaded, switching to fallback"
             );
             *effective_model = fallback.clone();
-            let fb_ctx = build_prompt_context(&self.settings, &self.session, self.frozen.as_ref(), None, None);
+            let fb_ctx = build_prompt_context(
+                &self.settings,
+                &self.session,
+                self.frozen.as_ref(),
+                None,
+                None,
+            );
             let fb_prompt = assemble_prompt(
                 self.scene.as_ref(),
                 &self.settings,
@@ -1460,6 +1550,7 @@ pub(crate) struct ToolExecCtx {
     pub telemetry_handle: telemetry::TelemetryHandle,
     pub turn_id: String,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub hooks: Arc<hooks::HookRunner>,
 }
 
 /// Execute a single tool and record telemetry. Free function for streaming executor.
@@ -1476,9 +1567,42 @@ async fn execute_tool_inner(
     name: &str,
     input: serde_json::Value,
 ) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
-    let tool = ctx.tools
+    let tool = ctx
+        .tools
         .get(name)
         .ok_or_else(|| format!("Tool not found: {name}"))?;
+
+    // PreToolUse: can block the call outright, or rewrite its input.
+    // TS parity: executePreToolUseHooks in query.ts.
+    let mut input = input;
+    if ctx.hooks.has_hooks_for(hooks::HookEvent::PreToolUse) {
+        let pre_input = hooks::HookInput {
+            hook_event_name: "PreToolUse".into(),
+            session_id: ctx.session_id.clone(),
+            cwd: ctx.cwd.display().to_string(),
+            permission_mode: "default".into(),
+            tool_name: Some(name.to_string()),
+            tool_input: Some(input.clone()),
+            tool_use_id: None,
+            tool_result: None,
+            is_error: None,
+            user_prompt: None,
+        };
+        let hook_result = ctx
+            .hooks
+            .run(hooks::HookEvent::PreToolUse, &pre_input)
+            .await;
+        if let Some(response) = hook_result.blocked() {
+            return Err(format!(
+                "Blocked by PreToolUse hook: {}",
+                response.message.as_deref().unwrap_or("no reason given")
+            ));
+        }
+        if let Some(updated) = hook_result.updated_input() {
+            input = updated.clone();
+        }
+    }
+
     let tool_ctx = ToolContext {
         cwd: ctx.cwd.clone(),
         session_id: ctx.session_id.clone(),
@@ -1500,11 +1624,15 @@ async fn execute_tool_inner(
         agent_depth: 0,
         events_tx: None,
     };
+    let input_for_post_hook = input.clone();
     let tool_start = std::time::Instant::now();
-    let result = tool.call(input, tool_ctx, base::tool::ProgressSender::noop("")).await;
+    let result = tool
+        .call(input, tool_ctx, base::tool::ProgressSender::noop(""))
+        .await;
     let latency_ms = tool_start.elapsed().as_millis() as f64;
     let is_error = result.is_err();
-    let _ = ctx.telemetry_handle
+    let _ = ctx
+        .telemetry_handle
         .record(telemetry::TelemetryEvent::tool_execution(
             &ctx.session_id,
             ctx.turn_no,
@@ -1512,7 +1640,11 @@ async fn execute_tool_inner(
             telemetry::ToolExecutionPayload {
                 tool_name: name.to_string(),
                 tool_use_id: String::new(),
-                outcome: if is_error { telemetry::ToolOutcome::Failed } else { telemetry::ToolOutcome::Succeeded },
+                outcome: if is_error {
+                    telemetry::ToolOutcome::Failed
+                } else {
+                    telemetry::ToolOutcome::Succeeded
+                },
                 is_error,
                 error_message: None,
                 latency_ms: latency_ms as u64,
@@ -1521,7 +1653,8 @@ async fn execute_tool_inner(
                 user_approved: true,
             },
         ));
-    match result {
+
+    let outcome = match result {
         Ok(r) => {
             let text = match r.content {
                 ToolResultContent::Text(t) => t,
@@ -1530,7 +1663,38 @@ async fn execute_tool_inner(
             Ok((text, r.new_messages))
         }
         Err(e) => Err(e.to_string()),
+    };
+
+    // PostToolUse: fire-and-forget notification — the tool already ran, so
+    // there's no "block" to apply here (unlike PreToolUse). Aborting the
+    // whole turn from a PostToolUse hook (`continue: false`) isn't wired up:
+    // this function can only report this one call's outcome, not reach back
+    // into the streaming loop that's iterating tool calls — a bigger change
+    // than this fix's scope. TS parity: executePostToolUseHooks in query.ts.
+    if ctx.hooks.has_hooks_for(hooks::HookEvent::PostToolUse) {
+        let (result_json, is_error_flag) = match &outcome {
+            Ok((text, _)) => (serde_json::Value::String(text.clone()), false),
+            Err(e) => (serde_json::Value::String(e.clone()), true),
+        };
+        let post_input = hooks::HookInput {
+            hook_event_name: "PostToolUse".into(),
+            session_id: ctx.session_id.clone(),
+            cwd: ctx.cwd.display().to_string(),
+            permission_mode: "default".into(),
+            tool_name: Some(name.to_string()),
+            tool_input: Some(input_for_post_hook),
+            tool_use_id: None,
+            tool_result: Some(result_json),
+            is_error: Some(is_error_flag),
+            user_prompt: None,
+        };
+        let _ = ctx
+            .hooks
+            .run(hooks::HookEvent::PostToolUse, &post_input)
+            .await;
     }
+
+    outcome
 }
 
 fn build_prompt_context<'a>(
@@ -1571,7 +1735,12 @@ fn build_prompt_context<'a>(
         // `local_data_dir` is already the `.atta/` dir (flat, no scope
         // segment) — no need to prepend another `.atta/` (previously double-
         // nested to `.atta/.atta/scratchpad`).
-        scratchpad_dir: settings.paths.local_data_dir.join("scratchpad").to_str().map(|s| Cow::Owned(s.to_string())),
+        scratchpad_dir: settings
+            .paths
+            .local_data_dir
+            .join("scratchpad")
+            .to_str()
+            .map(|s| Cow::Owned(s.to_string())),
         output_style_content: output_style.map(Cow::Owned),
         available_tools: None, // populated by caller if needed
     }
@@ -1724,9 +1893,18 @@ fn extract_suffixed_number_from_end(s: &str) -> Option<u64> {
     let mut multiplier = 1u64;
     if end > 0 {
         match chars[end - 1] {
-            'k' | 'K' => { multiplier = 1_000; end -= 1; }
-            'm' | 'M' => { multiplier = 1_000_000; end -= 1; }
-            'b' | 'B' => { multiplier = 1_000_000_000; end -= 1; }
+            'k' | 'K' => {
+                multiplier = 1_000;
+                end -= 1;
+            }
+            'm' | 'M' => {
+                multiplier = 1_000_000;
+                end -= 1;
+            }
+            'b' | 'B' => {
+                multiplier = 1_000_000_000;
+                end -= 1;
+            }
             _ => {}
         }
     }
@@ -1852,6 +2030,151 @@ mod tests {
     use super::*;
     use base::interface::settings::ThinkingMode;
 
+    // ── PreToolUse / PostToolUse hook wiring (regression) ──
+    //
+    // Prior to this fix, `ToolExecCtx`/`execute_tool_inner` never consulted
+    // `HookRunner` at all — a configured PreToolUse/PostToolUse hook had
+    // zero effect on real tool calls, despite the engine (HookRunner::run,
+    // block/updated_input decisions) being fully implemented and tested in
+    // `crates/hooks` in isolation.
+
+    /// A probe tool that records the input it was actually called with.
+    struct ProbeTool {
+        called: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl base::tool::Tool for ProbeTool {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            input: serde_json::Value,
+            _ctx: base::tool::ToolContext,
+            _progress: base::tool::ProgressSender,
+        ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+            *self.called.lock().unwrap() = Some(input);
+            Ok(base::tool::ToolResult::text("probe-ran"))
+        }
+    }
+
+    fn test_exec_ctx(
+        tools: Arc<base::tool::InMemoryToolRegistry>,
+        hooks: Arc<hooks::HookRunner>,
+    ) -> ToolExecCtx {
+        ToolExecCtx {
+            tools,
+            cwd: std::env::temp_dir(),
+            session_id: "test-session".into(),
+            turn_no: 1,
+            telemetry_handle: telemetry::TelemetryHandle::noop(),
+            turn_id: "test-turn".into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            hooks,
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_blocks_call() {
+        let called = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: called.clone(),
+        }));
+
+        let mut settings: hooks::config::HooksSettings = std::collections::HashMap::new();
+        settings.insert(
+            hooks::HookEvent::PreToolUse,
+            vec![hooks::config::HookConfig::Command {
+                command: r#"echo '{"decision":"block","message":"nope"}'"#.into(),
+                shell: None,
+                timeout: None,
+                if_pattern: None,
+                only_on_error: None,
+                once: None,
+                async_rewake: None,
+            }],
+        );
+        let hooks_runner = Arc::new(hooks::HookRunner::new(settings));
+        let ctx = test_exec_ctx(tools, hooks_runner);
+
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({"x": 1})).await;
+        assert!(result.is_err(), "expected the tool call to be blocked");
+        assert!(result.unwrap_err().contains("nope"));
+        assert!(
+            called.lock().unwrap().is_none(),
+            "tool must not have actually run"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_rewrites_input() {
+        let called = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: called.clone(),
+        }));
+
+        let mut settings: hooks::config::HooksSettings = std::collections::HashMap::new();
+        settings.insert(
+            hooks::HookEvent::PreToolUse,
+            vec![hooks::config::HookConfig::Command {
+                command: r#"echo '{"updated_input":{"x":99}}'"#.into(),
+                shell: None,
+                timeout: None,
+                if_pattern: None,
+                only_on_error: None,
+                once: None,
+                async_rewake: None,
+            }],
+        );
+        let hooks_runner = Arc::new(hooks::HookRunner::new(settings));
+        let ctx = test_exec_ctx(tools, hooks_runner);
+
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({"x": 1})).await;
+        assert!(
+            result.is_ok(),
+            "expected the (rewritten) call to succeed: {result:?}"
+        );
+        assert_eq!(*called.lock().unwrap(), Some(serde_json::json!({"x": 99})));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_fires_after_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("post-hook-ran");
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }));
+
+        let mut settings: hooks::config::HooksSettings = std::collections::HashMap::new();
+        settings.insert(
+            hooks::HookEvent::PostToolUse,
+            vec![hooks::config::HookConfig::Command {
+                command: format!("touch {}", marker.display()),
+                shell: None,
+                timeout: None,
+                if_pattern: None,
+                only_on_error: None,
+                once: None,
+                async_rewake: None,
+            }],
+        );
+        let hooks_runner = Arc::new(hooks::HookRunner::new(settings));
+        let ctx = test_exec_ctx(tools, hooks_runner);
+
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
+        assert!(result.is_ok());
+        assert!(
+            marker.exists(),
+            "PostToolUse hook should have run and created the marker file"
+        );
+    }
+
     #[test]
     fn turn_outcome_default() {
         let outcome = TurnOutcome::default();
@@ -1867,7 +2190,9 @@ mod tests {
         // 90% of target → stop
         assert!(!should_continue_token_budget(90_000, 100_000, 0, 1_000, 0));
         // High continuation count alone does NOT stop (no hard cap; was 10).
-        assert!(should_continue_token_budget(10_000, 100_000, 20, 1_000, 1_000));
+        assert!(should_continue_token_budget(
+            10_000, 100_000, 20, 1_000, 1_000
+        ));
     }
 
     #[test]
@@ -1875,7 +2200,9 @@ mod tests {
         // ≥3 continuations, both deltas <500 → stop even below 90%
         assert!(!should_continue_token_budget(10_000, 100_000, 3, 400, 400));
         // ≥3 but large delta → continue
-        assert!(should_continue_token_budget(10_000, 100_000, 3, 1_000, 1_000));
+        assert!(should_continue_token_budget(
+            10_000, 100_000, 3, 1_000, 1_000
+        ));
         // <3 continuations, small deltas → still continue
         assert!(should_continue_token_budget(10_000, 100_000, 2, 400, 400));
     }
@@ -1884,7 +2211,10 @@ mod tests {
 
     #[test]
     fn parse_shorthand_500k() {
-        assert_eq!(parse_token_budget_directive("+500k do this task"), Some(500_000));
+        assert_eq!(
+            parse_token_budget_directive("+500k do this task"),
+            Some(500_000)
+        );
     }
 
     #[test]
@@ -1957,10 +2287,7 @@ mod tests {
 
     #[test]
     fn strip_no_directive() {
-        assert_eq!(
-            strip_token_budget_directive("hello world"),
-            "hello world"
-        );
+        assert_eq!(strip_token_budget_directive("hello world"), "hello world");
     }
 
     #[test]
@@ -2024,7 +2351,7 @@ mod tests {
             default_provider: None,
             task_models: Default::default(),
             language: None,
-        feature_flags: Default::default(),
+            feature_flags: Default::default(),
             session_dir: None,
         };
         let session = session::session::SessionManager::in_memory(None);
@@ -2095,15 +2422,17 @@ For each memory, return a JSON object with:\n\
 Return only a JSON array of memories. If nothing is worth saving, return [].";
 
     use base::interface::settings::ThinkingMode;
-    let request_messages = vec![
-        ModelMessage {
-            role: MessageRole::User,
-            content: vec![
-                ModelContentBlock::Text { text: prompt.to_string() },
-                ModelContentBlock::Text { text: messages_text },
-            ],
-        },
-    ];
+    let request_messages = vec![ModelMessage {
+        role: MessageRole::User,
+        content: vec![
+            ModelContentBlock::Text {
+                text: prompt.to_string(),
+            },
+            ModelContentBlock::Text {
+                text: messages_text,
+            },
+        ],
+    }];
     let params = base::interface::model::StreamParams {
         model: "claude-haiku-4-5-20251001".into(),
         max_tokens: 2000,
