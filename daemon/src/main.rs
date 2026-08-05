@@ -14,16 +14,19 @@ use std::sync::Arc;
 
 use base::context::EngineConfig;
 use base::interface::permission::PermissionOutcome;
-use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
-use daemon::{config::*, write_lock_file, DaemonServer, SessionPool};
 use clap::Parser;
-use telemetry::perf::PerfCollector;
+use daemon::{config::*, write_lock_file, DaemonServer, SessionPool};
+use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
 use telemetry::events::StartupTimingPayload;
+use telemetry::perf::PerfCollector;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "AttaCore daemon: multi-session agent engine over JSON-RPC")]
+#[command(
+    version,
+    about = "AttaCore daemon: multi-session agent engine over JSON-RPC"
+)]
 struct Cli {
     /// Unix socket path (default: $HOME/.atta/<scene>/daemon.sock)
     #[arg(long)]
@@ -72,9 +75,9 @@ fn resolve_scene(name: &str) -> anyhow::Result<Arc<dyn base::interface::scene::A
         "coding" => Ok(Arc::new(scene::scene::coding::CodingScene)),
         "chat" => Ok(Arc::new(scene::scene::chat::ChatScene)),
         "demo" => Ok(Arc::new(scene::scene::demo::DemoScene)),
-        other => anyhow::bail!(
-            "unsupported --scene `{other}` — supported scenes: coding, chat, demo"
-        ),
+        other => {
+            anyhow::bail!("unsupported --scene `{other}` — supported scenes: coding, chat, demo")
+        }
     }
 }
 
@@ -120,8 +123,13 @@ async fn main() -> anyhow::Result<()> {
     // function (that duplication is exactly how `permission_rules` ended up
     // parsed nowhere despite being a real `Settings` field).
     let paths = DefaultDaemonPaths::from_env(&scope);
-    let mut daemon_config =
-        load_daemon_config(&cli.model, cli.max_tokens, cli.socket.as_deref(), &scope, &paths);
+    let mut daemon_config = load_daemon_config(
+        &cli.model,
+        cli.max_tokens,
+        cli.socket.as_deref(),
+        &scope,
+        &paths,
+    );
     daemon_config.session_cap = cli.session_cap;
     daemon_config.session_idle_timeout_secs = cli.session_idle_timeout;
     daemon_config.settings.session_dir = Some(daemon_config.settings.paths.local_data_dir.clone());
@@ -194,7 +202,9 @@ async fn main() -> anyhow::Result<()> {
     let client: Arc<dyn AnthropicClient> = match std::env::var("ANTHROPIC_BASE_URL").ok() {
         Some(mut url) => {
             // Ensure trailing slash so Url::join appends instead of replacing
-            if !url.ends_with('/') { url.push('/'); }
+            if !url.ends_with('/') {
+                url.push('/');
+            }
             let base = reqwest::Url::parse(&url)
                 .map_err(|e| anyhow::anyhow!("invalid ANTHROPIC_BASE_URL: {e}"))?;
             Arc::new(HttpAnthropicClient::with_base(auth, base)?)
@@ -228,7 +238,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Startup checkpoint: memory_loaded ──────────────────────────────
     let _memory_load_ms = perf.checkpoint("memory_loaded");
-    info!(elapsed_ms = _memory_load_ms, "startup: memory store initialised");
+    info!(
+        elapsed_ms = _memory_load_ms,
+        "startup: memory store initialised"
+    );
 
     // ── Engine config ──────────────────────────────────────────────────
     let mut engine_config = EngineConfig::defaults_for(&daemon_config.settings.model.model_name);
@@ -238,14 +251,16 @@ async fn main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mcp_servers = daemon_config.settings.mcp_servers.clone();
 
-    let permission: Arc<dyn base::interface::permission::Permission> =
-        Arc::new(AllowAllPermission);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
 
     // ── Startup checkpoint: skills_scanned ─────────────────────────────
     // (No skills scanning currently performed in the daemon — placeholder
     //  checkpoint for future integration.)
     let _skills_scan_ms = perf.checkpoint("skills_scanned");
-    info!(elapsed_ms = _skills_scan_ms, "startup: skills scanned (noop)");
+    info!(
+        elapsed_ms = _skills_scan_ms,
+        "startup: skills scanned (noop)"
+    );
 
     // ── Startup checkpoint: mcp_connected ──────────────────────────────
     // MCP servers connect in the background *after* the pool is built and
@@ -254,13 +269,20 @@ async fn main() -> anyhow::Result<()> {
     // connect", not "connection finished"; connecting is intentionally
     // async so a slow/unreachable server can never delay startup.
     let _mcp_connect_ms = perf.checkpoint("mcp_connected");
-    info!(elapsed_ms = _mcp_connect_ms, n_configured = mcp_servers.len(), "startup: mcp connect kicked off in background");
+    info!(
+        elapsed_ms = _mcp_connect_ms,
+        n_configured = mcp_servers.len(),
+        "startup: mcp connect kicked off in background"
+    );
 
     // ── Startup checkpoint: tools_registered ───────────────────────────
     // (Tools are registered implicitly via the session engine. Placeholder
     //  checkpoint for explicit registration timing.)
     let _tools_reg_ms = perf.checkpoint("tools_registered");
-    info!(elapsed_ms = _tools_reg_ms, "startup: tools registered (noop)");
+    info!(
+        elapsed_ms = _tools_reg_ms,
+        "startup: tools registered (noop)"
+    );
 
     // ── Session transcript persistence ──────────────────────────────────
     // `sessions/` follows the same "global + project, no scene" rule as
@@ -300,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
     // shared-across-sessions path as user-configured ones — see
     // `SessionPool::plugin_mcp_servers`.
     let mut mcp_servers = mcp_servers;
-    mcp_servers.extend(pool.plugin_mcp_servers());
+    mcp_servers.extend(pool.plugin_mcp_servers().await);
     pool.connect_mcp_servers_in_background(mcp_servers);
 
     // ── Cross-tool config import (process-level, once) ─────────────────
@@ -362,11 +384,7 @@ async fn main() -> anyhow::Result<()> {
         first_api_call_ms: 0,
     };
 
-    info!(
-        total_ms = total_startup_ms,
-        ?timing,
-        "startup complete"
-    );
+    info!(total_ms = total_startup_ms, ?timing, "startup complete");
 
     // If telemetry is available, emit the startup timing event.
     // (The daemon currently does not wire up the full telemetry pipeline

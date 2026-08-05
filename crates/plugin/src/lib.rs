@@ -3,13 +3,15 @@
 
 pub mod agent_registry;
 pub mod bundled;
+pub mod cache;
+pub mod cli;
 pub mod discovery;
+pub mod fetch;
 pub mod homograph;
 pub mod manifest;
 pub mod marketplace;
 pub mod resolver;
-pub mod cache;
-pub mod cli;
+pub mod state;
 
 pub use discovery::discover_plugins;
 pub use manifest::{Plugin, PluginError, PluginManifest, SlashEntry};

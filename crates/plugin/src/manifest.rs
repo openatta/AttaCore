@@ -99,6 +99,8 @@ pub enum PluginError {
     Schema(String),
     #[error("homograph: {0}")]
     Homograph(String),
+    #[error("checksum: {0}")]
+    Checksum(String),
 }
 
 #[derive(Debug, Clone)]

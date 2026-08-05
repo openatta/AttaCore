@@ -92,9 +92,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("plugin.toml"),
-            format!(
-                "[plugin]\nname = \"{name}\"\nversion = \"{version}\"\n{extra_toml}"
-            ),
+            format!("[plugin]\nname = \"{name}\"\nversion = \"{version}\"\n{extra_toml}"),
         )
         .unwrap();
     }
@@ -113,15 +111,27 @@ mod tests {
         let scene = TempDir::new().unwrap();
         write_plugin(global.path(), "my-plugin", "1.0.0", "");
         let plugins = discover_plugins(global.path(), scene.path());
-        assert!(plugins.iter().any(|p| p.manifest.plugin.name == "my-plugin"));
+        assert!(plugins
+            .iter()
+            .any(|p| p.manifest.plugin.name == "my-plugin"));
     }
 
     #[test]
     fn scene_tier_overrides_global_tier_same_name() {
         let global = TempDir::new().unwrap();
         let scene = TempDir::new().unwrap();
-        write_plugin(global.path(), "my-plugin", "1.0.0", "description = \"global\"\n");
-        write_plugin(scene.path(), "my-plugin", "1.0.0", "description = \"scene\"\n");
+        write_plugin(
+            global.path(),
+            "my-plugin",
+            "1.0.0",
+            "description = \"global\"\n",
+        );
+        write_plugin(
+            scene.path(),
+            "my-plugin",
+            "1.0.0",
+            "description = \"scene\"\n",
+        );
         let plugins = discover_plugins(global.path(), scene.path());
         let found: Vec<_> = plugins
             .iter()
@@ -135,7 +145,12 @@ mod tests {
     fn disk_plugin_overrides_builtin_same_name() {
         let global = TempDir::new().unwrap();
         let scene = TempDir::new().unwrap();
-        write_plugin(global.path(), "plugin-hello", "1.0.0", "description = \"custom hello\"\n");
+        write_plugin(
+            global.path(),
+            "plugin-hello",
+            "1.0.0",
+            "description = \"custom hello\"\n",
+        );
         let plugins = discover_plugins(global.path(), scene.path());
         let hello = plugins
             .iter()

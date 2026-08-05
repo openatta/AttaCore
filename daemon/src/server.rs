@@ -39,10 +39,7 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    pub fn new(
-        pool: Arc<SessionPool>,
-        shutdown_token: CancellationToken,
-    ) -> Self {
+    pub fn new(pool: Arc<SessionPool>, shutdown_token: CancellationToken) -> Self {
         Self {
             pool,
             started_at: Instant::now(),
@@ -160,9 +157,23 @@ impl DaemonServer {
             "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, writer).await,
             "config.setProvider" => self.method_config_set_provider(id, req.params).await,
             "config.getProvider" => self.method_config_get_provider(id, req.params).await,
-            "mcp.status" => RpcResponse::ok(id, serde_json::json!({"servers": self.pool.mcp_status().await})),
+            "mcp.status" => RpcResponse::ok(
+                id,
+                serde_json::json!({"servers": self.pool.mcp_status().await}),
+            ),
             "mcp.addServer" => self.method_mcp_add_server(id, req.params).await,
-            "commands.list" => RpcResponse::ok(id, serde_json::json!({"commands": self.pool.list_commands()})),
+            "commands.list" => RpcResponse::ok(
+                id,
+                serde_json::json!({"commands": self.pool.list_commands().await}),
+            ),
+            "plugin.list" => RpcResponse::ok(
+                id,
+                serde_json::json!({"plugins": self.pool.list_plugins().await}),
+            ),
+            "plugin.install" => self.method_plugin_install(id, req.params).await,
+            "plugin.uninstall" => self.method_plugin_uninstall(id, req.params).await,
+            "plugin.enable" => self.method_plugin_set_enabled(id, req.params, true).await,
+            "plugin.disable" => self.method_plugin_set_enabled(id, req.params, false).await,
             "import.list" => {
                 let sources = self.pool.list_import_sources().await;
                 RpcResponse::ok(id, serde_json::json!({"sources": sources}))
@@ -180,7 +191,9 @@ impl DaemonServer {
             "session.close" => {
                 let session_id = match req.params.get("session_id").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
-                    None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id"),
+                    None => {
+                        return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id")
+                    }
                 };
                 self.pool.shutdown_session(&session_id).await;
                 RpcResponse::ok(id, serde_json::json!({"closed": session_id}))
@@ -201,7 +214,11 @@ impl DaemonServer {
     /// connection closes. Does not replay past events; subscribe before the
     /// event you care about can happen (e.g. right after startup, before
     /// relying on `mcp_connected`/`import_detected`).
-    async fn method_daemon_subscribe_events(&self, id: serde_json::Value, writer: Writer) -> RpcResponse {
+    async fn method_daemon_subscribe_events(
+        &self,
+        id: serde_json::Value,
+        writer: Writer,
+    ) -> RpcResponse {
         let mut rx = self.pool.subscribe_events();
         let forward_writer = writer.clone();
         tokio::spawn(async move {
@@ -209,7 +226,9 @@ impl DaemonServer {
                 match rx.recv().await {
                     Ok(event) => {
                         let frame = crate::rpc::StreamFrame::daemon_event(event);
-                        let Ok(mut b) = serde_json::to_vec(&frame) else { continue };
+                        let Ok(mut b) = serde_json::to_vec(&frame) else {
+                            continue;
+                        };
                         b.push(b'\n');
                         if forward_writer.lock().await.write_all(&b).await.is_err() {
                             break; // connection closed
@@ -226,14 +245,130 @@ impl DaemonServer {
     /// `config.getProvider` params: `{"include_secrets": false}` (optional,
     /// default `false`). Read-side counterpart to `config.setProvider` — see
     /// `SessionPool::get_providers` doc comment for the redaction default.
-    async fn method_config_get_provider(&self, id: serde_json::Value, params: serde_json::Value) -> RpcResponse {
-        let include_secrets = params.get("include_secrets").and_then(|v| v.as_bool()).unwrap_or(false);
+    async fn method_config_get_provider(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let include_secrets = params
+            .get("include_secrets")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         RpcResponse::ok(id, self.pool.get_providers(include_secrets).await)
     }
 
     /// `mcp.addServer` params: `{"name": "...", "config": {"type": "stdio", ...}}`
     /// (`config` is an `mcp::config::McpServerConfig`, tagged by `type`).
-    async fn method_mcp_add_server(&self, id: serde_json::Value, params: serde_json::Value) -> RpcResponse {
+    /// `plugin.install` params:
+    /// ```json
+    /// {
+    ///   "name": "code-review-helper",
+    ///   "version": "1.0.0",
+    ///   "download_url": "file:///path/to/plugin.zip",   // or https://...
+    ///   "checksum": "<sha256 hex>",                       // required for http(s), optional for file://
+    ///   "scope": "global"                                 // optional, default "global"; or "scene"
+    /// }
+    /// ```
+    /// No marketplace lookup — installs directly from the given source (see
+    /// `plugin::cli::PluginCommands::install_source`). Verifies the
+    /// checksum before extracting; a network (`http(s)://`) source without
+    /// a `checksum` is rejected outright.
+    async fn method_plugin_install(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing name"),
+        };
+        let version = match params.get("version").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing version"),
+        };
+        let download_url = match params.get("download_url").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing download_url"),
+        };
+        let checksum = params
+            .get("checksum")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let scope = params
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("global")
+            .to_string();
+
+        match self
+            .pool
+            .install_plugin(&name, &version, &download_url, checksum.as_deref(), &scope)
+            .await
+        {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, codes::INVALID_PARAMS, e),
+        }
+    }
+
+    /// `plugin.uninstall` params: `{"name": "...", "version": "..." (optional, omit = all), "scope": "global"|"scene" (optional, default "global")}`
+    async fn method_plugin_uninstall(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing name"),
+        };
+        let version = params
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let scope = params
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("global")
+            .to_string();
+
+        match self
+            .pool
+            .uninstall_plugin(&name, version.as_deref(), &scope)
+            .await
+        {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, codes::INVALID_PARAMS, e),
+        }
+    }
+
+    /// Shared handler for `plugin.enable`/`plugin.disable`. Params:
+    /// `{"name": "...", "scope": "global"|"scene" (optional, default "global")}`
+    async fn method_plugin_set_enabled(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+        enabled: bool,
+    ) -> RpcResponse {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing name"),
+        };
+        let scope = params
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("global")
+            .to_string();
+
+        match self.pool.set_plugin_enabled(&name, enabled, &scope).await {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, codes::INVALID_PARAMS, e),
+        }
+    }
+
+    async fn method_mcp_add_server(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
         let name = match params.get("name").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing name"),
@@ -250,7 +385,11 @@ impl DaemonServer {
 
     /// `import.run` params: `{"source": "claude_code" | "codex" | "cursor"}`
     /// (one of the `source` values `import.list` returned).
-    async fn method_import_run(&self, id: serde_json::Value, params: serde_json::Value) -> RpcResponse {
+    async fn method_import_run(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
         let source = match params.get("source").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing source"),
@@ -284,7 +423,10 @@ impl DaemonServer {
             Some(s) => s.to_string(),
             None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing provider_id"),
         };
-        let delete = params.get("delete").and_then(|v| v.as_bool()).unwrap_or(false);
+        let delete = params
+            .get("delete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let config_patch = params.get("config").cloned();
         let default_provider = params
             .get("default_provider")
@@ -294,7 +436,13 @@ impl DaemonServer {
 
         match self
             .pool
-            .set_provider(&provider_id, delete, config_patch, default_provider, task_models_patch)
+            .set_provider(
+                &provider_id,
+                delete,
+                config_patch,
+                default_provider,
+                task_models_patch,
+            )
             .await
         {
             Ok(result) => RpcResponse::ok(id, result),

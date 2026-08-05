@@ -30,22 +30,24 @@ impl PluginCommands {
         Self { cache, resolver }
     }
 
-    /// Install a plugin from the marketplace.
-    pub async fn install(&self, name: &str, version: Option<&str>) -> Result<PluginCommandResult, PluginError> {
-        // 1. Check blocklist for known-malicious names (including confusable variants)
-        if let Some(blocked) = crate::homograph::check_blocklist(name) {
-            return Err(PluginError::Homograph(format!(
-                "plugin name '{name}' is blocked (matches blocklist entry '{blocked}')"
-            )));
-        }
+    /// Install a plugin from the marketplace (name + version resolved via
+    /// the configured `PluginResolver`). For installing from an explicit
+    /// source (no marketplace needed — e.g. sideloading, or this daemon
+    /// simply has none configured), use `install_source` directly.
+    pub async fn install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<PluginCommandResult, PluginError> {
+        self.check_name(name)?;
 
         let Some(ref resolver) = self.resolver else {
             return Err(PluginError::Schema(
-                "no marketplace configured — cannot install plugins".into(),
+                "no marketplace configured — cannot install plugins by name; use install_source with an explicit download_url instead".into(),
             ));
         };
 
-        // 2. Check for homograph attacks against official plugin names in the registry
+        // Check for homograph attacks against official plugin names in the registry.
         let index = resolver.fetch_index().await?;
         let official_names: Vec<&str> = index.iter().map(|e| e.name.as_str()).collect();
         if let Some(msg) = crate::homograph::check_homograph_name(name, &official_names) {
@@ -55,14 +57,14 @@ impl PluginCommands {
         let version = version.unwrap_or("latest");
 
         // Find the entry in the already-fetched index to avoid a second fetch
-        let entry = index.iter().find(|e| {
-            e.name == name
-                && (version == "latest"
-                    || version == "any"
-                    || e.version == version)
-        }).ok_or_else(|| {
-            PluginError::Schema(format!("plugin {name}@{version} not found in registry"))
-        })?;
+        let entry = index
+            .iter()
+            .find(|e| {
+                e.name == name && (version == "latest" || version == "any" || e.version == version)
+            })
+            .ok_or_else(|| {
+                PluginError::Schema(format!("plugin {name}@{version} not found in registry"))
+            })?;
 
         let source = PluginSource {
             download_url: entry.download_url.clone(),
@@ -70,9 +72,22 @@ impl PluginCommands {
             version: entry.version.clone(),
         };
 
-        // Download and extract the plugin to the cache
-        // (Actual download/extraction is a placeholder for now)
-        if self.cache.is_cached(name, source.version.as_str()) {
+        self.install_source(name, &source).await
+    }
+
+    /// Install a plugin from an explicit `PluginSource` — no marketplace
+    /// resolver needed. Still runs the blocklist name check (homograph
+    /// check against *official* names only makes sense with a marketplace
+    /// index to compare against, so it's skipped here — there's no
+    /// registry of "official" names to be a homograph of).
+    pub async fn install_source(
+        &self,
+        name: &str,
+        source: &PluginSource,
+    ) -> Result<PluginCommandResult, PluginError> {
+        self.check_name(name)?;
+
+        if self.cache.is_cached(name, &source.version) {
             return Ok(PluginCommandResult {
                 success: true,
                 message: format!("plugin '{name}' v{} is already installed", source.version),
@@ -82,11 +97,7 @@ impl PluginCommands {
             });
         }
 
-        // Placeholder: mark as cached by creating the directory
-        let dir = self.cache.version_dir(name, &source.version);
-        self.cache.ensure_dirs()?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to create plugin dir: {e}"))))?;
+        crate::fetch::install_from_source(&self.cache, name, source).await?;
 
         Ok(PluginCommandResult {
             success: true,
@@ -100,8 +111,21 @@ impl PluginCommands {
         })
     }
 
+    fn check_name(&self, name: &str) -> Result<(), PluginError> {
+        if let Some(blocked) = crate::homograph::check_blocklist(name) {
+            return Err(PluginError::Homograph(format!(
+                "plugin name '{name}' is blocked (matches blocklist entry '{blocked}')"
+            )));
+        }
+        Ok(())
+    }
+
     /// Uninstall a plugin version.
-    pub async fn uninstall(&self, name: &str, version: Option<&str>) -> Result<PluginCommandResult, PluginError> {
+    pub async fn uninstall(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<PluginCommandResult, PluginError> {
         if let Some(version) = version {
             self.cache.remove_version(name, version)?;
             Ok(PluginCommandResult {
@@ -176,10 +200,7 @@ impl PluginCommands {
             });
         }
 
-        // Install latest version
-        let dir = self.cache.version_dir(name, &latest_version);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| PluginError::Io(std::io::Error::other(format!("failed to create plugin dir: {e}"))))?;
+        crate::fetch::install_from_source(&self.cache, name, &source).await?;
 
         Ok(PluginCommandResult {
             success: true,

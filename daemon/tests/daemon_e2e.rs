@@ -14,15 +14,55 @@ use daemon::config::StaticDaemonPaths;
 use daemon::rpc::codes;
 use daemon::{DaemonServer, SessionPool};
 use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
+
+/// Build a zip archive (in memory) for a minimal demo plugin declaring one
+/// `/name` slash command, write it to `dir`, and return `(archive_path,
+/// sha256_hex)`.
+fn build_demo_plugin_zip(
+    dir: &std::path::Path,
+    plugin_name: &str,
+    command_name: &str,
+) -> (PathBuf, String) {
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file("plugin.toml", opts).unwrap();
+        use std::io::Write;
+        write!(
+            writer,
+            "[plugin]\nname = \"{plugin_name}\"\nversion = \"1.0.0\"\ndescription = \"demo plugin\"\n\n[slash_commands]\n\"/{command_name}\" = \"prompts/{command_name}.md\"\n"
+        )
+        .unwrap();
+        writer
+            .start_file(&format!("prompts/{command_name}.md"), opts)
+            .unwrap();
+        write!(writer, "Demo prompt body for /{command_name}: {{args}}").unwrap();
+        writer.finish().unwrap();
+    }
+    let archive_path = dir.join(format!("{plugin_name}.zip"));
+    std::fs::write(&archive_path, &buf).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    let checksum = hex::encode(hasher.finalize());
+    (archive_path, checksum)
+}
 
 /// Always-allow permission for tests.
 struct AllowAllPermission;
 #[async_trait::async_trait]
 impl base::interface::permission::Permission for AllowAllPermission {
-    async fn check(&self, _: &str, _: &serde_json::Value, _: &std::path::Path, _: &str) -> base::interface::permission::PermissionOutcome {
+    async fn check(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+        _: &std::path::Path,
+        _: &str,
+    ) -> base::interface::permission::PermissionOutcome {
         base::interface::permission::PermissionOutcome::Permit
     }
 }
@@ -44,14 +84,12 @@ async fn start_server() -> (
     ));
     let scene: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> =
-        Arc::new(AllowAllPermission);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
     let engine_config = EngineConfig::defaults_for("claude-sonnet-4-6");
 
     // 使用 dummy client（不真正调 LLM）
-    let client: Arc<dyn AnthropicClient> = Arc::new(
-        HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap(),
-    );
+    let client: Arc<dyn AnthropicClient> =
+        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
 
     let paths: Arc<dyn daemon::config::DaemonPaths> =
         Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
@@ -102,7 +140,11 @@ async fn rpc_call(sock: &std::path::Path, msg: &str) -> String {
 #[tokio::test]
 async fn status_returns_info() {
     let (_server, sock, _dir, handle) = start_server().await;
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"daemon.status","id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"daemon.status","id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(v["result"].is_object(), "expected success, got: {v}");
     assert!(v["result"]["version"].is_string());
@@ -173,10 +215,17 @@ async fn unknown_method_returns_error() {
 #[tokio::test]
 async fn doctor_reports_no_providers_configured_as_ok() {
     let (_server, sock, _dir, handle) = start_server().await;
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"daemon.doctor","id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"daemon.doctor","id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["providers"]["ok"], true, "resp: {v}");
-    assert_eq!(v["result"]["session_persistence"]["history_store_wired"], false);
+    assert_eq!(
+        v["result"]["session_persistence"]["history_store_wired"],
+        false
+    );
     assert!(v["result"]["settings_tiers"].as_array().unwrap().len() == 3);
 
     _server.shutdown_token().cancel();
@@ -203,7 +252,11 @@ async fn set_provider_writes_project_settings_and_doctor_sees_it() {
     assert_eq!(written["providers"]["deepseek"]["api_key"], "k");
 
     // Doctor now reflects the newly-written provider.
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"daemon.doctor","id":2}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"daemon.doctor","id":2}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["providers"]["default_provider"], "deepseek");
 
@@ -231,8 +284,14 @@ async fn set_provider_partial_patch_does_not_clobber_untouched_fields() {
     let written = std::fs::read_to_string(dir.path().join(".atta").join("settings.json")).unwrap();
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert_eq!(written["providers"]["deepseek"]["api_key"], "new-key");
-    assert_eq!(written["providers"]["deepseek"]["base_url"], "https://api.deepseek.com/v1");
-    assert_eq!(written["providers"]["deepseek"]["default_model"], "deepseek-pro");
+    assert_eq!(
+        written["providers"]["deepseek"]["base_url"],
+        "https://api.deepseek.com/v1"
+    );
+    assert_eq!(
+        written["providers"]["deepseek"]["default_model"],
+        "deepseek-pro"
+    );
 
     _server.shutdown_token().cancel();
     let _ = handle.await;
@@ -264,7 +323,11 @@ async fn set_provider_delete_removes_entry() {
 #[tokio::test]
 async fn set_provider_rejects_missing_provider_id() {
     let (_server, sock, _dir, handle) = start_server().await;
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.setProvider","params":{},"id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"config.setProvider","params":{},"id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "resp: {v}");
 
@@ -301,7 +364,11 @@ async fn set_provider_refuses_to_clobber_a_malformed_existing_settings_json() {
 #[tokio::test]
 async fn turn_id_is_base58_uuid_22_chars() {
     let id = Id::new().to_string();
-    assert!((21..=22).contains(&id.len()), "expected 21-22 chars, got {}: {id}", id.len());
+    assert!(
+        (21..=22).contains(&id.len()),
+        "expected 21-22 chars, got {}: {id}",
+        id.len()
+    );
 }
 
 #[tokio::test]
@@ -309,7 +376,10 @@ async fn mcp_status_empty_when_nothing_connected() {
     let (_server, sock, _dir, handle) = start_server().await;
     let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"mcp.status","id":1}"#).await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    assert!(v["result"]["servers"].as_array().unwrap().is_empty(), "resp: {v}");
+    assert!(
+        v["result"]["servers"].as_array().unwrap().is_empty(),
+        "resp: {v}"
+    );
 
     _server.shutdown_token().cancel();
     let _ = handle.await;
@@ -328,12 +398,18 @@ async fn mcp_add_server_writes_settings_and_reports_connect_failure() {
 
     let written = std::fs::read_to_string(dir.path().join(".atta").join("settings.json")).unwrap();
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
-    assert_eq!(written["mcp_servers"]["bogus"]["command"], "definitely-not-a-real-binary-xyz");
+    assert_eq!(
+        written["mcp_servers"]["bogus"]["command"],
+        "definitely-not-a-real-binary-xyz"
+    );
 
     // The binary doesn't exist, so the connect attempt fails — status must not list it.
     let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"mcp.status","id":2}"#).await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    assert!(v["result"]["servers"].as_array().unwrap().is_empty(), "resp: {v}");
+    assert!(
+        v["result"]["servers"].as_array().unwrap().is_empty(),
+        "resp: {v}"
+    );
 
     _server.shutdown_token().cancel();
     let _ = handle.await;
@@ -366,10 +442,13 @@ async fn subscribe_events_receives_mcp_connect_failed_notification() {
     .await;
 
     let mut event_line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), sub_reader.read_line(&mut event_line))
-        .await
-        .expect("timed out waiting for daemon.event notification")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sub_reader.read_line(&mut event_line),
+    )
+    .await
+    .expect("timed out waiting for daemon.event notification")
+    .unwrap();
     let event: serde_json::Value = serde_json::from_str(&event_line).unwrap();
     assert_eq!(event["method"], "daemon.event", "event: {event}");
     assert_eq!(event["params"]["kind"], "mcp_connect_failed");
@@ -388,9 +467,16 @@ async fn get_provider_redacts_api_key_by_default_and_reveals_with_flag() {
     )
     .await;
 
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.getProvider","id":2}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"config.getProvider","id":2}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["result"]["providers"]["deepseek"]["api_key"], "***1234", "resp: {v}");
+    assert_eq!(
+        v["result"]["providers"]["deepseek"]["api_key"], "***1234",
+        "resp: {v}"
+    );
 
     let resp = rpc_call(
         &sock,
@@ -398,7 +484,10 @@ async fn get_provider_redacts_api_key_by_default_and_reveals_with_flag() {
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["result"]["providers"]["deepseek"]["api_key"], "sk-secret-1234", "resp: {v}");
+    assert_eq!(
+        v["result"]["providers"]["deepseek"]["api_key"], "sk-secret-1234",
+        "resp: {v}"
+    );
 
     _server.shutdown_token().cancel();
     let _ = handle.await;
@@ -422,7 +511,11 @@ async fn session_close_removes_unknown_session_gracefully() {
 #[tokio::test]
 async fn session_close_rejects_missing_session_id() {
     let (_server, sock, _dir, handle) = start_server().await;
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"session.close","params":{},"id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.close","params":{},"id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "resp: {v}");
 
@@ -438,7 +531,10 @@ async fn import_list_detects_claude_md_in_project_dir() {
     let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"import.list","id":1}"#).await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let sources = v["result"]["sources"].as_array().unwrap();
-    assert!(sources.iter().any(|s| s["source"] == "claude_code"), "resp: {v}");
+    assert!(
+        sources.iter().any(|s| s["source"] == "claude_code"),
+        "resp: {v}"
+    );
 
     _server.shutdown_token().cancel();
     let _ = handle.await;
@@ -498,7 +594,11 @@ async fn import_run_source_not_currently_detected_errors() {
 #[tokio::test]
 async fn commands_list_returns_builtin_local_commands() {
     let (_server, sock, _dir, handle) = start_server().await;
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"commands.list","id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"commands.list","id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let commands = v["result"]["commands"].as_array().expect("commands array");
 
@@ -507,7 +607,10 @@ async fn commands_list_returns_builtin_local_commands() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     for expected in ["help", "skills", "clear", "compact", "cost"] {
-        assert!(names.contains(&expected), "missing builtin command {expected}: {names:?}");
+        assert!(
+            names.contains(&expected),
+            "missing builtin command {expected}: {names:?}"
+        );
     }
     let help = commands.iter().find(|c| c["name"] == "help").unwrap();
     assert_eq!(help["kind"], "local");
@@ -523,7 +626,12 @@ async fn commands_list_includes_installed_plugin_slash_command() {
     // Install a plugin directly into the global tier's versioned cache —
     // same layout `plugin::discovery::discover_plugins` reads from
     // (`{global_root}/plugins/cache/{name}/{version}/plugin.toml`).
-    let plugin_dir = dir.path().join("plugins").join("cache").join("code-review-helper").join("1.0.0");
+    let plugin_dir = dir
+        .path()
+        .join("plugins")
+        .join("cache")
+        .join("code-review-helper")
+        .join("1.0.0");
     std::fs::create_dir_all(plugin_dir.join("prompts")).unwrap();
     std::fs::write(
         plugin_dir.join("plugin.toml"),
@@ -538,7 +646,11 @@ description = "Adds /review"
 "#,
     )
     .unwrap();
-    std::fs::write(plugin_dir.join("prompts/review.md"), "Review the diff: {args}").unwrap();
+    std::fs::write(
+        plugin_dir.join("prompts/review.md"),
+        "Review the diff: {args}",
+    )
+    .unwrap();
 
     let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
     let memory_store = Arc::new(MemoryStore::new(
@@ -547,17 +659,24 @@ description = "Adds /review"
     ));
     let scene: Arc<dyn base::interface::scene::AgentScene> =
         Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> =
-        Arc::new(AllowAllPermission);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
     let engine_config = EngineConfig::defaults_for("claude-sonnet-4-6");
-    let client: Arc<dyn AnthropicClient> = Arc::new(
-        HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap(),
-    );
+    let client: Arc<dyn AnthropicClient> =
+        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
     let paths: Arc<dyn daemon::config::DaemonPaths> =
         Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
     let pool = Arc::new(SessionPool::new(
-        8, 3600, client, settings, scene, permission, memory_store,
-        dir.path().to_path_buf(), engine_config, None, paths,
+        8,
+        3600,
+        client,
+        settings,
+        scene,
+        permission,
+        memory_store,
+        dir.path().to_path_buf(),
+        engine_config,
+        None,
+        paths,
     ));
     let cancel = CancellationToken::new();
     let server = Arc::new(daemon::DaemonServer::new(pool, cancel));
@@ -575,7 +694,11 @@ description = "Adds /review"
     }
     assert!(sock.exists(), "socket never bound");
 
-    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"commands.list","id":1}"#).await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"commands.list","id":1}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let commands = v["result"]["commands"].as_array().expect("commands array");
     let review = commands
@@ -586,5 +709,153 @@ description = "Adds /review"
     assert_eq!(review["source"], "plugin");
 
     server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn plugin_install_rejects_bad_checksum() {
+    let (_server, sock, dir, handle) = start_server().await;
+    let (archive_path, _correct_checksum) =
+        build_demo_plugin_zip(dir.path(), "demo-plugin", "demo");
+
+    let resp = rpc_call(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"plugin.install","id":1,"params":{{"name":"demo-plugin","version":"1.0.0","download_url":"file://{}","checksum":"{}"}}}}"#,
+            archive_path.display(),
+            "0".repeat(64),
+        ),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "resp: {v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("checksum"),
+        "resp: {v}"
+    );
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
+    let (_server, sock, dir, handle) = start_server().await;
+    let (archive_path, checksum) = build_demo_plugin_zip(dir.path(), "demo-plugin", "demo");
+
+    // ── install ──
+    let resp = rpc_call(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"plugin.install","id":1,"params":{{"name":"demo-plugin","version":"1.0.0","download_url":"file://{}","checksum":"{}"}}}}"#,
+            archive_path.display(),
+            checksum,
+        ),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["success"], true, "install resp: {v}");
+
+    // ── plugin.list shows it, enabled ──
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":2}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let plugins = v["result"]["plugins"].as_array().unwrap();
+    let demo = plugins.iter().find(|p| p["name"] == "demo-plugin").unwrap();
+    assert_eq!(demo["enabled"], true);
+
+    // ── commands.list shows the plugin's slash command ──
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"commands.list","id":3}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let commands = v["result"]["commands"].as_array().unwrap();
+    assert!(
+        commands.iter().any(|c| c["name"] == "demo"),
+        "commands: {commands:?}"
+    );
+
+    // ── disable ──
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"plugin.disable","id":4,"params":{"name":"demo-plugin"}}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["enabled"], false, "resp: {v}");
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"commands.list","id":5}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let commands = v["result"]["commands"].as_array().unwrap();
+    assert!(
+        !commands.iter().any(|c| c["name"] == "demo"),
+        "commands still has it: {commands:?}"
+    );
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":6}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let plugins = v["result"]["plugins"].as_array().unwrap();
+    let demo = plugins.iter().find(|p| p["name"] == "demo-plugin").unwrap();
+    assert_eq!(
+        demo["enabled"], false,
+        "plugin.list still shows enabled: {demo:?}"
+    );
+
+    // ── re-enable ──
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"plugin.enable","id":7,"params":{"name":"demo-plugin"}}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["enabled"], true, "resp: {v}");
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"commands.list","id":8}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let commands = v["result"]["commands"].as_array().unwrap();
+    assert!(
+        commands.iter().any(|c| c["name"] == "demo"),
+        "commands: {commands:?}"
+    );
+
+    // ── uninstall ──
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"plugin.uninstall","id":9,"params":{"name":"demo-plugin"}}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["success"], true, "resp: {v}");
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":10}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let plugins = v["result"]["plugins"].as_array().unwrap();
+    assert!(
+        !plugins.iter().any(|p| p["name"] == "demo-plugin"),
+        "plugins: {plugins:?}"
+    );
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"commands.list","id":11}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let commands = v["result"]["commands"].as_array().unwrap();
+    assert!(
+        !commands.iter().any(|c| c["name"] == "demo"),
+        "commands: {commands:?}"
+    );
+
+    _server.shutdown_token().cancel();
     let _ = handle.await;
 }

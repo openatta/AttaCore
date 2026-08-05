@@ -48,6 +48,11 @@
 | [`import.list`](#importlist) | import | 是 | 检测可导入的跨工具配置（Claude Code/Codex/Cursor） |
 | [`import.run`](#importrun) | import | 否 | 执行一次导入 |
 | [`commands.list`](#commandslist) | commands | 是 | 列出可用 slash command（内置 + skill + 插件贡献） |
+| [`plugin.list`](#pluginlist) | plugin | 是 | 列出已安装插件（含禁用的）及其启用状态 |
+| [`plugin.install`](#plugininstall) | plugin | 否 | 从显式 source（无需 marketplace）安装插件，校验 checksum |
+| [`plugin.uninstall`](#pluginuninstall) | plugin | 否 | 卸载一个插件（全部或指定版本） |
+| [`plugin.enable`](#pluginenable--plugindisable) | plugin | 否 | 启用一个插件 |
+| [`plugin.disable`](#pluginenable--plugindisable) | plugin | 否 | 禁用一个插件 |
 
 ---
 
@@ -295,7 +300,7 @@
 
 ### `commands.list`
 
-无参数。返回本次 daemon 生命周期内（启动时一次性构建，不随运行时改动热更新）生效的完整 slash command 目录：内置 local 命令（`help`/`skills`/`clear`/`compact`/`cost`）+ skill 派生的 prompt 命令 + 已安装插件（`plugin.toml` 的 `[slash_commands]`）贡献的 prompt 命令。
+无参数。返回当前生效的完整 slash command 目录：内置 local 命令（`help`/`skills`/`clear`/`compact`/`cost`）+ skill 派生的 prompt 命令 + 已启用插件（`plugin.toml` 的 `[slash_commands]`）贡献的 prompt 命令。**跟随插件安装/启用/禁用/卸载热更新**——见下方 `plugin.*`：任意 `plugin.install`/`uninstall`/`enable`/`disable` 调用成功后都会重建这份目录，对**新建**的 session 立即生效（已在运行的 session 不受影响，语义同 `config.setProvider`/`mcp.addServer`）。
 
 ```jsonc
 {"jsonrpc":"2.0","method":"commands.list","id":1}
@@ -307,6 +312,57 @@
 ```
 
 `kind`：`"local"`（立即执行、不进 LLM，`stop_reason` 会是 `"command_executed"`）或 `"prompt"`（展开 skill/插件正文、继续走一次 LLM turn）。`source`：`"builtin"`/`"user"`/`"project"`/`"plugin"`。**没有单独的执行 RPC**——`turn.rs` 的 `process_turn` 已经会拦截 `/name args` 并按 `kind` 分别处理，调用方直接把命令行文本作为 [`session.run_turn`](#sessionrun_turn) 的 `message` 发送即可，走同一条已有路径。
+
+---
+
+## `plugin.*`
+
+插件的安装/启用/禁用/卸载管理面。**没有 marketplace 依赖**——`plugin.install` 直接从调用方给出的 `download_url` 安装（本地 `file://` 路径或 `https://` URL），不需要配置注册表。安装目标是两层"插件 tier"之一：`"global"`（`~/.atta/plugins/`，跨 scene 共享，默认）或 `"scene"`（`~/.atta/scenes/<scene>/plugins/`，仅当前 daemon 绑定的 scene）。
+
+### `plugin.list`
+
+无参数。列出**所有**已发现的插件（内置 + 两层 tier 上已安装的，不管是否禁用）及其 `enabled` 状态——管理界面需要看到并重新启用被禁用的插件，所以跟 [`commands.list`](#commandslist)（只反映激活集）不同。
+
+```jsonc
+{"jsonrpc":"2.0","method":"plugin.list","id":1}
+// {"jsonrpc":"2.0","id":1,"result":{"plugins":[
+//   {"name":"plugin-hello","version":"0.1.0","description":"...","enabled":true},
+//   {"name":"code-review-helper","version":"1.0.0","description":"...","enabled":false}
+// ]}}
+```
+
+### `plugin.install`
+
+```jsonc
+{"jsonrpc":"2.0","method":"plugin.install","id":1,"params":{
+  "name": "code-review-helper",
+  "version": "1.0.0",
+  "download_url": "file:///abs/path/to/plugin.zip",
+  "checksum": "<sha256 hex, lowercase>",
+  "scope": "global"
+}}
+// {"jsonrpc":"2.0","id":1,"result":{"success":true,"message":"installed plugin 'code-review-helper' v1.0.0 from file:///..."}}
+```
+
+插件归档是 zip，解压时用 `enclosed_name()` 过滤路径穿越条目（zip-slip 防护，越界条目直接跳过，不写入任何位置）。**`checksum` 对 `https://`/`http://` 来源是必填的**——缺失直接拒绝，不发起网络请求；对 `file://` 本地路径是可选的（本地路径本身已经是可信来源，不存在"传输途中被篡改"这个威胁模型）。`scope` 缺省 `"global"`。`name`/`version`/`download_url` 缺失 → `INVALID_PARAMS`；checksum 不匹配 / 下载失败 / 归档格式非法 → `INVALID_PARAMS`（错误信息里说明具体原因）。成功后会重建 [`commands.list`](#commandslist) 用的共享目录（见上方"跟随插件…热更新"）。
+
+### `plugin.uninstall`
+
+```jsonc
+{"jsonrpc":"2.0","method":"plugin.uninstall","id":1,"params":{"name":"code-review-helper","scope":"global"}}
+// {"jsonrpc":"2.0","id":1,"result":{"success":true,"message":"removed plugin 'code-review-helper' (1 versions)"}}
+```
+
+`version` 可选，缺省删除该插件在这一 tier 下的全部版本。`scope` 缺省 `"global"`。
+
+### `plugin.enable` / `plugin.disable`
+
+```jsonc
+{"jsonrpc":"2.0","method":"plugin.disable","id":1,"params":{"name":"code-review-helper","scope":"global"}}
+// {"jsonrpc":"2.0","id":1,"result":{"name":"code-review-helper","enabled":false,"scope":"global"}}
+```
+
+启用状态存在 `<tier_root>/enabled.json`（`{"插件名": bool}`），从未设置过等价于启用（"已安装 == 已激活"的历史隐含行为不变）。scene 层显式设置优先于 global 层显式设置，都没设置时默认启用。`scope` 缺省 `"global"`。
 
 ---
 

@@ -15,17 +15,17 @@ use base::interface::memory::MemoryStore;
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::Settings;
+use base::interface::settings::{VcrConfig, VcrMode};
 use mcp::manager::McpManager;
 use model::adapter::AnthropicModel;
 use model::client::AnthropicClient;
-use telemetry::file_recorder::FileRecorder;
-use telemetry::vcr::VcrModel;
-use base::interface::settings::{VcrConfig, VcrMode};
 use runtime::agent::{Builder, EventReceiver, InputMessage, InputSender};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use telemetry::file_recorder::FileRecorder;
+use telemetry::vcr::VcrModel;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
@@ -34,6 +34,42 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 type Writer = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
+
+/// The two plugin-tier root directories (plain `plugins/`, not
+/// `plugins/cache/` — see `plugin::cache` module docs) for this daemon
+/// instance's paths: global (shared across scenes) and scene (this
+/// daemon's `--scene`).
+fn plugin_tier_dirs(paths: &dyn crate::config::DaemonPaths) -> (PathBuf, PathBuf) {
+    (
+        paths.global_root().join("plugins"),
+        paths.config_root().join("plugins"),
+    )
+}
+
+/// Every plugin discovered on disk + built-ins, regardless of enable state
+/// — used by `plugin.list` so disabled plugins still show up (with
+/// `enabled: false`), not just the active set sessions actually use.
+fn discover_all_plugins(paths: &dyn crate::config::DaemonPaths) -> Vec<plugin::manifest::Plugin> {
+    let (global, scene) = plugin_tier_dirs(paths);
+    plugin::discover_plugins(&global, &scene)
+}
+
+/// Subset of `all` that's currently enabled (see `plugin::state`) — what
+/// actually gets wired into new sessions' hooks/MCP/commands/agent types.
+fn active_plugins(
+    paths: &dyn crate::config::DaemonPaths,
+    all: &[plugin::manifest::Plugin],
+) -> Vec<plugin::manifest::Plugin> {
+    let (global, scene) = plugin_tier_dirs(paths);
+    let global_state = plugin::state::EnableState::new(global);
+    let scene_state = plugin::state::EnableState::new(scene);
+    all.iter()
+        .filter(|p| {
+            plugin::state::resolve_enabled(&p.manifest.plugin.name, &global_state, &scene_state)
+        })
+        .cloned()
+        .collect()
+}
 
 /// Build the command catalog shared by every session: skill-derived + the 5
 /// built-in local commands (via `CommandRegistry::from_skill_manager`), then
@@ -154,19 +190,20 @@ pub struct SessionPool {
     /// `send()` returning `Err` just means "no subscribers right now", not
     /// a real error, so callers of `emit_event` ignore it.
     events_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    /// Plugins available to this daemon instance — built-ins plus whatever's
-    /// installed under `{global,scene}/plugins/cache/` (see
-    /// `plugin::discover_plugins`). Discovered once at construction time;
-    /// installing a plugin after startup requires a daemon restart to take
-    /// effect (no hot-reload — see the "关键决策" note on this in the
-    /// feature spec this shipped with).
-    plugins: Arc<Vec<plugin::manifest::Plugin>>,
+    /// *Active* (enabled) plugins available to this daemon instance — see
+    /// `discover_all_plugins`/`active_plugins`. Hot-swappable like
+    /// `settings`/`mcp`: `refresh_plugins()` (called after
+    /// `plugin.install`/`uninstall`/`enable`/`disable`/`update`) updates
+    /// this for sessions created *after* the call; already-running sessions
+    /// keep whatever plugin set they were built with.
+    plugins: AsyncRwLock<Arc<Vec<plugin::manifest::Plugin>>>,
     /// Command catalog shared by every session — skill-derived + built-in
-    /// local commands + plugin-contributed slash commands, built once at
-    /// startup instead of re-scanning skill dirs per session (see
-    /// `build_shared_commands`). Backs the `commands.list` RPC directly and
-    /// is injected into each new session via `Builder::commands_override`.
-    commands: Arc<runtime::commands::CommandRegistry>,
+    /// local commands + plugin-contributed slash commands, rebuilt by
+    /// `refresh_plugins()` instead of re-scanning skill dirs per session
+    /// (see `build_shared_commands`). Backs the `commands.list` RPC
+    /// directly and is injected into each new session via
+    /// `Builder::commands_override`.
+    commands: AsyncRwLock<Arc<runtime::commands::CommandRegistry>>,
 }
 
 /// session.list 返回的单条记录。
@@ -206,9 +243,8 @@ impl SessionPool {
         let model = Arc::new(AnthropicModel::new(client.clone()));
         let (events_tx, _) = tokio::sync::broadcast::channel(256);
 
-        let global_plugins_dir = paths.global_root().join("plugins");
-        let scene_plugins_dir = paths.config_root().join("plugins");
-        let plugins = Arc::new(plugin::discover_plugins(&global_plugins_dir, &scene_plugins_dir));
+        let all_plugins = discover_all_plugins(paths.as_ref());
+        let plugins = Arc::new(active_plugins(paths.as_ref(), &all_plugins));
         let commands = build_shared_commands(&settings, &plugins);
 
         Self {
@@ -227,8 +263,8 @@ impl SessionPool {
             paths,
             mcp: AsyncRwLock::new(Arc::new(McpManager::empty())),
             events_tx,
-            plugins,
-            commands,
+            plugins: AsyncRwLock::new(plugins),
+            commands: AsyncRwLock::new(commands),
         }
     }
 
@@ -255,18 +291,140 @@ impl SessionPool {
     /// `commands.list` RPC. Executing one is not a separate RPC: send
     /// `/name args` as the `message` of `session.run_turn`, which already
     /// intercepts and runs it (see `runtime::turn::process_turn`).
-    pub fn list_commands(&self) -> Vec<runtime::commands::CommandInfo> {
-        self.commands.list_detailed()
+    pub async fn list_commands(&self) -> Vec<runtime::commands::CommandInfo> {
+        self.commands.read().await.list_detailed()
     }
 
-    /// MCP server configs declared by installed plugins — see the
+    /// MCP server configs declared by *active* installed plugins — see the
     /// `plugin_mcp_server_configs` free function. Callers merge this into
     /// `settings.mcp_servers` before the single startup
     /// `connect_mcp_servers_in_background` call, so plugin-declared servers
     /// get the exact same centrally-connected/shared-across-sessions
     /// treatment as user-configured ones.
-    pub fn plugin_mcp_servers(&self) -> HashMap<String, serde_json::Value> {
-        plugin_mcp_server_configs(&self.plugins)
+    pub async fn plugin_mcp_servers(&self) -> HashMap<String, serde_json::Value> {
+        plugin_mcp_server_configs(&self.plugins.read().await)
+    }
+
+    /// List every installed plugin (built-in + disk, both tiers) with its
+    /// current enabled state — for the `plugin.list` RPC. Unlike
+    /// `self.plugins` (the active set wired into sessions), this includes
+    /// disabled plugins too, since a management UI needs to show and
+    /// re-enable them.
+    pub async fn list_plugins(&self) -> Vec<serde_json::Value> {
+        let all = discover_all_plugins(self.paths.as_ref());
+        let (global, scene) = plugin_tier_dirs(self.paths.as_ref());
+        let global_state = plugin::state::EnableState::new(global);
+        let scene_state = plugin::state::EnableState::new(scene);
+        all.iter()
+            .map(|p| {
+                let name = &p.manifest.plugin.name;
+                serde_json::json!({
+                    "name": name,
+                    "version": p.manifest.plugin.version,
+                    "description": p.manifest.plugin.description,
+                    "enabled": plugin::state::resolve_enabled(name, &global_state, &scene_state),
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve `scope` ("global" or "scene") to its plugins-tier root
+    /// directory (plain `plugins/`, not `plugins/cache/`).
+    fn plugin_tier_root(&self, scope: &str) -> Result<PathBuf, String> {
+        let (global, scene) = plugin_tier_dirs(self.paths.as_ref());
+        match scope {
+            "global" => Ok(global),
+            "scene" => Ok(scene),
+            other => Err(format!(
+                "invalid scope '{other}' — expected 'global' or 'scene'"
+            )),
+        }
+    }
+
+    /// Install a plugin from an explicit source (no marketplace needed —
+    /// see `plugin::cli::PluginCommands::install_source`). `scope` picks
+    /// which tier's cache the plugin lands in ("global", the default a
+    /// caller should use unless it specifically wants a scene-only
+    /// install, or "scene"). Refreshes the active plugin/command set on
+    /// success so sessions created after this call see it — already-running
+    /// sessions are unaffected, same as `config.setProvider`/`mcp.addServer`.
+    pub async fn install_plugin(
+        &self,
+        name: &str,
+        version: &str,
+        download_url: &str,
+        checksum: Option<&str>,
+        scope: &str,
+    ) -> Result<serde_json::Value, String> {
+        let tier_root = self.plugin_tier_root(scope)?;
+        let cache = plugin::cache::PluginCache::new(tier_root.join("cache"));
+        let commands = plugin::cli::PluginCommands::new(cache, None);
+        let source = plugin::marketplace::PluginSource {
+            download_url: download_url.to_string(),
+            checksum: checksum.map(|s| s.to_string()),
+            version: version.to_string(),
+        };
+        let result = commands
+            .install_source(name, &source)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.refresh_plugins().await;
+        Ok(serde_json::json!({
+            "success": result.success,
+            "message": result.message,
+        }))
+    }
+
+    /// Uninstall a plugin (all versions, or a specific one) from `scope`'s
+    /// tier. Refreshes the active plugin/command set — see `install_plugin`.
+    pub async fn uninstall_plugin(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        scope: &str,
+    ) -> Result<serde_json::Value, String> {
+        let tier_root = self.plugin_tier_root(scope)?;
+        let cache = plugin::cache::PluginCache::new(tier_root.join("cache"));
+        let commands = plugin::cli::PluginCommands::new(cache, None);
+        let result = commands
+            .uninstall(name, version)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.refresh_plugins().await;
+        Ok(serde_json::json!({
+            "success": result.success,
+            "message": result.message,
+        }))
+    }
+
+    /// Enable or disable a plugin by name in `scope`'s tier (see
+    /// `plugin::state`). Refreshes the active plugin/command set — see
+    /// `install_plugin`.
+    pub async fn set_plugin_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+        scope: &str,
+    ) -> Result<serde_json::Value, String> {
+        let tier_root = self.plugin_tier_root(scope)?;
+        let state = plugin::state::EnableState::new(tier_root);
+        state
+            .set_enabled(name, enabled)
+            .map_err(|e| e.to_string())?;
+        self.refresh_plugins().await;
+        Ok(serde_json::json!({"name": name, "enabled": enabled, "scope": scope}))
+    }
+
+    /// Re-discover plugins from disk and rebuild the shared command
+    /// catalog — see the `plugins`/`commands` field doc comments for the
+    /// hot-swap semantics (new sessions only).
+    async fn refresh_plugins(&self) {
+        let all = discover_all_plugins(self.paths.as_ref());
+        let plugins = Arc::new(active_plugins(self.paths.as_ref(), &all));
+        let settings = self.settings.read().await.clone();
+        let commands = build_shared_commands(&settings, &plugins);
+        *self.plugins.write().await = plugins;
+        *self.commands.write().await = commands;
     }
 
     /// Current MCP connection status — see `mcp::manager::McpManager::server_statuses`.
@@ -386,8 +544,12 @@ impl SessionPool {
         } else {
             serde_json::json!({})
         };
-        let obj = project_json.as_object_mut().expect("verified to be an object above");
-        let mcp_servers = obj.entry("mcp_servers").or_insert_with(|| serde_json::json!({}));
+        let obj = project_json
+            .as_object_mut()
+            .expect("verified to be an object above");
+        let mcp_servers = obj
+            .entry("mcp_servers")
+            .or_insert_with(|| serde_json::json!({}));
         if !mcp_servers.is_object() {
             *mcp_servers = serde_json::json!({});
         }
@@ -498,7 +660,9 @@ impl SessionPool {
         })?;
         let sources = base::frozen::detect_import_sources(&self.cwd).await;
         let Some(matched) = sources.iter().find(|s| s.kind() == kind) else {
-            return Err(format!("source `{source}` not currently detected in this project"));
+            return Err(format!(
+                "source `{source}` not currently detected in this project"
+            ));
         };
         let summary = base::frozen::execute_import(&self.cwd, matched)
             .await
@@ -532,7 +696,10 @@ impl SessionPool {
     /// (`{project_root}/.atta/settings.json`) — the tier `config.setProvider`
     /// writes to.
     pub fn project_settings_path(&self) -> PathBuf {
-        self.paths.project_root().join(".atta").join("settings.json")
+        self.paths
+            .project_root()
+            .join(".atta")
+            .join("settings.json")
     }
 
     /// Merge a provider config patch (and/or `default_provider` /
@@ -604,18 +771,24 @@ impl SessionPool {
         } else {
             serde_json::json!({})
         };
-        let obj = project_json.as_object_mut().expect("verified to be an object above");
+        let obj = project_json
+            .as_object_mut()
+            .expect("verified to be an object above");
 
         if delete {
             if let Some(providers) = obj.get_mut("providers").and_then(|v| v.as_object_mut()) {
                 providers.remove(provider_id);
             }
         } else if let Some(cfg) = config_patch {
-            let providers = obj.entry("providers").or_insert_with(|| serde_json::json!({}));
+            let providers = obj
+                .entry("providers")
+                .or_insert_with(|| serde_json::json!({}));
             if !providers.is_object() {
                 *providers = serde_json::json!({});
             }
-            let providers_obj = providers.as_object_mut().expect("just normalized to object above");
+            let providers_obj = providers
+                .as_object_mut()
+                .expect("just normalized to object above");
             let mut existing = providers_obj
                 .remove(provider_id)
                 .unwrap_or_else(|| serde_json::json!({}));
@@ -624,11 +797,16 @@ impl SessionPool {
         }
 
         if let Some(dp) = default_provider {
-            obj.insert("default_provider".to_string(), serde_json::Value::String(dp));
+            obj.insert(
+                "default_provider".to_string(),
+                serde_json::Value::String(dp),
+            );
         }
 
         if let Some(tm) = task_models_patch {
-            let task_models = obj.entry("task_models").or_insert_with(|| serde_json::json!({}));
+            let task_models = obj
+                .entry("task_models")
+                .or_insert_with(|| serde_json::json!({}));
             if !task_models.is_object() {
                 *task_models = serde_json::json!({});
             }
@@ -695,21 +873,26 @@ impl SessionPool {
         config.permission_mode = base::permission::PermissionMode::BypassPermissions;
 
         // Apply VCR wrapping if configured
-        let model: Arc<dyn base::interface::model::Model> = match options.and_then(|o| o.vcr.as_ref()) {
-            Some(vcr) => {
-                let mode = match vcr.mode.as_str() {
-                    "record" => VcrMode::Record,
-                    _ => VcrMode::Replay,
-                };
-                Arc::new(VcrModel::new(
-                    self.model.clone(),
-                    Some(VcrConfig { mode, scenario: vcr.scenario.clone(), fallback_on_miss: true }),
-                    std::path::PathBuf::from("/tmp/atta_vcr_nonexistent"),
-                    std::path::PathBuf::from(&vcr.dir),
-                ))
-            }
-            None => self.model.clone(),
-        };
+        let model: Arc<dyn base::interface::model::Model> =
+            match options.and_then(|o| o.vcr.as_ref()) {
+                Some(vcr) => {
+                    let mode = match vcr.mode.as_str() {
+                        "record" => VcrMode::Record,
+                        _ => VcrMode::Replay,
+                    };
+                    Arc::new(VcrModel::new(
+                        self.model.clone(),
+                        Some(VcrConfig {
+                            mode,
+                            scenario: vcr.scenario.clone(),
+                            fallback_on_miss: true,
+                        }),
+                        std::path::PathBuf::from("/tmp/atta_vcr_nonexistent"),
+                        std::path::PathBuf::from(&vcr.dir),
+                    ))
+                }
+                None => self.model.clone(),
+            };
 
         let mut builder = Builder::new()
             .scene(scene)
@@ -718,8 +901,8 @@ impl SessionPool {
             .permission(self.permission.clone())
             .memory_store(self.memory_store.clone())
             .session_id(session_id.clone())
-            .plugins(self.plugins.clone())
-            .commands_override(self.commands.clone());
+            .plugins(self.plugins.read().await.clone())
+            .commands_override(self.commands.read().await.clone());
         if let Some(ref store) = self.history_store {
             builder = builder.history_store(store.clone());
         }
@@ -741,10 +924,14 @@ impl SessionPool {
         }
 
         // Apply telemetry file recorder if configured
-        if let Some(telemetry_path) = options.and_then(|o| o.telemetry.as_ref()).map(|t| t.output.clone()) {
+        if let Some(telemetry_path) = options
+            .and_then(|o| o.telemetry.as_ref())
+            .map(|t| t.output.clone())
+        {
             if let Ok(rec) = FileRecorder::new(&telemetry_path) {
                 let rec = std::sync::Arc::new(rec);
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<telemetry::events::TelemetryEvent>(1024);
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<telemetry::events::TelemetryEvent>(1024);
                 let rec_clone = rec.clone();
                 tokio::spawn(async move {
                     use telemetry::TelemetryRecorder;
@@ -756,9 +943,8 @@ impl SessionPool {
             }
         }
 
-        let (agent, event_rx, input_tx) = builder
-            .build()
-            .map_err(|e| format!("build agent: {e}"))?;
+        let (agent, event_rx, input_tx) =
+            builder.build().map_err(|e| format!("build agent: {e}"))?;
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -814,7 +1000,10 @@ impl SessionPool {
             }
             None => {
                 let sid = Id::new().to_string();
-                match self.create(sid.clone(), self.scene.clone(), options.as_ref()).await {
+                match self
+                    .create(sid.clone(), self.scene.clone(), options.as_ref())
+                    .await
+                {
                     Ok(sid) => sid,
                     Err(e) => {
                         return RpcResponse::err(id, codes::INTERNAL_ERROR, e);
@@ -874,7 +1063,12 @@ impl SessionPool {
                         }
                     }
                 }
-                Some(AgentEvent::ToolUse { id: tid, name, input, .. }) => {
+                Some(AgentEvent::ToolUse {
+                    id: tid,
+                    name,
+                    input,
+                    ..
+                }) => {
                     let f = StreamFrame::event(
                         &sid,
                         &turn_id,
@@ -888,7 +1082,13 @@ impl SessionPool {
                         }
                     }
                 }
-                Some(AgentEvent::ToolResult { id: tid, name, content, is_error, .. }) => {
+                Some(AgentEvent::ToolResult {
+                    id: tid,
+                    name,
+                    content,
+                    is_error,
+                    ..
+                }) => {
                     let f = StreamFrame::event(
                         &sid,
                         &turn_id,
@@ -902,7 +1102,12 @@ impl SessionPool {
                         }
                     }
                 }
-                Some(AgentEvent::TurnComplete { stop_reason, api_calls: ac, usage, .. }) => {
+                Some(AgentEvent::TurnComplete {
+                    stop_reason,
+                    api_calls: ac,
+                    usage,
+                    ..
+                }) => {
                     api_calls = ac;
                     let f = StreamFrame::event(
                         &sid,
@@ -956,10 +1161,7 @@ impl SessionPool {
                     // 尝试通过场景判断是否需要命名（现在是这个 daemon 实例唯一
                     // 配置的那个 scene 说了算，不再写死查 chat 场景）
                     if self.scene.auto_name_session() {
-                        if let Some(prompt) = self
-                            .scene
-                            .session_name_prompt(&message)
-                        {
+                        if let Some(prompt) = self.scene.session_name_prompt(&message) {
                             match self.generate_session_name(&prompt).await {
                                 Ok(name) => {
                                     live.name = Some(name.clone());
@@ -1076,7 +1278,11 @@ impl SessionPool {
                     }
                 }
                 if !to_evict.is_empty() {
-                    debug!(evicted = to_evict.len(), remaining = sessions.len(), "janitor run");
+                    debug!(
+                        evicted = to_evict.len(),
+                        remaining = sessions.len(),
+                        "janitor run"
+                    );
                 }
             }
         });
@@ -1088,7 +1294,10 @@ impl SessionPool {
     async fn resume_or_create(&self, sid: String, options: Option<&SessionOptions>) -> String {
         // 尝试从 HistoryStore 加载历史消息
         let has_history = if let Some(ref store) = self.history_store {
-            match store.load(base::session::SessionId::parse(&sid).unwrap()).await {
+            match store
+                .load(base::session::SessionId::parse(&sid).unwrap())
+                .await
+            {
                 Ok(entries) => !entries.is_empty(),
                 Err(_) => false,
             }
@@ -1141,7 +1350,9 @@ impl SessionPool {
         use base::interface::prompt::PromptBlock;
         use futures::StreamExt;
 
-        let system = PromptBlock::system("你是一个简洁的标题生成器。只输出 3-5 个词的中文标题，不要任何解释。");
+        let system = PromptBlock::system(
+            "你是一个简洁的标题生成器。只输出 3-5 个词的中文标题，不要任何解释。",
+        );
         let messages = vec![ModelMessage {
             role: MessageRole::User,
             content: vec![ModelContentBlock::Text {

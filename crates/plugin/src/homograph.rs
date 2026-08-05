@@ -24,31 +24,43 @@ static CONFUSABLE_MAP: LazyLock<HashMap<char, Vec<char>>> = LazyLock::new(|| {
     let mut m = HashMap::new();
 
     // ── Latin lowercase confusables ──
-    m.insert('a', vec![
-        '\u{0430}', // Cyrillic small letter a
-        '\u{0251}', // Latin small letter alpha
-        '\u{03B1}', // Greek small letter alpha
-    ]);
-    m.insert('c', vec![
-        '\u{0441}', // Cyrillic small letter es
-        '\u{03F2}', // Greek lunate sigma symbol
-        '\u{03C2}', // Greek small letter final sigma
-    ]);
+    m.insert(
+        'a',
+        vec![
+            '\u{0430}', // Cyrillic small letter a
+            '\u{0251}', // Latin small letter alpha
+            '\u{03B1}', // Greek small letter alpha
+        ],
+    );
+    m.insert(
+        'c',
+        vec![
+            '\u{0441}', // Cyrillic small letter es
+            '\u{03F2}', // Greek lunate sigma symbol
+            '\u{03C2}', // Greek small letter final sigma
+        ],
+    );
     m.insert('e', vec!['\u{0435}', '\u{0451}']); // Cyrillic small ie, Cyrillic small io
-    m.insert('i', vec![
-        '\u{0456}', // Cyrillic small letter byelorussian-ukrainian i
-        '\u{026A}', // Latin letter small capital i
-        '\u{0438}', // Cyrillic small letter i
-    ]);
+    m.insert(
+        'i',
+        vec![
+            '\u{0456}', // Cyrillic small letter byelorussian-ukrainian i
+            '\u{026A}', // Latin letter small capital i
+            '\u{0438}', // Cyrillic small letter i
+        ],
+    );
     m.insert('j', vec!['\u{0458}']); // Cyrillic small letter je
     m.insert('k', vec!['\u{043A}']); // Cyrillic small letter ka
     m.insert('m', vec!['\u{043C}']); // Cyrillic small letter em
     m.insert('n', vec!['\u{03B7}']); // Greek small letter eta
-    m.insert('o', vec![
-        '\u{043E}', // Cyrillic small letter o
-        '\u{03BF}', // Greek small letter omicron
-        '\u{0585}', // Armenian small letter oh
-    ]);
+    m.insert(
+        'o',
+        vec![
+            '\u{043E}', // Cyrillic small letter o
+            '\u{03BF}', // Greek small letter omicron
+            '\u{0585}', // Armenian small letter oh
+        ],
+    );
     m.insert('p', vec!['\u{0440}']); // Cyrillic small letter er
     m.insert('s', vec!['\u{0455}']); // Cyrillic small letter dze
     m.insert('t', vec!['\u{0442}']); // Cyrillic small letter te
@@ -57,30 +69,45 @@ static CONFUSABLE_MAP: LazyLock<HashMap<char, Vec<char>>> = LazyLock::new(|| {
     m.insert('y', vec!['\u{0443}']); // Cyrillic small letter u
 
     // ── Latin uppercase confusables ──
-    m.insert('A', vec![
-        '\u{0410}', // Cyrillic capital letter a
-        '\u{0391}', // Greek capital letter alpha
-    ]);
+    m.insert(
+        'A',
+        vec![
+            '\u{0410}', // Cyrillic capital letter a
+            '\u{0391}', // Greek capital letter alpha
+        ],
+    );
     m.insert('B', vec!['\u{0412}']); // Cyrillic capital letter ve
     m.insert('C', vec!['\u{0421}']); // Cyrillic capital letter es
-    m.insert('E', vec![
-        '\u{0415}', // Cyrillic capital letter ie
-        '\u{0395}', // Greek capital letter epsilon
-    ]);
-    m.insert('H', vec![
-        '\u{041D}', // Cyrillic capital letter en
-        '\u{0397}', // Greek capital letter eta
-    ]);
-    m.insert('I', vec![
-        '\u{0406}', // Cyrillic capital letter byelorussian-ukrainian i
-        '\u{0399}', // Greek capital letter iota
-    ]);
+    m.insert(
+        'E',
+        vec![
+            '\u{0415}', // Cyrillic capital letter ie
+            '\u{0395}', // Greek capital letter epsilon
+        ],
+    );
+    m.insert(
+        'H',
+        vec![
+            '\u{041D}', // Cyrillic capital letter en
+            '\u{0397}', // Greek capital letter eta
+        ],
+    );
+    m.insert(
+        'I',
+        vec![
+            '\u{0406}', // Cyrillic capital letter byelorussian-ukrainian i
+            '\u{0399}', // Greek capital letter iota
+        ],
+    );
     m.insert('K', vec!['\u{041A}']); // Cyrillic capital letter ka
     m.insert('M', vec!['\u{041C}']); // Cyrillic capital letter em
-    m.insert('O', vec![
-        '\u{041E}', // Cyrillic capital letter o
-        '\u{039F}', // Greek capital letter omicron
-    ]);
+    m.insert(
+        'O',
+        vec![
+            '\u{041E}', // Cyrillic capital letter o
+            '\u{039F}', // Greek capital letter omicron
+        ],
+    );
     m.insert('P', vec!['\u{0420}']); // Cyrillic capital letter er
     m.insert('T', vec!['\u{0422}']); // Cyrillic capital letter te
     m.insert('X', vec!['\u{0425}']); // Cyrillic capital letter ha
@@ -159,7 +186,11 @@ pub fn check_homograph_name(name: &str, official_names: &[&str]) -> Option<Strin
 /// Returns the blocklist entry that matched, or `None` if the name is not blocked.
 pub fn check_blocklist(name: &str) -> Option<&'static str> {
     let normalized = normalize(name);
-    BLOCKLIST.iter().find(|&&blocked| normalized == *blocked).copied().map(|v| v as _)
+    BLOCKLIST
+        .iter()
+        .find(|&&blocked| normalized == *blocked)
+        .copied()
+        .map(|v| v as _)
 }
 
 #[cfg(test)]
@@ -242,10 +273,7 @@ mod tests {
         let name = "pr\u{03BF}ject";
         let official = &["project"];
         let msg = check_homograph_name(name, official);
-        assert!(
-            msg.is_some(),
-            "should detect Greek omicron homograph"
-        );
+        assert!(msg.is_some(), "should detect Greek omicron homograph");
     }
 
     // ── check_blocklist tests ──
@@ -268,7 +296,10 @@ mod tests {
         // Cyrillic 'е' (U+0435) looks like Latin 'e'
         let name = "\u{0435}vil-plugin";
         let result = check_blocklist(name);
-        assert!(result.is_some(), "should detect confusable variant of blocked name");
+        assert!(
+            result.is_some(),
+            "should detect confusable variant of blocked name"
+        );
         assert_eq!(result.unwrap(), "evil-plugin");
     }
 

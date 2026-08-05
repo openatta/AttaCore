@@ -6,16 +6,16 @@ use base::interface::model::Model;
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::Settings;
+use base::tool::InMemoryToolRegistry;
 use compaction::cached::CachedMicroCompact;
 use compaction::compact::{Compactor, DefaultCompactor};
 use hooks::HookRunner;
 use mcp::manager::McpManager;
-use telemetry::perf::PerfCollector;
 use session::session::SessionManager;
-use telemetry::{TelemetryHandle, TelemetryRecorder};
-use base::tool::InMemoryToolRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
+use telemetry::perf::PerfCollector;
+use telemetry::{TelemetryHandle, TelemetryRecorder};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing;
@@ -186,13 +186,15 @@ impl Agent {
                     "Recovering orphaned permission from previous session"
                 );
                 self.has_handled_orphaned_permission = true;
-                let _ = self.process_turn(
-                    InputMessage::PermissionResponse {
-                        prompt_id: "orphaned".into(),
-                        decision,
-                    },
-                    cancel.clone(),
-                ).await;
+                let _ = self
+                    .process_turn(
+                        InputMessage::PermissionResponse {
+                            prompt_id: "orphaned".into(),
+                            decision,
+                        },
+                        cancel.clone(),
+                    )
+                    .await;
             }
         }
         self.has_handled_orphaned_permission = true;
@@ -264,9 +266,11 @@ impl Agent {
             base::frozen::FrozenContext::collect(cwd.clone(), &scope),
             // 2. Re-scan skills directories for newly added skills.
             async move {
-                let count0 = skills.load_dir(&global_skills_dir, skills::manager::SkillSource::User);
+                let count0 =
+                    skills.load_dir(&global_skills_dir, skills::manager::SkillSource::User);
                 let count1 = skills.load_dir(&scene_skills_dir, skills::manager::SkillSource::User);
-                let count2 = skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
+                let count2 =
+                    skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
                 (count0.ok(), count1.ok(), count2.ok())
             },
             // 3. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
@@ -294,16 +298,12 @@ impl Agent {
     /// List persisted sessions. External interface (read-only, from HistoryStore).
     pub async fn list_sessions(
         &self,
-    ) -> Result<Vec<session::session::SessionSummary>, session::session::SessionError>
-    {
+    ) -> Result<Vec<session::session::SessionSummary>, session::session::SessionError> {
         self.session.list_sessions().await
     }
 
     /// Delete a persisted session from HistoryStore. External interface.
-    pub async fn delete_session(
-        &self,
-        id: &str,
-    ) -> Result<(), session::session::SessionError> {
+    pub async fn delete_session(&self, id: &str) -> Result<(), session::session::SessionError> {
         self.session.delete_session(id).await
     }
 
@@ -460,7 +460,11 @@ impl Agent {
 
     /// Run hooks for a lifecycle event.
     /// Returns hook outputs that may block actions or inject text.
-    pub async fn run_hooks(&self, event: hooks::HookEvent, input: &hooks::HookInput) -> hooks::runner::HookRunResult {
+    pub async fn run_hooks(
+        &self,
+        event: hooks::HookEvent,
+        input: &hooks::HookInput,
+    ) -> hooks::runner::HookRunResult {
         self.hooks.run(event, input).await
     }
 
@@ -609,8 +613,9 @@ fn build_hook_runner(
         settings.model.model_name.clone(),
         settings.model.max_tokens,
     ));
-    let agent_spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner> =
-        Arc::new(crate::agent_spawner_impl::RuntimeAgentSpawner::new(agent_tool));
+    let agent_spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner> = Arc::new(
+        crate::agent_spawner_impl::RuntimeAgentSpawner::new(agent_tool),
+    );
     let agent_executor = Arc::new(crate::hook_executors::AgentSpawnerHookExecutor::new(
         agent_spawner,
         settings.paths.project_root(),
@@ -870,7 +875,8 @@ impl Builder {
         // sub-agents (`resolve_tools()` reads the registry at call time).
         let agent_tool_arc = {
             let agent_engine_config = Arc::new({
-                let mut c = base::context::EngineConfig::defaults_for(settings.model.model_name.clone());
+                let mut c =
+                    base::context::EngineConfig::defaults_for(settings.model.model_name.clone());
                 c.max_tokens = settings.model.max_tokens;
                 c.fallback_model = settings.model.fallback_model.clone();
                 c
@@ -900,12 +906,10 @@ impl Builder {
             hooks.set_wake_receiver(rx);
         }
         // Telemetry: use pre-built handle if injected, else noop (events silently dropped).
-        let telemetry_handle = self
-            .telemetry_handle_override
-            .unwrap_or_else(|| {
-                let (tx, _rx) = tokio::sync::mpsc::channel(1);
-                TelemetryHandle::new(tx)
-            });
+        let telemetry_handle = self.telemetry_handle_override.unwrap_or_else(|| {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            TelemetryHandle::new(tx)
+        });
         // MCP: use pre-built manager if injected, else empty (no servers).
         let mcp = self.mcp_manager_override.unwrap_or_else(McpManager::empty);
         // Skill auto-loading: scan ~/.atta/skills/ (global default), then
@@ -925,7 +929,10 @@ impl Builder {
             ),
             skill_mgr.load_dir(&project_skills_dir, skills::manager::SkillSource::Project),
         ];
-        let loaded_count: usize = skill_load_results.iter().filter_map(|r| r.as_ref().ok()).sum();
+        let loaded_count: usize = skill_load_results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .sum();
         // Register built-in (bundled) skills after disk skills.
         // Disk-loaded skills with the same name take priority — bundled is fallback.
         for bundled in skills::bundled::bundled_skills() {
@@ -941,9 +948,9 @@ impl Builder {
         // once at startup, not per session).
         let skill_mgr_arc = std::sync::Arc::new(skill_mgr);
         let command_registry = self.commands_override.clone().unwrap_or_else(|| {
-            std::sync::Arc::new(
-                crate::commands::CommandRegistry::from_skill_manager(&skill_mgr_arc)
-            )
+            std::sync::Arc::new(crate::commands::CommandRegistry::from_skill_manager(
+                &skill_mgr_arc,
+            ))
         });
         // Register SkillTool using the populated skill manager
         tools::register_skill_tool(&tools, Arc::clone(&skill_mgr_arc), scene.default_skills());
@@ -962,9 +969,15 @@ impl Builder {
         tools.register(agent_tool_arc);
         // Register MCP resource tools if clients are available
         if !mcp.clients().is_empty() {
-            tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(mcp.clients().to_vec())));
-            tools.register(std::sync::Arc::new(mcp::tools::ReadMcpResourceTool::new(mcp.clients().to_vec())));
-            tools.register(std::sync::Arc::new(mcp::tools::DispatchMcpTool::new(mcp.clients().to_vec())));
+            tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(
+                mcp.clients().to_vec(),
+            )));
+            tools.register(std::sync::Arc::new(mcp::tools::ReadMcpResourceTool::new(
+                mcp.clients().to_vec(),
+            )));
+            tools.register(std::sync::Arc::new(mcp::tools::DispatchMcpTool::new(
+                mcp.clients().to_vec(),
+            )));
         }
 
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1001,12 +1014,10 @@ impl Builder {
                 permission_denial_count: 0,
                 compact_warning_issued: false,
                 time_based_mc_config: compaction::time_based_mc::TimeBasedMcConfig::default(),
-                cached_mc: CachedMicroCompact::new(
-                    compaction::cached::CachedMcConfig {
-                        enabled: cached_mc_enabled,
-                        ..Default::default()
-                    }
-                ),
+                cached_mc: CachedMicroCompact::new(compaction::cached::CachedMcConfig {
+                    enabled: cached_mc_enabled,
+                    ..Default::default()
+                }),
                 compaction_state: compaction::reactive::CompactionState::default(),
                 team_id: None,
                 orphaned_permission: None,
@@ -1041,9 +1052,12 @@ mod tests {
         Settings {
             model: ModelSettings {
                 api_type: base::provider::ApiType::Anthropic,
-                base_url: String::new(), auth_token: String::new(),
-                model_name: "test".into(), max_tokens: 2000,
-                thinking_mode: ThinkingMode::Auto, fallback_model: None,
+                base_url: String::new(),
+                auth_token: String::new(),
+                model_name: "test".into(),
+                max_tokens: 2000,
+                thinking_mode: ThinkingMode::Auto,
+                fallback_model: None,
             },
             paths: PathSettings {
                 user_data_dir: "/tmp".into(),
@@ -1054,8 +1068,13 @@ mod tests {
             execution: ExecutionSettings::default(),
             compaction: CompactionConfig::default(),
             sandbox: SandboxConfig::default(),
-            instruction_file: None, prompt_append: None, prompt_override: None,
-            vcr: None, telemetry_url: None, session_dir: None, memory_enabled: true,
+            instruction_file: None,
+            prompt_append: None,
+            prompt_override: None,
+            vcr: None,
+            telemetry_url: None,
+            session_dir: None,
+            memory_enabled: true,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,
@@ -1148,15 +1167,14 @@ pre_tool_use = "hooks/pre.sh"
         .unwrap();
         std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
         std::fs::write(dir.path().join("hooks/pre.sh"), "echo plugin-hook").unwrap();
-        let plugin = plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml"))
-            .unwrap();
+        let plugin =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
 
         let settings = test_settings();
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[plugin]);
         assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
     }
-
 
     #[test]
     fn channel_types_construct() {

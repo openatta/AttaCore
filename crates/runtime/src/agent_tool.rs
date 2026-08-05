@@ -16,26 +16,21 @@
 //! `resolve_tools()` applies when spawning sub-agents.
 
 use crate::agent::{Builder, InputMessage};
+use anyhow::anyhow;
+use async_trait::async_trait;
+use base::context::EngineConfig;
 use base::interface::event::AgentEvent;
-use base::interface::model::{
-    MessageRole, Model, ModelContentBlock, ModelMessage,
-};
+use base::interface::model::{MessageRole, Model, ModelContentBlock, ModelMessage};
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::{
     ExecutionSettings, ModelSettings, PathSettings, PermissionMode, SandboxConfig, Settings,
     ThinkingMode,
 };
-use team::remote_agent::{
-    NoopRemoteTransport, RemoteAgentEvent, RemoteAgentRequest, RemoteAgentTransport,
-};
 use base::tool::InMemoryToolRegistry;
-use tools::worktree::create_worktree;
-use anyhow::anyhow;
-use async_trait::async_trait;
-use base::context::EngineConfig; use base::tool::ToolContext;
-use base::tool::ToolResultContent;
 use base::tool::ProgressSender;
+use base::tool::ToolContext;
+use base::tool::ToolResultContent;
 use futures::StreamExt;
 use history::store::HistoryStore;
 use schemars::JsonSchema;
@@ -43,6 +38,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
+use team::remote_agent::{
+    NoopRemoteTransport, RemoteAgentEvent, RemoteAgentRequest, RemoteAgentTransport,
+};
+use tools::worktree::create_worktree;
 
 // ═══════════════════════════════════════════════════════════
 // Agent type registry
@@ -254,7 +253,9 @@ pub fn agent_def_to_type(
 /// so the model can see what `subagent_type` values are actually available
 /// (built-in + any custom types loaded from `.atta/agents/`) without a
 /// separate discovery call. Sorted by name for stable output.
-fn describe_agent_types(agent_types: &std::collections::HashMap<String, AgentTypeDefinition>) -> String {
+fn describe_agent_types(
+    agent_types: &std::collections::HashMap<String, AgentTypeDefinition>,
+) -> String {
     let mut names: Vec<&String> = agent_types.keys().collect();
     names.sort();
     let mut lines = vec![
@@ -418,8 +419,13 @@ fn bg_task_id() -> String {
     let chars: Vec<char> = "0123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
     let mut n = ts;
     let mut s = String::new();
-    while n > 0 { s.push(chars[(n % 36) as usize]); n /= 36; }
-    if s.is_empty() { s.push('0'); }
+    while n > 0 {
+        s.push(chars[(n % 36) as usize]);
+        n /= 36;
+    }
+    if s.is_empty() {
+        s.push('0');
+    }
     s
 }
 
@@ -453,8 +459,11 @@ fn fallback_settings(
     Settings {
         model: ModelSettings {
             api_type: base::provider::ApiType::Anthropic,
-            base_url: String::new(), auth_token: String::new(),
-            model_name, max_tokens, thinking_mode: ThinkingMode::Auto,
+            base_url: String::new(),
+            auth_token: String::new(),
+            model_name,
+            max_tokens,
+            thinking_mode: ThinkingMode::Auto,
             fallback_model,
         },
         paths: PathSettings {
@@ -470,8 +479,12 @@ fn fallback_settings(
         execution: ExecutionSettings::default(),
         compaction: Default::default(),
         sandbox: SandboxConfig::default(),
-        instruction_file: None, prompt_append: None, prompt_override: None,
-        vcr: None, telemetry_url: None, session_dir: None,
+        instruction_file: None,
+        prompt_append: None,
+        prompt_override: None,
+        vcr: None,
+        telemetry_url: None,
+        session_dir: None,
         memory_enabled: true,
         permission_mode: PermissionMode::default(),
         permission_rules: Vec::new(),
@@ -539,7 +552,14 @@ impl AgentTool {
         config: Arc<EngineConfig>,
         fallback_tools: Arc<InMemoryToolRegistry>,
     ) -> Self {
-        Self::with_parent_tools(model, config, fallback_tools.clone(), fallback_tools, &[], &[])
+        Self::with_parent_tools(
+            model,
+            config,
+            fallback_tools.clone(),
+            fallback_tools,
+            &[],
+            &[],
+        )
     }
 
     /// `agent_dirs` are scanned low → high priority (see `merge_agent_types`)
@@ -667,7 +687,9 @@ impl AgentTool {
         let c = &self.inner.config;
         let model_name = model_name.unwrap_or(&c.model).to_string();
         match &self.inner.parent_settings {
-            Some(parent) => settings_from_parent(parent, model_name, c.max_tokens, c.fallback_model.clone()),
+            Some(parent) => {
+                settings_from_parent(parent, model_name, c.max_tokens, c.fallback_model.clone())
+            }
             None => fallback_settings(model_name, c.max_tokens, c.fallback_model.clone(), cwd),
         }
     }
@@ -730,7 +752,9 @@ impl AgentTool {
             let mut t = String::new();
             while let Some(ev) = event_rx.recv().await {
                 match &ev {
-                    AgentEvent::TextDelta { text, .. } => { t.push_str(text); }
+                    AgentEvent::TextDelta { text, .. } => {
+                        t.push_str(text);
+                    }
                     AgentEvent::TurnComplete { .. } => break,
                     _ => {}
                 }
@@ -739,7 +763,9 @@ impl AgentTool {
         });
 
         let _ = input_tx.send(InputMessage::User {
-            content: prompt.clone(), attachments: vec![], turn_id: turn_id.clone(),
+            content: prompt.clone(),
+            attachments: vec![],
+            turn_id: turn_id.clone(),
         });
         let outcome = agent.run_turn(prompt, turn_id, cancel).await;
         drop(input_tx);
@@ -752,7 +778,9 @@ impl AgentTool {
     }
 
     async fn launch_bg(
-        &self, input: &AgentInput, ctx: &ToolContext,
+        &self,
+        input: &AgentInput,
+        ctx: &ToolContext,
     ) -> Result<base::tool::ToolResult, base::error::ToolError> {
         let tid = bg_task_id();
         let task = ctx.session.register_running_task(tid.clone());
@@ -779,8 +807,14 @@ impl AgentTool {
 
         tokio::spawn(async move {
             let r = Self::run_sub_inner(
-                &inner, prompt, tools, cwd, outer_cancel, subagent_type.as_deref(),
-            ).await;
+                &inner,
+                prompt,
+                tools,
+                cwd,
+                outer_cancel,
+                subagent_type.as_deref(),
+            )
+            .await;
             let mut s = tc.status.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(*s, base::context::RunningStatus::Running) {
                 *s = match &r {
@@ -789,7 +823,10 @@ impl AgentTool {
                 };
             }
             if let Ok(ref text) = r {
-                tc.output.lock().unwrap_or_else(|e| e.into_inner()).push_str(text);
+                tc.output
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_str(text);
             }
             session.persist_running_task(&tc);
             session.remove_running_task_persistence(&tid_c);
@@ -800,8 +837,11 @@ impl AgentTool {
     /// Static helper for background execution. `subagent_type` — see
     /// `run_sub`'s doc comment; resolved the same way against `inner.agent_types`.
     async fn run_sub_inner(
-        inner: &Inner, prompt: String, tools: Arc<InMemoryToolRegistry>,
-        cwd: std::path::PathBuf, cancel: tokio_util::sync::CancellationToken,
+        inner: &Inner,
+        prompt: String,
+        tools: Arc<InMemoryToolRegistry>,
+        cwd: std::path::PathBuf,
+        cancel: tokio_util::sync::CancellationToken,
         subagent_type: Option<&str>,
     ) -> Result<String, base::error::ToolError> {
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
@@ -828,7 +868,11 @@ impl AgentTool {
         let sid = uuid::Uuid::new_v4().to_string();
         let (mut agent, mut event_rx, input_tx) = Builder::new()
             .session_id(sid)
-            .scene(scene).model(inner.model.clone()).tools(tools).settings(settings).permission(perm)
+            .scene(scene)
+            .model(inner.model.clone())
+            .tools(tools)
+            .settings(settings)
+            .permission(perm)
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
 
@@ -837,7 +881,9 @@ impl AgentTool {
             let mut t = String::new();
             while let Some(ev) = event_rx.recv().await {
                 match &ev {
-                    AgentEvent::TextDelta { text, .. } => { t.push_str(text); }
+                    AgentEvent::TextDelta { text, .. } => {
+                        t.push_str(text);
+                    }
                     AgentEvent::TurnComplete { .. } => break,
                     _ => {}
                 }
@@ -846,7 +892,9 @@ impl AgentTool {
         });
 
         let _ = input_tx.send(InputMessage::User {
-            content: prompt.clone(), attachments: vec![], turn_id: turn_id.clone(),
+            content: prompt.clone(),
+            attachments: vec![],
+            turn_id: turn_id.clone(),
         });
         let outcome = agent.run_turn(prompt, turn_id, cancel).await;
         drop(input_tx);
@@ -1003,7 +1051,11 @@ struct AlwaysPermit;
 #[async_trait]
 impl Permission for AlwaysPermit {
     async fn check(
-        &self, _tn: &str, _i: &Value, _c: &std::path::Path, _s: &str,
+        &self,
+        _tn: &str,
+        _i: &Value,
+        _c: &std::path::Path,
+        _s: &str,
     ) -> base::interface::permission::PermissionOutcome {
         base::interface::permission::PermissionOutcome::Permit
     }
@@ -1015,9 +1067,9 @@ fn convert_content_blocks(blocks: &[base::message::ContentBlock]) -> Vec<ModelCo
     blocks
         .iter()
         .filter_map(|block| match block {
-            base::message::ContentBlock::Text { text, .. } => Some(ModelContentBlock::Text {
-                text: text.clone(),
-            }),
+            base::message::ContentBlock::Text { text, .. } => {
+                Some(ModelContentBlock::Text { text: text.clone() })
+            }
             base::message::ContentBlock::ToolUse { id, name, input } => {
                 Some(ModelContentBlock::ToolUse {
                     id: id.clone(),
@@ -1053,7 +1105,10 @@ fn bg_result(task_id: &str, status: &str) -> base::tool::ToolResult {
         content: ToolResultContent::Text(format!(
             "background task spawned (task_id: {task_id}, status: {status})"
         )),
-        is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
+        is_error: false,
+        structured_content: None,
+        mcp_meta: None,
+        new_messages: None,
     }
 }
 
@@ -1063,7 +1118,9 @@ fn bg_result(task_id: &str, status: &str) -> base::tool::ToolResult {
 
 #[async_trait]
 impl base::tool::Tool for AgentTool {
-    fn name(&self) -> &str { AGENT_TOOL_NAME }
+    fn name(&self) -> &str {
+        AGENT_TOOL_NAME
+    }
     fn description(&self) -> &str {
         &self.inner.description
     }
@@ -1073,11 +1130,18 @@ impl base::tool::Tool for AgentTool {
     async fn prompt(&self, _: &base::tool::PromptContext) -> String {
         include_str!("agent_tool.prompt.md").to_string()
     }
-    fn is_concurrency_safe(&self, _: &Value) -> bool { true }
-    fn is_read_only(&self, _: &Value) -> bool { false }
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
 
     async fn call(
-        &self, input: Value, ctx: ToolContext, _progress: ProgressSender,
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        _progress: ProgressSender,
     ) -> Result<base::tool::ToolResult, base::error::ToolError> {
         let inp: AgentInput = serde_json::from_value(input)
             .map_err(|e| base::error::ToolError::Validation(format!("{e}")))?;
@@ -1085,26 +1149,37 @@ impl base::tool::Tool for AgentTool {
         // Remote
         if inp.remote {
             let req = RemoteAgentRequest {
-                prompt: inp.prompt.clone(), allowed_tools: vec![],
+                prompt: inp.prompt.clone(),
+                allowed_tools: vec![],
                 worktree_slug: inp.worktree.clone(),
             };
-            let stream = self.remote.spawn(req)
-                .await.map_err(|e| base::error::ToolError::Execution(anyhow!("remote: {e}")))?;
+            let stream = self
+                .remote
+                .spawn(req)
+                .await
+                .map_err(|e| base::error::ToolError::Execution(anyhow!("remote: {e}")))?;
             tokio::pin!(stream);
             let mut text = String::new();
             while let Some(ev) = stream.next().await {
                 match ev {
                     Ok(RemoteAgentEvent::TextDelta(t)) => text.push_str(&t),
-                    Ok(RemoteAgentEvent::Final { output_text, .. }) => { text = output_text; break; }
-                    Ok(RemoteAgentEvent::Error(m)) =>
-                        return Err(base::error::ToolError::Execution(anyhow!("{m}"))),
+                    Ok(RemoteAgentEvent::Final { output_text, .. }) => {
+                        text = output_text;
+                        break;
+                    }
+                    Ok(RemoteAgentEvent::Error(m)) => {
+                        return Err(base::error::ToolError::Execution(anyhow!("{m}")))
+                    }
                     Err(e) => return Err(base::error::ToolError::Execution(anyhow!("{e}"))),
                     _ => {}
                 }
             }
             return Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(text),
-                is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
+                is_error: false,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
             });
         }
 
@@ -1126,16 +1201,29 @@ impl base::tool::Tool for AgentTool {
         let perm = self.permission_handler();
 
         match self
-            .run_sub(prompt, tools, cwd, ctx.cancel.child_token(), perm, inp.subagent_type.as_deref())
+            .run_sub(
+                prompt,
+                tools,
+                cwd,
+                ctx.cancel.child_token(),
+                perm,
+                inp.subagent_type.as_deref(),
+            )
             .await
         {
             Ok(text) => Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(text),
-                is_error: false, structured_content: None, mcp_meta: None, new_messages: None,
+                is_error: false,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
             }),
             Err(e) => Ok(base::tool::ToolResult {
                 content: ToolResultContent::Text(format!("sub-agent error: {e}")),
-                is_error: true, structured_content: None, mcp_meta: None, new_messages: None,
+                is_error: true,
+                structured_content: None,
+                mcp_meta: None,
+                new_messages: None,
             }),
         }
     }
@@ -1225,9 +1313,21 @@ mod catalog_tests {
         let global_dir = base.join("global");
         let scene_dir = base.join("scene");
         let project_dir = base.join("project");
-        write_agent_md(&global_dir, "reviewer.md", "---\ndescription: from global\n---\nbody");
-        write_agent_md(&scene_dir, "reviewer.md", "---\ndescription: from scene\n---\nbody");
-        write_agent_md(&project_dir, "reviewer.md", "---\ndescription: from project\n---\nbody");
+        write_agent_md(
+            &global_dir,
+            "reviewer.md",
+            "---\ndescription: from global\n---\nbody",
+        );
+        write_agent_md(
+            &scene_dir,
+            "reviewer.md",
+            "---\ndescription: from scene\n---\nbody",
+        );
+        write_agent_md(
+            &project_dir,
+            "reviewer.md",
+            "---\ndescription: from project\n---\nbody",
+        );
 
         let merged = merge_agent_types(&[&global_dir, &scene_dir, &project_dir], &[]);
         let _ = std::fs::remove_dir_all(&base);
@@ -1244,7 +1344,10 @@ mod catalog_tests {
             system_prompt: "Plugin explore body.".into(),
         }];
         let merged = merge_agent_types(&[], &plugin_types);
-        assert_eq!(merged["explore"].description, "Plugin-provided explore override");
+        assert_eq!(
+            merged["explore"].description,
+            "Plugin-provided explore override"
+        );
         assert_eq!(merged["explore"].system_prompt, "Plugin explore body.");
         // Untouched built-ins survive.
         assert!(merged.contains_key("code-reviewer"));
@@ -1428,17 +1531,28 @@ mod catalog_tests {
 
         // "general-purpose" is a full-access type (empty allowed_tools).
         let resolved = agent_tool.resolve_tools(Some("general-purpose"));
-        let names: Vec<String> = resolved.all().iter().map(|t| t.name().to_string()).collect();
+        let names: Vec<String> = resolved
+            .all()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
         assert!(names.iter().any(|n| n == "Read"));
         assert!(names.iter().any(|n| n == "Bash"));
-        assert!(!names.iter().any(|n| n == AGENT_TOOL_NAME), "sub-agent must not be able to spawn further sub-agents");
+        assert!(
+            !names.iter().any(|n| n == AGENT_TOOL_NAME),
+            "sub-agent must not be able to spawn further sub-agents"
+        );
     }
 
     #[test]
     fn resolve_tools_restricted_type_filters_to_allowed_list() {
         let agent_tool = test_agent_tool();
         let resolved = agent_tool.resolve_tools(Some("explore"));
-        let names: Vec<String> = resolved.all().iter().map(|t| t.name().to_string()).collect();
+        let names: Vec<String> = resolved
+            .all()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
         assert!(names.iter().any(|n| n == "Read")); // explore allows Read
         assert!(!names.iter().any(|n| n == "Bash")); // explore doesn't allow Bash
     }
@@ -1461,14 +1575,8 @@ mod catalog_tests {
         let tools = Arc::new(InMemoryToolRegistry::new());
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
-        let agent_tool = AgentTool::with_parent_tools(
-            model,
-            config,
-            tools.clone(),
-            tools,
-            &[&dir],
-            &[],
-        );
+        let agent_tool =
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[&dir], &[]);
         let _ = std::fs::remove_dir_all(&dir);
 
         // Same lookup `run_sub`/`run_sub_inner` perform: resolve the type's
@@ -1480,7 +1588,8 @@ mod catalog_tests {
             .and_then(|d| d.model.as_deref());
         assert_eq!(model_override, Some("claude-opus-4-8"));
 
-        let settings = agent_tool.sub_settings(model_override, std::path::PathBuf::from("/tmp/cwd"));
+        let settings =
+            agent_tool.sub_settings(model_override, std::path::PathBuf::from("/tmp/cwd"));
         assert_eq!(settings.model.model_name, "claude-opus-4-8");
 
         // A call with no override (or an unknown type) still falls back to
