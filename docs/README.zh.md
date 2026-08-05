@@ -17,8 +17,10 @@ AttaCore **不是**面向终端用户的 AI 助手，而是**面向开发者的 
 | **并发** | v2 流式工具执行器在模型仍在生成 token 时并行运行安全工具——GPU 流水线思维应用于 LLM 工具调用 |
 | **安全** | 三级权限模型（允许/询问/禁止）、基于 glob 的规则引擎、Unicode 规范化路径安全、沙盒执行、LLM 辅助分类 |
 | **多 Agent** | 一等公民的团队协作：Coordinator、Mailbox、共享记忆、远程 Agent 派生——像微服务一样组合 Agent |
+| **多供应商路由** | 在 `settings.json` 里登记多个 LLM 供应商，按任务类型分级路由——子 agent 可以用比主对话更便宜/不同的模型，daemon 启动时解析并校验 |
+| **场景自定义** | Agent 行为——系统提示词、工具白名单、执行限制——由 `AgentScene` trait 定义，不写死在引擎里。三个内置场景形成一条"抄作业"的阶梯：完整参照、精简参照、最小骨架 |
 | **可观测性** | 40+ 结构化遥测事件、OpenTelemetry 导出、VCR 录制/回放实现确定性测试、成本追踪 |
-| **可嵌入** | 库模式（Rust API）或 Daemon 模式（JSON-RPC 2.0 over Unix Socket / TCP）——同一引擎，任选集成方式 |
+| **可嵌入** | 库模式（Rust API）或 Daemon 模式（JSON-RPC 2.0 over Unix Socket / TCP，TCP 带 token 握手鉴权）——同一引擎，任选集成方式 |
 
 ## 架构
 
@@ -89,6 +91,41 @@ AttaCore 是一个 5 层、严格分层的 Rust workspace。依赖只能向上�
 | **协议** | 全量 MCP 支持（stdio / SSE / Streamable HTTP） |
 
 每个工具都实现统一的 `Tool` trait——一致的错误处理、权限门控和遥测埋点。
+
+### 场景自定义
+
+Agent 的行为——系统提示词、工具白名单、token 预算、执行限制——由 [`AgentScene`](../crates/core/src/interface/scene.rs) trait 定义，不写死在引擎里。三个内置场景深度各不相同，形成一条学习/抄作业的阶梯：
+
+| 场景 | 深度 | 用途 |
+|---|---|---|
+| `CodingScene` | 完整参照实现（~850 行）——带缓存优化的多段式系统提示词，行为对齐 Claude Code | 生产级深度的范例 |
+| `ChatScene` | 精简但完整——每个方法都实现了，每处设计决策都配"为什么这么写"的注释 | 写自己的场景时直接抄的模板 |
+| `DemoScene` | 最小骨架——只实现 trait 里 6 个必须方法，所有可选扩展点都留在默认值 | "不覆写某个方法会发生什么"的范例 |
+
+自己实现 `AgentScene` 就能做出贴合自己产品的场景——客服 bot 场景、数据分析场景，随你的领域需要——然后通过 `--scene`（daemon 模式）或 `Builder::scene(...)`（库模式）选用它。完整的 trait 注入图景见下方[自定义行为](#自定义行为)。
+
+### 多 LLM 供应商与任务级路由
+
+不再是写死的单一 Anthropic client：`settings.json` 可以登记多个供应商，按任务类型把请求路由过去，而不是整个引擎只认一个模型：
+
+```json
+{
+  "providers": {
+    "anthropic": { "api_type": "anthropic", "api_key": "sk-ant-...", "default_model": "claude-sonnet-4-6" },
+    "deepseek":  { "api_type": "anthropic", "base_url": "https://api.deepseek.com", "api_key": "sk-...",
+                   "default_model": "deepseek-pro", "models": ["deepseek-pro", "deepseek-flash"] }
+  },
+  "default_provider": "anthropic",
+  "task_models": { "subagent": "deepseek" }
+}
+```
+
+- **启动时解析并校验**——引用了不存在的 provider、缺 `default_model`、或 `api_type` 不支持,都会让 daemon 在启动阶段直接报错退出,不会等到会话中途才暴露问题。
+- **已接线**：`Agent` 工具的子 agent 生成点会通过解析出的 provider/model（`TaskRouter`）发起请求，不再无条件继承父 session 的模型。
+- **尚未接线**：主对话模型、`team` 协调依然走单一的、从环境变量读取配置的 client；`api_type: openai_compatible` 在配置 schema 层面是合法值，但还没有对应的协议实现——声明这个类型会在启动时直接报错退出，而不是悄悄降级成 Anthropic。
+- 随时用 `daemon.doctor` RPC 查看实际解析出的路由结果；用 `config.getProvider`/`config.setProvider` 读写供应商配置，不用手改 JSON 文件。
+
+完整配置参考和精确的实施状态见 [`docs/LLM_PROVIDERS.md`](LLM_PROVIDERS.md)。
 
 ### 上下文压缩
 
@@ -246,7 +283,7 @@ Daemon 特性：
 - **会话池**：可配置容量上限、LRU 驱逐、空闲超时
 - **服务发现**：通过 PID lock file + Unix socket，客户端自动发现
 - **优雅关闭**：等待进行中的 turn 完成后退出
-- **TCP 模式**：基于 token 的认证，支持远程访问
+- **TCP 模式**：每条连接的第一条消息必须是 `daemon.auth` 握手（常量时间比较 token），通过之后才会分派其余方法——Unix socket 不需要握手，靠文件权限做访问控制
 
 ### 库模式（嵌入式 Rust API）
 
@@ -363,12 +400,11 @@ let id = Id::parse(s)?;        // 从外部输入验证解码（检查 16 字节
 
 ```
 AttaCore/
-├── crates/           # 18 个 Rust crate（引擎本体）
+├── crates/           # 17 个 Rust crate（引擎本体）
 ├── daemon/           # JSON-RPC 2.0 daemon（参考应用）
 ├── tests/            # 集成测试 + 测试运行器 + fixtures
 ├── docs/             # 文档
-├── 3rds/             # 第三方依赖 / vendored 代码
-├── Cargo.toml        # Workspace 根（22 个成员）
+├── Cargo.toml        # Workspace 根（19 个成员）
 └── README.md         # 英文版本
 ```
 
@@ -379,7 +415,8 @@ AttaCore/
 | [README.md](../README.md) | 英文版本 — 项目概览、架构、快速开始 |
 | [README.zh.md](README.zh.md) | **你在这里** — 中文版，面向中文开发者 |
 | [DEV_GUIDE.md](DEV_GUIDE.md) | Daemon 与库模式的完整 API 参考 |
-| [CLAUDE.md](../CLAUDE.md) | Agent 指令 — 代码规范、设计规则 |
+| [LLM_PROVIDERS.md](LLM_PROVIDERS.md) | 多 LLM 供应商配置参考 — schema、示例、精确的接线状态 |
+| [DAEMON_RPC.md](DAEMON_RPC.md) | 完整 JSON-RPC 方法参考 — 参数、错误码、TCP 鉴权握手 |
 
 ## 许可
 

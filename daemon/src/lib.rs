@@ -6,6 +6,7 @@
 pub mod config;
 pub mod discovery;
 pub mod doctor;
+pub mod model_router;
 pub mod rpc;
 pub mod server;
 pub mod session_manager;

@@ -17,8 +17,10 @@ AttaCore is **not** an end-user AI assistant. It is a **developer-facing agent e
 | **Concurrency** | v2 streaming tool executor pipelines safe-parallel tools while the model is still generating tokens — GPU-pipeline thinking applied to LLM tool calls |
 | **Safety** | Three-tier permission model (allow/ask/deny), glob-based rule engine, Unicode-normalized path safety, sandboxed execution, LLM-assisted classification |
 | **Multi-Agent** | First-class team coordination: Coordinator, Mailbox, shared memory, remote agent spawning — compose agents like microservices |
+| **Multi-Provider Routing** | Declare several LLM providers in `settings.json` and route by task type — sub-agent spawns can run on a cheaper/different model than the main conversation, resolved and validated at daemon startup |
+| **Scene Customization** | Agent behavior — system prompt, tool whitelist, execution limits — lives behind the `AgentScene` trait, not hardcoded. Three built-in scenes double as a copy-from-here ladder: full reference, compact reference, minimal skeleton |
 | **Observability** | 40+ structured telemetry events, OpenTelemetry export, VCR record/replay for deterministic testing, cost tracking |
-| **Embeddable** | Library mode (Rust API) or Daemon mode (JSON-RPC 2.0 over Unix socket / TCP) — same engine, your choice of integration surface |
+| **Embeddable** | Library mode (Rust API) or Daemon mode (JSON-RPC 2.0 over Unix socket / TCP, token-handshake authenticated) — same engine, your choice of integration surface |
 
 ## Architecture
 
@@ -89,6 +91,41 @@ Shared types and traits for the entire system: `Model` (LLM backend abstraction)
 | **Protocol** | Full MCP support (stdio / SSE / Streamable HTTP) |
 
 Every tool implements the unified `Tool` trait — consistent error handling, permission gating, and telemetry instrumentation.
+
+### Scene Customization
+
+Agent behavior — system prompt, tool whitelist, token budget, execution limits — is defined by the [`AgentScene`](crates/core/src/interface/scene.rs) trait, not hardcoded into the engine. Three built-in scenes double as a learning ladder, each at a different depth:
+
+| Scene | Depth | Use it as… |
+|---|---|---|
+| `CodingScene` | Full reference (~850 lines) — cache-optimized, multi-section system prompt, behavior aligned with Claude Code | The production-depth example |
+| `ChatScene` | Complete but compact — every method implemented, each with a "why this design" comment | The template to copy when writing your own scene |
+| `DemoScene` | Minimal skeleton — only the 6 required trait methods; every optional extension point left at its default | The "what happens if I don't override this" example |
+
+Implement `AgentScene` yourself to ship a scene tailored to your product — a support-bot scene, a data-analysis scene, whatever your domain needs — then select it via `--scene` (daemon mode) or `Builder::scene(...)` (library mode). See [Customizing Behavior](#customizing-behavior) below for the full trait-injection picture.
+
+### Multi-Provider LLM & Task-Level Routing
+
+Beyond a single hardcoded Anthropic client, `settings.json` can declare several providers and route requests to them by task type instead of one model for the whole engine:
+
+```json
+{
+  "providers": {
+    "anthropic": { "api_type": "anthropic", "api_key": "sk-ant-...", "default_model": "claude-sonnet-4-6" },
+    "deepseek":  { "api_type": "anthropic", "base_url": "https://api.deepseek.com", "api_key": "sk-...",
+                   "default_model": "deepseek-pro", "models": ["deepseek-pro", "deepseek-flash"] }
+  },
+  "default_provider": "anthropic",
+  "task_models": { "subagent": "deepseek" }
+}
+```
+
+- **Resolved and validated at startup** — an unknown provider, a missing `default_model`, or an unsupported `api_type` fails the daemon at boot with a clear error, not mid-session.
+- **Wired**: the `Agent` tool's sub-agent spawns route through the resolved provider/model (`TaskRouter`) instead of always inheriting the parent session's model.
+- **Not yet wired**: the main conversation model and `team` coordination still use the single env-var-configured client; `api_type: openai_compatible` is accepted by the config schema but has no protocol implementation yet — declaring one fails fast at startup with a descriptive error instead of silently falling back to Anthropic.
+- Inspect resolved routing anytime via the `daemon.doctor` RPC; read/write provider config without hand-editing JSON via `config.getProvider`/`config.setProvider`.
+
+See [`docs/LLM_PROVIDERS.md`](docs/LLM_PROVIDERS.md) for the full config reference and exact implementation status.
 
 ### Context Compaction
 
@@ -246,7 +283,7 @@ Daemon features:
 - **Session pool** with configurable capacity, LRU eviction, and idle timeout
 - **Discovery** via PID lock file + Unix socket — clients find the daemon automatically
 - **Graceful shutdown** with in-flight turn completion
-- **TCP mode** with token-based authentication for remote access
+- **TCP mode** requires a `daemon.auth` handshake (constant-time token comparison) as the first message on every connection before any other method is dispatched — Unix sockets skip this and rely on filesystem permissions instead
 
 ### Library Mode (Embedded Rust API)
 
@@ -363,12 +400,11 @@ let id = Id::parse(s)?;        // Validate and decode external input (checks 16-
 
 ```
 AttaCore/
-├── crates/           # 18 Rust crates (the engine)
+├── crates/           # 17 Rust crates (the engine)
 ├── daemon/           # JSON-RPC 2.0 daemon (reference application)
 ├── tests/            # Integration tests + test runner + fixtures
 ├── docs/             # Documentation
-├── 3rds/             # Third-party dependencies / vendored code
-├── Cargo.toml        # Workspace root (22 members)
+├── Cargo.toml        # Workspace root (19 members)
 └── README.md         # You are here
 ```
 
@@ -379,7 +415,8 @@ AttaCore/
 | [README.md](README.md) | **You are here** — project overview, architecture, quick start |
 | [README.zh.md](docs/README.zh.md) | 中文版本 — 同样的内容，面向中文开发者 |
 | [DEV_GUIDE.md](docs/DEV_GUIDE.md) | Full API reference for Daemon and Library modes |
-| [CLAUDE.md](CLAUDE.md) | Agent instructions — codebase conventions, design rules |
+| [LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) | Multi-provider LLM config reference — schema, examples, exact wiring status |
+| [DAEMON_RPC.md](docs/DAEMON_RPC.md) | Complete JSON-RPC method reference — params, errors, TCP auth handshake |
 
 ## License
 

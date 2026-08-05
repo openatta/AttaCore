@@ -8,12 +8,15 @@
 //! `session.run_turn` (already runs with `PermissionMode::BypassPermissions`,
 //! "IDE plugins manage their own sandbox") — trusts whoever can reach this
 //! socket. There is no per-method authorization on top of that: Unix socket
-//! file permissions are the entire access-control story locally, and the TCP
-//! listener's shared token (`--token`/`ATTACORE_DAEMON_TOKEN`) is the entire
-//! story remotely. In particular, `config.setProvider` lets any caller who
-//! can reach this socket point future LLM traffic at an attacker-controlled
-//! `base_url`/`api_key` — treat socket/token exposure with the same care as
-//! exposing the LLM credentials themselves.
+//! file permissions are the entire access-control story locally. For TCP,
+//! each connection must open with a `daemon.auth` handshake carrying the
+//! shared token (`--token`/`ATTACORE_DAEMON_TOKEN`, see
+//! [`DaemonServer::authenticate_tcp`]) before any other method is dispatched
+//! — once a connection passes the handshake it is trusted for its lifetime,
+//! same as a Unix socket connection. In particular, `config.setProvider` lets
+//! any authenticated caller point future LLM traffic at an
+//! attacker-controlled `base_url`/`api_key` — treat socket/token exposure
+//! with the same care as exposing the LLM credentials themselves.
 
 use crate::rpc::{codes, RpcRequest, RpcResponse};
 use crate::session_pool::SessionPool;
@@ -30,6 +33,22 @@ use tracing::{debug, info, warn};
 
 type Writer = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
 type Reader = Box<dyn AsyncRead + Send + Unpin + 'static>;
+type LineReader = tokio::io::Lines<BufReader<Reader>>;
+
+/// Fixed-time byte comparison — avoids leaking the TCP token's length-matched
+/// prefix via response-time side channels. `a`/`b` differing in length is not
+/// itself timing-sensitive (tokens are a fixed shared secret, not attacker-
+/// influenced length), so a cheap length check up front is fine.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 pub struct DaemonServer {
     pool: Arc<SessionPool>,
@@ -62,6 +81,25 @@ impl DaemonServer {
         }
         let listener = TcpListener::bind(addr).await?;
         info!(addr=%addr, "TCP listener bound");
+        self.serve_tcp_listener(listener).await
+    }
+
+    /// Accept loop over an already-bound TCP listener — split out from
+    /// [`Self::serve_tcp`] so tests can bind an ephemeral port (`127.0.0.1:0`),
+    /// read the OS-assigned port via `listener.local_addr()`, and drive this
+    /// loop directly instead of guessing a fixed port.
+    ///
+    /// Re-checks (doesn't just trust `serve_tcp`'s check) that a token is
+    /// configured — this is a `pub` method, so a caller could reach it
+    /// without going through `serve_tcp` at all (e.g. binding the listener
+    /// itself for socket-activation setups) and forgetting `set_tcp_token`
+    /// first. Without this, that mistake wouldn't fail loudly — every
+    /// connection would just silently get rejected by `authenticate_tcp`
+    /// forever, which is safe but confusing to debug.
+    pub async fn serve_tcp_listener(self: Arc<Self>, listener: TcpListener) -> anyhow::Result<()> {
+        if self.tcp_token.read().await.is_none() {
+            anyhow::bail!("TCP requires token");
+        }
         loop {
             tokio::select! {
                 _ = self.shutdown_token.cancelled() => break,
@@ -119,24 +157,98 @@ impl DaemonServer {
         &self,
         reader: Reader,
         writer: Writer,
-        _tcp: bool,
+        tcp: bool,
     ) -> anyhow::Result<()> {
         let mut lines = BufReader::new(reader).lines();
+
+        // Unix socket connections are trusted for their lifetime by file
+        // permissions alone (see the module doc comment's trust-boundary
+        // note) — no handshake needed. TCP connections must authenticate
+        // once, up front, before any RPC method is dispatched.
+        if tcp && !self.authenticate_tcp(&mut lines, &writer).await {
+            return Ok(());
+        }
+
         while let Ok(Some(line)) = lines.next_line().await {
             let req: RpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
             let resp = self.dispatch(req, writer.clone()).await;
-            let mut buf = serde_json::to_vec(&resp).unwrap_or_default();
-            buf.push(b'\n');
-            let mut w = writer.lock().await;
-            if w.write_all(&buf).await.is_err() {
+            if !self.write_response(&writer, &resp).await {
                 break;
             }
-            let _ = w.flush().await;
         }
         Ok(())
+    }
+
+    /// TCP-only handshake: the first line on the connection must be a
+    /// `daemon.auth` request carrying `params.token` equal to the token
+    /// configured via `--token`/`ATTACORE_DAEMON_TOKEN`. Writes back an ok/err
+    /// response either way. Returns `true` if the connection may proceed to
+    /// the normal dispatch loop, `false` if it was rejected (or closed before
+    /// sending anything) and the caller should just drop it.
+    async fn authenticate_tcp(&self, lines: &mut LineReader, writer: &Writer) -> bool {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            _ => return false,
+        };
+        let req: RpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => {
+                self.write_response(
+                    writer,
+                    &RpcResponse::err(
+                        serde_json::Value::Null,
+                        codes::UNAUTHORIZED,
+                        "first message must be a valid daemon.auth request",
+                    ),
+                )
+                .await;
+                return false;
+            }
+        };
+        let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+        if req.method != "daemon.auth" {
+            self.write_response(
+                writer,
+                &RpcResponse::err(id, codes::UNAUTHORIZED, "must authenticate via daemon.auth first"),
+            )
+            .await;
+            return false;
+        }
+        let provided = req.params.get("token").and_then(|v| v.as_str()).unwrap_or("");
+        let expected = self.tcp_token.read().await;
+        let authenticated = expected
+            .as_deref()
+            .is_some_and(|t| constant_time_eq(t.as_bytes(), provided.as_bytes()));
+        drop(expected);
+
+        if !authenticated {
+            self.write_response(
+                writer,
+                &RpcResponse::err(id, codes::UNAUTHORIZED, "invalid token"),
+            )
+            .await;
+            return false;
+        }
+        self.write_response(writer, &RpcResponse::ok(id, serde_json::json!({"authenticated": true})))
+            .await;
+        true
+    }
+
+    /// Serialize + write one response line, flush, and report whether the
+    /// write succeeded (`false` means the peer is gone — caller should stop
+    /// writing to this connection).
+    async fn write_response(&self, writer: &Writer, resp: &RpcResponse) -> bool {
+        let mut buf = serde_json::to_vec(resp).unwrap_or_default();
+        buf.push(b'\n');
+        let mut w = writer.lock().await;
+        if w.write_all(&buf).await.is_err() {
+            return false;
+        }
+        let _ = w.flush().await;
+        true
     }
 
     async fn dispatch(&self, req: RpcRequest, writer: Writer) -> RpcResponse {

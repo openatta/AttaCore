@@ -204,6 +204,13 @@ pub struct SessionPool {
     /// directly and is injected into each new session via
     /// `Builder::commands_override`.
     commands: AsyncRwLock<Arc<runtime::commands::CommandRegistry>>,
+    /// Multi-provider per-task-type model routing (see
+    /// `base::provider::TaskRouter` / `daemon::model_router`), built once
+    /// at startup from `settings.providers`/`task_models` when configured.
+    /// `None` when the user hasn't configured `providers` — every session
+    /// created by this pool then behaves exactly as before multi-provider
+    /// routing existed (all sub-agent spawns inherit `self.model`).
+    task_router: Option<Arc<base::provider::TaskRouter>>,
 }
 
 /// session.list 返回的单条记录。
@@ -239,6 +246,7 @@ impl SessionPool {
         engine_config: EngineConfig,
         history_store: Option<Arc<dyn history::store::HistoryStore>>,
         paths: Arc<dyn crate::config::DaemonPaths>,
+        task_router: Option<Arc<base::provider::TaskRouter>>,
     ) -> Self {
         let model = Arc::new(AnthropicModel::new(client.clone()));
         let (events_tx, _) = tokio::sync::broadcast::channel(256);
@@ -265,6 +273,7 @@ impl SessionPool {
             events_tx,
             plugins: AsyncRwLock::new(plugins),
             commands: AsyncRwLock::new(commands),
+            task_router,
         }
     }
 
@@ -906,6 +915,9 @@ impl SessionPool {
         if let Some(ref store) = self.history_store {
             builder = builder.history_store(store.clone());
         }
+        if let Some(ref router) = self.task_router {
+            builder = builder.task_router(router.clone());
+        }
 
         // Give this session its own owned `McpManager` built from the
         // centrally-connected client handles (cheap `Arc` clones — not a
@@ -959,7 +971,7 @@ impl SessionPool {
 
         // 容量检查：驱逐最久未活跃的 session
         if sessions.len() >= self.cap {
-            self.evict_lru(&mut sessions).await;
+            evict_lru(&mut sessions);
         }
 
         let live = LiveSession {
@@ -995,7 +1007,12 @@ impl SessionPool {
                     sid.clone()
                 } else {
                     drop(sessions);
-                    self.resume_or_create(sid.clone(), options.as_ref()).await
+                    match self.resume_or_create(sid.clone(), options.as_ref()).await {
+                        Ok(sid) => sid,
+                        Err(e) => {
+                            return RpcResponse::err(id, codes::INTERNAL_ERROR, e);
+                        }
+                    }
                 }
             }
             None => {
@@ -1264,13 +1281,7 @@ impl SessionPool {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await; // 每 5 分钟
                 let mut sessions = pool.sessions.lock().await;
-                let timeout = pool.idle_timeout;
-                let now = Instant::now();
-                let to_evict: Vec<String> = sessions
-                    .iter()
-                    .filter(|(_, live)| now.duration_since(live.last_active) > timeout)
-                    .map(|(sid, _)| sid.clone())
-                    .collect();
+                let to_evict = idle_session_ids(&sessions, Instant::now(), pool.idle_timeout);
                 for sid in &to_evict {
                     if let Some(live) = sessions.remove(sid) {
                         live.cancel.cancel();
@@ -1291,14 +1302,31 @@ impl SessionPool {
     // ── 内部方法 ──
 
     /// 从 HistoryStore 恢复 session 或创建新的。
-    async fn resume_or_create(&self, sid: String, options: Option<&SessionOptions>) -> String {
-        // 尝试从 HistoryStore 加载历史消息
+    /// Resume a session referenced by `sid` (loading history first, if a
+    /// `history_store` is configured) or create it fresh under a new id if
+    /// that fails. Mirrors `create()`'s `Result<String, String>` shape — a
+    /// second failed attempt is a real (if rare) error condition, not a bug,
+    /// so it's propagated to the caller instead of panicking (see
+    /// `docs/design/2026-08-04-...` follow-up: a `create()` failure here is
+    /// systemic — e.g. engine construction failing, or a `daemon.shutdown`
+    /// racing this call — so retrying under a new id is unlikely to help,
+    /// but the caller still deserves a normal JSON-RPC error instead of the
+    /// connection silently dying).
+    async fn resume_or_create(
+        &self,
+        sid: String,
+        options: Option<&SessionOptions>,
+    ) -> Result<String, String> {
+        // 尝试从 HistoryStore 加载历史消息。`sid` 来自 RPC 调用方（`session.run_turn`
+        // 的 `session_id` 参数），不保证是合法的 BASE58 ID——解析失败当作"没有历史"
+        // 处理（等价于查不到），而不是 unwrap 崩溃：一个格式错误的 session_id 不该
+        // 让整条连接的处理任务 panic。
         let has_history = if let Some(ref store) = self.history_store {
-            match store
-                .load(base::session::SessionId::parse(&sid).unwrap())
-                .await
-            {
-                Ok(entries) => !entries.is_empty(),
+            match base::session::SessionId::parse(&sid) {
+                Ok(parsed) => match store.load(parsed).await {
+                    Ok(entries) => !entries.is_empty(),
+                    Err(_) => false,
+                },
                 Err(_) => false,
             }
         } else {
@@ -1307,43 +1335,30 @@ impl SessionPool {
 
         if has_history {
             match self.create(sid.clone(), self.scene.clone(), options).await {
-                Ok(s) => s,
+                Ok(s) => Ok(s),
                 Err(e) => {
                     warn!(%sid, error=%e, "resume failed, creating new");
                     let new_sid = Id::new().to_string();
                     self.create(new_sid.clone(), self.scene.clone(), options)
                         .await
-                        .unwrap_or_else(|e| panic!("create session: {e}"))
+                        .map_err(|e| format!("resume {sid} failed, retry also failed: {e}"))
                 }
             }
         } else {
             match self.create(sid.clone(), self.scene.clone(), options).await {
-                Ok(s) => s,
+                Ok(s) => Ok(s),
                 Err(e) => {
                     warn!(sid, error=%e, "create with given sid failed");
                     let new_sid = Id::new().to_string();
                     self.create(new_sid.clone(), self.scene.clone(), options)
                         .await
-                        .unwrap_or_else(|e| panic!("create session: {e}"))
+                        .map_err(|e| format!("create {sid} failed, retry also failed: {e}"))
                 }
             }
         }
     }
 
     /// LRU 驱逐：移除最久未活跃的 session。
-    async fn evict_lru(&self, sessions: &mut HashMap<String, LiveSession>) {
-        if let Some((sid, _)) = sessions
-            .iter()
-            .min_by_key(|(_, live)| live.last_active)
-            .map(|(k, v)| (k.clone(), v.last_active))
-        {
-            if let Some(live) = sessions.remove(&sid) {
-                live.cancel.cancel();
-                info!(%sid, "session evicted (LRU, pool full)");
-            }
-        }
-    }
-
     /// 调用 LLM 生成 session 名称。
     async fn generate_session_name(&self, prompt: &str) -> Result<String, String> {
         use base::interface::model::{MessageRole, ModelContentBlock, ModelMessage, StreamParams};
@@ -1400,6 +1415,38 @@ impl SessionPool {
     }
 }
 
+/// LRU 驱逐：从 `sessions` 里移除最久未活跃的一个（若非空）。不依赖 `SessionPool`
+/// 的任何字段，拆成自由函数而非 `&self` 方法——一是本来就没用到 `self`，二是
+/// 让测试不用搭一整个 `SessionPool` 就能直接验证驱逐选中的是最旧的那个。
+fn evict_lru(sessions: &mut HashMap<String, LiveSession>) {
+    if let Some((sid, _)) = sessions
+        .iter()
+        .min_by_key(|(_, live)| live.last_active)
+        .map(|(k, v)| (k.clone(), v.last_active))
+    {
+        if let Some(live) = sessions.remove(&sid) {
+            live.cancel.cancel();
+            info!(%sid, "session evicted (LRU, pool full)");
+        }
+    }
+}
+
+/// Session id 列表：`last_active` 距 `now` 超过 `timeout` 的那些。拆成纯函数
+/// （不做任何驱逐动作，只挑出 id）——原逻辑内嵌在 `start_janitor` 真实跑
+/// 300 秒一次的循环体里，没法在测试里等 5 分钟去验证；抽出来之后可以直接用
+/// 人为构造的" last_active 已经很旧"的 session 测，不用真的睡觉。
+fn idle_session_ids(
+    sessions: &HashMap<String, LiveSession>,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|(_, live)| now.duration_since(live.last_active) > timeout)
+        .map(|(sid, _)| sid.clone())
+        .collect()
+}
+
 fn format_instant(t: Instant) -> String {
     let ago = Instant::now().duration_since(t);
     let secs_ago = ago.as_secs();
@@ -1443,5 +1490,95 @@ mod redact_tests {
         // panic here; char-based slicing must not.
         let s = "sk-😀😀😀😀";
         assert_eq!(redact_secret(s), "***😀😀😀😀");
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    /// A `LiveSession` with no real agent behind it — only `last_active`
+    /// (and `cancel`, so eviction's `.cancel()` call doesn't panic) matter
+    /// for these tests.
+    fn dummy_live_session(last_active: Instant) -> LiveSession {
+        let (input_tx, _input_rx): (InputSender, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx): (_, EventReceiver) = tokio::sync::mpsc::unbounded_channel();
+        LiveSession {
+            input_tx,
+            event_rx: Arc::new(AsyncMutex::new(Some(event_rx))),
+            cancel: CancellationToken::new(),
+            name: None,
+            created_at: last_active,
+            last_active,
+            is_first_turn: true,
+        }
+    }
+
+    #[test]
+    fn evict_lru_removes_the_least_recently_active_session() {
+        let now = Instant::now();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "oldest".to_string(),
+            dummy_live_session(now.checked_sub(Duration::from_secs(60)).unwrap()),
+        );
+        sessions.insert(
+            "middle".to_string(),
+            dummy_live_session(now.checked_sub(Duration::from_secs(30)).unwrap()),
+        );
+        sessions.insert("newest".to_string(), dummy_live_session(now));
+
+        evict_lru(&mut sessions);
+
+        assert_eq!(sessions.len(), 2, "sessions: {:?}", sessions.keys().collect::<Vec<_>>());
+        assert!(!sessions.contains_key("oldest"));
+        assert!(sessions.contains_key("middle"));
+        assert!(sessions.contains_key("newest"));
+    }
+
+    #[test]
+    fn evict_lru_on_empty_map_is_a_noop() {
+        let mut sessions: HashMap<String, LiveSession> = HashMap::new();
+        evict_lru(&mut sessions); // must not panic
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn idle_session_ids_selects_only_sessions_past_timeout() {
+        let now = Instant::now();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "stale".to_string(),
+            dummy_live_session(now.checked_sub(Duration::from_secs(600)).unwrap()),
+        );
+        sessions.insert("fresh".to_string(), dummy_live_session(now));
+
+        let idle = idle_session_ids(&sessions, now, Duration::from_secs(300));
+        assert_eq!(idle, vec!["stale".to_string()]);
+    }
+
+    #[test]
+    fn idle_session_ids_empty_when_nothing_past_timeout() {
+        let now = Instant::now();
+        let mut sessions = HashMap::new();
+        sessions.insert("fresh".to_string(), dummy_live_session(now));
+
+        let idle = idle_session_ids(&sessions, now, Duration::from_secs(300));
+        assert!(idle.is_empty());
+    }
+
+    #[test]
+    fn idle_session_ids_exactly_at_timeout_boundary_is_not_evicted() {
+        // 边界用 `>` 不是 `>=`（见 idle_session_ids 实现）——正好等于超时
+        // 阈值的 session 这一轮还不驱逐，下一轮才会（因为到那时肯定 `>` 了）。
+        let now = Instant::now();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "exactly_at_boundary".to_string(),
+            dummy_live_session(now.checked_sub(Duration::from_secs(300)).unwrap()),
+        );
+
+        let idle = idle_session_ids(&sessions, now, Duration::from_secs(300));
+        assert!(idle.is_empty(), "idle: {idle:?}");
     }
 }

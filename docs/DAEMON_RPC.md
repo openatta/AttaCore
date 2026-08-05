@@ -23,10 +23,15 @@
   | `SESSION_NOT_FOUND` | -32000 | daemon 扩展：引用的 session id 不存在 |
   | `SESSION_CAP_REACHED` | -32001 | daemon 扩展：预留，当前未在任何路径实际触发 |
   | `ENGINE_ERROR` | -32002 | daemon 扩展：session 运行时（Agent 内部）报错 |
+  | `UNAUTHORIZED` | -32003 | daemon 扩展：TCP 连接的 `daemon.auth` 握手缺失、格式错、或 token 不匹配（仅 TCP；Unix socket 不会触发） |
 
   **畸形请求（整行不是合法 JSON，或缺 `method` 字段导致反序列化失败）不会收到任何响应**——`handle_connection` 直接 `continue` 跳过这一行，连接不会因此关闭，也不会收到一条 `PARSE_ERROR` 错误帧。这和很多 JSON-RPC 实现的"至少回一个 parse error"不同，调用方需要自己保证发送的每一行是合法 JSON。
 
-- **信任边界**：**没有任何方法级鉴权**。Unix socket 的文件权限（本地）/ `--token`（TCP，`--listen` 必须搭配 `--token` 或 `ATTACORE_DAEMON_TOKEN` 环境变量）是唯一的访问控制层。能连上这个 socket 的调用方，能调用下表**任何**方法——包括改写 LLM 供应商密钥（`config.setProvider`）、读出明文密钥（`config.getProvider` + `include_secrets:true`）、杀掉所有 session（`daemon.shutdown`）。对待 socket/token 暴露面应该和对待 LLM 凭证本身一样谨慎。
+- **信任边界**：没有方法级鉴权（一旦连接建立/通过握手，能调用下表**任何**方法——包括改写 LLM 供应商密钥 `config.setProvider`、读出明文密钥 `config.getProvider`+`include_secrets:true`、杀掉所有 session `daemon.shutdown`）。Unix socket 的文件权限（本地）是唯一访问控制层，连接建立即信任，无需握手。**TCP 连接必须先握手**：连接建立后的第一条消息必须是
+  ```json
+  {"jsonrpc":"2.0","method":"daemon.auth","params":{"token":"<--token 的值>"},"id":1}
+  ```
+  握手成功返回 `{"result":{"authenticated":true}}`，之后该连接的后续请求正常按下表 dispatch，不必每条都带 token（连接级信任，同 Unix socket）。握手失败（token 错、第一条消息不是 `daemon.auth`、或整行不是合法 JSON）返回 `UNAUTHORIZED` 错误帧后**服务端主动断开连接**——不会进入下面的方法分派。对待 socket/token 暴露面应该和对待 LLM 凭证本身一样谨慎。
 
 ---
 

@@ -16,7 +16,7 @@ use daemon::{DaemonServer, SessionPool};
 use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 /// Build a zip archive (in memory) for a minimal demo plugin declaring one
@@ -106,6 +106,7 @@ async fn start_server() -> (
         engine_config,
         None,
         paths,
+        None, // task_router
     ));
 
     let cancel = CancellationToken::new();
@@ -677,6 +678,7 @@ description = "Adds /review"
         engine_config,
         None,
         paths,
+        None, // task_router
     ));
     let cancel = CancellationToken::new();
     let server = Arc::new(daemon::DaemonServer::new(pool, cancel));
@@ -858,4 +860,291 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
 
     _server.shutdown_token().cancel();
     let _ = handle.await;
+}
+
+// ── resume_or_create panic-avoidance (malformed session_id + real history_store) ──
+//
+// `SessionPool::resume_or_create` used to `unwrap()` a `SessionId::parse()`
+// call and `panic!()` on a second failed retry — both only reachable when a
+// real `HistoryStore` is configured (the `start_server()` helper above uses
+// `history_store: None`, which never exercises that code path). Production
+// `daemon/src/main.rs` does wire up a real store, so this needs its own
+// server variant.
+
+async fn start_server_with_history() -> (
+    Arc<DaemonServer>,
+    PathBuf,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("test.sock");
+
+    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
+    let memory_store = Arc::new(MemoryStore::new(
+        dir.path().join("user").join("memory"),
+        dir.path().join("local").join("memory"),
+    ));
+    let scene: Arc<dyn base::interface::scene::AgentScene> =
+        Arc::new(scene::scene::coding::CodingScene);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
+    let engine_config = EngineConfig::defaults_for("claude-sonnet-4-6");
+
+    let client: Arc<dyn AnthropicClient> =
+        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
+
+    let paths: Arc<dyn daemon::config::DaemonPaths> =
+        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
+
+    let history_store: Option<Arc<dyn history::store::HistoryStore>> = Some(Arc::new(
+        history::store::JsonlHistoryStore::with_root(dir.path(), dir.path().join("sessions"))
+            .await
+            .unwrap(),
+    ));
+
+    let pool = Arc::new(SessionPool::new(
+        8,
+        3600,
+        client,
+        settings,
+        scene,
+        permission,
+        memory_store,
+        dir.path().to_path_buf(),
+        engine_config,
+        history_store,
+        paths,
+        None, // task_router
+    ));
+
+    let cancel = CancellationToken::new();
+    let server = Arc::new(DaemonServer::new(pool, cancel));
+    let server2 = server.clone();
+    let sock2 = sock.clone();
+    let handle = tokio::spawn(async move {
+        let _ = server2.serve_unix(&sock2).await;
+    });
+
+    for _ in 0..20 {
+        if sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(sock.exists(), "socket never bound");
+    (server, sock, dir, handle)
+}
+
+#[tokio::test]
+async fn run_turn_with_malformed_session_id_and_history_store_does_not_panic() {
+    let (_server, sock, _dir, handle) = start_server_with_history().await;
+
+    // Not a valid BASE58(UUID) — used to `unwrap()`-panic inside
+    // `resume_or_create` when a real `HistoryStore` is configured. A
+    // panicking `tokio::spawn`'d connection task just drops the socket
+    // silently, so the regression signature here is "no response at all
+    // (empty read)", not a catchable Rust panic in the test process itself.
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"session_id":"not-a-valid-id!!","message":"hi"},"id":1}"#,
+    )
+    .await;
+    assert!(
+        !resp.is_empty(),
+        "connection died with no response — resume_or_create likely panicked on an unparsable session_id"
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object() || v["error"].is_object(), "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+// ── TCP daemon.auth handshake ───────────────────────────────────────────
+
+/// Mirrors `start_server()` but over TCP via `serve_tcp_listener` (bound
+/// separately so the test knows the OS-assigned ephemeral port before the
+/// accept loop starts — `serve_tcp` itself only takes a fixed `SocketAddr`).
+async fn start_tcp_server(
+    token: &str,
+) -> (
+    Arc<DaemonServer>,
+    std::net::SocketAddr,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+
+    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
+    let memory_store = Arc::new(MemoryStore::new(
+        dir.path().join("user").join("memory"),
+        dir.path().join("local").join("memory"),
+    ));
+    let scene: Arc<dyn base::interface::scene::AgentScene> =
+        Arc::new(scene::scene::coding::CodingScene);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
+    let engine_config = EngineConfig::defaults_for("claude-sonnet-4-6");
+    let client: Arc<dyn AnthropicClient> =
+        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
+    let paths: Arc<dyn daemon::config::DaemonPaths> =
+        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
+
+    let pool = Arc::new(SessionPool::new(
+        8,
+        3600,
+        client,
+        settings,
+        scene,
+        permission,
+        memory_store,
+        dir.path().to_path_buf(),
+        engine_config,
+        None,
+        paths,
+        None, // task_router
+    ));
+
+    let cancel = CancellationToken::new();
+    let server = Arc::new(DaemonServer::new(pool, cancel));
+    server.set_tcp_token(token.to_string()).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server2 = server.clone();
+    let handle = tokio::spawn(async move {
+        let _ = server2.serve_tcp_listener(listener).await;
+    });
+
+    (server, addr, dir, handle)
+}
+
+/// Connect, send a `daemon.auth` handshake with `token`, and return the open
+/// stream plus the parsed handshake response (so callers can keep using the
+/// same connection afterward — unlike `rpc_call`, which opens/closes fresh).
+async fn tcp_handshake(addr: std::net::SocketAddr, token: &str) -> (TcpStream, serde_json::Value) {
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let req =
+        format!(r#"{{"jsonrpc":"2.0","method":"daemon.auth","params":{{"token":"{token}"}},"id":0}}"#);
+    client.write_all(req.as_bytes()).await.unwrap();
+    client.write_all(b"\n").await.unwrap();
+    let mut buf = String::new();
+    {
+        let (r, _) = client.split();
+        let mut br = BufReader::new(r);
+        br.read_line(&mut buf).await.unwrap();
+    }
+    (client, serde_json::from_str(&buf).unwrap())
+}
+
+#[tokio::test]
+async fn tcp_rejects_request_before_handshake_and_closes_connection() {
+    let (_server, addr, _dir, handle) = start_tcp_server("s3cr3t").await;
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    // Skip the handshake — send a normal method call first.
+    client
+        .write_all(br#"{"jsonrpc":"2.0","method":"daemon.status","id":1}"#)
+        .await
+        .unwrap();
+    client.write_all(b"\n").await.unwrap();
+
+    let mut buf = String::new();
+    {
+        let (r, _) = client.split();
+        let mut br = BufReader::new(r);
+        br.read_line(&mut buf).await.unwrap();
+    }
+    let v: serde_json::Value = serde_json::from_str(&buf).unwrap();
+    assert_eq!(v["error"]["code"], codes::UNAUTHORIZED, "resp: {v}");
+
+    // The server closes the connection after rejecting the handshake — the
+    // next read should see EOF (0 bytes), not a second response, proving
+    // `daemon.status` itself was never dispatched.
+    let mut trailing = String::new();
+    let (r, _) = client.split();
+    let mut br = BufReader::new(r);
+    let n = br.read_line(&mut trailing).await.unwrap();
+    assert_eq!(n, 0, "connection should be closed after auth rejection");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn tcp_rejects_wrong_token() {
+    let (_server, addr, _dir, handle) = start_tcp_server("s3cr3t").await;
+    let (_client, v) = tcp_handshake(addr, "wrong-token").await;
+    assert_eq!(v["error"]["code"], codes::UNAUTHORIZED, "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn tcp_accepts_correct_token_then_dispatches_normally() {
+    let (_server, addr, _dir, handle) = start_tcp_server("s3cr3t").await;
+    let (mut client, v) = tcp_handshake(addr, "s3cr3t").await;
+    assert_eq!(v["result"]["authenticated"], true, "resp: {v}");
+
+    // Same connection, now dispatches like any other request.
+    client
+        .write_all(br#"{"jsonrpc":"2.0","method":"daemon.status","id":2}"#)
+        .await
+        .unwrap();
+    client.write_all(b"\n").await.unwrap();
+    let mut buf = String::new();
+    let (r, _) = client.split();
+    let mut br = BufReader::new(r);
+    br.read_line(&mut buf).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&buf).unwrap();
+    assert!(v["result"]["version"].is_string(), "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn serve_tcp_listener_bails_without_a_token_even_when_called_directly() {
+    // `serve_tcp_listener` is `pub` specifically so tests (and any other
+    // caller who already has a bound `TcpListener`, e.g. socket activation)
+    // can drive it without going through `serve_tcp`'s addr-binding — but
+    // that means it can't just trust `serve_tcp`'s "token is set" check to
+    // have already run. This calls it directly, skipping `set_tcp_token`
+    // entirely, and asserts it fails loudly instead of silently rejecting
+    // every future connection forever.
+    let dir = tempfile::tempdir().unwrap();
+    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
+    let memory_store = Arc::new(MemoryStore::new(
+        dir.path().join("user").join("memory"),
+        dir.path().join("local").join("memory"),
+    ));
+    let scene: Arc<dyn base::interface::scene::AgentScene> =
+        Arc::new(scene::scene::coding::CodingScene);
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
+    let engine_config = EngineConfig::defaults_for("claude-sonnet-4-6");
+    let client: Arc<dyn AnthropicClient> =
+        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
+    let paths: Arc<dyn daemon::config::DaemonPaths> =
+        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
+    let pool = Arc::new(SessionPool::new(
+        8,
+        3600,
+        client,
+        settings,
+        scene,
+        permission,
+        memory_store,
+        dir.path().to_path_buf(),
+        engine_config,
+        None,
+        paths,
+        None, // task_router
+    ));
+    let server = Arc::new(DaemonServer::new(pool, CancellationToken::new()));
+    // Deliberately NOT calling server.set_tcp_token(...).
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = server.serve_tcp_listener(listener).await.unwrap_err();
+    assert!(err.to_string().contains("token"), "err: {err}");
 }

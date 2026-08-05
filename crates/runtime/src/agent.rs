@@ -574,6 +574,8 @@ pub struct Builder {
     /// Pre-built command registry shared across many sessions instead of
     /// re-scanning skill dirs per session — see `Builder::commands_override`.
     commands_override: Option<Arc<crate::commands::CommandRegistry>>,
+    /// Multi-provider per-task-type model routing — see `Builder::task_router`.
+    task_router: Option<Arc<base::provider::TaskRouter>>,
 }
 
 /// Build a `HookRunner` from `settings.hooks_config` (raw JSON from
@@ -659,6 +661,7 @@ impl Builder {
             wake_rx: None,
             plugins: None,
             commands_override: None,
+            task_router: None,
         }
     }
 
@@ -778,6 +781,18 @@ impl Builder {
         self
     }
 
+    /// Multi-provider per-task-type model routing (see
+    /// `base::provider::TaskRouter`). When set, forwarded to the
+    /// `AgentTool` this session's engine builds so its sub-agent spawn
+    /// points (`run_sub`/`run_sub_inner`/resume) route through
+    /// `TaskRouter::model_for("subagent")` instead of always inheriting
+    /// this session's own `model`. Unset (the default) preserves prior
+    /// behavior exactly — sub-agents always use the parent's model.
+    pub fn task_router(mut self, r: Arc<base::provider::TaskRouter>) -> Self {
+        self.task_router = Some(r);
+        self
+    }
+
     pub fn build(self) -> Result<(Agent, EventReceiver, InputSender), EngineError> {
         let scene = self
             .scene
@@ -886,17 +901,19 @@ impl Builder {
             let global_agents_dir = settings.paths.global_data_dir.join("agents");
             let agent_dirs: [&std::path::Path; 3] =
                 [&global_agents_dir, &scene_agents_dir, &project_agents_dir];
-            Arc::new(
-                crate::agent_tool::AgentTool::with_parent_tools(
-                    model.clone(),
-                    agent_engine_config,
-                    tools.clone(),
-                    tools.clone(),
-                    &agent_dirs,
-                    &plugin_agent_types,
-                )
-                .with_settings(settings.clone()),
+            let mut agent_tool = crate::agent_tool::AgentTool::with_parent_tools(
+                model.clone(),
+                agent_engine_config,
+                tools.clone(),
+                tools.clone(),
+                &agent_dirs,
+                &plugin_agent_types,
             )
+            .with_settings(settings.clone());
+            if let Some(router) = self.task_router.clone() {
+                agent_tool = agent_tool.with_task_router(router);
+            }
+            Arc::new(agent_tool)
         };
         let hooks = self.hooks.unwrap_or_else(|| {
             build_hook_runner(&settings, model.clone(), agent_tool_arc.clone(), &plugins)

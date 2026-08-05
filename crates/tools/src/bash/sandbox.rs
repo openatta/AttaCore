@@ -2,13 +2,26 @@
 //! additional 子树以内。
 //!
 //! - **macOS**：`sandbox-exec -p <profile> bash -c <cmd>`，profile 用 TinyScheme
-//!   拒写非允许路径。SIP 之外其它子系统（exec / network）不限制 —— 我们只防
-//!   "意外写错地方"，不是恶意防御。
+//!   拒写非允许路径。exec 不限制。网络默认放行（见 [`NetworkMode`]），可选
+//!   `DenyAll`/`Allowlist`——两者都用 `(deny network*)`，Allowlist 再逐域名
+//!   `(allow network-outbound (remote tcp "domain:*"))` 放行；DNS 解析走
+//!   `mDNSResponder` IPC，不受 `network*` 过滤影响，两种受限模式下都还能用。
 //! - **Linux**：`bwrap --ro-bind / / --bind <writable> <writable> ... bash -c <cmd>`。
-//!   bwrap 不在 PATH → 降级（无沙盒）+ warn。
+//!   bwrap 不在 PATH → 降级（无沙盒）+ warn。网络：`DenyAll` 用 `--unshare-net`
+//!   （新网络命名空间，只剩 loopback）；bwrap 没有域名/IP 级过滤能力，
+//!   `Allowlist` 在这个平台上退化成同样的 `--unshare-net`（+ warn 日志）而不是
+//!   静默放开成 Unrestricted——失败要往"更安全"的方向失败。
 //! - **Windows**：不做；`dangerously_disable_sandbox` 自动开（warn 一次）。
 //!
 //! 受 `EngineConfig::dangerously_disable_sandbox` 控制；为 true 直跑无沙盒。
+//!
+//! `SandboxPolicy`（含 `network_mode`/`allowed_domains`）目前只从
+//! `bash.rs::to_sandbox_policy()` 转换 `ToolContext.sandbox` 得到——而
+//! `ToolContext.sandbox` 本身在所有构造点都还是 `Default::default()`（没有
+//! settings.json → EngineConfig → ToolContext 这一段的接线），所以在真实
+//! settings.json 里配置 `sandbox.network_mode` 目前还不会生效。这个模块内的
+//! 逻辑（profile 生成）是完整、经测试的；缺的是更上游的配置读取，不在本次
+//! 改动范围内。
 //!
 //! # 已知沙盒逃逸风险
 //!
@@ -79,11 +92,12 @@ pub struct SandboxPolicy {
     /// Absolute paths the sandbox is **denied** read access to. Defaults
     /// include common credential stores (see [`default_deny_read`]).
     pub deny_read: Vec<PathBuf>,
-    /// Network policy (currently always `Unrestricted`; DenyAll/Allowlist reserved for future use).
-    #[allow(dead_code)]
+    /// Network policy — see [`NetworkMode`].
     pub network_mode: NetworkMode,
-    /// Reserved for future `Allowlist` network mode support.
-    #[allow(dead_code)]
+    /// Domains allowed to make outbound connections when `network_mode` is
+    /// [`NetworkMode::Allowlist`]. Ignored otherwise. Matched literally
+    /// against the connection target's hostname (no wildcards) — see
+    /// `build_macos_profile`'s network section for the exact rule shape.
     pub allowed_domains: Vec<String>,
 }
 
@@ -92,6 +106,15 @@ pub enum NetworkMode {
     /// Unrestricted outbound (default; Bash often needs `curl` / `npm install`).
     #[default]
     Unrestricted,
+    /// No outbound network access at all (DNS resolution via the OS
+    /// resolver still works on macOS — it's IPC to `mDNSResponder`, not a
+    /// raw socket the sandbox profile's `network*` filter covers — but no
+    /// TCP/UDP connection actually reaching the network is permitted).
+    DenyAll,
+    /// Outbound TCP restricted to `SandboxPolicy::allowed_domains`; DNS
+    /// resolution still works (same rationale as `DenyAll`). An empty
+    /// `allowed_domains` list under this mode is equivalent to `DenyAll`.
+    Allowlist,
 }
 
 /// Default deny-read paths — credential stores that almost never want to be
@@ -258,8 +281,27 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
     }
 
     // ---- **Hardening **: network policy ----
-    // Unrestricted is the only supported mode — (allow default) at the top of
-    // the profile already covers unrestricted networking.
+    // `(allow default)` at the top of the profile already covers unrestricted
+    // networking — Unrestricted needs no extra rules. DenyAll/Allowlist add a
+    // blanket `(deny network*)` (does not affect DNS: that's IPC to
+    // mDNSResponder on macOS, not covered by the `network*` filter category),
+    // then Allowlist re-allows outbound TCP to each configured domain —
+    // sandbox-exec's `remote tcp` filter matches by hostname, not just IP.
+    match policy.network_mode {
+        NetworkMode::Unrestricted => {}
+        NetworkMode::DenyAll => {
+            s.push_str("(deny network*)\n");
+        }
+        NetworkMode::Allowlist => {
+            s.push_str("(deny network*)\n");
+            for domain in &policy.allowed_domains {
+                s.push_str(&format!(
+                    "(allow network-outbound (remote tcp \"{}:*\"))\n",
+                    sandbox_escape(domain)
+                ));
+            }
+        }
+    }
 
     s
 }
@@ -357,8 +399,30 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
         }
     }
 
-    // **Hardening **: network policy — Unrestricted is the only supported mode
-    // (bwrap default).
+    // **Hardening **: network policy. bwrap has no domain/IP-level filter —
+    // its only lever is `--unshare-net` (new network namespace with nothing
+    // but loopback, i.e. total isolation). DenyAll maps onto that directly.
+    // Allowlist can't be honored precisely on this platform (no local proxy
+    // / iptables setup here), so it degrades to the same full isolation
+    // rather than silently falling back to Unrestricted — consistent with
+    // this crate's "safe by default, opt into less safety not more"
+    // principle (README §Design Principles): failing closed on an
+    // unsupported restriction is safer than failing open.
+    match opts.policy.network_mode {
+        NetworkMode::Unrestricted => {}
+        NetworkMode::DenyAll => {
+            args.push("--unshare-net".into());
+        }
+        NetworkMode::Allowlist => {
+            tracing::warn!(
+                domains = ?opts.policy.allowed_domains,
+                "sandbox: NetworkMode::Allowlist has no bwrap equivalent (no domain/IP \
+                 filtering primitive) — falling back to full network isolation \
+                 (--unshare-net) rather than allowing unrestricted access"
+            );
+            args.push("--unshare-net".into());
+        }
+    }
 
     args.push("--".into());
     args.push("bash".into());
@@ -602,6 +666,134 @@ mod tests {
             .find("(allow file-read* (subpath \"/tmp/some-secret\"))")
             .unwrap();
         assert!(allow_idx > deny_idx);
+    }
+
+    // ---- network policy ----
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unrestricted_network_emits_no_network_rules() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Unrestricted;
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert!(
+            !profile.contains("network"),
+            "Unrestricted must not add any network rule, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_deny_all_network_emits_deny_network_rule() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::DenyAll;
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert!(profile.contains("(deny network*)"), "profile:\n{profile}");
+        assert!(
+            !profile.contains("network-outbound"),
+            "DenyAll must not also emit an allowlist rule, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_allowlist_network_denies_then_allows_each_domain() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Allowlist;
+        o.policy.allowed_domains = vec!["api.example.com".into(), "registry.npmjs.org".into()];
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert!(profile.contains("(deny network*)"), "profile:\n{profile}");
+        assert!(
+            profile.contains("(allow network-outbound (remote tcp \"api.example.com:*\"))"),
+            "profile:\n{profile}"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (remote tcp \"registry.npmjs.org:*\"))"),
+            "profile:\n{profile}"
+        );
+        // Both allow rules must come after the deny for sandbox-exec's
+        // top-to-bottom evaluation order to actually re-permit them.
+        let deny_idx = profile.find("(deny network*)").unwrap();
+        let allow_idx = profile.find("(allow network-outbound").unwrap();
+        assert!(allow_idx > deny_idx);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_allowlist_with_no_domains_still_denies_network() {
+        // Empty allowed_domains under Allowlist == DenyAll in effect (no
+        // allow rules to re-permit anything).
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Allowlist;
+        o.policy.allowed_domains = vec![];
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert!(profile.contains("(deny network*)"), "profile:\n{profile}");
+        assert!(!profile.contains("network-outbound"), "profile:\n{profile}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_domain_is_escaped() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Allowlist;
+        o.policy.allowed_domains = vec!["evil\".com".into()];
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert!(profile.contains("evil\\\".com"), "profile:\n{profile}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_rules_keep_profile_parens_balanced() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Allowlist;
+        o.policy.allowed_domains = vec!["a.example.com".into(), "b.example.com".into()];
+        let cmd = wrap(o);
+        let profile = &cmd.args[1];
+        assert_eq!(profile.matches('(').count(), profile.matches(')').count());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_deny_all_network_uses_unshare_net() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::DenyAll;
+        let cmd = wrap(o);
+        if cmd.mode != SandboxMode::LinuxBwrap {
+            return; // bwrap not installed in this environment
+        }
+        assert!(cmd.args.iter().any(|a| a == "--unshare-net"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unrestricted_network_omits_unshare_net() {
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Unrestricted;
+        let cmd = wrap(o);
+        if cmd.mode != SandboxMode::LinuxBwrap {
+            return;
+        }
+        assert!(!cmd.args.iter().any(|a| a == "--unshare-net"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_allowlist_network_falls_back_to_unshare_net() {
+        // bwrap has no domain-level filter — Allowlist must fail closed
+        // (full isolation), not silently degrade to Unrestricted.
+        let mut o = opts("ls", Path::new("/tmp/work"));
+        o.policy.network_mode = NetworkMode::Allowlist;
+        o.policy.allowed_domains = vec!["api.example.com".into()];
+        let cmd = wrap(o);
+        if cmd.mode != SandboxMode::LinuxBwrap {
+            return;
+        }
+        assert!(cmd.args.iter().any(|a| a == "--unshare-net"));
     }
 
     // ---- Phase 3-3: fault injection tests ----

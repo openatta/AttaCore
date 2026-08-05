@@ -7,13 +7,21 @@
 //! these fields directly — see `docs/design/2026-08-04-multi-provider-llm-migration.md`
 //! for why the two-representation split was a structural risk worth fixing.
 //!
-//! This module only resolves *which provider/model a task should use* from
-//! already-merged config; it does not yet dispatch actual LLM requests
-//! through the resolved provider (Phase 4 in the design doc above — wiring
-//! `SessionPool`/`AgentTool`/etc. to consume this is future work).
+//! This module resolves *which provider/model a task should use* from
+//! already-merged config (`resolve_task_models`) and, via [`TaskRouter`],
+//! hands back the already-constructed `Arc<dyn Model>` instance for a given
+//! task type. `TaskRouter` itself only holds `Arc<dyn Model>` values — it
+//! doesn't know how to build one from a [`ProviderConfig`] (that needs a
+//! concrete `Model` impl like `model::adapter::AnthropicModel`, and `core`
+//! can't depend on `model` without inverting the crate layering). The
+//! construction site is `daemon::model_router::build_task_router`; wiring it
+//! into `SessionPool`/`AgentTool`'s sub-agent spawn points is
+//! `crates/runtime/src/agent.rs::Builder::task_router` /
+//! `crates/runtime/src/agent_tool.rs::Inner::model_for_subagent`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// API protocol type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -182,6 +190,54 @@ pub fn resolve_task_models(
     Ok((resolved, warnings))
 }
 
+/// Per-task-type model routing, ready to answer "which `Arc<dyn Model>`
+/// should this task use" without re-resolving config on every call.
+///
+/// Purely a data holder: `providers`/`default` are already-constructed
+/// `Arc<dyn Model>` instances (one per configured provider), `resolved`
+/// comes straight from [`resolve_task_models`]. Building the instances
+/// themselves lives outside `core` — see the module doc comment.
+pub struct TaskRouter {
+    providers: HashMap<String, Arc<dyn crate::interface::model::Model>>,
+    /// task_type → (provider_id, model). Only contains entries for task
+    /// types with an explicit `task_models` override (see
+    /// `resolve_task_models`'s doc comment) — task types with no entry use
+    /// `default`.
+    resolved: HashMap<String, ResolvedModel>,
+    /// `providers[default_provider]`'s instance — used for any task type
+    /// with no `task_models` entry, or whose resolved provider isn't in
+    /// `providers` (defensive; `resolve_task_models` only ever resolves to
+    /// providers present in the same map `providers` was built from, so
+    /// this shouldn't be reachable in practice).
+    default: Arc<dyn crate::interface::model::Model>,
+}
+
+impl TaskRouter {
+    pub fn new(
+        providers: HashMap<String, Arc<dyn crate::interface::model::Model>>,
+        resolved: HashMap<String, ResolvedModel>,
+        default: Arc<dyn crate::interface::model::Model>,
+    ) -> Self {
+        Self {
+            providers,
+            resolved,
+            default,
+        }
+    }
+
+    /// The model instance `task` should use.
+    pub fn model_for(&self, task: &str) -> Arc<dyn crate::interface::model::Model> {
+        match self.resolved.get(task) {
+            Some(r) => self
+                .providers
+                .get(&r.provider_id)
+                .cloned()
+                .unwrap_or_else(|| self.default.clone()),
+            None => self.default.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +404,92 @@ mod tests {
         let task_models = HashMap::new();
         let err = resolve_task_models(&providers, Some("ghost"), &task_models).unwrap_err();
         assert!(err.contains("ghost"));
+    }
+
+    // ---- TaskRouter ----
+
+    /// Minimal `Model` stub — `stream()` is never called by these tests
+    /// (they only exercise routing, not actual requests). Instances are
+    /// told apart via `Arc::ptr_eq`, not any field on this type.
+    struct TaggedModel;
+
+    #[async_trait::async_trait]
+    impl crate::interface::model::Model for TaggedModel {
+        fn api_type(&self) -> crate::provider::ApiType {
+            crate::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<crate::interface::prompt::PromptBlock>,
+            _tools: Vec<crate::interface::model::ToolDef>,
+            _messages: Vec<crate::interface::model::ModelMessage>,
+            _params: crate::interface::model::StreamParams,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::interface::model::ModelStream, crate::interface::model::ModelError> {
+            unimplemented!("routing tests never call stream()")
+        }
+    }
+
+    fn tagged(_label: &'static str) -> Arc<dyn crate::interface::model::Model> {
+        Arc::new(TaggedModel)
+    }
+
+    #[test]
+    fn task_router_routes_to_resolved_providers_model() {
+        let mut providers = HashMap::new();
+        providers.insert("anthropic".to_string(), tagged("anthropic"));
+        providers.insert("deepseek".to_string(), tagged("deepseek"));
+
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "subagent".to_string(),
+            ResolvedModel {
+                provider_id: "deepseek".into(),
+                model: "deepseek-pro".into(),
+            },
+        );
+
+        let router = TaskRouter::new(providers, resolved, tagged("anthropic"));
+        let picked = router.model_for("subagent");
+        assert_eq!(picked.api_type(), ApiType::Anthropic); // sanity: both tagged models report the same api_type
+        // Identity check via Arc pointer equality — proves the deepseek
+        // instance (not the default) was returned.
+        assert!(Arc::ptr_eq(
+            &picked,
+            router.providers.get("deepseek").unwrap()
+        ));
+    }
+
+    #[test]
+    fn task_router_falls_back_to_default_for_unresolved_task() {
+        let mut providers = HashMap::new();
+        providers.insert("anthropic".to_string(), tagged("anthropic"));
+        let default = tagged("anthropic");
+
+        let router = TaskRouter::new(providers, HashMap::new(), default.clone());
+        let picked = router.model_for("main"); // no task_models entry for "main"
+        assert!(Arc::ptr_eq(&picked, &default));
+    }
+
+    #[test]
+    fn task_router_falls_back_to_default_when_resolved_provider_is_missing() {
+        // Defensive path: resolved names a provider that isn't in the
+        // `providers` map (shouldn't happen via `resolve_task_models`, but
+        // `TaskRouter::new` doesn't re-validate that invariant itself).
+        let providers = HashMap::new();
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "subagent".to_string(),
+            ResolvedModel {
+                provider_id: "ghost".into(),
+                model: "whatever".into(),
+            },
+        );
+        let default = tagged("anthropic");
+
+        let router = TaskRouter::new(providers, resolved, default.clone());
+        let picked = router.model_for("subagent");
+        assert!(Arc::ptr_eq(&picked, &default));
     }
 
     #[test]

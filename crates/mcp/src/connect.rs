@@ -352,20 +352,58 @@ impl McpClient for StdioMcpClient {
     async fn get_prompt(
         &self,
         prompt_name: &str,
-        _args: &std::collections::HashMap<String, String>,
+        args: &std::collections::HashMap<String, String>,
     ) -> Result<String, McpError> {
+        use rmcp::model::GetPromptRequestParams;
+
         let guard = self.inner.lock().await;
-        let _svc = guard.as_ref().ok_or_else(|| McpError::NotConnected {
+        let svc = guard.as_ref().ok_or_else(|| McpError::NotConnected {
             name: self.server_name.clone(),
         })?;
-        // MCP prompts/get is available via rmcp but the client-side
-        // invocation path differs by transport. For now, return a
-        // descriptive placeholder — the prompt metadata is already
-        // visible in the slash command listing.
-        Ok(format!(
-            "MCP prompt '{prompt_name}' on server '{}' — use `/mcp` to see server details.",
-            self.server_name
-        ))
+
+        let mut params = GetPromptRequestParams::new(prompt_name);
+        if !args.is_empty() {
+            let mut json_args = rmcp::model::JsonObject::new();
+            for (k, v) in args {
+                json_args.insert(k.clone(), serde_json::Value::String(v.clone()));
+            }
+            params = params.with_arguments(json_args);
+        }
+
+        let result = svc
+            .get_prompt(params)
+            .await
+            .map_err(|e| McpError::RmcpService(format!("get_prompt: {e}")))?;
+
+        Ok(render_prompt_result(result))
+    }
+}
+
+/// 把 `prompts/get` 的结果渲染成给 slash command 用的纯文本：拼接所有消息的
+/// 文本内容，非文本 content（图片/资源）用占位说明——`execute_prompt()` 的调
+/// 用方期望一个可以直接当 prompt body 用的字符串，不是结构化多模态内容。
+/// 消息为空时退回 `description`（服务器可能只填了这一个字段）。
+fn render_prompt_result(result: rmcp::model::GetPromptResult) -> String {
+    use rmcp::model::PromptMessageContent;
+
+    let rendered = result
+        .messages
+        .iter()
+        .map(|m| match &m.content {
+            PromptMessageContent::Text { text } => text.clone(),
+            PromptMessageContent::Image { .. } => "[image content omitted]".to_string(),
+            PromptMessageContent::Resource { .. } => "[embedded resource omitted]".to_string(),
+            PromptMessageContent::ResourceLink { link } => {
+                format!("[resource link: {}]", link.uri)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if rendered.is_empty() {
+        result.description.unwrap_or_default()
+    } else {
+        rendered
     }
 }
 
@@ -1035,6 +1073,75 @@ mod tests {
             consecutive_failures: AtomicU32::new(0),
         };
         assert_eq!(client.transport_kind(), "streamable_http");
+    }
+
+    // ---- get_prompt ----
+
+    #[tokio::test]
+    async fn get_prompt_errors_not_connected_when_no_session() {
+        // 之前的实现无视连接状态，永远返回一句硬编码占位文案——这个测试确保
+        // `get_prompt` 现在和其他真实方法（`list_prompts`/`read_resource`）一样，
+        // 未连接时报 `NotConnected`，而不是伪装成功。
+        let client = StdioMcpClient {
+            server_name: "x".into(),
+            config: McpServerConfig::Stdio {
+                command: "echo".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                scope: None,
+            },
+            instructions: None,
+            inner: tokio::sync::Mutex::new(None),
+            last_reconnect_at: tokio::sync::Mutex::new(None),
+            consecutive_failures: AtomicU32::new(0),
+        };
+        let err = client
+            .get_prompt("some-prompt", &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::NotConnected { .. }), "err: {err:?}");
+    }
+
+    fn text_message(role: rmcp::model::PromptMessageRole, text: &str) -> rmcp::model::PromptMessage {
+        rmcp::model::PromptMessage::new_text(role, text)
+    }
+
+    #[test]
+    fn render_prompt_result_joins_text_messages() {
+        use rmcp::model::PromptMessageRole;
+        let result = rmcp::model::GetPromptResult::new(vec![
+            text_message(PromptMessageRole::User, "first"),
+            text_message(PromptMessageRole::Assistant, "second"),
+        ]);
+        assert_eq!(render_prompt_result(result), "first\n\nsecond");
+    }
+
+    #[test]
+    fn render_prompt_result_falls_back_to_description_when_no_messages() {
+        let mut result = rmcp::model::GetPromptResult::new(Vec::new());
+        result.description = Some("fallback description".into());
+        assert_eq!(render_prompt_result(result), "fallback description");
+    }
+
+    #[test]
+    fn render_prompt_result_empty_when_no_messages_and_no_description() {
+        let result = rmcp::model::GetPromptResult::new(Vec::new());
+        assert_eq!(render_prompt_result(result), "");
+    }
+
+    #[test]
+    fn render_prompt_result_placeholders_non_text_content() {
+        use rmcp::model::{PromptMessage, PromptMessageContent, PromptMessageRole};
+        let resource = rmcp::model::Annotated::new(
+            rmcp::model::RawResource::new("file:///tmp/x.txt", "x.txt"),
+            None,
+        );
+        let result = rmcp::model::GetPromptResult::new(vec![PromptMessage::new(
+            PromptMessageRole::User,
+            PromptMessageContent::resource_link(resource),
+        )]);
+        let rendered = render_prompt_result(result);
+        assert!(rendered.contains("file:///tmp/x.txt"), "rendered: {rendered}");
     }
 
     #[tokio::test]

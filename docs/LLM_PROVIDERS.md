@@ -1,6 +1,12 @@
 # 多 LLM 供应商配置指南
 
-> **实施状态**：配置文件的三层位置（全局/scene/项目）、`providers`/`default_provider`/`task_models` 的解析、字段级合并、模型允许列表过滤、悬空引用降级 + 启动告警——**均已实施**（`crates/core/src/interface/settings.rs`::`Settings::load()`、`crates/core/src/provider.rs`）。settings.json 的解析现在统一走 `base::interface::settings::Settings::load()` 这一套（不再有 `daemon` 自己的一份 `SettingsFile`），并发布了 JSON Schema（`docs/schemas/settings.schema.json`，可在 settings.json 顶层加 `"$schema"` 指向它获得编辑器自动补全/校验）。新增了三个只读/写配置的 daemon RPC——`daemon.doctor`（诊断）、`config.setProvider`（写供应商配置）、`config.getProvider`（读回，`api_key` 默认脱敏）——见下方「通过 RPC 配置」一节。**尚未实施**：把解析出的 provider/task 配置接到实际发起 LLM 请求的代码路径（`SessionPool`/`AgentTool`/`team::coordinator` 等六处，仍然全部走原有的单一 Anthropic 客户端）。也就是说：**现在配置 `providers`/`task_models`，daemon 启动时（或调用 `config.setProvider` 后）会解析、校验、告诉你每个任务实际解析到哪个 provider/model，但实际对话请求暂时还是走原来的那一个供应商**，不会真的按任务分流。详见 `docs/design/2026-08-04-multi-provider-llm-migration.md` §4-§6。
+> **实施状态**（2026-08-05 更新）：配置文件的三层位置（全局/scene/项目）、`providers`/`default_provider`/`task_models` 的解析、字段级合并、模型允许列表过滤、悬空引用降级 + 启动告警——**均已实施**（`crates/core/src/interface/settings.rs`::`Settings::load()`、`crates/core/src/provider.rs`）。settings.json 的解析统一走 `base::interface::settings::Settings::load()`，并发布了 JSON Schema（`docs/schemas/settings.schema.json`）。三个配置 daemon RPC——`daemon.doctor`（诊断）、`config.setProvider`（写）、`config.getProvider`（读回，`api_key` 默认脱敏）——见下方「通过 RPC 配置」一节。
+>
+> **运行时接线（新）**：daemon 启动时，如果 `providers` 非空，会真正构造每个 provider 的 `Arc<dyn Model>` 实例（`daemon::model_router::build_task_router`），并把结果接进 `TaskRouter`（`crates/core/src/provider.rs`）。**`Agent` 工具的子 agent 生成点（`run_sub`/`run_sub_inner`/resume，共三处）已经按 `"subagent"` 任务类型查表路由**——`task_models.subagent` 配了 DeepSeek，子 agent 真的会发请求到 DeepSeek，不再只是解析+记日志。
+>
+> **仍未接线**：① 主对话本身（`SessionPool` 里的会话模型）依然是单一的、从 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 环境变量构造的 client——`task_models.main` 这类 override 目前没有任何调用点会去查；② `team::coordinator`/`crates/tools/src/secondary_llm.rs` 经核实是零生产调用点，本轮未接线；③ `api_type: openai_compatible` 只是配置 schema 层面的合法值，没有对应的协议实现——启动时构造 provider 实例会直接报错退出（而不是降级成 Anthropic 或运行时才失败）。④ **`config.setProvider` 目前不会热更新已构建的 `TaskRouter`**——它会正确写入 settings.json 并让 `daemon.doctor`/`config.getProvider` 看到新配置，但实际路由用的 `TaskRouter` 是 daemon 启动时构造的那一份，改了 provider 配置后新建的 session 依然走旧路由，直到重启 daemon。这是一个已知缺口，不是本次改动的范围。
+>
+> 详见 `docs/design/2026-08-04-multi-provider-llm-migration.md` §4-§6（原始设计推理，含"尚未实施"的历史记录，实际现状以本段为准）。
 
 ---
 
@@ -75,16 +81,16 @@
 }
 ```
 
-`<task_type>` 是自由字符串，不强制枚举——拼错或者写了个引擎还不认识的任务类型名，不会导致配置报错，只是这条 override 不会被任何调用点用到（因为还没有代码去查它，见文首的实施状态说明）。等运行时接线完成后（见设计文档 §6 阶段 4）实际会用到的任务类型：
+`<task_type>` 是自由字符串，不强制枚举——拼错或者写了个引擎还不认识的任务类型名，不会导致配置报错，只是这条 override 不会被任何调用点用到。当前各任务类型的实际接线状态：
 
-| 任务类型 | 对应场景 |
-|---|---|
-| `main` | 主对话 |
-| `subagent` | 子 agent（Agent 工具生成的子任务） |
-| `team` | 多 agent 协作 |
-| `classifier` | 权限判断用的内部分类调用 |
-| `compact` | 长对话上下文压缩摘要 |
-| `web_fetch` | 网页抓取内容摘要 |
+| 任务类型 | 对应场景 | 接线状态 |
+|---|---|---|
+| `main` | 主对话 | 未接线——`SessionPool` 的会话模型固定读环境变量 |
+| `subagent` | 子 agent（Agent 工具生成的子任务） | **已接线**——`run_sub`/`run_sub_inner`/resume 三处生成点都会查 |
+| `team` | 多 agent 协作 | 未接线——`team::coordinator` 经核实零生产调用点 |
+| `classifier` | 权限判断用的内部分类调用 | 未接线 |
+| `compact` | 长对话上下文压缩摘要 | 未接线 |
+| `web_fetch` | 网页抓取内容摘要 | 未接线——`secondary_llm.rs` 经核实零生产调用点 |
 
 ---
 
@@ -237,7 +243,7 @@
 
 ### `config.setProvider`：写供应商配置
 
-请求写的是**当前项目**的项目层 `settings.json`（`<repo>/.atta/settings.json`），语义是**局部 patch**（只覆盖你传的字段，不动其余字段），和手写项目层文件做字段级覆盖是同一套合并规则。写入后，daemon 会立即重新加载全局→scene→项目三层合并出的完整配置并生效于**之后新建的** session（已经在运行的 session 不受影响，除非重启 daemon）。
+请求写的是**当前项目**的项目层 `settings.json`（`<repo>/.atta/settings.json`），语义是**局部 patch**（只覆盖你传的字段，不动其余字段），和手写项目层文件做字段级覆盖是同一套合并规则。写入后，daemon 会立即重新加载全局→scene→项目三层合并出的完整配置，`daemon.doctor`/`config.getProvider` 会立刻看到新值。**但实际发起请求用的 `TaskRouter` 不会跟着热更新**——它是 daemon 启动时构造的一份 `Arc<dyn Model>` 实例集合，`config.setProvider` 只改了 settings.json 和"诊断视图"，不会重新构造这份路由表，所以新建的 session 依然用旧的 provider/model 组合，直到重启 daemon。这是已知缺口，调用这个 RPC 时不要误以为路由会立即切换。
 
 ```jsonc
 // 请求
@@ -345,10 +351,11 @@
 
 ## 与现状的差异对照
 
-| | 现状（原有单供应商路径） | 本设计（新增，尚未接管实际请求） |
+| | 现状（原有单供应商路径） | 本设计（多供应商配置） |
 |---|---|---|
 | 密钥来源 | 环境变量 `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` | `settings.json` 的 `providers.<id>.api_key` |
 | 供应商数量 | 全进程唯一一个 | 任意多个，按 id 登记 |
-| 任务级路由 | 无 | 已解析、已校验、已记日志；**尚未接到实际请求路径** |
+| 任务级路由 | 无 | 已解析、已校验；`subagent` 任务类型**已接到实际请求路径**，`main`/`team`/`classifier`/`compact`/`web_fetch` 仍未接线（见上方任务类型表） |
 | 模型名校验 | 无 | `models` 允许列表过滤 + 回退 |
 | 供应商配置出错 | 不适用 | 分两条路径（provider 悬空 vs 模型不在允许列表），均软降级 + 警告，不阻塞启动（除非连 `default_provider` 本身都无效） |
+| 运行时热更新 | 不适用（改环境变量需要重启进程） | `config.setProvider` 会更新 settings.json 和诊断视图，但**不会**热更新已构造的 `TaskRouter`——路由本身仍需重启 daemon 才生效 |

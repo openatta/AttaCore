@@ -39,6 +39,27 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 // Commands can't block on interactive prompts (stdin is null → EOF), and any
 // genuine stall hits the per-command `timeout` below.
 
+/// `ToolContext.sandbox`（`base::tool::SandboxSettings`，跨 crate 的纯数据
+/// 视图，见其 doc comment）→ 这个 crate 真正用来生成沙盒 profile 的
+/// `sandbox::SandboxPolicy`。两边字段形状故意保持一一对应，这里只是把
+/// `base::context::config::NetworkModeConfig` 换成本 crate 的
+/// `sandbox::NetworkMode`（同名变体，逐一转换，没有默认值坍缩）。
+/// `allow_read` 目前没有对应的上游配置项，恒为空——和转换前
+/// `SandboxPolicy::default()` 的行为一致，不是本次改动引入的空缺。
+fn to_sandbox_policy(settings: &base::tool::SandboxSettings) -> sandbox::SandboxPolicy {
+    let network_mode = match settings.network_mode {
+        base::context::config::NetworkModeConfig::Unrestricted => sandbox::NetworkMode::Unrestricted,
+        base::context::config::NetworkModeConfig::DenyAll => sandbox::NetworkMode::DenyAll,
+        base::context::config::NetworkModeConfig::Allowlist => sandbox::NetworkMode::Allowlist,
+    };
+    sandbox::SandboxPolicy {
+        allow_read: Vec::new(),
+        deny_read: settings.deny_read.clone(),
+        network_mode,
+        allowed_domains: settings.allowed_domains.clone(),
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BashInput {
     /// The shell command to execute (run via `bash -c`).
@@ -159,7 +180,7 @@ impl Tool for BashTool {
             cwd: &ctx.cwd,
             additional_writable: &writable,
             disable: ctx.dangerously_disable_sandbox,
-            policy: sandbox::SandboxPolicy::default()});
+            policy: to_sandbox_policy(&ctx.sandbox)});
         if wrapped.mode == SandboxMode::Unavailable {
             tracing::warn!(
                 platform = std::env::consts::OS,
@@ -776,6 +797,38 @@ mod tests {
 
     fn ctx_in(cwd: &std::path::Path) -> ToolContext {
         ToolContext::for_test(cwd.to_path_buf())
+    }
+
+    // ---- to_sandbox_policy ----
+
+    #[test]
+    fn to_sandbox_policy_maps_each_network_mode_variant() {
+        use base::context::config::NetworkModeConfig;
+
+        let mut settings = base::tool::SandboxSettings {
+            network_mode: NetworkModeConfig::Unrestricted,
+            ..Default::default()
+        };
+        assert_eq!(to_sandbox_policy(&settings).network_mode, sandbox::NetworkMode::Unrestricted);
+
+        settings.network_mode = NetworkModeConfig::DenyAll;
+        assert_eq!(to_sandbox_policy(&settings).network_mode, sandbox::NetworkMode::DenyAll);
+
+        settings.network_mode = NetworkModeConfig::Allowlist;
+        assert_eq!(to_sandbox_policy(&settings).network_mode, sandbox::NetworkMode::Allowlist);
+    }
+
+    #[test]
+    fn to_sandbox_policy_carries_deny_read_and_allowed_domains_through() {
+        let settings = base::tool::SandboxSettings {
+            deny_read: vec![PathBuf::from("/tmp/secret")],
+            allowed_domains: vec!["api.example.com".to_string()],
+            network_mode: base::context::config::NetworkModeConfig::Allowlist,
+        };
+        let policy = to_sandbox_policy(&settings);
+        assert_eq!(policy.deny_read, vec![PathBuf::from("/tmp/secret")]);
+        assert_eq!(policy.allowed_domains, vec!["api.example.com".to_string()]);
+        assert!(policy.allow_read.is_empty(), "no upstream source for allow_read yet");
     }
 
     // ---- safe-bash allow-list ----

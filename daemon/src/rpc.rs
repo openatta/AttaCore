@@ -76,6 +76,8 @@ pub mod codes {
     pub const SESSION_NOT_FOUND: i32 = -32000;
     pub const SESSION_CAP_REACHED: i32 = -32001;
     pub const ENGINE_ERROR: i32 = -32002;
+    /// TCP handshake (`daemon.auth`) missing, malformed, or wrong token.
+    pub const UNAUTHORIZED: i32 = -32003;
 }
 
 // ── Session options (extensible, passed via session.run_turn params) ──

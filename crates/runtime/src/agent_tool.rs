@@ -536,6 +536,29 @@ struct Inner {
     /// `None` when unset (e.g. in tests, or the generic `AgentSpawner`
     /// bridge) falls back to the previous hardcoded-`"code"` behavior.
     parent_settings: Option<Arc<Settings>>,
+    /// Multi-provider per-task-type model routing — see
+    /// `Builder::task_router` / `Inner::model_for_subagent`. `None` (the
+    /// default) means every sub-agent spawn inherits `model` unchanged,
+    /// exactly matching behavior before multi-provider routing existed.
+    task_router: Option<Arc<base::provider::TaskRouter>>,
+}
+
+impl Inner {
+    /// The model instance a sub-agent spawn should use. All three spawn
+    /// points (`run_sub`, `run_sub_inner`, resume) are the same task type —
+    /// `task_models` in settings.json is keyed by a small fixed taxonomy
+    /// (`main`/`subagent`/`team`/`classifier`/`compact`/`web_fetch`, see
+    /// `docs/design/2026-08-04-multi-provider-llm-migration.md` §3.2), not
+    /// by `subagent_type` (which agent *kind* — "general-purpose",
+    /// "code-reviewer", etc. — a different axis entirely), so the lookup
+    /// key here is always the literal `"subagent"` task type regardless of
+    /// which `subagent_type` was requested.
+    fn model_for_subagent(&self) -> Arc<dyn Model> {
+        match &self.task_router {
+            Some(router) => router.model_for("subagent"),
+            None => self.model.clone(),
+        }
+    }
 }
 
 pub struct AgentTool {
@@ -586,6 +609,7 @@ impl AgentTool {
                 agent_types: Arc::new(agent_types),
                 description,
                 parent_settings: None,
+                task_router: None,
             }),
             remote: Arc::new(NoopRemoteTransport),
         }
@@ -597,6 +621,14 @@ impl AgentTool {
     pub fn with_settings(mut self, settings: Arc<Settings>) -> Self {
         let mut inner = (*self.inner).clone();
         inner.parent_settings = Some(settings);
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// See `Inner::task_router` / `Inner::model_for_subagent`.
+    pub fn with_task_router(mut self, router: Arc<base::provider::TaskRouter>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.task_router = Some(router);
         self.inner = Arc::new(inner);
         self
     }
@@ -739,7 +771,7 @@ impl AgentTool {
         let (mut agent, mut event_rx, input_tx) = Builder::new()
             .session_id(sid)
             .scene(scene)
-            .model(self.inner.model.clone())
+            .model(self.inner.model_for_subagent())
             .tools(tools)
             .settings(settings)
             .permission(perm)
@@ -869,7 +901,7 @@ impl AgentTool {
         let (mut agent, mut event_rx, input_tx) = Builder::new()
             .session_id(sid)
             .scene(scene)
-            .model(inner.model.clone())
+            .model(inner.model_for_subagent())
             .tools(tools)
             .settings(settings)
             .permission(perm)
@@ -988,7 +1020,7 @@ impl AgentTool {
         let (mut agent, mut event_rx, input_tx) = Builder::new()
             .session_id(new_sid.clone())
             .scene(scene)
-            .model(self.inner.model.clone())
+            .model(self.inner.model_for_subagent())
             .tools(tools)
             .settings(settings)
             .permission(perm)
@@ -1512,6 +1544,59 @@ mod catalog_tests {
         // `Builder::build()` wires it — needed so `resolve_tools()`'s
         // recursion guard has something to actually filter out.
         agent_tool
+    }
+
+    // ---- model_for_subagent / multi-provider routing ----
+
+    #[test]
+    fn model_for_subagent_uses_parent_model_when_no_router_configured() {
+        let agent_tool = test_agent_tool();
+        let picked = agent_tool.inner.model_for_subagent();
+        assert!(Arc::ptr_eq(&picked, &agent_tool.inner.model));
+    }
+
+    #[test]
+    fn model_for_subagent_routes_through_task_router_when_configured() {
+        let routed_model: Arc<dyn Model> = Arc::new(DummyModel);
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("other".to_string(), routed_model.clone());
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "subagent".to_string(),
+            base::provider::ResolvedModel {
+                provider_id: "other".into(),
+                model: "x".into(),
+            },
+        );
+        let default_model: Arc<dyn Model> = Arc::new(DummyModel);
+        let router = Arc::new(base::provider::TaskRouter::new(
+            providers,
+            resolved,
+            default_model,
+        ));
+
+        let agent_tool = test_agent_tool().with_task_router(router);
+        let picked = agent_tool.inner.model_for_subagent();
+        assert!(Arc::ptr_eq(&picked, &routed_model));
+        assert!(!Arc::ptr_eq(&picked, &agent_tool.inner.model));
+    }
+
+    #[test]
+    fn model_for_subagent_falls_back_to_default_when_no_subagent_override() {
+        // No "subagent" entry in `resolved` — router's own `default`
+        // (which may differ from `inner.model`) should win, proving the
+        // router is actually consulted rather than short-circuited.
+        let router_default: Arc<dyn Model> = Arc::new(DummyModel);
+        let router = Arc::new(base::provider::TaskRouter::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            router_default.clone(),
+        ));
+
+        let agent_tool = test_agent_tool().with_task_router(router);
+        let picked = agent_tool.inner.model_for_subagent();
+        assert!(Arc::ptr_eq(&picked, &router_default));
+        assert!(!Arc::ptr_eq(&picked, &agent_tool.inner.model));
     }
 
     #[test]
