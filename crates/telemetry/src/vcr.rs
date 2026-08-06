@@ -236,6 +236,15 @@ impl Model for VcrModel {
                     fallback_on_miss,
                     "VCR replay miss (falls back to a real model call if fallback_on_miss is set)"
                 );
+                if std::env::var("ATTA_DEBUG_VCR_MISS").is_ok() {
+                    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+                    names.sort();
+                    eprintln!("VCR_MISS_DEBUG tools: {names:?}");
+                    eprintln!("VCR_MISS_DEBUG model: {model_name}");
+                    eprintln!("VCR_MISS_DEBUG system_text ({} bytes): {dehydrated_system}", dehydrated_system.len());
+                    let msg_bodies: Vec<String> = messages.iter().map(|m| dehydrate(&format!("{:?}", m))).collect();
+                    eprintln!("VCR_MISS_DEBUG messages ({} msgs): {}", messages.len(), msg_bodies.join("||"));
+                }
                 if !fallback_on_miss {
                     return Err(ModelError::Internal(format!(
                         "VCR replay miss: no fixture for hash {req_hash}. Run with ATTA_VCR_RECORD={scenario}"

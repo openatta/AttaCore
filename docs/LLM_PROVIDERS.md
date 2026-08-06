@@ -4,6 +4,8 @@
 >
 > **运行时接线（新）**：daemon 启动时，如果 `providers` 非空，会真正构造每个 provider 的 `Arc<dyn Model>` 实例（`daemon::model_router::build_task_router`），并把结果接进 `TaskRouter`（`crates/core/src/provider.rs`）。**`Agent` 工具的子 agent 生成点（`run_sub`/`run_sub_inner`/resume，共三处）已经按 `"subagent"` 任务类型查表路由**——`task_models.subagent` 配了 DeepSeek，子 agent 真的会发请求到 DeepSeek，不再只是解析+记日志。
 >
+> **`memory` 任务类型（新）**：post-turn 记忆抽取（`crates/runtime/src/turn.rs::extract_memories_after_turn`）现在也按 `TaskRouter` 查表——配了 `task_models.memory` 就用那个供应商/模型，没配就沿用主对话模型，和 `"subagent"` 走的是同一套机制（`Agent` 结构体新增 `task_router` 字段，`Builder::build()` 里同时接给 `AgentTool` 和 `Agent` 自身，不再只转发给前者）。同时 `AgentScene` trait 新增 `memory_extraction_prompt()`——scene 可以覆盖"什么算值得跨会话记住的东西"这句话术的开头段（`ChatScene`/`ResearchScene` 已经各自覆盖成非代码库场景的说法），JSON 输出格式的部分固定不可覆盖。
+>
 > **热更新（新）**：`config.setProvider`/`config.reload` 两条路径（分别对应"通过接口改"和"手改 settings.json 文件后通知重载"）都会重新解析配置、重建 `TaskRouter`，`daemon` 不用重启。已经在运行的 session 不会被立即打断——每个 session 用一个惰性代数（`config_generation`）标记自己是不是过期，下一次收到消息、且当时没有别的 turn 正在处理时，会先原地重建（同一个 `session_id`，从 `HistoryStore` 恢复历史）再处理这条消息；如果当时正忙，这次跳过重建，用旧配置服务完，下次再检查。**只对配置了 `HistoryStore` 的 daemon 生效**（生产环境默认配置了；纯内存 session 永远不会被重建，会一直留在它创建时的配置上）。RPC 响应里 `routing.router_rebuilt`/`routing.router_error` 两个字段能看出这次调用有没有真的换成功，见 `docs/DAEMON_RPC.md` 的 `config.setProvider`/`config.reload` 章节。
 >
 > **仍未接线**：① 主对话本身（`SessionPool` 里的会话模型）依然是单一的、从 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 环境变量构造的 client——`task_models.main` 这类 override 目前没有任何调用点会去查；② `team::coordinator`/`crates/tools/src/secondary_llm.rs` 经核实是零生产调用点，本轮未接线；③ `api_type: openai_compatible` 只是配置 schema 层面的合法值，没有对应的协议实现——构造 provider 实例（无论是启动时还是热重载时）会直接报错/报告失败退出（而不是降级成 Anthropic 或运行时才失败）。
@@ -30,7 +32,7 @@
 ```
 ~/.atta/settings.json              全局层：跨所有 scene 共享
         ↓ 被下面覆盖
-~/.atta/scenes/<scene>/settings.json   scene 级：coding/chat/demo 各自独立
+~/.atta/scenes/<scene>/settings.json   scene 级：coding/chat/demo/research 各自独立
         ↓ 被下面覆盖
 <repo>/.atta/settings.json         项目级：仅本项目生效
 ```

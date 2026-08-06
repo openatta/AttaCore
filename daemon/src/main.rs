@@ -75,8 +75,11 @@ fn resolve_scene(name: &str) -> anyhow::Result<Arc<dyn base::interface::scene::A
         "coding" => Ok(Arc::new(scene::scene::coding::CodingScene)),
         "chat" => Ok(Arc::new(scene::scene::chat::ChatScene)),
         "demo" => Ok(Arc::new(scene::scene::demo::DemoScene)),
+        "research" => Ok(Arc::new(scene::scene::research::ResearchScene)),
         other => {
-            anyhow::bail!("unsupported --scene `{other}` — supported scenes: coding, chat, demo")
+            anyhow::bail!(
+                "unsupported --scene `{other}` — supported scenes: coding, chat, demo, research"
+            )
         }
     }
 }
@@ -296,13 +299,15 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── Startup checkpoint: tools_registered ───────────────────────────
-    // (Tools are registered implicitly via the session engine. Placeholder
-    //  checkpoint for explicit registration timing.)
+    // Real registration happens just below, inside `SessionPool::new()`
+    // (`tools::register_builtin_tools`), whose result every session's
+    // `Builder` shares via `.tools(self.tools.clone())`. This checkpoint
+    // used to be a placeholder marking a step that didn't exist yet — that
+    // was a real bug (no session ever had Bash/Read/Write/... registered,
+    // only the handful `Builder::build()` wires internally), now fixed; the
+    // marker stays purely for startup-timing telemetry.
     let _tools_reg_ms = perf.checkpoint("tools_registered");
-    info!(
-        elapsed_ms = _tools_reg_ms,
-        "startup: tools registered (noop)"
-    );
+    info!(elapsed_ms = _tools_reg_ms, "startup: tools registered");
 
     // ── Session transcript persistence ──────────────────────────────────
     // `sessions/` follows the same "global + project, no scene" rule as

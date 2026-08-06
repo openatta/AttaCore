@@ -332,8 +332,17 @@ impl HttpRemoteTransport {
         auth_token: String,
         retry_delays: Vec<Duration>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+        let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(5));
+        // See `tools::security::is_loopback_url`'s doc comment — a
+        // self-hosted/local remote-agent endpoint should never go through
+        // the ambient HTTP(S)_PROXY (that env var means "reach the real
+        // internet," not "also proxy calls back into my own machine").
+        // `endpoint` is fixed for this transport's whole lifetime, so this
+        // only needs checking once, here, not per-request.
+        if tools::security::is_loopback_url(&endpoint) {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .expect("reqwest Client::builder() with default options should never fail");
         Self {

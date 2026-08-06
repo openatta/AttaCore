@@ -156,7 +156,9 @@ pub fn resolve_task_models(
                 ));
                 default_model.clone()
             }),
-            Some(m) if provider_cfg.models.is_empty() || provider_cfg.models.iter().any(|x| x == m) => {
+            Some(m)
+                if provider_cfg.models.is_empty() || provider_cfg.models.iter().any(|x| x == m) =>
+            {
                 m.to_string()
             }
             Some(m) => {
@@ -236,6 +238,15 @@ impl TaskRouter {
             None => self.default.clone(),
         }
     }
+
+    /// The model name string `task` should use, if `task_models` has an
+    /// explicit override for it. `None` means "no override" — callers
+    /// combine this with `model_for()` (which already falls back to
+    /// `default` in the same case) and their own default model-name
+    /// constant, mirroring how `model_for` falls back.
+    pub fn model_name_for(&self, task: &str) -> Option<&str> {
+        self.resolved.get(task).map(|r| r.model.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -254,10 +265,7 @@ mod tests {
 
     fn providers_fixture() -> HashMap<String, ProviderConfig> {
         let mut p = HashMap::new();
-        p.insert(
-            "anthropic".to_string(),
-            provider("claude-sonnet-4-6", &[]),
-        );
+        p.insert("anthropic".to_string(), provider("claude-sonnet-4-6", &[]));
         p.insert(
             "deepseek".to_string(),
             provider("deepseek-pro", &["deepseek-pro", "deepseek-flash"]),
@@ -425,7 +433,8 @@ mod tests {
             _messages: Vec<crate::interface::model::ModelMessage>,
             _params: crate::interface::model::StreamParams,
             _cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::interface::model::ModelStream, crate::interface::model::ModelError> {
+        ) -> Result<crate::interface::model::ModelStream, crate::interface::model::ModelError>
+        {
             unimplemented!("routing tests never call stream()")
         }
     }
@@ -452,8 +461,8 @@ mod tests {
         let router = TaskRouter::new(providers, resolved, tagged("anthropic"));
         let picked = router.model_for("subagent");
         assert_eq!(picked.api_type(), ApiType::Anthropic); // sanity: both tagged models report the same api_type
-        // Identity check via Arc pointer equality — proves the deepseek
-        // instance (not the default) was returned.
+                                                           // Identity check via Arc pointer equality — proves the deepseek
+                                                           // instance (not the default) was returned.
         assert!(Arc::ptr_eq(
             &picked,
             router.providers.get("deepseek").unwrap()
@@ -495,7 +504,10 @@ mod tests {
     #[test]
     fn task_model_override_deserializes_both_forms() {
         let shorthand: TaskModelOverride = serde_json::from_str("\"deepseek\"").unwrap();
-        assert_eq!(shorthand, TaskModelOverride::ProviderOnly("deepseek".into()));
+        assert_eq!(
+            shorthand,
+            TaskModelOverride::ProviderOnly("deepseek".into())
+        );
 
         let detailed: TaskModelOverride =
             serde_json::from_str(r#"{"provider":"deepseek","model":"deepseek-flash"}"#).unwrap();

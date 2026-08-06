@@ -68,6 +68,30 @@ struct Args {
     /// today's UTC date (YYYY-MM-DD) if that's unset either.
     #[clap(long)]
     round: Option<String>,
+
+    /// Which registered `AgentScene` to run the case against — coding, chat,
+    /// research, or demo. `api_runner.rs` used to hard-code `CodingScene`;
+    /// chat/research were never exercised end-to-end anywhere in the repo
+    /// until this flag existed.
+    #[clap(long, default_value = "coding")]
+    scene: String,
+}
+
+/// Mirrors `daemon/src/main.rs::resolve_scene` — kept as a small independent
+/// copy rather than a shared dependency, since `test-runner` shouldn't need
+/// to depend on the `daemon` binary crate just for this one match.
+fn resolve_scene(
+    name: &str,
+) -> anyhow::Result<std::sync::Arc<dyn base::interface::scene::AgentScene>> {
+    match name {
+        "coding" => Ok(std::sync::Arc::new(scene::scene::coding::CodingScene)),
+        "chat" => Ok(std::sync::Arc::new(scene::scene::chat::ChatScene)),
+        "research" => Ok(std::sync::Arc::new(scene::scene::research::ResearchScene)),
+        "demo" => Ok(std::sync::Arc::new(scene::scene::demo::DemoScene)),
+        other => anyhow::bail!(
+            "unsupported --scene `{other}` — supported scenes: coding, chat, research, demo"
+        ),
+    }
 }
 
 #[tokio::main]
@@ -93,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let scenario = args.scenario.clone().unwrap_or_else(|| {
-        args.case.file_stem()
+        args.case
+            .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| {
                 // Extract numeric prefix: "000.c_project" → "000"
@@ -108,7 +133,10 @@ async fn main() -> anyhow::Result<()> {
     // cassette_dir: 本地/CI 缓存的 VCR 录制数据（tests/fixtures/cassettes/，已 gitignore），
     // 按 round 分目录存放——重新录制开新一轮，旧轮次原样留在磁盘上，互不覆盖。
     // output_dir: 纯生成物（人读日志/报告/遥测），继续留在 tests/output/，被 .gitignore 排除。
-    let cassette_dir = PathBuf::from("tests/fixtures/cassettes").join(&scenario).join(&args.mode).join(&round);
+    let cassette_dir = PathBuf::from("tests/fixtures/cassettes")
+        .join(&scenario)
+        .join(&args.mode)
+        .join(&round);
     let output_dir = args.out_dir.join(&scenario).join(&args.mode);
     let report_dir = args.out_dir.join(&scenario);
     let _ = std::fs::create_dir_all(&cassette_dir);
@@ -117,10 +145,28 @@ async fn main() -> anyhow::Result<()> {
 
     match args.mode.as_str() {
         "api" | "agent" => {
-            run_api_mode(&args, &case, vcr_mode, &scenario, &cassette_dir, &output_dir, &report_dir, &config_path).await?;
+            run_api_mode(
+                &args,
+                &case,
+                vcr_mode,
+                &scenario,
+                &cassette_dir,
+                &output_dir,
+                &report_dir,
+                &config_path,
+            )
+            .await?;
         }
         "cli" | "daemon" => {
-            run_cli_mode(&args, &case, &scenario, &cassette_dir, &output_dir, &report_dir).await?;
+            run_cli_mode(
+                &args,
+                &case,
+                &scenario,
+                &cassette_dir,
+                &output_dir,
+                &report_dir,
+            )
+            .await?;
         }
         _ => anyhow::bail!("Unknown mode: {}. Use 'api' or 'cli'.", args.mode),
     }
@@ -154,6 +200,7 @@ async fn run_api_mode(
         vcr_dir: cassette_dir.clone(),
         telemetry_path: Some(telemetry_path),
         fixture_dir: args.fixture.clone(),
+        scene: resolve_scene(&args.scene)?,
     };
 
     let outputs = api_runner::run_test_case(runner_config, case).await?;
@@ -176,8 +223,14 @@ async fn run_cli_mode(
     report_dir: &PathBuf,
 ) -> anyhow::Result<()> {
     let config_path = shellexpand::tilde(&args.config).to_string();
-    let vcr_mode: Option<String> = std::env::var("ATTA_VCR_RECORD").ok().map(|_| "record".into())
-        .or_else(|| std::env::var("ATTA_VCR_REPLAY").ok().map(|_| "replay".into()));
+    let vcr_mode: Option<String> = std::env::var("ATTA_VCR_RECORD")
+        .ok()
+        .map(|_| "record".into())
+        .or_else(|| {
+            std::env::var("ATTA_VCR_REPLAY")
+                .ok()
+                .map(|_| "replay".into())
+        });
     let config = cli_runner::CliRunnerConfig {
         socket_path: args.socket.clone(),
         daemon_binary: args.daemon_binary.clone(),
@@ -187,6 +240,7 @@ async fn run_cli_mode(
         cassette_dir: cassette_dir.clone(),
         output_dir: output_dir.clone(),
         fixture_dir: args.fixture.clone(),
+        scene: args.scene.clone(),
     };
 
     let outputs = cli_runner::run_test_case(config, case).await?;
@@ -215,26 +269,51 @@ async fn run_comparison(
                     verdict: comparator::Verdict::Fail,
                     reasoning: format!("比对失败: {e}"),
                 });
-            eprintln!("Turn {}: {:?} — {}", i, cmp.verdict, cmp.reasoning.chars().take(100).collect::<String>());
+            eprintln!(
+                "Turn {}: {:?} — {}",
+                i,
+                cmp.verdict,
+                cmp.reasoning.chars().take(100).collect::<String>()
+            );
             comparisons.push(cmp);
         }
     }
     reporter::write_reports(case, &comparisons, report_dir)?;
-    let passed = comparisons.iter().filter(|c| c.verdict == comparator::Verdict::Pass).count();
-    let failed = comparisons.iter().filter(|c| c.verdict == comparator::Verdict::Fail).count();
+    let passed = comparisons
+        .iter()
+        .filter(|c| c.verdict == comparator::Verdict::Pass)
+        .count();
+    let failed = comparisons
+        .iter()
+        .filter(|c| c.verdict == comparator::Verdict::Fail)
+        .count();
     eprintln!("\n=== Comparison Complete ===");
-    eprintln!("  {} passed, {} failed, {}/{} total", passed, failed, comparisons.len(), case.turns.len());
-    if failed > 0 { std::process::exit(1); }
+    eprintln!(
+        "  {} passed, {} failed, {}/{} total",
+        passed,
+        failed,
+        comparisons.len(),
+        case.turns.len()
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
-fn build_model(config: &config::TestModelConfig) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
+fn build_model(
+    config: &config::TestModelConfig,
+) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
     let mut url = config.base_url.clone();
-    if !url.ends_with('/') { url.push('/'); }
+    if !url.ends_with('/') {
+        url.push('/');
+    }
     let c = model::client::HttpAnthropicClient::with_base(
         model::client::AuthMode::ApiKey(config.auth_token.clone()),
         url::Url::parse(&url)?,
     )?
     .with_backoff(vec![100, 200, 500]);
-    Ok(std::sync::Arc::new(model::adapter::AnthropicModel::new(std::sync::Arc::new(c))))
+    Ok(std::sync::Arc::new(model::adapter::AnthropicModel::new(
+        std::sync::Arc::new(c),
+    )))
 }

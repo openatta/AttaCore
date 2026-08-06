@@ -87,10 +87,16 @@ impl Tool for PingTool {
     ) -> Result<ToolResult, ToolError> {
         let input: PingInput = serde_json::from_value(input)?;
 
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::limited(3))
+            .redirect(reqwest::redirect::Policy::limited(3));
+        // See `crate::security::is_loopback_url`'s doc comment — a loopback
+        // ping target should never go through the ambient HTTP(S)_PROXY.
+        if crate::security::is_loopback_url(&input.url) {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .map_err(|e| ToolError::exec(format!("{e}")))?;
 

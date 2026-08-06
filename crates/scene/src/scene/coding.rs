@@ -40,21 +40,6 @@ impl AgentScene for CodingScene {
         vec![]
     }
 
-    fn default_skills(&self) -> Vec<String> {
-        vec![
-            "simplify".into(),
-            "verify".into(),
-            "debug".into(),
-            "batch".into(),
-            "stuck".into(),
-            "loop".into(),
-            "remember".into(),
-            "skillify".into(),
-            "updateConfig".into(),
-            "loremIpsum".into(),
-        ]
-    }
-
     fn token_budget(&self) -> TokenBudget {
         TokenBudget {
             compact_threshold: 150_000,

@@ -152,6 +152,12 @@ pub struct Agent {
     pub(crate) event_tx: EventSender,
     /// Skip startup warmup (for tests).
     pub(crate) skip_warmup: bool,
+    /// Multi-provider per-task-type model routing — see `Builder::task_router`.
+    /// Retained here (not just forwarded to `AgentTool`) so turn-processing
+    /// code (`turn.rs`) can route its own background LLM calls — e.g. post-turn
+    /// memory extraction's `task_models.memory` — through the same mechanism
+    /// already proven for sub-agent spawns (`"subagent"` task type).
+    pub(crate) task_router: Option<Arc<base::provider::TaskRouter>>,
 }
 
 impl Agent {
@@ -970,7 +976,7 @@ impl Builder {
             ))
         });
         // Register SkillTool using the populated skill manager
-        tools::register_skill_tool(&tools, Arc::clone(&skill_mgr_arc), scene.default_skills());
+        tools::register_skill_tool(&tools, Arc::clone(&skill_mgr_arc));
         // Register TaskStopTool — stop running background tasks by ID
         tools.register(std::sync::Arc::new(tools::task_stop::TaskStopTool));
         // Register TaskOutputTool — retrieve output from running/completed tasks
@@ -1061,6 +1067,7 @@ impl Builder {
                 input_rx,
                 event_tx,
                 skip_warmup: self.skip_warmup,
+                task_router: self.task_router,
             },
             event_rx,
             input_tx,

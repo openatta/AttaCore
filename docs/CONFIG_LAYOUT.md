@@ -56,7 +56,7 @@ $HOME/
     ├── vcr/                       # 同上，不分 scene
     ├── mcp/                       # 同上，不分 scene
     └── scenes/                    # config 类资源的 scene 覆盖层——只有需要"这个 scene 要特化"时才会有内容
-        └── <scene>/                 # 本仓库里就是 AgentScene::id()：coding/chat/demo 之一
+        └── <scene>/                 # 本仓库里就是 AgentScene::id()：coding/chat/demo/research 之一
             ├── settings.json         # 覆盖全局同名字段
             ├── skills/                # 覆盖/新增全局同名技能
             ├── plugins/               # scene 专属插件
@@ -165,7 +165,7 @@ AttaCore 对 `CLAUDE.md`/`.claude/skills/`/`.cursorrules`/`.cursor/rules/*.mdc` 
 
 ## 面向 AttaCore 集成方的说明
 
-AttaCore 是一个通用 agent 库，**引擎层本身不预设、不内置任何具体命名空间**——`base::paths::ConfigPaths::from_env(cwd, scope)` 等函数的 `scope: &str` 参数是必填的，不存在"AttaCore 自带的默认产品身份"这回事。任何基于 AttaCore 构建产品的调用方，在自己的公开接口层（CLI flag、配置文件、环境变量等）决定这个字符串怎么来、要不要校验、要不要给默认值——**本仓库自带的 `daemon` 选择了"复用已有的 `AgentScene` 概念，并对输入做封闭集合校验"**这个具体做法：`--scene` 只接受代码里注册过的场景（`coding`/`chat`/`demo`），传别的值 daemon 直接启动失败，不是"接受任意字符串再兜底"。这不代表所有基于 AttaCore 的产品都必须复用 `AgentScene` 作为命名空间来源——你可以按自己的产品形态设计校验规则，引擎不替你做这个选择。项目级目录（`.atta/`、`.agents/`）不需要设置这个命名空间，天然按仓库隔离。
+AttaCore 是一个通用 agent 库，**引擎层本身不预设、不内置任何具体命名空间**——`base::paths::ConfigPaths::from_env(cwd, scope)` 等函数的 `scope: &str` 参数是必填的，不存在"AttaCore 自带的默认产品身份"这回事。任何基于 AttaCore 构建产品的调用方，在自己的公开接口层（CLI flag、配置文件、环境变量等）决定这个字符串怎么来、要不要校验、要不要给默认值——**本仓库自带的 `daemon` 选择了"复用已有的 `AgentScene` 概念，并对输入做封闭集合校验"**这个具体做法：`--scene` 只接受代码里注册过的场景（`coding`/`chat`/`demo`），传别的值 daemon 直接启动失败，不是"接受任意字符串再兜底"。这不代表所有基于 AttaCore 的产品都必须复用 `AgentScene` 作为命名空间来源——你可以按自己的产品形态设计校验规则，引擎不替你做这个选择。项目级目录（`.atta/`、`.agents/`）不需要设置这个命名空间，天然按仓库隔离。（本仓库注册的场景集合会随时间增加——写这段时是 `coding`/`chat`/`demo`，当前实际是 `coding`/`chat`/`demo`/`research`，见 `crates/scene/src/scene/mod.rs::register_builtin`——校验规则本身不变，只是集合内容不是本文档要跟踪的东西。）
 
 `ConfigPaths` 暴露 `user_data_dir`（scene 覆盖根，`{global_data_dir}/scenes/<scope>/`）和 `global_data_dir`（扁平全局根）两个字段——`memory`/`sessions`/`vcr`/`mcp` 只应该从 `global_data_dir`（+ 项目级 `local_data_dir`）派生，不应该从 `user_data_dir` 派生，否则会意外引入 scene 隔离，见核心原则 3。
 

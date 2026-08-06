@@ -4,9 +4,10 @@
 
 use base::interface::event::AgentEvent;
 use base::interface::model::Model;
+use base::interface::scene::AgentScene;
 use base::interface::settings::{PermissionMode, ThinkingMode, VcrConfig, VcrMode};
 use base::provider::ApiType;
-use base::tool::{InMemoryToolRegistry, Tool};
+use base::tool::InMemoryToolRegistry;
 use runtime::agent::{Builder, InputMessage};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +28,9 @@ pub struct AgentRunnerConfig {
     /// 配置——而不是像默认路径那样手搭一份空 Settings。None 时行为不变（兼容
     /// 不需要模板项目配置的用例，如裸 Agent 冒烟测试）。
     pub fixture_dir: Option<PathBuf>,
+    /// 用哪个 `AgentScene` 跑这个用例——之前这里写死 `CodingScene`，chat/research
+    /// 场景从没被端到端跑过。调用方（`main.rs`）负责按 `--scene` 解析出实例。
+    pub scene: Arc<dyn AgentScene>,
 }
 
 pub struct TurnOutput {
@@ -34,7 +38,10 @@ pub struct TurnOutput {
     pub tool_uses: Vec<(String, serde_json::Value)>,
 }
 
-pub async fn run_test_case(config: AgentRunnerConfig, case: &TestCase) -> anyhow::Result<Vec<TurnOutput>> {
+pub async fn run_test_case(
+    config: AgentRunnerConfig,
+    case: &TestCase,
+) -> anyhow::Result<Vec<TurnOutput>> {
     let tmp = PathBuf::from("/tmp/atta_test_runner");
     let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::create_dir_all(&tmp);
@@ -57,7 +64,10 @@ pub async fn run_test_case(config: AgentRunnerConfig, case: &TestCase) -> anyhow
     Ok(results)
 }
 
-async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) -> anyhow::Result<TurnOutput> {
+async fn run_one_turn(
+    config: &AgentRunnerConfig,
+    turn: &crate::script::Turn,
+) -> anyhow::Result<TurnOutput> {
     let tmp = PathBuf::from("/tmp/atta_test_runner");
     let _ = std::fs::create_dir_all(&tmp);
 
@@ -69,12 +79,17 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
     let strict = std::env::var("ATTA_VCR_STRICT").is_ok_and(|v| v != "0" && !v.is_empty());
     let vcr_model = Arc::new(VcrModel::new(
         config.model.clone(),
-        Some(VcrConfig { mode: config.vcr_mode, scenario: config.vcr_scenario.clone(), fallback_on_miss: !strict }),
+        Some(VcrConfig {
+            mode: config.vcr_mode,
+            scenario: config.vcr_scenario.clone(),
+            fallback_on_miss: !strict,
+        }),
         PathBuf::from("/tmp/atta_vcr_nonexistent"),
         config.vcr_dir.clone(),
     ));
 
-    let model_name = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
+    let model_name =
+        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
 
     let mut settings = if config.fixture_dir.is_some() {
         // 真实的 Settings::load() 路径：从拷贝出来的模板项目读
@@ -93,13 +108,19 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
         base::interface::settings::Settings::defaults_for(&model_name)
     };
     settings.model = base::interface::settings::ModelSettings {
-        api_type: ApiType::Anthropic, base_url: String::new(), auth_token: String::new(),
-        model_name: model_name.clone(), max_tokens: 2000,
-        thinking_mode: ThinkingMode::Off, fallback_model: None,
+        api_type: ApiType::Anthropic,
+        base_url: String::new(),
+        auth_token: String::new(),
+        model_name: model_name.clone(),
+        max_tokens: 2000,
+        thinking_mode: ThinkingMode::Off,
+        fallback_model: None,
     };
     if config.fixture_dir.is_none() {
         settings.paths = base::interface::settings::PathSettings {
-            user_data_dir: tmp.join("user"), global_data_dir: tmp.join("global"), local_data_dir: tmp.join("local"),
+            user_data_dir: tmp.join("user"),
+            global_data_dir: tmp.join("global"),
+            local_data_dir: tmp.join("local"),
             scope: "code".into(),
         };
     }
@@ -112,12 +133,47 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
     let tools_registry = make_tools();
 
     let mut builder = Builder::new()
-        .scene(Arc::new(scene::scene::coding::CodingScene))
+        .scene(config.scene.clone())
         .model(vcr_model)
         .tools(tools_registry)
-        .settings(settings)
+        .settings(settings.clone())
         .session_id(format!("test-turn-{}", turn.index))
         .skip_warmup(true);
+
+    // Connect any MCP servers the fixture's settings.json configured — without
+    // this, `Settings.mcp_servers` gets parsed but never actually connected, so
+    // no MCP tool (e.g. `mcp__demo__ping`) is ever registered/callable and the
+    // model never even sees it as an option. `daemon` does the equivalent via
+    // `SessionPool::connect_mcp_servers_in_background` (main.rs); this harness
+    // had no equivalent at all. Synchronous here (not fire-and-forget like
+    // daemon) since the test needs the tools registered before the turn starts.
+    if !settings.mcp_servers.is_empty() {
+        let mut parsed = std::collections::HashMap::new();
+        for (name, v) in &settings.mcp_servers {
+            match serde_json::from_value::<mcp::config::McpServerConfig>(v.clone()) {
+                Ok(cfg) => {
+                    parsed.insert(name.clone(), cfg);
+                }
+                Err(e) => eprintln!("invalid mcp_servers.{name} config, skipping: {e}"),
+            }
+        }
+        if !parsed.is_empty() {
+            let requested: Vec<String> = parsed.keys().cloned().collect();
+            let manager = mcp::manager::McpManager::connect_all(parsed).await;
+            let connected: std::collections::HashSet<String> = manager
+                .server_statuses()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            for name in &requested {
+                eprintln!(
+                    "MCP server '{name}': {}",
+                    if connected.contains(name) { "connected" } else { "failed to connect" }
+                );
+            }
+            builder = builder.mcp_manager(manager);
+        }
+    }
 
     // Inject telemetry if configured
     if let Some(ref tp) = config.telemetry_path {
@@ -133,7 +189,8 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
         builder = builder.telemetry_handle(telemetry::TelemetryHandle::new(tx));
     }
 
-    let (agent, mut event_rx, input_tx) = builder.build()
+    let (agent, mut event_rx, input_tx) = builder
+        .build()
         .map_err(|e| anyhow::anyhow!("build agent: {e}"))?;
 
     let cancel = CancellationToken::new();
@@ -176,12 +233,18 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
                 AgentEvent::ToolUse { name, input, .. } => tool_uses.push((name, input)),
                 AgentEvent::TurnComplete { .. } => return Ok((text, tool_uses)),
                 AgentEvent::Error { code, message, .. } => {
-                    return Err(anyhow::anyhow!("turn {} failed: [{code}] {message}", turn.index));
+                    return Err(anyhow::anyhow!(
+                        "turn {} failed: [{code}] {message}",
+                        turn.index
+                    ));
                 }
                 _ => {}
             }
         }
-        anyhow::bail!("turn {} ended: event channel closed before TurnComplete/Error", turn.index);
+        anyhow::bail!(
+            "turn {} ended: event channel closed before TurnComplete/Error",
+            turn.index
+        );
     };
 
     let (text, tool_uses) = match tokio::time::timeout(turn_timeout, collect).await {
@@ -202,21 +265,11 @@ async fn run_one_turn(config: &AgentRunnerConfig, turn: &crate::script::Turn) ->
 }
 
 fn make_tools() -> Arc<InMemoryToolRegistry> {
+    // Was a hand-rolled duplicate of this exact list — now the single source
+    // of truth also used by `daemon` (see `tools::register_builtin_tools`'s
+    // doc comment for why that duplication used to matter: daemon had none
+    // of this registered at all).
     let reg = Arc::new(InMemoryToolRegistry::new());
-    let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(tools::bash::BashTool),
-        Arc::new(tools::file_read::FileReadTool),
-        Arc::new(tools::file_write::FileWriteTool),
-        Arc::new(tools::file_edit::FileEditTool),
-        Arc::new(tools::grep::GrepTool),
-        Arc::new(tools::glob::GlobTool),
-        Arc::new(tools::lsp::LspTool::ephemeral()),
-        Arc::new(tools::todo_write::TodoWriteTool),
-        Arc::new(tools::tasks::TaskCreateTool),
-        Arc::new(tools::tasks::TaskUpdateTool),
-        Arc::new(tools::task_output::TaskOutputTool),
-        Arc::new(tools::task_stop::TaskStopTool),
-    ];
-    for t in tools { reg.register(t); }
+    tools::register_builtin_tools(&reg);
     reg
 }

@@ -208,10 +208,22 @@ enum FetchError {
     Other(#[from] anyhow::Error)}
 
 async fn fetch(url: &str) -> Result<(u16, String), FetchError> {
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(TIMEOUT)
         .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none()) // Don't follow redirects — TS parity
+        .redirect(reqwest::redirect::Policy::none()); // Don't follow redirects — TS parity
+    // A loopback target should never go through the ambient HTTP(S)_PROXY —
+    // that env var means "reach the real internet through this egress proxy,"
+    // not "also proxy calls to my own machine." Left unhandled, a dev/CI
+    // environment with HTTP_PROXY set (and no NO_PROXY carve-out) silently
+    // routes even `http://127.0.0.1:*` through the proxy, which can't reach
+    // back into the local port — this is exactly what broke this tool's own
+    // local-server tests. Genuine external fetches still respect the system
+    // proxy as before; only loopback targets bypass it.
+    if crate::security::is_loopback_url(url) {
+        builder = builder.no_proxy();
+    }
+    let client = builder
         .build()
         .map_err(|e| FetchError::Other(anyhow::Error::new(e)))?;
 

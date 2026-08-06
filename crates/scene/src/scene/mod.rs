@@ -1,11 +1,13 @@
 //! Built-in scene implementations.
 //!
 //! Scenes are code-level AgentScene implementations, registered at compile time.
-//! AttaCode provides `coding` (Claude Code parity) and `demo` (framework showcase).
+//! AttaCore provides `coding` (Claude Code parity), `chat` (general assistant),
+//! `research` (search/compare/conclude), and `demo` (framework showcase).
 
 pub mod chat;
 pub mod coding;
 pub mod demo;
+pub mod research;
 
 use base::interface::scene::AgentScene;
 use std::collections::HashMap;
@@ -52,5 +54,6 @@ impl SceneRegistry {
         self.register(Arc::new(chat::ChatScene));
         self.register(Arc::new(coding::CodingScene));
         self.register(Arc::new(demo::DemoScene));
+        self.register(Arc::new(research::ResearchScene));
     }
 }

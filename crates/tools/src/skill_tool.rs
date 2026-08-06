@@ -15,21 +15,26 @@ use std::sync::Arc;
 /// Skills are .md files in `~/.atta/skills/` (global default),
 /// `~/.atta/scenes/<scene>/skills/` (scene override), and
 /// `<project>/.agents/skills/` (project-level).
+///
+/// Any skill the `SkillManager` loaded is invocable — the only gate is each
+/// skill's own `disable_model_invocation` frontmatter flag (checked in
+/// `call()` below). There used to be a second, coarser gate here too: a
+/// scene-supplied allow-list (plus a hardcoded duplicate of it), which meant
+/// a project's own `.agents/skills/*.md` could never be invoked via this
+/// tool no matter what — `disable_model_invocation` already covers "should
+/// the model be allowed to call this," per-skill, which is the right
+/// granularity; the scene-level list was redundant with it and actively
+/// blocked legitimate project skills, so it's gone.
 pub struct SkillTool {
     /// Reference to the skill manager for looking up and expanding skills.
     skill_manager: std::sync::Arc<skills::manager::SkillManager>,
-    /// List of skill names that the user has explicitly allowed to be invoked.
-    user_invocable: Vec<String>,
     /// P2-10: Agent spawner for forked skill execution (context: "fork").
     spawner: Option<Arc<dyn AgentSpawner>>,
 }
 
 impl SkillTool {
-    pub fn new(
-        skill_manager: std::sync::Arc<skills::manager::SkillManager>,
-        user_invocable: Vec<String>,
-    ) -> Self {
-        Self { skill_manager, user_invocable, spawner: None }
+    pub fn new(skill_manager: std::sync::Arc<skills::manager::SkillManager>) -> Self {
+        Self { skill_manager, spawner: None }
     }
 
     /// P2-10: Set the agent spawner for forked skill execution.
@@ -126,21 +131,6 @@ impl Tool for SkillTool {
             // No spawner: fall through to inline execution below.
         }
 
-        // Allow scene skills + user-invocable skills
-        let scene_skills = [
-            "simplify", "verify", "debug", "batch", "stuck", "loop",
-            "remember", "skillify", "updateConfig", "loremIpsum",
-        ];
-        let denied = !scene_skills.contains(&skill_name)
-            && !self.user_invocable.iter().any(|s| s == skill_name);
-        if denied {
-            return Err(ToolError::Denied(format!(
-                "Skill '{skill_name}' is not in the user-invocable skills list. \
-                 Available: {}",
-                self.user_invocable.join(", ")
-            )));
-        }
-
         // Get the skill body content
         let body = self.skill_manager.get_skill_content(skill_name)
             .ok_or_else(|| ToolError::NotFound(format!(
@@ -178,9 +168,89 @@ impl Tool for SkillTool {
     }
 }
 
-impl SkillTool {
-    /// Return the list of user-invocable skill names for prompt rendering.
-    pub fn user_invocable_names(&self) -> Vec<String> {
-        self.user_invocable.clone()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base::frozen::skill::{SkillEntry, SkillSource as FrozenSkillSource};
+
+    fn register_test_skill(
+        mgr: &skills::manager::SkillManager,
+        name: &str,
+        body: &str,
+        disable_model_invocation: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        // Leak the tempdir so the file survives past this function — fine for
+        // a short-lived test process.
+        let path = dir.keep().join(format!("{name}.md"));
+        std::fs::write(&path, body).unwrap();
+        mgr.register_bundled(SkillEntry {
+            name: name.into(),
+            description: format!("{name} skill"),
+            source: FrozenSkillSource::Project,
+            path,
+            disable_model_invocation,
+            ..Default::default()
+        });
+    }
+
+    /// Regression: a project-defined skill (e.g. loaded from
+    /// `.agents/skills/`) used to be unconditionally denied by a hardcoded
+    /// scene-level allow-list, regardless of its own frontmatter — this is
+    /// exactly the case that was broken.
+    #[tokio::test]
+    async fn project_skill_without_disable_flag_is_invocable() {
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        register_test_skill(&mgr, "code-review", "Review the changed files.", false);
+        let tool = SkillTool::new(mgr);
+
+        let result = tool
+            .call(
+                serde_json::json!({"skill": "code-review"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("call should not error");
+
+        assert!(!result.is_error);
+        assert!(result.new_messages.is_some(), "expanded skill content should be injected as a new message");
+    }
+
+    /// A skill's own `disable_model_invocation: true` is still respected —
+    /// this is the one gate that survived (per-skill, not per-scene).
+    #[tokio::test]
+    async fn skill_with_disable_model_invocation_is_denied() {
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        register_test_skill(&mgr, "manual-only", "Only run via slash command.", true);
+        let tool = SkillTool::new(mgr);
+
+        let err = tool
+            .call(
+                serde_json::json!({"skill": "manual-only"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect_err("disable_model_invocation should deny the call");
+
+        assert!(matches!(err, ToolError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_returns_not_found() {
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        let tool = SkillTool::new(mgr);
+
+        let err = tool
+            .call(
+                serde_json::json!({"skill": "does-not-exist"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect_err("unknown skill should error");
+
+        assert!(matches!(err, ToolError::NotFound(_)));
     }
 }

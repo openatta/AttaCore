@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 /// needing to know which one the current session actually uses (`tools`
 /// doesn't depend on the `scene` crate). Keep in sync with
 /// `daemon::main::resolve_scene` and `crates/scene/src/scene/*.rs`.
-const KNOWN_SCENES: &[&str] = &["coding", "chat", "demo"];
+const KNOWN_SCENES: &[&str] = &["coding", "chat", "demo", "research"];
 
 /// 沙盒包装结果：直接喂给 `tokio::process::Command::new(prog).args(args)`。
 #[derive(Debug, Clone)]
@@ -578,7 +578,10 @@ mod tests {
         assert_eq!(cmd.args[pos - 1], "--ro-bind-try");
         // Source == dest for a self-remount, and settings.local.json gets the same treatment.
         assert_eq!(cmd.args[pos + 1], needle);
-        assert!(cmd.args.iter().any(|a| a == "/tmp/work/.atta/settings.local.json"));
+        assert!(cmd
+            .args
+            .iter()
+            .any(|a| a == "/tmp/work/.atta/settings.local.json"));
     }
 
     #[cfg(target_os = "linux")]
@@ -588,9 +591,14 @@ mod tests {
         if cmd.mode != SandboxMode::LinuxBwrap {
             return;
         }
-        let Some(home) = std::env::var_os("HOME") else { return };
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
         let home_str = std::path::Path::new(&home).display().to_string();
-        assert!(cmd.args.iter().any(|a| a == &format!("{home_str}/.atta/settings.json")));
+        assert!(cmd
+            .args
+            .iter()
+            .any(|a| a == &format!("{home_str}/.atta/settings.json")));
         for scene in KNOWN_SCENES {
             let needle = format!("{home_str}/.atta/scenes/{scene}/settings.json");
             assert!(
@@ -937,7 +945,10 @@ mod tests {
         };
         let cmd = wrap(o);
         let profile = &cmd.args[1];
-        assert!(!KNOWN_SCENES.is_empty(), "sanity: scene list must not be empty");
+        assert!(
+            !KNOWN_SCENES.is_empty(),
+            "sanity: scene list must not be empty"
+        );
         for scene in KNOWN_SCENES {
             let needle = format!(".atta/scenes/{scene}/settings.json\"))");
             assert!(
@@ -959,7 +970,9 @@ mod tests {
         };
         let cmd = wrap(o);
         let profile = &cmd.args[1];
-        let Some(home) = std::env::var_os("HOME") else { return };
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
         let home_str = std::path::Path::new(&home).display().to_string();
         let needle = format!("(deny file-write* (literal \"{home_str}/.atta/settings.json\"))");
         assert!(

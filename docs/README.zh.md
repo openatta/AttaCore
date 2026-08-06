@@ -248,7 +248,7 @@ cargo test -p daemon
 ```sh
 export ANTHROPIC_API_KEY=sk-...
 cargo run -p daemon
-# 监听 $HOME/.atta/<scene>/daemon.sock（--scene 默认为 "coding"，必须是已注册的场景——coding/chat/demo——否则 daemon 启动失败）
+# 监听 $HOME/.atta/<scene>/daemon.sock（--scene 默认为 "coding"，必须是已注册的场景——coding/chat/demo/research——否则 daemon 启动失败）
 # 写入 discovery lock file → 客户端自动发现
 ```
 
@@ -343,7 +343,7 @@ Builder::new()
 ### Settings 层级（优先级从低到高）
 
 1. 内置默认值
-2. `$HOME/.atta/<scene>/settings.json`（或 `.toml`）—— `<scene>` 是 daemon 的 `AgentScene` id（`coding`/`chat`/`demo`）；用 `--scene` 指定（默认 `coding`）
+2. `$HOME/.atta/<scene>/settings.json`（或 `.toml`）—— `<scene>` 是 daemon 的 `AgentScene` id（`coding`/`chat`/`demo`/`research`）；用 `--scene` 指定（默认 `coding`）
 3. `<project>/.atta/settings.json`（或 `.toml`）—— 项目级状态是扁平的，没有 scope 这一层
 4. CLI 参数
 

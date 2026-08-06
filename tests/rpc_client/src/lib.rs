@@ -33,6 +33,10 @@ pub struct VcrRunOptions {
     pub scenario: String,
     /// Absolute path to the VCR cassette directory.
     pub dir: String,
+    /// See `daemon::rpc::VcrOptions::strict`'s doc comment — disables the
+    /// network fallback on a replay miss so a hash mismatch fails loudly
+    /// instead of silently making a real, billed API call.
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

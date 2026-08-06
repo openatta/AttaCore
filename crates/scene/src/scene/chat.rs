@@ -153,6 +153,22 @@ impl AgentScene for ChatScene {
             "用 3-5 个词概括以下对话的主题，只输出标题不要任何解释：\n{first_message}"
         ))
     }
+
+    /// CodingScene 的默认抽取话术是"排除能从代码库/git 历史推导出的内容"——
+    /// 对话场景没有代码库这个概念，沿用会让模型困惑（它会去找一个不存在的
+    /// 代码库）。换成对话场景真正关心的边界：用户偏好/背景这类值得跨会话
+    /// 记住的事实，而不是这一轮聊天本身的话题内容（话题本身该由
+    /// `session_name_prompt` 命名，不该重复存进 durable memory）。
+    fn memory_extraction_prompt(&self) -> Option<String> {
+        Some(
+            "Extract any durable memories from this conversation excerpt. A durable \
+             memory is a fact about the user's preferences, background, or ongoing \
+             interests that should persist across chat sessions. Do not extract the \
+             topic of this particular conversation itself — only lasting facts about \
+             the user that would be useful to recall in a future, unrelated chat."
+                .to_string(),
+        )
+    }
 }
 
 /// Identity + 能力边界。独立成函数（而不是内联在 `build_system_prompt`
@@ -330,6 +346,13 @@ mod tests {
     #[test]
     fn auto_name_session_is_enabled() {
         assert!(ChatScene.auto_name_session());
+    }
+
+    #[test]
+    fn memory_extraction_prompt_overrides_codebase_wording() {
+        let p = ChatScene.memory_extraction_prompt().unwrap();
+        assert!(!p.contains("codebase"));
+        assert!(p.contains("preferences"));
     }
 
     #[test]

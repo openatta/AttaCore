@@ -131,3 +131,51 @@ pub fn normalize_path_lexically(p: &Path) -> PathBuf {
     out
 }
 
+/// Whether `url`'s host is loopback (`127.0.0.1`, `::1`, `localhost`).
+/// Used to decide whether an HTTP client should bypass the ambient
+/// `HTTP_PROXY`/`HTTPS_PROXY` for this specific request — see callers
+/// (`web_fetch.rs`, `ping.rs`) for why: those env vars mean "reach the real
+/// internet through this egress proxy," not "also proxy calls back into my
+/// own machine," but reqwest has no built-in way to express that distinction
+/// short of the `NO_PROXY` env var, which callers of this tool don't control.
+/// Malformed URLs are treated as non-loopback (fail open to the existing,
+/// proxy-respecting behavior — never silently bypass a proxy for a URL we
+/// couldn't even parse).
+pub fn is_loopback_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        // IPv6 hosts come back bracketed (`"[::1]"`), unlike v4/hostnames.
+        .is_some_and(|h| {
+            let h = h.trim_start_matches('[').trim_end_matches(']');
+            h == "localhost" || h == "127.0.0.1" || h == "::1"
+        })
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_loopback_hosts() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/health"));
+        assert!(is_loopback_url("http://localhost/"));
+        assert!(is_loopback_url("https://localhost:9000"));
+        assert!(is_loopback_url("http://[::1]:3000"));
+    }
+
+    #[test]
+    fn does_not_flag_real_external_hosts() {
+        assert!(!is_loopback_url("https://example.com"));
+        assert!(!is_loopback_url("https://10.211.55.2:8001"));
+        assert!(!is_loopback_url("https://api.anthropic.com/v1/messages"));
+    }
+
+    #[test]
+    fn malformed_url_fails_open_to_non_loopback() {
+        // Never silently bypass the proxy for a URL we couldn't even parse.
+        assert!(!is_loopback_url("not a url at all"));
+        assert!(!is_loopback_url(""));
+    }
+}
+

@@ -183,6 +183,16 @@ pub struct SessionPool {
     scene: Arc<dyn AgentScene>,
     permission: Arc<dyn Permission>,
     memory_store: Arc<MemoryStore>,
+    /// Built-in tool registry (Bash/Read/Write/Edit/Grep/Glob/...), shared
+    /// (cheap `Arc` clone) by every session `Builder`. Built once here via
+    /// `tools::register_builtin_tools` — before this field existed,
+    /// `Builder::tools()` was never called anywhere in this file, so every
+    /// daemon session ran with only the handful of tools `Builder::build()`
+    /// registers internally (Skill/TaskStop/TaskOutput/Import/Agent/MCP) and
+    /// nothing else — no Bash, no file edits, no web fetch. See
+    /// `tools::register_builtin_tools`'s doc comment for the full story and
+    /// what's deliberately excluded.
+    tools: Arc<base::tool::InMemoryToolRegistry>,
     cwd: PathBuf,
     engine_config: EngineConfig,
     history_store: Option<Arc<dyn history::store::HistoryStore>>,
@@ -314,6 +324,9 @@ impl SessionPool {
         let plugins = Arc::new(active_plugins(paths.as_ref(), &all_plugins));
         let commands = build_shared_commands(&settings, &plugins);
 
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools::register_builtin_tools(&tools);
+
         Self {
             sessions: AsyncMutex::new(HashMap::new()),
             cap,
@@ -324,6 +337,7 @@ impl SessionPool {
             scene,
             permission,
             memory_store,
+            tools,
             cwd,
             engine_config,
             history_store,
@@ -964,9 +978,10 @@ impl SessionPool {
                     // `resolve_task_models` succeeding guarantees
                     // `default_provider` is `Some` and non-empty (it's one
                     // of the function's own hard-error checks).
-                    let default_provider = reloaded.default_provider.as_deref().expect(
-                        "resolve_task_models already validated default_provider is set",
-                    );
+                    let default_provider = reloaded
+                        .default_provider
+                        .as_deref()
+                        .expect("resolve_task_models already validated default_provider is set");
                     match crate::model_router::build_task_router(
                         &reloaded.providers,
                         default_provider,
@@ -1031,7 +1046,7 @@ impl SessionPool {
                         Some(VcrConfig {
                             mode,
                             scenario: vcr.scenario.clone(),
-                            fallback_on_miss: true,
+                            fallback_on_miss: !vcr.strict,
                         }),
                         std::path::PathBuf::from("/tmp/atta_vcr_nonexistent"),
                         std::path::PathBuf::from(&vcr.dir),
@@ -1043,6 +1058,7 @@ impl SessionPool {
         let mut builder = Builder::new()
             .scene(scene)
             .model(model)
+            .tools(self.tools.clone())
             .settings(self.settings.read().await.clone())
             .permission(self.permission.clone())
             .memory_store(self.memory_store.clone())
@@ -1123,7 +1139,9 @@ impl SessionPool {
             created_at: Instant::now(),
             last_active: Instant::now(),
             is_first_turn: true,
-            config_generation: self.config_generation.load(std::sync::atomic::Ordering::Relaxed),
+            config_generation: self
+                .config_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
         };
         // `insert` returning `Some` means a live entry already existed under
         // this exact sid — only reachable via the config-generation recreate
@@ -1716,7 +1734,12 @@ mod eviction_tests {
 
         evict_lru(&mut sessions);
 
-        assert_eq!(sessions.len(), 2, "sessions: {:?}", sessions.keys().collect::<Vec<_>>());
+        assert_eq!(
+            sessions.len(),
+            2,
+            "sessions: {:?}",
+            sessions.keys().collect::<Vec<_>>()
+        );
         assert!(!sessions.contains_key("oldest"));
         assert!(sessions.contains_key("middle"));
         assert!(sessions.contains_key("newest"));
@@ -1743,7 +1766,10 @@ mod eviction_tests {
             old.cancel.cancel();
         }
 
-        assert!(old_cancel.is_cancelled(), "replaced session's token must be cancelled");
+        assert!(
+            old_cancel.is_cancelled(),
+            "replaced session's token must be cancelled"
+        );
         assert_eq!(sessions.len(), 1);
     }
 

@@ -932,11 +932,36 @@ Continue working. Used {accumulated}/{target} output tokens ({remaining} remaini
             // TS parity: initExtractMemories() called via handleStopHooks in stopHooks.ts.
             // Only extract if the model produced a complete response (not cancelled/max_turns).
             {
+                const DEFAULT_MEMORY_MODEL: &str = "claude-haiku-4-5-20251001";
                 let session_messages = self.session.messages().to_vec();
                 let store = self.memory_store.clone();
-                let model = self.model.clone();
+                // `task_models.memory` lets an app point this background
+                // extraction call at a different vendor/model than the main
+                // conversation — same TaskRouter mechanism already proven
+                // for the "subagent" task type (see
+                // `AgentTool::Inner::model_for_subagent`). No override
+                // configured → falls back to the main model, unchanged from
+                // prior behavior.
+                let (model, model_name) = match &self.task_router {
+                    Some(router) => (
+                        router.model_for("memory"),
+                        router
+                            .model_name_for("memory")
+                            .unwrap_or(DEFAULT_MEMORY_MODEL)
+                            .to_string(),
+                    ),
+                    None => (self.model.clone(), DEFAULT_MEMORY_MODEL.to_string()),
+                };
+                let prompt_intro = self.scene.memory_extraction_prompt();
                 tokio::spawn(async move {
-                    extract_memories_after_turn(&store, &session_messages, model.as_ref()).await;
+                    extract_memories_after_turn(
+                        &store,
+                        &session_messages,
+                        model.as_ref(),
+                        &model_name,
+                        prompt_intro.as_deref(),
+                    )
+                    .await;
                 });
             }
 
@@ -2535,10 +2560,21 @@ mod tests {
 ///
 /// TS parity: `initExtractMemories()` in extractMemories.ts, called via
 /// handleStopHooks in stopHooks.ts after each complete query loop.
+///
+/// `model`/`model_name` are resolved by the caller — normally via
+/// `TaskRouter::model_for("memory")` / `model_name_for("memory")` when a
+/// `task_models.memory` override is configured (see
+/// `docs/design/2026-08-04-multi-provider-llm-migration.md` §3.2), falling
+/// back to the main conversation model otherwise, mirroring
+/// `AgentTool::Inner::model_for_subagent`'s pattern for the `"subagent"`
+/// task type. `prompt_intro` is the scene's `memory_extraction_prompt()`
+/// override, if any — see `AgentScene::memory_extraction_prompt`.
 pub(crate) async fn extract_memories_after_turn(
     store: &MemoryStore,
     messages: &[ModelMessage],
     model: &dyn base::interface::model::Model,
+    model_name: &str,
+    prompt_intro: Option<&str>,
 ) {
     // Only extract if there are messages worth analyzing
     if messages.len() < 2 {
@@ -2575,33 +2611,35 @@ pub(crate) async fn extract_memories_after_turn(
         return;
     }
 
-    let prompt = "\
+    const DEFAULT_MEMORY_EXTRACTION_INTRO: &str = "\
 Extract any durable memories from this conversation excerpt. A durable \
 memory is a fact about the user, project, or workflow that should persist \
 across sessions. Only extract memories that are NOT derivable from the \
-current codebase or git history.\n\n\
+current codebase or git history.";
+    let intro = prompt_intro.unwrap_or(DEFAULT_MEMORY_EXTRACTION_INTRO);
+    let prompt = format!(
+        "{intro}\n\n\
 For each memory, return a JSON object with:\n\
 - name: short kebab-case slug\n\
 - description: 1-line summary used to decide relevance during recall\n\
 - content: the fact; for feedback/project, follow with **Why:** and **How to apply:** lines\n\
 - type: one of [user, feedback, project, reference]\n\
 - confidence: 0.0-1.0 (default 0.8)\n\n\
-Return only a JSON array of memories. If nothing is worth saving, return [].";
+Return only a JSON array of memories. If nothing is worth saving, return []."
+    );
 
     use base::interface::settings::ThinkingMode;
     let request_messages = vec![ModelMessage {
         role: MessageRole::User,
         content: vec![
-            ModelContentBlock::Text {
-                text: prompt.to_string(),
-            },
+            ModelContentBlock::Text { text: prompt },
             ModelContentBlock::Text {
                 text: messages_text,
             },
         ],
     }];
     let params = base::interface::model::StreamParams {
-        model: "claude-haiku-4-5-20251001".into(),
+        model: model_name.to_string(),
         max_tokens: 2000,
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
@@ -2671,5 +2709,132 @@ Return only a JSON array of memories. If nothing is worth saving, return [].";
         if let Err(e) = store.persist_batch(memories) {
             tracing::debug!(error = %e, "auto memory extraction: persist failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod extract_memories_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records the `StreamParams`/request text it was called with instead of
+    /// hitting a real provider, and returns a canned "[]" response so
+    /// `extract_memories_after_turn` completes without persisting anything.
+    struct CapturingModel {
+        captured: Mutex<Option<(base::interface::model::StreamParams, String)>>,
+    }
+
+    impl CapturingModel {
+        fn new() -> Self {
+            Self {
+                captured: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl base::interface::model::Model for CapturingModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            messages: Vec<ModelMessage>,
+            params: base::interface::model::StreamParams,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            let prompt_text = messages
+                .first()
+                .and_then(|m| m.content.first())
+                .and_then(|b| match b {
+                    ModelContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            *self.captured.lock().unwrap() = Some((params, prompt_text));
+            let events = vec![Ok(base::interface::model::ModelEvent::TextDelta {
+                text: "[]".to_string(),
+            })];
+            Ok(Box::new(futures::stream::iter(events)))
+        }
+    }
+
+    fn user_msg(text: &str) -> ModelMessage {
+        ModelMessage {
+            role: MessageRole::User,
+            content: vec![ModelContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn tmp_memory_store() -> MemoryStore {
+        let base =
+            std::env::temp_dir().join(format!("atta-test-memstore-{}", uuid::Uuid::new_v4()));
+        MemoryStore::new(base.join("user"), base.join("local"))
+    }
+
+    #[tokio::test]
+    async fn model_name_flows_into_stream_params() {
+        let store = tmp_memory_store();
+        let messages = vec![user_msg("hello"), user_msg("world")];
+        let model = CapturingModel::new();
+
+        extract_memories_after_turn(&store, &messages, &model, "custom-vendor-model", None).await;
+
+        let (params, _) = model
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stream() was called");
+        assert_eq!(params.model, "custom-vendor-model");
+    }
+
+    #[tokio::test]
+    async fn no_prompt_override_uses_default_codebase_intro() {
+        let store = tmp_memory_store();
+        let messages = vec![user_msg("hello"), user_msg("world")];
+        let model = CapturingModel::new();
+
+        extract_memories_after_turn(&store, &messages, &model, "m", None).await;
+
+        let (_, prompt_text) = model
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stream() was called");
+        assert!(prompt_text.contains("codebase or git history"));
+    }
+
+    #[tokio::test]
+    async fn scene_prompt_override_replaces_default_intro() {
+        let store = tmp_memory_store();
+        let messages = vec![user_msg("hello"), user_msg("world")];
+        let model = CapturingModel::new();
+
+        extract_memories_after_turn(
+            &store,
+            &messages,
+            &model,
+            "m",
+            Some("Extract facts about the user's chat preferences."),
+        )
+        .await;
+
+        let (_, prompt_text) = model
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stream() was called");
+        assert!(prompt_text.contains("chat preferences"));
+        assert!(!prompt_text.contains("codebase or git history"));
+        // Fixed JSON-schema instructions must survive regardless of override.
+        assert!(prompt_text.contains("kebab-case slug"));
     }
 }

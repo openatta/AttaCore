@@ -248,7 +248,7 @@ cargo test -p daemon
 ```sh
 export ANTHROPIC_API_KEY=sk-...
 cargo run -p daemon
-# Listens on $HOME/.atta/<scene>/daemon.sock (--scene defaults to "coding"; must be a registered scene — coding/chat/demo — or the daemon fails to start)
+# Listens on $HOME/.atta/<scene>/daemon.sock (--scene defaults to "coding"; must be a registered scene — coding/chat/demo/research — or the daemon fails to start)
 # Writes discovery lock file → clients auto-discover
 ```
 
@@ -343,7 +343,7 @@ Builder::new()
 ### Settings Layers (lowest to highest priority)
 
 1. Built-in defaults
-2. `$HOME/.atta/<scene>/settings.json` (or `.toml`) — `<scene>` is the daemon's `AgentScene` id (`coding`/`chat`/`demo`); set via `--scene` (defaults to `coding`)
+2. `$HOME/.atta/<scene>/settings.json` (or `.toml`) — `<scene>` is the daemon's `AgentScene` id (`coding`/`chat`/`demo`/`research`); set via `--scene` (defaults to `coding`)
 3. `<project>/.atta/settings.json` (or `.toml`) — project-level state is flat, no scope segment
 4. CLI arguments
 

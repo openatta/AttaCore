@@ -108,11 +108,6 @@ pub trait AgentScene: Send + Sync + 'static {
         vec![]
     }
 
-    /// Skills loaded by default for this scene.
-    fn default_skills(&self) -> Vec<String> {
-        vec![]
-    }
-
     /// Execution parameters.
     fn execution_params(&self) -> ExecutionParams {
         ExecutionParams::default()
@@ -127,6 +122,19 @@ pub trait AgentScene: Send + Sync + 'static {
     /// 生成 session 名称的 prompt（仅当 auto_name_session() = true 时调用）。
     /// 参数 `first_message` 是用户的首条消息内容。
     fn session_name_prompt(&self, _first_message: &str) -> Option<String> {
+        None
+    }
+
+    /// Override the intro sentence used by post-turn durable-memory
+    /// extraction (see `runtime::turn::extract_memories_after_turn`). The
+    /// built-in default is coding-flavored ("not derivable from the current
+    /// codebase or git history") — scenes without a codebase concept (chat,
+    /// research) can return `Some(..)` here to describe what counts as a
+    /// durable memory in their own domain. `None` (default) keeps the
+    /// built-in wording. Only the intro is replaceable; the JSON output
+    /// schema instructions that follow it are fixed, since the extraction
+    /// call site parses that exact shape.
+    fn memory_extraction_prompt(&self) -> Option<String> {
         None
     }
 }

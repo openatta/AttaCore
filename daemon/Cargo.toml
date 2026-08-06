@@ -23,6 +23,7 @@ hooks         = { workspace = true }
 session       = { workspace = true }
 plugin        = { workspace = true }
 skills        = { workspace = true }
+tools         = { workspace = true }
 tokio         = { workspace = true, features = ["full"] }
 tokio-util    = { workspace = true }
 serde         = { workspace = true }
@@ -43,7 +44,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tools = { workspace = true }
 compaction = { workspace = true }
 url = { workspace = true }
 sha2 = { workspace = true }

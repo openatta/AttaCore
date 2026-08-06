@@ -96,6 +96,15 @@ pub struct VcrOptions {
     pub mode: String,      // "record" | "replay"
     pub scenario: String,
     pub dir: String,       // absolute path to VCR fixture directory
+    /// Disable the network fallback on a replay miss — fail immediately
+    /// instead of silently making a real (billed) API call. Was previously
+    /// hardcoded `fallback_on_miss: true` server-side with no way for a
+    /// caller to opt out (`api_runner.rs`'s equivalent direct-API path has
+    /// supported this via `ATTA_VCR_STRICT` since earlier this session; the
+    /// daemon RPC path never got the same knob). Defaults to `false` (the
+    /// prior, only-available behavior) so existing callers are unaffected.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
