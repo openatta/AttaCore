@@ -4,7 +4,9 @@
 >
 > **运行时接线（新）**：daemon 启动时，如果 `providers` 非空，会真正构造每个 provider 的 `Arc<dyn Model>` 实例（`daemon::model_router::build_task_router`），并把结果接进 `TaskRouter`（`crates/core/src/provider.rs`）。**`Agent` 工具的子 agent 生成点（`run_sub`/`run_sub_inner`/resume，共三处）已经按 `"subagent"` 任务类型查表路由**——`task_models.subagent` 配了 DeepSeek，子 agent 真的会发请求到 DeepSeek，不再只是解析+记日志。
 >
-> **仍未接线**：① 主对话本身（`SessionPool` 里的会话模型）依然是单一的、从 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 环境变量构造的 client——`task_models.main` 这类 override 目前没有任何调用点会去查；② `team::coordinator`/`crates/tools/src/secondary_llm.rs` 经核实是零生产调用点，本轮未接线；③ `api_type: openai_compatible` 只是配置 schema 层面的合法值，没有对应的协议实现——启动时构造 provider 实例会直接报错退出（而不是降级成 Anthropic 或运行时才失败）。④ **`config.setProvider` 目前不会热更新已构建的 `TaskRouter`**——它会正确写入 settings.json 并让 `daemon.doctor`/`config.getProvider` 看到新配置，但实际路由用的 `TaskRouter` 是 daemon 启动时构造的那一份，改了 provider 配置后新建的 session 依然走旧路由，直到重启 daemon。这是一个已知缺口，不是本次改动的范围。
+> **热更新（新）**：`config.setProvider`/`config.reload` 两条路径（分别对应"通过接口改"和"手改 settings.json 文件后通知重载"）都会重新解析配置、重建 `TaskRouter`，`daemon` 不用重启。已经在运行的 session 不会被立即打断——每个 session 用一个惰性代数（`config_generation`）标记自己是不是过期，下一次收到消息、且当时没有别的 turn 正在处理时，会先原地重建（同一个 `session_id`，从 `HistoryStore` 恢复历史）再处理这条消息；如果当时正忙，这次跳过重建，用旧配置服务完，下次再检查。**只对配置了 `HistoryStore` 的 daemon 生效**（生产环境默认配置了；纯内存 session 永远不会被重建，会一直留在它创建时的配置上）。RPC 响应里 `routing.router_rebuilt`/`routing.router_error` 两个字段能看出这次调用有没有真的换成功，见 `docs/DAEMON_RPC.md` 的 `config.setProvider`/`config.reload` 章节。
+>
+> **仍未接线**：① 主对话本身（`SessionPool` 里的会话模型）依然是单一的、从 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 环境变量构造的 client——`task_models.main` 这类 override 目前没有任何调用点会去查；② `team::coordinator`/`crates/tools/src/secondary_llm.rs` 经核实是零生产调用点，本轮未接线；③ `api_type: openai_compatible` 只是配置 schema 层面的合法值，没有对应的协议实现——构造 provider 实例（无论是启动时还是热重载时）会直接报错/报告失败退出（而不是降级成 Anthropic 或运行时才失败）。
 >
 > 详见 `docs/design/2026-08-04-multi-provider-llm-migration.md` §4-§6（原始设计推理，含"尚未实施"的历史记录，实际现状以本段为准）。
 
@@ -358,4 +360,4 @@
 | 任务级路由 | 无 | 已解析、已校验；`subagent` 任务类型**已接到实际请求路径**，`main`/`team`/`classifier`/`compact`/`web_fetch` 仍未接线（见上方任务类型表） |
 | 模型名校验 | 无 | `models` 允许列表过滤 + 回退 |
 | 供应商配置出错 | 不适用 | 分两条路径（provider 悬空 vs 模型不在允许列表），均软降级 + 警告，不阻塞启动（除非连 `default_provider` 本身都无效） |
-| 运行时热更新 | 不适用（改环境变量需要重启进程） | `config.setProvider` 会更新 settings.json 和诊断视图，但**不会**热更新已构造的 `TaskRouter`——路由本身仍需重启 daemon 才生效 |
+| 运行时热更新 | 不适用（改环境变量需要重启进程） | `config.setProvider`/`config.reload` 都会重建 `TaskRouter`，不用重启 daemon；新 session 立即用新配置，已在运行的 session 惰性追上（下次空闲时原地重建，见上方"热更新"说明） |

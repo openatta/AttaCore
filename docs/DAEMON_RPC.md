@@ -48,6 +48,7 @@
 | [`session.run_turn`](#sessionrun_turn) | session | 否 | 发一条消息、跑一轮，流式返回事件 |
 | [`config.setProvider`](#configsetprovider) | config | 否 | 写入/删除一个 LLM 供应商配置 |
 | [`config.getProvider`](#configgetprovider) | config | 是 | 读回当前生效的供应商配置（`api_key` 默认脱敏） |
+| [`config.reload`](#configreload) | config | 否 | 不写文件，重新读一遍磁盘上当前的三层 settings.json 并生效 |
 | [`mcp.status`](#mcpstatus) | mcp | 是 | 已连接 MCP server 列表 |
 | [`mcp.addServer`](#mcpaddserver) | mcp | 否 | 添加并连接一个 MCP server |
 | [`import.list`](#importlist) | import | 是 | 检测可导入的跨工具配置（Claude Code/Codex/Cursor） |
@@ -217,11 +218,17 @@
 // {"jsonrpc":"2.0","id":1,"result":{
 //   "written_to":"/repo/.atta/settings.json","providers":["deepseek"],
 //   "default_provider":"deepseek","task_models":["subagent"],
-//   "routing":{"ok":true,"warnings":[],"error":null}
+//   "routing":{"ok":true,"warnings":[],"error":null,"router_rebuilt":false,"router_error":"provider 'deepseek': api_type 'openai_compatible' has no runtime implementation yet ..."}
 // }}
 ```
 
 `provider_id` 缺失 / `config` 或 `task_models` 校验不通过 → `INVALID_PARAMS`，不写文件。**已存在但内容不是合法 JSON 对象的 `settings.json`** 也会被拒绝（`INVALID_PARAMS`），不会静默清空重写——这是本仓库一次审查中修的一个真实 bug，务必别退化回去。
+
+`routing` 里两组字段是两件独立的事，不要混着读：
+- `ok`/`warnings`/`error` —— `base::provider::resolve_task_models` 纯配置校验的结果（`task_models` 引用的 provider 存不存在、模型名在不在允许列表里……），不关心 `api_type` 是否有真实实现。
+- `router_rebuilt`/`router_error` —— 上面校验通过之后，是不是真的把新配置构造成了活的 `Arc<dyn Model>` 实例并换掉了正在用的路由表。`api_type: openai_compatible` 就是"`ok:true` 但 `router_rebuilt:false`"的典型例子——配置本身逻辑自洽，但引擎还没有对应协议的实现，**实际发起的请求依然走旧的路由表**，直到你换成 `api_type:"anthropic"` 的 provider。
+- 无论 `routing` 结果如何，settings.json 都已经写盘——这是既有设计（校验不过不拒绝写入，只报告），本次新增的路由重建同样遵循这个哲学：重建失败不回滚文件、不影响这次 RPC 的整体成功，只是"这次没能让新配置生效"，旧路由继续服务。
+- **正在运行的 session 现在也会追上新配置**——不是立即生效，而是懒惰的：每个 session 在收到`config.setProvider`/`config.reload` 之后的下一条消息时，如果当时没有别的 turn 正在处理，会先原地重建（同一个 session_id、从 `HistoryStore` 恢复历史）再处理这条消息；如果当时正忙，本次跳过重建，继续用旧配置服务完这条消息，下一次调用再检查。只对配置了 `HistoryStore` 的 daemon 生效（生产环境默认配置了）。
 
 ### `config.getProvider`
 
@@ -229,6 +236,21 @@
 {"jsonrpc":"2.0","method":"config.getProvider","id":1,"params":{"include_secrets":false}}
 // api_key 默认脱敏为 "***<末4位>"；include_secrets:true 才返回明文
 ```
+
+### `config.reload`
+
+```jsonc
+{"jsonrpc":"2.0","method":"config.reload","id":1}
+// 无参数。重新读一遍全局→scene→项目三层 settings.json（不写任何 patch，就是
+// "不管谁改了文件，现在给我按磁盘上现在的内容重新生效一次"），响应形状和
+// config.setProvider 的一致（少一个 written_to 字段）：
+// {"jsonrpc":"2.0","id":1,"result":{
+//   "providers":["deepseek"],"default_provider":"deepseek","task_models":["subagent"],
+//   "routing":{"ok":true,"warnings":[],"error":null,"router_rebuilt":true,"router_error":null}
+// }}
+```
+
+给"直接手改 settings.json 文件，而不是走 `config.setProvider` 一个字段一个字段 patch"这个场景用——效果和 `config.setProvider` 完全一样（同一套 `SessionPool::apply_reloaded_settings()`），只是不先写文件这一步。
 
 ---
 

@@ -871,7 +871,7 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
 // `daemon/src/main.rs` does wire up a real store, so this needs its own
 // server variant.
 
-async fn start_server_with_history() -> (
+async fn start_server_with_history(cap: usize) -> (
     Arc<DaemonServer>,
     PathBuf,
     tempfile::TempDir,
@@ -903,7 +903,7 @@ async fn start_server_with_history() -> (
     ));
 
     let pool = Arc::new(SessionPool::new(
-        8,
+        cap,
         3600,
         client,
         settings,
@@ -937,7 +937,7 @@ async fn start_server_with_history() -> (
 
 #[tokio::test]
 async fn run_turn_with_malformed_session_id_and_history_store_does_not_panic() {
-    let (_server, sock, _dir, handle) = start_server_with_history().await;
+    let (_server, sock, _dir, handle) = start_server_with_history(8).await;
 
     // Not a valid BASE58(UUID) — used to `unwrap()`-panic inside
     // `resume_or_create` when a real `HistoryStore` is configured. A
@@ -1147,4 +1147,237 @@ async fn serve_tcp_listener_bails_without_a_token_even_when_called_directly() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let err = server.serve_tcp_listener(listener).await.unwrap_err();
     assert!(err.to_string().contains("token"), "err: {err}");
+}
+
+// ── config.reload + hot-reloadable task routing ─────────────────────────
+
+#[tokio::test]
+async fn config_reload_with_no_providers_reports_ok_and_no_router() {
+    let (_server, sock, _dir, handle) = start_server().await;
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.reload","id":1}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object(), "expected success, got: {v}");
+    assert_eq!(v["result"]["routing"]["ok"], true, "resp: {v}");
+    assert_eq!(v["result"]["routing"]["router_rebuilt"], false, "resp: {v}");
+    assert!(v["result"]["providers"].as_array().unwrap().is_empty());
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn config_reload_picks_up_a_hand_edited_settings_file() {
+    // The whole point of `config.reload` (vs `config.setProvider`) is
+    // supporting a human editing settings.json directly, outside any RPC —
+    // this writes the project-tier file by hand (no `config.setProvider`
+    // call at all) and confirms `config.reload` alone picks it up.
+    let (_server, sock, dir, handle) = start_server().await;
+
+    let settings_path = dir.path().join(".atta").join("settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({
+            "providers": {
+                "anthropic": {
+                    "api_type": "anthropic",
+                    "api_key": "sk-ant-hand-edited",
+                    "default_model": "claude-sonnet-4-6"
+                }
+            },
+            "default_provider": "anthropic"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.reload","id":1}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object(), "expected success, got: {v}");
+    assert_eq!(v["result"]["default_provider"], "anthropic", "resp: {v}");
+    assert_eq!(v["result"]["routing"]["ok"], true, "resp: {v}");
+    assert_eq!(v["result"]["routing"]["router_rebuilt"], true, "resp: {v}");
+    assert_eq!(v["result"]["routing"]["router_error"], serde_json::Value::Null, "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn set_provider_with_openai_compatible_resolves_but_does_not_rebuild_router() {
+    // `resolve_task_models` doesn't know about `api_type` (pure config-shape
+    // validation), so `routing.ok` stays `true` — same contract as
+    // `set_provider_writes_project_settings_and_doctor_sees_it`. But
+    // `openai_compatible` has no runtime `Model` impl yet, so the *live*
+    // router must not be swapped, and that failure must be visible in a
+    // field that doesn't retroactively change what `routing.ok` has always
+    // meant.
+    let (_server, sock, _dir, handle) = start_server().await;
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"config.setProvider","params":{"provider_id":"deepseek","config":{"api_type":"openai_compatible","base_url":"https://api.deepseek.com/v1","api_key":"k","default_model":"deepseek-pro"},"default_provider":"deepseek"},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["routing"]["ok"], true, "resp: {v}");
+    assert_eq!(v["result"]["routing"]["router_rebuilt"], false, "resp: {v}");
+    let router_error = v["result"]["routing"]["router_error"].as_str().unwrap();
+    assert!(router_error.contains("openai_compatible"), "router_error: {router_error}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn set_provider_with_unresolvable_config_reports_routing_not_ok() {
+    // Distinguishes the other failure layer: `default_provider` pointing at
+    // a provider that doesn't exist is a `resolve_task_models` failure, not
+    // a router-build failure — `routing.ok` must be `false` here (unlike
+    // the openai_compatible case above).
+    let (_server, sock, _dir, handle) = start_server().await;
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"config.setProvider","params":{"provider_id":"anthropic","config":{"api_type":"anthropic","api_key":"k","default_model":"claude-sonnet-4-6"},"default_provider":"ghost-provider"},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["routing"]["ok"], false, "resp: {v}");
+    assert_eq!(v["result"]["routing"]["router_rebuilt"], false, "resp: {v}");
+    let error = v["result"]["routing"]["error"].as_str().unwrap();
+    assert!(error.contains("ghost-provider"), "error: {error}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn existing_session_survives_a_config_reload_between_turns() {
+    // Smoke test for the lazy-recreate path in `run_turn`: a session created
+    // before a reload must still be usable (same session_id, no
+    // SESSION_NOT_FOUND / crash) for a turn sent after the reload bumped
+    // `config_generation` — proving the stale-generation branch in
+    // `run_turn` (recreate via `resume_or_create`) doesn't break the normal
+    // "session already exists" path. Uses `start_server_with_history()`
+    // because the recreate path only engages for HistoryStore-backed
+    // sessions (see `run_turn`'s doc comment).
+    let (_server, sock, _dir, handle) = start_server_with_history(8).await;
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"hello"},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object() || v["error"].is_object(), "resp: {v}");
+    let session_id = {
+        let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let sessions = v["result"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "resp: {v}");
+        sessions[0]["session_id"].as_str().unwrap().to_string()
+    };
+
+    // Bump config_generation without touching this session directly.
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.reload","id":3}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object(), "reload should succeed: {v}");
+
+    // Same session_id, second turn — must not come back SESSION_NOT_FOUND.
+    let resp = rpc_call(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.run_turn","params":{{"session_id":"{session_id}","message":"still there?"}},"id":4}}"#
+        ),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_ne!(v["error"]["code"], codes::SESSION_NOT_FOUND, "resp: {v}");
+    assert!(v["result"].is_object() || v["error"].is_object(), "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn recreating_a_stale_session_at_capacity_does_not_evict_an_unrelated_session() {
+    // Regression test: `create()`'s capacity check used to run unconditionally
+    // before `insert`, not accounting for the config-generation recreate path
+    // replacing an *existing* map entry under the same sid rather than adding
+    // a new one. At capacity, that spuriously evicted an unrelated session
+    // even though the total session count wasn't actually growing.
+    let (_server, sock, _dir, handle) = start_server_with_history(2).await;
+
+    async fn session_ids(sock: &std::path::Path) -> std::collections::HashSet<String> {
+        let resp = rpc_call(sock, r#"{"jsonrpc":"2.0","method":"session.list","id":99}"#).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        v["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // Create the two sessions one at a time, diffing `session.list` after
+    // each — `self.sessions` is a `HashMap`, so its iteration order carries
+    // no creation-order information; this is the only reliable way to know
+    // which of the two is objectively older (`id_older`, created first,
+    // never touched again) vs the one we're about to recreate (`id_newer`).
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"hi 0"},"id":0}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object() || v["error"].is_object(), "resp: {v}");
+    let after_first = session_ids(&sock).await;
+    assert_eq!(after_first.len(), 1, "ids: {after_first:?}");
+    let id_older = after_first.into_iter().next().unwrap();
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"hi 1"},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object() || v["error"].is_object(), "resp: {v}");
+    let after_second = session_ids(&sock).await;
+    assert_eq!(after_second.len(), 2, "ids: {after_second:?}");
+    let id_newer = after_second
+        .into_iter()
+        .find(|id| id != &id_older)
+        .expect("second session must have a different id than the first");
+
+    // Bump config_generation, then send a second turn to the *newer* session
+    // — this triggers the stale-generation recreate path for it while the
+    // pool is already at capacity (2/2). If eviction incorrectly treats this
+    // replace-in-place as "adding a new session", it'll evict whatever's
+    // globally least-recently-active — `id_older`, which this call never
+    // touches.
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.reload","id":11}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object(), "reload should succeed: {v}");
+
+    let resp = rpc_call(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.run_turn","params":{{"session_id":"{id_newer}","message":"again"}},"id":12}}"#
+        ),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object() || v["error"].is_object(), "resp: {v}");
+
+    let final_ids = session_ids(&sock).await;
+    assert_eq!(final_ids.len(), 2, "ids: {final_ids:?}");
+    assert!(
+        final_ids.contains(&id_older),
+        "unrelated older session was evicted as a side effect of recreating the newer one: {final_ids:?}"
+    );
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
 }

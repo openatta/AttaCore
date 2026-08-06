@@ -123,7 +123,7 @@ Agent 的行为——系统提示词、工具白名单、token 预算、执行�
 - **启动时解析并校验**——引用了不存在的 provider、缺 `default_model`、或 `api_type` 不支持,都会让 daemon 在启动阶段直接报错退出,不会等到会话中途才暴露问题。
 - **已接线**：`Agent` 工具的子 agent 生成点会通过解析出的 provider/model（`TaskRouter`）发起请求，不再无条件继承父 session 的模型。
 - **尚未接线**：主对话模型、`team` 协调依然走单一的、从环境变量读取配置的 client；`api_type: openai_compatible` 在配置 schema 层面是合法值，但还没有对应的协议实现——声明这个类型会在启动时直接报错退出，而不是悄悄降级成 Anthropic。
-- 随时用 `daemon.doctor` RPC 查看实际解析出的路由结果；用 `config.getProvider`/`config.setProvider` 读写供应商配置，不用手改 JSON 文件。
+- 随时用 `daemon.doctor` RPC 查看实际解析出的路由结果；用 `config.getProvider`/`config.setProvider` 读写供应商配置，不用手改 JSON 文件——两者都会热更新路由表（不用重启 daemon），`config.reload` 则是给手改了 settings.json 文件的场景用，效果一样。正在运行的 session 会在下一轮惰性追上新配置。
 
 完整配置参考和精确的实施状态见 [`docs/LLM_PROVIDERS.md`](LLM_PROVIDERS.md)。
 
@@ -255,7 +255,7 @@ cargo run -p daemon
 ### 运行集成测试
 
 ```sh
-# 前置：在仓库根目录放置 .deepseek 文件（包含 API key）
+# 前置：在仓库根目录放置 .env 文件（已 gitignore，包含 API key）——见 tests/README.md
 # API 模式（直接构造 Agent）
 ./tests/run_api.sh 000.c_project
 

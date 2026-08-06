@@ -15,14 +15,10 @@
 //!   --mode daemon --socket /tmp/attacored.sock --case tests/cases/c_project.test
 //! ```
 
-mod api_runner;
-mod cli_runner;
-mod comparator;
-mod reporter;
-mod script;
+use test_runner::{api_runner, cli_runner, comparator, config, reporter, script};
 
 use base::interface::settings::VcrMode;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, clap::Parser)]
 #[clap(name = "attacore-test", about = "AttaCore test runner")]
@@ -55,9 +51,23 @@ struct Args {
     #[clap(long)]
     scenario: Option<String>,
 
-    /// DeepSeek config file path (supports .sh format: export KEY=VALUE)
-    #[clap(long, default_value = ".deepseek")]
+    /// Model config file path (.env, export KEY=VALUE format)
+    #[clap(long, default_value = ".env")]
     config: String,
+
+    /// Template project fixture to run the case against (e.g.
+    /// tests/fixtures/template_project). Copied to a fresh tmp dir before
+    /// each run; the fixture itself is never mutated. Omit for cases that
+    /// don't need project-level config (hooks/mcp/agents/rules).
+    #[clap(long)]
+    fixture: Option<PathBuf>,
+
+    /// VCR round identifier — cassette data is stored under a per-round
+    /// subdirectory so re-recording never overwrites/mixes with an earlier
+    /// round (see docs/TESTING_GUIDE.md). Defaults to $ATTA_VCR_ROUND, or
+    /// today's UTC date (YYYY-MM-DD) if that's unset either.
+    #[clap(long)]
+    round: Option<String>,
 }
 
 #[tokio::main]
@@ -92,17 +102,25 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "unknown".to_string())
     });
 
-    let vcr_dir = args.out_dir.join(&scenario).join(&args.mode);
+    let round = config::resolve_vcr_round(args.round.clone());
+    eprintln!("VCR round: {round}");
+
+    // cassette_dir: 本地/CI 缓存的 VCR 录制数据（tests/fixtures/cassettes/，已 gitignore），
+    // 按 round 分目录存放——重新录制开新一轮，旧轮次原样留在磁盘上，互不覆盖。
+    // output_dir: 纯生成物（人读日志/报告/遥测），继续留在 tests/output/，被 .gitignore 排除。
+    let cassette_dir = PathBuf::from("tests/fixtures/cassettes").join(&scenario).join(&args.mode).join(&round);
+    let output_dir = args.out_dir.join(&scenario).join(&args.mode);
     let report_dir = args.out_dir.join(&scenario);
-    let _ = std::fs::create_dir_all(&vcr_dir);
+    let _ = std::fs::create_dir_all(&cassette_dir);
+    let _ = std::fs::create_dir_all(&output_dir);
     let _ = std::fs::create_dir_all(&report_dir);
 
     match args.mode.as_str() {
         "api" | "agent" => {
-            run_api_mode(&args, &case, vcr_mode, &scenario, &vcr_dir, &report_dir, &config_path).await?;
+            run_api_mode(&args, &case, vcr_mode, &scenario, &cassette_dir, &output_dir, &report_dir, &config_path).await?;
         }
         "cli" | "daemon" => {
-            run_cli_mode(&args, &case, &scenario, &report_dir).await?;
+            run_cli_mode(&args, &case, &scenario, &cassette_dir, &output_dir, &report_dir).await?;
         }
         _ => anyhow::bail!("Unknown mode: {}. Use 'api' or 'cli'.", args.mode),
     }
@@ -115,28 +133,33 @@ async fn run_api_mode(
     case: &script::TestCase,
     vcr_mode: VcrMode,
     scenario: &str,
-    vcr_dir: &PathBuf,
+    cassette_dir: &PathBuf,
+    output_dir: &PathBuf,
     report_dir: &PathBuf,
     config_path: &str,
 ) -> anyhow::Result<()> {
-    // Build DeepSeek model
-    let config = load_config(config_path)?;
-    let model = build_model(&config)?;
+    let model_config = config::load_env_config(Path::new(config_path))?;
+    eprintln!(
+        "Config: model={} (record + VCR fallback-on-miss — must match to keep cassette hashes valid) / fast_model={} (LLM comparator only)",
+        model_config.model, model_config.fast_model
+    );
+    let model = build_model(&model_config)?;
 
-    let telemetry_path = vcr_dir.join(format!("{scenario}.telemetry.md"));
+    let telemetry_path = output_dir.join(format!("{scenario}.telemetry.md"));
 
     let runner_config = api_runner::AgentRunnerConfig {
         model: model.clone(),
         vcr_mode: vcr_mode.clone(),
         vcr_scenario: scenario.to_string(),
-        vcr_dir: vcr_dir.clone(),
+        vcr_dir: cassette_dir.clone(),
         telemetry_path: Some(telemetry_path),
+        fixture_dir: args.fixture.clone(),
     };
 
     let outputs = api_runner::run_test_case(runner_config, case).await?;
 
     if args.compare {
-        let compare_model = build_compare_model(&config)?;
+        let compare_model = build_model(&model_config)?;
         run_comparison(case, &outputs, compare_model.as_ref(), report_dir).await?;
     } else {
         eprintln!("Skipping comparison (use --compare to enable LLM-based verification)");
@@ -144,26 +167,33 @@ async fn run_api_mode(
     Ok(())
 }
 
-async fn run_cli_mode(args: &Args, case: &script::TestCase, scenario: &str, report_dir: &PathBuf) -> anyhow::Result<()> {
+async fn run_cli_mode(
+    args: &Args,
+    case: &script::TestCase,
+    scenario: &str,
+    cassette_dir: &PathBuf,
+    output_dir: &PathBuf,
+    report_dir: &PathBuf,
+) -> anyhow::Result<()> {
     let config_path = shellexpand::tilde(&args.config).to_string();
     let vcr_mode: Option<String> = std::env::var("ATTA_VCR_RECORD").ok().map(|_| "record".into())
         .or_else(|| std::env::var("ATTA_VCR_REPLAY").ok().map(|_| "replay".into()));
-    let output_dir = args.out_dir.join(scenario).join("cli");
-    let _ = std::fs::create_dir_all(&output_dir);
     let config = cli_runner::CliRunnerConfig {
         socket_path: args.socket.clone(),
         daemon_binary: args.daemon_binary.clone(),
         config_path: config_path.clone().into(),
         scenario: scenario.to_string(),
         vcr_mode,
-        output_dir,
+        cassette_dir: cassette_dir.clone(),
+        output_dir: output_dir.clone(),
+        fixture_dir: args.fixture.clone(),
     };
 
     let outputs = cli_runner::run_test_case(config, case).await?;
 
     if args.compare {
-        let cfg = load_config(&config_path)?;
-        let compare_model = build_compare_model(&cfg)?;
+        let model_config = config::load_env_config(Path::new(&config_path))?;
+        let compare_model = build_model(&model_config)?;
         run_comparison(case, &outputs, compare_model.as_ref(), report_dir).await?;
     }
     Ok(())
@@ -198,32 +228,13 @@ async fn run_comparison(
     Ok(())
 }
 
-fn load_config(path: &str) -> anyhow::Result<(String, String, String)> {
-    let content = std::fs::read_to_string(path)?;
-    let (mut url, mut token, mut model) = (String::new(), String::new(), String::new());
-    for line in content.lines() {
-        let l = line.trim();
-        if let Some(v) = l.strip_prefix("export ANTHROPIC_BASE_URL=") { url = v.trim().into(); }
-        else if let Some(v) = l.strip_prefix("export ANTHROPIC_AUTH_TOKEN=") { token = v.trim().into(); }
-        else if let Some(v) = l.strip_prefix("export ANTHROPIC_MODEL=") { model = v.trim().into(); }
-    }
-    anyhow::ensure!(!url.is_empty(), "ANTHROPIC_BASE_URL not found in config");
-    anyhow::ensure!(!token.is_empty(), "ANTHROPIC_AUTH_TOKEN not found in config");
-    Ok((url, token, model))
-}
-
-fn build_model(config: &(String, String, String)) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
-    let (url, token, _) = config;
-    let mut url = url.clone();
+fn build_model(config: &config::TestModelConfig) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
+    let mut url = config.base_url.clone();
     if !url.ends_with('/') { url.push('/'); }
     let c = model::client::HttpAnthropicClient::with_base(
-        model::client::AuthMode::ApiKey(token.clone()),
+        model::client::AuthMode::ApiKey(config.auth_token.clone()),
         url::Url::parse(&url)?,
     )?
     .with_backoff(vec![100, 200, 500]);
     Ok(std::sync::Arc::new(model::adapter::AnthropicModel::new(std::sync::Arc::new(c))))
-}
-
-fn build_compare_model(config: &(String, String, String)) -> anyhow::Result<std::sync::Arc<dyn base::interface::model::Model>> {
-    build_model(config)
 }

@@ -94,12 +94,20 @@ impl VcrModel {
         // Rust's `cfg(test)` is compile-time only, so we detect at runtime.
         let in_test = std::env::var("CARGO_TEST_RUNNER").is_ok()
             || std::env::var("ATTA_VCR_AUTO_DETECT").is_ok();
+        // `ATTA_VCR_STRICT=1`: turn off the silent network fallback on a replay
+        // miss. Without this, a miss is invisible except as "this run took way
+        // longer than expected" (see the warn log added alongside this flag —
+        // docs/design/2026-08-05-test-architecture.md §13/§14) — with it, a
+        // miss fails immediately with the hash that didn't match, which is what
+        // you want when actively diagnosing *why* something misses instead of
+        // just needing the run to complete one way or another.
+        let strict = std::env::var("ATTA_VCR_STRICT").is_ok_and(|v| v != "0" && !v.is_empty());
         if let Ok(name) = std::env::var("ATTA_VCR_RECORD") {
             Some(VcrConfig { mode: VcrMode::Record, scenario: name, fallback_on_miss: true })
         } else if let Ok(name) = std::env::var("ATTA_VCR_REPLAY") {
-            Some(VcrConfig { mode: VcrMode::Replay, scenario: name, fallback_on_miss: true })
+            Some(VcrConfig { mode: VcrMode::Replay, scenario: name, fallback_on_miss: !strict })
         } else if in_test {
-            Some(VcrConfig { mode: VcrMode::Replay, scenario: "auto".into(), fallback_on_miss: true })
+            Some(VcrConfig { mode: VcrMode::Replay, scenario: "auto".into(), fallback_on_miss: !strict })
         } else {
             None
         }
@@ -187,6 +195,12 @@ impl Model for VcrModel {
             Some(VcrConfig { mode: VcrMode::Replay, scenario, fallback_on_miss, .. }) => {
                 let entries = self.load_entries(scenario);
                 if let Some(entry) = entries.get(&req_hash) {
+                    tracing::debug!(
+                        scenario = %scenario,
+                        hash = %req_hash,
+                        turn_id = ?self.current_turn_id,
+                        "VCR replay hit"
+                    );
                     let chunks: Vec<Result<ModelEvent, ModelError>> = entry.chunks.iter().map(|c| {
                         Ok(match c {
                             VcrChunk::TextDelta { text } => ModelEvent::TextDelta { text: hydrate(text) },
@@ -204,6 +218,24 @@ impl Model for VcrModel {
                     }).collect();
                     return Ok(Box::new(futures::stream::iter(chunks)));
                 }
+                // Miss: without this, the only symptom is "replay took way longer
+                // than expected" (silent fallback_on_miss network call) — the
+                // exact scenario that took hours to diagnose forensically (see
+                // docs/design/2026-08-05-test-architecture.md §12/§13). Log
+                // enough to make the *next* miss diagnosable in seconds instead:
+                // whether a cassette even loaded (available_entries), and the
+                // hash that didn't match anything in it. The hash itself can't
+                // be reverse-engineered into "which field differs", but
+                // `available_entries == 0` immediately rules out "wrong
+                // scenario/round" vs "content actually diverged".
+                tracing::warn!(
+                    scenario = %scenario,
+                    hash = %req_hash,
+                    turn_id = ?self.current_turn_id,
+                    available_entries = entries.len(),
+                    fallback_on_miss,
+                    "VCR replay miss (falls back to a real model call if fallback_on_miss is set)"
+                );
                 if !fallback_on_miss {
                     return Err(ModelError::Internal(format!(
                         "VCR replay miss: no fixture for hash {req_hash}. Run with ATTA_VCR_RECORD={scenario}"
@@ -317,6 +349,28 @@ fn dehydrate(s: &str) -> String {
     result = RE_KNOWLEDGE_CUTOFF.replace_all(&result, "knowledge cutoff is [CUTOFF]").to_string();
     result = RE_POWERED_BY_MODEL.replace_all(&result, "You are powered by the model [MODEL]").to_string();
     result = RE_MODEL_DESC.replace_all(&result, "The most recent Claude models are [MODELS]").to_string();
+
+    // ── `ls -l`-style timestamps embedded in tool_result content ──
+    // VCR only mocks the *model's* response, never tool execution — every
+    // replay actually re-runs Bash/Write/etc. for real. A command like
+    // `ls -la` embeds a real modification timestamp ("Aug  5 22:59" or, for
+    // files >6mo old, "Aug  5  2025") in its stdout, which then becomes part
+    // of a tool_result message baked into every subsequent request's hash.
+    // Record-time and replay-time are two different real timestamps, so that
+    // one field alone desyncs the hash for that turn *and every turn after
+    // it* (the model then gets a fresh, real response with a new tool_use id
+    // that can never match the rest of the original cassette either — see
+    // docs/design/2026-08-05-test-architecture.md §13 for the full forensic
+    // trail that found this). Matches both BSD/macOS and GNU `ls -l` default
+    // date formats.
+    static RE_LS_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})\b",
+        )
+        .unwrap()
+    });
+    result = RE_LS_TIMESTAMP.replace_all(&result, "[LS_TIMESTAMP]").to_string();
+
     result
 }
 
@@ -340,6 +394,7 @@ fn hydrate(s: &str) -> String {
     result = result.replace("[CUTOFF]", "April 2025");
     result = result.replace("[MODEL]", "claude-sonnet-4-6");
     result = result.replace("[MODELS]", "Fable 5 and the Claude 4.X family");
+    result = result.replace("[LS_TIMESTAMP]", "Jan  1 00:00");
     result
 }
 
@@ -398,6 +453,46 @@ pub fn verify_fixtures_in_ci(scenarios: &[&str], vcr_dir: &Path) -> Result<(), S
 mod tests {
     use super::*;
     use base::interface::model::ModelEvent;
+
+    /// The property that actually matters: two `ls -la` runs against the
+    /// exact same directory contents, minutes/days apart (so the timestamp
+    /// column differs but everything else is identical), must dehydrate to
+    /// the *same* string — otherwise `hash_request()` diverges between
+    /// record-time and replay-time purely because of wall-clock timing, not
+    /// because anything about the request actually changed. This is the bug
+    /// from docs/design/2026-08-05-test-architecture.md §13.
+    #[test]
+    fn dehydrate_normalizes_ls_l_timestamps_so_repeated_runs_hash_the_same() {
+        let recorded = "-rw-r--r--  1 xbitshans  staff  45 Aug  5 22:59 greet.h\n\
+                         drwxr-xr-x  3 xbitshans  staff  96 Aug  5 20:21 build";
+        let replayed = "-rw-r--r--  1 xbitshans  staff  45 Aug  6 09:03 greet.h\n\
+                         drwxr-xr-x  3 xbitshans  staff  96 Aug  6 09:03 build";
+        assert_ne!(recorded, replayed, "sanity: the two raw ls outputs actually differ");
+        assert_eq!(
+            dehydrate(recorded),
+            dehydrate(replayed),
+            "ls -l timestamps must dehydrate identically regardless of the actual date/time"
+        );
+    }
+
+    /// GNU/BSD `ls -l` switches to a year column instead of a time-of-day
+    /// column once a file is more than ~6 months old — must also normalize.
+    #[test]
+    fn dehydrate_normalizes_ls_l_year_form_too() {
+        let old_file = "-rw-r--r--  1 xbitshans  staff  45 Jan  3  2025 old.txt";
+        let recent_file = "-rw-r--r--  1 xbitshans  staff  45 Jan  3 10:00 old.txt";
+        assert_eq!(dehydrate(old_file), dehydrate(recent_file));
+    }
+
+    /// Round-trip sanity for the new placeholder, matching the pattern of
+    /// every other dehydrate/hydrate pair in this module.
+    #[test]
+    fn ls_timestamp_placeholder_hydrates_to_something_not_the_literal_placeholder() {
+        let dehydrated = dehydrate("Aug  5 22:59 greet.h");
+        assert!(dehydrated.contains("[LS_TIMESTAMP]"));
+        let hydrated = hydrate(&dehydrated);
+        assert!(!hydrated.contains("[LS_TIMESTAMP]"));
+    }
 
     struct MockModel;
 

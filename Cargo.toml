@@ -19,7 +19,9 @@ members = [
     "crates/team",
     "crates/task",
     "daemon",
+    "tests/rpc_client",
     "tests/runner",
+    "tests/fixtures/mcp_toy_server",
 ]
 
 [workspace.package]
@@ -106,3 +108,4 @@ scene      = { path = "crates/scene" }
 team       = { path = "crates/team" }
 task       = { path = "crates/task" }
 daemon     = { path = "daemon" }
+rpc-client = { path = "tests/rpc_client" }

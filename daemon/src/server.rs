@@ -269,6 +269,15 @@ impl DaemonServer {
             "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, writer).await,
             "config.setProvider" => self.method_config_set_provider(id, req.params).await,
             "config.getProvider" => self.method_config_get_provider(id, req.params).await,
+            // No params. Re-reads all three settings.json tiers from disk
+            // as-is — for a human (or another process) who hand-edited a
+            // file directly instead of going through `config.setProvider`.
+            // Shares `SessionPool::apply_reloaded_settings()` with
+            // `config.setProvider`, so the two converge on identical
+            // semantics (routing re-resolved, task_router rebuilt,
+            // already-running sessions recreate themselves lazily on their
+            // next turn — see `SessionPool::run_turn`).
+            "config.reload" => RpcResponse::ok(id, self.pool.reload_settings().await),
             "mcp.status" => RpcResponse::ok(
                 id,
                 serde_json::json!({"servers": self.pool.mcp_status().await}),

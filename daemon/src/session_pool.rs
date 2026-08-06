@@ -152,6 +152,14 @@ struct LiveSession {
     last_active: Instant,
     /// 用于首轮命名判断。
     is_first_turn: bool,
+    /// `SessionPool.config_generation` 的值，建这个 Agent 时记录的快照。
+    /// `run_turn` 每次分派给一个已存在的 session 前，会拿这个值跟池子当前的
+    /// 代数比——落后就说明期间有过 `config.setProvider`/`config.reload`，
+    /// 在真正发这条消息之前原地重建（见 `run_turn` 里的重建逻辑）。用代数
+    /// 而不是"reload 时主动去改每个 session"，是因为改动只需要在两处发生：
+    /// reload 时 `fetch_add(1)`，用到时惰性比较一次，不用遍历/标记所有
+    /// session。
+    config_generation: u64,
 }
 
 // ── SessionPool ─────────────────────────────────────────────────────────
@@ -205,12 +213,28 @@ pub struct SessionPool {
     /// `Builder::commands_override`.
     commands: AsyncRwLock<Arc<runtime::commands::CommandRegistry>>,
     /// Multi-provider per-task-type model routing (see
-    /// `base::provider::TaskRouter` / `daemon::model_router`), built once
-    /// at startup from `settings.providers`/`task_models` when configured.
-    /// `None` when the user hasn't configured `providers` — every session
-    /// created by this pool then behaves exactly as before multi-provider
-    /// routing existed (all sub-agent spawns inherit `self.model`).
-    task_router: Option<Arc<base::provider::TaskRouter>>,
+    /// `base::provider::TaskRouter` / `daemon::model_router`), built at
+    /// startup from `settings.providers`/`task_models` when configured and
+    /// rebuilt by `apply_reloaded_settings()` on every successful
+    /// `config.setProvider`/`config.reload`. `None` when the user hasn't
+    /// configured `providers` — every session created by this pool then
+    /// behaves exactly as before multi-provider routing existed (all
+    /// sub-agent spawns inherit `self.model`). Hot-swappable like
+    /// `settings`/`mcp`/`plugins`/`commands` — only sessions created *after*
+    /// a swap observe it directly; already-running sessions catch up lazily
+    /// via `config_generation` (see `LiveSession::config_generation`).
+    task_router: AsyncRwLock<Option<Arc<base::provider::TaskRouter>>>,
+    /// Bumped by `apply_reloaded_settings()` on every successful reload.
+    /// Compared against each `LiveSession::config_generation` at dispatch
+    /// time (`run_turn`) to decide whether an already-running session needs
+    /// to be recreated before serving its next turn. `Ordering::Relaxed`
+    /// throughout — this is a "did *a* reload happen since I was built"
+    /// signal, not something anything is synchronized against; the actual
+    /// new config is read fresh (under its own lock) whenever a session
+    /// does recreate, so a relaxed load can't hand out stale settings, only
+    /// a stale *generation number* (worst case: one extra turn served on
+    /// old config before the recreate check catches up, never fewer).
+    config_generation: std::sync::atomic::AtomicU64,
 }
 
 /// session.list 返回的单条记录。
@@ -230,6 +254,41 @@ pub struct SessionInfo {
 pub enum SessionStatus {
     Active,
     Inactive,
+}
+
+/// Outcome of `SessionPool::apply_reloaded_settings()` — how a
+/// `config.setProvider`/`config.reload` call's routing re-resolution went.
+///
+/// Two genuinely different checks, kept in separate fields on purpose:
+/// `warnings`/`error` are `base::provider::resolve_task_models`'s own
+/// soft-fallback outcome — pure config-shape validation (does every
+/// `task_models` entry resolve to a provider that exists, etc.), unaware of
+/// `api_type` or whether a real client could actually be built. A config can
+/// resolve cleanly (`error: None`) yet still fail to produce a live
+/// `TaskRouter` (`router_rebuilt: false`, `router_error: Some(..)`) — e.g.
+/// `api_type: openai_compatible`, which the schema accepts but has no
+/// runtime implementation. Collapsing these into one `ok` flag would be a
+/// breaking change to what `routing.ok` has always meant to callers (see
+/// `set_provider_writes_project_settings_and_doctor_sees_it`'s test, which
+/// deliberately uses `openai_compatible` and asserts `routing.ok == true`).
+#[derive(Debug, Default)]
+struct ReloadReport {
+    warnings: Vec<String>,
+    error: Option<String>,
+    router_rebuilt: bool,
+    router_error: Option<String>,
+}
+
+impl ReloadReport {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": self.error.is_none(),
+            "warnings": self.warnings,
+            "error": self.error,
+            "router_rebuilt": self.router_rebuilt,
+            "router_error": self.router_error,
+        })
+    }
 }
 
 impl SessionPool {
@@ -273,7 +332,8 @@ impl SessionPool {
             events_tx,
             plugins: AsyncRwLock::new(plugins),
             commands: AsyncRwLock::new(commands),
-            task_router,
+            task_router: AsyncRwLock::new(task_router),
+            config_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -832,9 +892,51 @@ impl SessionPool {
             .await
             .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
 
-        // Reload the fully merged effective settings so the response (and
-        // any new session) reflects global/scene tiers too, not just what we
-        // just wrote at the project tier.
+        let (reloaded, report) = self.apply_reloaded_settings().await;
+        let result = serde_json::json!({
+            "written_to": settings_path.display().to_string(),
+            "providers": reloaded.providers.keys().collect::<Vec<_>>(),
+            "default_provider": reloaded.default_provider,
+            "task_models": reloaded.task_models.keys().collect::<Vec<_>>(),
+            "routing": report.to_json(),
+        });
+
+        Ok(result)
+    }
+
+    /// Re-read whatever is currently on disk across all three settings.json
+    /// tiers and apply it — the `config.reload` RPC's backing implementation,
+    /// used when a human (or another process) hand-edited a settings.json
+    /// file directly instead of going through `config.setProvider`. Shares
+    /// `apply_reloaded_settings()` with `set_provider()`, so both entry
+    /// points converge on identical semantics (routing re-resolved,
+    /// `task_router` rebuilt, `config_generation` bumped so already-running
+    /// sessions recreate themselves lazily — see `run_turn`).
+    pub async fn reload_settings(&self) -> serde_json::Value {
+        let (reloaded, report) = self.apply_reloaded_settings().await;
+        serde_json::json!({
+            "providers": reloaded.providers.keys().collect::<Vec<_>>(),
+            "default_provider": reloaded.default_provider,
+            "task_models": reloaded.task_models.keys().collect::<Vec<_>>(),
+            "routing": report.to_json(),
+        })
+    }
+
+    /// Re-read the three-tier merged settings.json from disk, re-resolve
+    /// `providers`/`task_models`, rebuild `self.task_router` from the result,
+    /// swap `self.settings`, and bump `self.config_generation` so already
+    /// running sessions know to recreate themselves before their next turn
+    /// (see `run_turn`). Shared by `set_provider()` (called after writing a
+    /// patch) and `reload_settings()` (called directly, no patch — just
+    /// "whatever's on disk right now").
+    ///
+    /// Never fails outright — misconfiguration degrades to "keep the
+    /// previous `task_router`, report why in the returned `ReloadReport`",
+    /// matching the pre-existing `resolve_task_models`-is-advisory
+    /// philosophy this function's callers already had (`set_provider`
+    /// used to write settings.json unconditionally even when the routing
+    /// preview it computed was invalid).
+    async fn apply_reloaded_settings(&self) -> (Arc<Settings>, ReloadReport) {
         let default_model = self.settings.read().await.model.model_name.clone();
         let reloaded = Settings::load(
             self.paths.global_root(),
@@ -844,30 +946,65 @@ impl SessionPool {
             &default_model,
         );
 
-        let (routing_ok, warnings, error) = if reloaded.providers.is_empty() {
-            (true, Vec::new(), None)
+        let mut report = ReloadReport::default();
+
+        if reloaded.providers.is_empty() {
+            // No providers configured (or the last one was just deleted) —
+            // routing reverts to "no router", same as if multi-provider
+            // config was never touched.
+            *self.task_router.write().await = None;
         } else {
             match base::provider::resolve_task_models(
                 &reloaded.providers,
                 reloaded.default_provider.as_deref(),
                 &reloaded.task_models,
             ) {
-                Ok((_, w)) => (true, w, None),
-                Err(e) => (false, Vec::new(), Some(e)),
+                Ok((resolved, warnings)) => {
+                    report.warnings = warnings;
+                    // `resolve_task_models` succeeding guarantees
+                    // `default_provider` is `Some` and non-empty (it's one
+                    // of the function's own hard-error checks).
+                    let default_provider = reloaded.default_provider.as_deref().expect(
+                        "resolve_task_models already validated default_provider is set",
+                    );
+                    match crate::model_router::build_task_router(
+                        &reloaded.providers,
+                        default_provider,
+                        resolved,
+                    ) {
+                        Ok(router) => {
+                            *self.task_router.write().await = Some(Arc::new(router));
+                            report.router_rebuilt = true;
+                        }
+                        Err(e) => {
+                            // Structural failure building a client (bad
+                            // api_key/base_url/unsupported api_type) — keep
+                            // serving on whatever `task_router` was already
+                            // live rather than tearing down working routing
+                            // over a bad edit. Deliberately `router_error`,
+                            // not `error` — `resolve_task_models` itself
+                            // succeeded (`report.warnings` above already
+                            // reflects that), only the build step failed;
+                            // see `ReloadReport`'s doc comment for why these
+                            // stay separate.
+                            warn!(error = %e, "task router rebuild failed; keeping previous router");
+                            report.router_error = Some(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "provider config no longer resolves; keeping previous router");
+                    report.error = Some(e);
+                }
             }
-        };
+        }
 
-        let result = serde_json::json!({
-            "written_to": settings_path.display().to_string(),
-            "providers": reloaded.providers.keys().collect::<Vec<_>>(),
-            "default_provider": reloaded.default_provider,
-            "task_models": reloaded.task_models.keys().collect::<Vec<_>>(),
-            "routing": { "ok": routing_ok, "warnings": warnings, "error": error },
-        });
+        let reloaded = Arc::new(reloaded);
+        *self.settings.write().await = reloaded.clone();
+        self.config_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        *self.settings.write().await = Arc::new(reloaded);
-
-        Ok(result)
+        (reloaded, report)
     }
 
     /// 创建新 session 并启动 Agent 后台 run loop。
@@ -915,8 +1052,8 @@ impl SessionPool {
         if let Some(ref store) = self.history_store {
             builder = builder.history_store(store.clone());
         }
-        if let Some(ref router) = self.task_router {
-            builder = builder.task_router(router.clone());
+        if let Some(router) = self.task_router.read().await.clone() {
+            builder = builder.task_router(router);
         }
 
         // Give this session its own owned `McpManager` built from the
@@ -969,8 +1106,12 @@ impl SessionPool {
 
         let mut sessions = self.sessions.lock().await;
 
-        // 容量检查：驱逐最久未活跃的 session
-        if sessions.len() >= self.cap {
+        // 容量检查：驱逐最久未活跃的 session。只有这次 insert 真的会让
+        // session **总数**增加时才需要驱逐——`session_id` 已经在 map 里的话
+        // （config-generation 触发的原地重建，见 `run_turn`），这次操作是
+        // "替换同一个 key"，不是"新增一个"，`sessions.len()` 不会变，不该
+        // 因为这次重建就凭空多驱逐一个无关的、真正最久未用的 session。
+        if !sessions.contains_key(&session_id) && sessions.len() >= self.cap {
             evict_lru(&mut sessions);
         }
 
@@ -982,8 +1123,17 @@ impl SessionPool {
             created_at: Instant::now(),
             last_active: Instant::now(),
             is_first_turn: true,
+            config_generation: self.config_generation.load(std::sync::atomic::Ordering::Relaxed),
         };
-        sessions.insert(session_id.clone(), live);
+        // `insert` returning `Some` means a live entry already existed under
+        // this exact sid — only reachable via the config-generation recreate
+        // path in `run_turn` (every other caller uses a freshly minted id
+        // confirmed absent from the map). Its `CancellationToken` isn't tied
+        // to `Drop`, so the old Agent's background loop would otherwise keep
+        // running forever as a leaked task if we didn't cancel it here.
+        if let Some(old) = sessions.insert(session_id.clone(), live) {
+            old.cancel.cancel();
+        }
         info!(%session_id, "session created");
         Ok(session_id)
     }
@@ -1002,17 +1152,52 @@ impl SessionPool {
         // ── 解析或创建 session ──
         let sid = match session_id {
             Some(ref sid) => {
-                let sessions = self.sessions.lock().await;
-                if sessions.contains_key(sid) {
-                    sid.clone()
-                } else {
-                    drop(sessions);
+                // 三种情况：① 不在内存里（走原有的 resume_or_create）；
+                // ② 在内存里且 config_generation 和池子当前代数一致（直接用，
+                // 最常见的路径）；③ 在内存里但代数落后——期间发生过
+                // `config.setProvider`/`config.reload`，需要在真正处理这条
+                // 消息之前原地重建，让它追上新配置。
+                //
+                // ③ 只有在这个 session 当前空闲（`event_rx` 是 `Some`，不是
+                // 正被另一个并发 turn 占用）时才重建——重建会取消旧 Agent、
+                // 换上新的，如果旧 Agent 正在处理另一条消息，这么做会把那条
+                // 消息腰斩。忙的话本次跳过重建，照旧用旧配置服务这条消息，
+                // 下一次调用到这个 session 时再检查一次（代数还是落后的，
+                // 不会漏检）。
+                let stale_but_idle_check = {
+                    let sessions = self.sessions.lock().await;
+                    match sessions.get(sid) {
+                        None => Err(()), // 不在内存里
+                        Some(live)
+                            if live.config_generation
+                                == self
+                                    .config_generation
+                                    .load(std::sync::atomic::Ordering::Relaxed) =>
+                        {
+                            Ok(None) // 在内存里，代数一致
+                        }
+                        Some(live) => Ok(Some(live.event_rx.clone())), // 代数落后，带上 event_rx 供忙检查
+                    }
+                };
+
+                let needs_resume = match stale_but_idle_check {
+                    Err(()) => true,
+                    Ok(None) => false,
+                    Ok(Some(event_rx_mutex)) => {
+                        // 只锁一下看现在是不是 Some（空闲），不 take——这里
+                        // 不负责真正 drain 它，只是探测忙不忙。
+                        event_rx_mutex.lock().await.is_some()
+                    }
+                };
+                if needs_resume {
                     match self.resume_or_create(sid.clone(), options.as_ref()).await {
                         Ok(sid) => sid,
                         Err(e) => {
                             return RpcResponse::err(id, codes::INTERNAL_ERROR, e);
                         }
                     }
+                } else {
+                    sid.clone()
                 }
             }
             None => {
@@ -1511,6 +1696,7 @@ mod eviction_tests {
             created_at: last_active,
             last_active,
             is_first_turn: true,
+            config_generation: 0,
         }
     }
 
@@ -1534,6 +1720,31 @@ mod eviction_tests {
         assert!(!sessions.contains_key("oldest"));
         assert!(sessions.contains_key("middle"));
         assert!(sessions.contains_key("newest"));
+    }
+
+    #[test]
+    fn inserting_over_an_existing_sid_must_cancel_the_replaced_sessions_token() {
+        // Mirrors the pattern `create()` uses: `sessions.insert(sid, new_live)`
+        // returning `Some(old)` means a live entry already existed under that
+        // exact sid — reachable via the config-generation recreate path in
+        // `run_turn`. `CancellationToken` isn't tied to `Drop`, so failing to
+        // call `.cancel()` on the returned old value would leak the old
+        // Agent's background `tokio::spawn` loop forever. This test isolates
+        // just that HashMap-replace-then-cancel pattern (not the full
+        // `create()`/`SessionPool`, which needs a live client/settings/etc.).
+        let mut sessions = HashMap::new();
+        let old_session = dummy_live_session(Instant::now());
+        let old_cancel = old_session.cancel.clone();
+        sessions.insert("sid".to_string(), old_session);
+        assert!(!old_cancel.is_cancelled());
+
+        let new_session = dummy_live_session(Instant::now());
+        if let Some(old) = sessions.insert("sid".to_string(), new_session) {
+            old.cancel.cancel();
+        }
+
+        assert!(old_cancel.is_cancelled(), "replaced session's token must be cancelled");
+        assert_eq!(sessions.len(), 1);
     }
 
     #[test]

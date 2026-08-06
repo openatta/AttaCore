@@ -23,6 +23,33 @@ const DEFAULT_BACKOFF_MS: &[u64] = &[1_000, 2_000, 4_000, 8_000, 16_000, 32_000]
 /// jitter 比例：±25%
 const JITTER_RATIO: f32 = 0.25;
 
+/// SSE 流两个事件之间允许的最大静默时间。响应头拿到之后（`send_with_retry` 已经
+/// 成功返回），流本身**没有任何超时保护**——如果底层连接在中途静默卡死（代理/
+/// 网络吞掉了后续字节但没有发 TCP RST/FIN，连接不报错也不结束），`events.next()`
+/// 会永远 pending，调用方（`crates/runtime/src/turn.rs` 的主循环）没有任何手段
+/// 感知到这一点，整个 turn 就此挂死——不报错、不超时、CPU 占用 0%，几乎无法从
+/// 外部区分"模型在正常思考"和"连接已经死了"。这个常量把这种情况转成一个明确的
+/// 、可重试的 `AnthropicError::StreamInterrupted`，而不是无限等待。
+/// 90s 留了足够余量给正常的长 thinking 停顿（比如大 context/推理模型），比大多数
+/// LLM 单个 SSE chunk 间隔要长得多。
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// 从已解析的 SSE 事件流里读下一项，最多等 `idle_timeout`——超时说明连接静默
+/// 卡死了（见 `STREAM_IDLE_TIMEOUT` 文档），返回一个 `StreamInterrupted` 错误项
+/// 而不是让调用方永远 pending。抽成独立函数方便直接单测，不用起真实 HTTP。
+async fn next_with_idle_timeout<S>(
+    events: &mut S,
+    idle_timeout: Duration,
+) -> Option<Result<StreamEvent, AnthropicError>>
+where
+    S: Stream<Item = Result<StreamEvent, AnthropicError>> + Unpin,
+{
+    match tokio::time::timeout(idle_timeout, events.next()).await {
+        Ok(next) => next,
+        Err(_elapsed) => Some(Err(AnthropicError::StreamInterrupted)),
+    }
+}
+
 /// 把 reqwest::Response 按状态码分流为 Ok(continue) / Err(分类后的 AnthropicError)。
 /// 抽到独立 fn：try_stream! 宏内的 ? 不能让借用检查器看出"err 分支总返回"。
 async fn classify_response(resp: reqwest::Response) -> Result<reqwest::Response, AnthropicError> {
@@ -125,7 +152,15 @@ async fn send_with_retry(
     let backoff = inner.backoff_ms.as_slice();
     let mut attempt = 0usize;
     loop {
-        match send_one(inner, req).await {
+        // `send_one` 的 `.send().await` 只有 TCP connect_timeout（30s）——连上之后
+        // 服务端/代理如果吃掉请求、永远不回任何字节，这一步会无限期挂着，跟
+        // `STREAM_IDLE_TIMEOUT` 保护的"连上了但流中途卡死"是同一类问题的另一半
+        // （见该常量的文档）。用同样的超时把它转成一个可重试的 `StreamInterrupted`。
+        let attempt_result = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, send_one(inner, req)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(AnthropicError::StreamInterrupted),
+        };
+        match attempt_result {
             Ok(resp) => return Ok(resp),
             Err(e) if e.is_retryable() && attempt < backoff.len() => {
                 let base = match &e {
@@ -285,7 +320,7 @@ impl AnthropicClient for HttpAnthropicClient {
                 .map_err(|e| AnthropicError::Transport(anyhow::Error::new(e)));
 
             let mut events = parse_sse(byte_stream);
-            while let Some(ev) = events.next().await {
+            while let Some(ev) = next_with_idle_timeout(&mut events, STREAM_IDLE_TIMEOUT).await {
                 yield ev?;
             }
         })
@@ -308,6 +343,38 @@ mod tests {
     fn boxes_into_trait_object() {
         let c = HttpAnthropicClient::new(AuthMode::ApiKey("dummy".into())).unwrap();
         let _: Arc<dyn AnthropicClient> = Arc::new(c);
+    }
+
+    /// 复现导致 000.c_project 真实录制卡死 150s+ 的场景：底层连接静默卡死（不报
+    /// 错、不结束流），没有这层超时的话 `events.next()` 会永远 pending。用
+    /// `start_paused` 让 90s 的等待在测试里瞬间"流逝"，不用真的等。
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_fires_when_stream_goes_silent_after_first_event() {
+        let mut events = futures::stream::iter(vec![Ok(StreamEvent::MessageStop)])
+            .chain(futures::stream::pending());
+
+        let first = next_with_idle_timeout(&mut events, Duration::from_secs(90)).await;
+        assert!(matches!(first, Some(Ok(StreamEvent::MessageStop))));
+
+        // 底层流之后再也不产出任何东西（模拟连接静默卡死）——第二次读应该在
+        // idle_timeout 后返回 StreamInterrupted，而不是永远 pending。
+        let second = next_with_idle_timeout(&mut events, Duration::from_secs(90)).await;
+        assert!(
+            matches!(second, Some(Err(AnthropicError::StreamInterrupted))),
+            "expected StreamInterrupted after idle timeout, got: {second:?}"
+        );
+    }
+
+    /// 正常情况：流在超时窗口内就正常结束（`None`），不应该被误判为超时。
+    #[tokio::test]
+    async fn idle_timeout_does_not_fire_when_stream_ends_normally() {
+        let mut events = futures::stream::iter(vec![Ok(StreamEvent::MessageStop)]);
+
+        let first = next_with_idle_timeout(&mut events, Duration::from_secs(90)).await;
+        assert!(matches!(first, Some(Ok(StreamEvent::MessageStop))));
+
+        let second = next_with_idle_timeout(&mut events, Duration::from_secs(90)).await;
+        assert!(second.is_none(), "stream ended normally, expected None, got: {second:?}");
     }
 
     /// 没有 ANTHROPIC_API_KEY / 没有网络也不能 panic。仅检查 URL 拼写 +

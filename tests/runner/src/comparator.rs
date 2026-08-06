@@ -5,7 +5,6 @@ use crate::script::Turn;
 use base::interface::model::{Model, MessageRole, ModelContentBlock, ModelMessage, StreamParams, ModelEvent};
 use base::interface::settings::ThinkingMode;
 use futures::StreamExt;
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, serde::Serialize)]

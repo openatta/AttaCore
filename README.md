@@ -123,7 +123,7 @@ Beyond a single hardcoded Anthropic client, `settings.json` can declare several 
 - **Resolved and validated at startup** — an unknown provider, a missing `default_model`, or an unsupported `api_type` fails the daemon at boot with a clear error, not mid-session.
 - **Wired**: the `Agent` tool's sub-agent spawns route through the resolved provider/model (`TaskRouter`) instead of always inheriting the parent session's model.
 - **Not yet wired**: the main conversation model and `team` coordination still use the single env-var-configured client; `api_type: openai_compatible` is accepted by the config schema but has no protocol implementation yet — declaring one fails fast at startup with a descriptive error instead of silently falling back to Anthropic.
-- Inspect resolved routing anytime via the `daemon.doctor` RPC; read/write provider config without hand-editing JSON via `config.getProvider`/`config.setProvider`.
+- Inspect resolved routing anytime via the `daemon.doctor` RPC; read/write provider config without hand-editing JSON via `config.getProvider`/`config.setProvider` — both hot-reload the router (no daemon restart), and `config.reload` picks up a hand-edited settings.json the same way. Already-running sessions catch up lazily, on their next turn.
 
 See [`docs/LLM_PROVIDERS.md`](docs/LLM_PROVIDERS.md) for the full config reference and exact implementation status.
 
@@ -255,7 +255,7 @@ cargo run -p daemon
 ### Run Integration Tests
 
 ```sh
-# Prerequisite: .deepseek file at repo root with API key
+# Prerequisite: .env file at repo root (gitignored) with API key — see tests/README.md
 # API mode (direct Agent construction)
 ./tests/run_api.sh 000.c_project
 

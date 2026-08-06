@@ -1,0 +1,19 @@
+{
+  "$schema": "../../../../docs/schemas/settings.schema.json",
+  "hooks_config": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "pre_bash_log.sh",
+        "if": "Bash",
+        "timeout": 5000
+      }
+    ]
+  },
+  "mcp_servers": {
+    "demo": {
+      "type": "stdio",
+      "command": "{{MCP_TOY_SERVER_BIN}}"
+    }
+  }
+}

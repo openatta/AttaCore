@@ -5,11 +5,16 @@ edition.workspace = true
 publish = false
 description = "AttaCore test runner — executes .test scenario files against Agent API or Daemon"
 
+[lib]
+name = "test_runner"
+path = "src/lib.rs"
+
 [[bin]]
 name = "attacore-test"
 path = "src/main.rs"
 
 [dependencies]
+rpc-client    = { workspace = true }
 base          = { workspace = true }
 runtime       = { workspace = true }
 model         = { workspace = true }
@@ -19,6 +24,7 @@ tools         = { workspace = true }
 mcp           = { workspace = true }
 permissions   = { workspace = true }
 skills        = { workspace = true }
+hooks         = { workspace = true }
 compaction    = { workspace = true }
 tokio         = { workspace = true, features = ["full"] }
 tokio-util    = { workspace = true }
@@ -32,3 +38,7 @@ tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap          = { version = "4", features = ["derive"] }
 shellexpand   = "3"
+zip           = { workspace = true }
+sha2          = { workspace = true }
+hex           = { workspace = true }
+time          = { workspace = true }

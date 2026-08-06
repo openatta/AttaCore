@@ -219,9 +219,25 @@ impl SkillManager {
         discovered
     }
 
-    /// List all loaded skills.
+    /// List all loaded skills, sorted by name.
+    ///
+    /// Sorted, not insertion/hash order: the backing store is a `HashMap`,
+    /// whose iteration order is randomized per-process (different every run,
+    /// same skill set or not) — every consumer of this list renders it
+    /// straight into user/model-facing text (`turn.rs::build_skills_text`
+    /// injects it verbatim into the system prompt, `agent.rs`'s `/skills`
+    /// command, the `SkillTool` lookup). An unsorted list meant the system
+    /// prompt's "## Available Skills" section came out in a different order
+    /// every single process start — which, since VCR's request hash covers
+    /// the full (dehydrated) prompt text, silently desynced the very first
+    /// turn's hash between any two runs of the exact same test case (see
+    /// docs/design/2026-08-05-test-architecture.md §14). Provider-side
+    /// prompt caching (most APIs cache by exact prefix match) would have the
+    /// same problem in production, independent of testing.
     pub fn list(&self) -> Vec<SkillInfo> {
-        self.skills.read().unwrap().values().cloned().collect()
+        let mut skills: Vec<SkillInfo> = self.skills.read().unwrap().values().cloned().collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills
     }
 
     /// Get a skill by name.
@@ -600,6 +616,34 @@ mod tests {
 
         mgr.load_dir(dir.path(), SkillSource::User).unwrap();
         assert_eq!(mgr.get("test-skill").unwrap().description, "disk version");
+    }
+
+    /// Regression: `list()` used to be `HashMap::values().collect()` — same
+    /// skill set, different (randomized, per-process) text order every run.
+    /// Since `turn.rs::build_skills_text` renders this straight into the
+    /// system prompt, that silently desynced VCR's request hash for the very
+    /// first turn of every replay (see
+    /// docs/design/2026-08-05-test-architecture.md §14). Register in
+    /// deliberately unsorted order and assert the output is alphabetical
+    /// regardless — a HashMap-order bug wouldn't reliably fail a single
+    /// `cargo test` run (order is only *unstable across* runs, not
+    /// necessarily "b before a" within one run), so this asserts the actual
+    /// contract (`list()` is sorted) rather than trying to catch
+    /// nondeterminism directly.
+    #[test]
+    fn list_is_sorted_by_name_regardless_of_registration_order() {
+        let mgr = SkillManager::new();
+        for name in ["zebra", "apple", "mango"] {
+            mgr.register_bundled(SkillEntry {
+                name: name.into(),
+                description: format!("{name} skill"),
+                source: FrozenSkillSource::User,
+                path: PathBuf::from(format!("(bundled:{name})")),
+                ..Default::default()
+            });
+        }
+        let names: Vec<String> = mgr.list().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["apple", "mango", "zebra"]);
     }
 
     #[test]
