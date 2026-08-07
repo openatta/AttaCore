@@ -28,6 +28,29 @@ pub enum PermissionMode {
     Yolo,
 }
 
+/// `interface::settings::PermissionMode` (serde/JSON-schema-facing, what
+/// `Settings`/RPC params deserialize into) and this `PermissionMode`
+/// (what `PermissionGate` actually dispatches on) are two distinct types
+/// with identical variant sets — a pre-existing split (see
+/// `context::config::EngineConfig::from_settings`, the first place this
+/// conversion was needed). Shared here instead of duplicated per call site.
+impl From<crate::interface::settings::PermissionMode> for PermissionMode {
+    fn from(m: crate::interface::settings::PermissionMode) -> Self {
+        match m {
+            crate::interface::settings::PermissionMode::Default => Self::Default,
+            crate::interface::settings::PermissionMode::AcceptEdits => Self::AcceptEdits,
+            crate::interface::settings::PermissionMode::BypassPermissions => {
+                Self::BypassPermissions
+            }
+            crate::interface::settings::PermissionMode::Plan => Self::Plan,
+            crate::interface::settings::PermissionMode::Auto => Self::Auto,
+            crate::interface::settings::PermissionMode::DontAsk => Self::DontAsk,
+            crate::interface::settings::PermissionMode::Bubble => Self::Bubble,
+            crate::interface::settings::PermissionMode::Yolo => Self::Yolo,
+        }
+    }
+}
+
 impl PermissionMode {
     /// True for read-only / non-mutating permission modes (Default, Plan).
     pub fn is_safe_default(self) -> bool {

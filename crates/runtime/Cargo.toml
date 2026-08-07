@@ -33,6 +33,7 @@ tracing       = { workspace = true }
 uuid          = { workspace = true }
 time          = { workspace = true }
 schemars = { workspace = true }
+notify        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

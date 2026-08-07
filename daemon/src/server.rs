@@ -320,6 +320,7 @@ impl DaemonServer {
                 RpcResponse::ok(id, serde_json::json!({"closed": session_id}))
             }
             "session.run_turn" => self.method_session_run_turn(id, req.params, writer).await,
+            "session.respondToPrompt" => self.method_session_respond_to_prompt(id, req.params).await,
             _ => RpcResponse::err(
                 id,
                 codes::METHOD_NOT_FOUND,
@@ -601,5 +602,55 @@ impl DaemonServer {
         self.pool
             .run_turn(session_id, user_msg, turn_id, writer, id, options)
             .await
+    }
+
+    /// `session.respondToPrompt` — answers a pending `kind:"prompt"`
+    /// `session.event` (currently only `prompt_type: "permission"`; the
+    /// method name and this dispatch are deliberately generic so a future
+    /// non-permission prompt type can reuse both without a new RPC method).
+    async fn method_session_respond_to_prompt(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let session_id = match params.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id"),
+        };
+        let prompt_id = match params.get("prompt_id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing prompt_id"),
+        };
+        let prompt_type = params
+            .get("prompt_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("permission");
+        if prompt_type != "permission" {
+            return RpcResponse::err(
+                id,
+                codes::INVALID_PARAMS,
+                format!("unsupported prompt_type: {prompt_type}"),
+            );
+        }
+        let decision: runtime::agent::PermissionDecision = match params
+            .get("decision")
+            .cloned()
+            .map(serde_json::from_value)
+        {
+            Some(Ok(d)) => d,
+            Some(Err(e)) => {
+                return RpcResponse::err(id, codes::INVALID_PARAMS, format!("bad decision: {e}"))
+            }
+            None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing decision"),
+        };
+
+        match self
+            .pool
+            .respond_to_prompt(&session_id, prompt_id.clone(), decision)
+            .await
+        {
+            Ok(()) => RpcResponse::ok(id, serde_json::json!({"prompt_id": prompt_id})),
+            Err(e) => RpcResponse::err(id, codes::SESSION_NOT_FOUND, e),
+        }
     }
 }

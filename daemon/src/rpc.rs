@@ -89,6 +89,19 @@ pub mod codes {
 pub struct SessionOptions {
     pub vcr: Option<VcrOptions>,
     pub telemetry: Option<TelemetryOptions>,
+    /// Opt-in real permission checking for this session — `None` (the
+    /// default) keeps today's behavior (`AllowAllPermission`, every tool
+    /// call proceeds, no `session.event{kind:"prompt"}` ever fires). Only a
+    /// session that explicitly sets this switches to a real
+    /// `RuleSetPermission`. This is deliberate: existing daemon-based
+    /// applications that don't know about `session.respondToPrompt` must
+    /// see zero behavior change.
+    pub permission_mode: Option<base::interface::settings::PermissionMode>,
+    /// Allow/deny/ask rules for the `RuleSetPermission` this session's
+    /// `permission_mode` (if set) constructs. Ignored when `permission_mode`
+    /// is `None`.
+    #[serde(default)]
+    pub permission_rules: Vec<base::permission::PermissionRule>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

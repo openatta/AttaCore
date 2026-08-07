@@ -61,6 +61,13 @@ pub struct EngineConfig {
     /// overrides any field. Tool layer (`attacode-tools::bash::sandbox`) reads
     /// these fields to build its platform-specific profile.
     pub sandbox_policy: SandboxPolicyConfig,
+    /// Mirrors `Settings.disable_skill_shell_execution` — read by
+    /// `SkillTool`'s dynamic-content-injection step via `ToolContext.config`.
+    /// Unlike `dangerously_disable_sandbox` above, this one *is* correctly
+    /// threaded from `Settings` at the one place `EngineConfig` gets built
+    /// from real settings (`agent.rs`'s `agent_engine_config` block) — not
+    /// left at its `defaults_for()` default everywhere.
+    pub disable_skill_shell_execution: bool,
 
     // ---- file-op limits (grouped 2026-05-09; was 3 flat fields) ----
     /// File read/write byte/line limits. Sub-config keeps related field
@@ -240,6 +247,7 @@ impl EngineConfig {
             permission_mode: PermissionMode::Default,
             dangerously_disable_sandbox: false,
             sandbox_policy: SandboxPolicyConfig::default(),
+            disable_skill_shell_execution: false,
 
             // grouped sub-configs
             file_limits: FileLimits::default(),
@@ -258,6 +266,71 @@ impl EngineConfig {
             max_agent_depth: 3,
             verbose_tool_results: false,
         }
+    }
+
+    /// Derive a real `EngineConfig` from a loaded `Settings` — every
+    /// production tool-dispatch call site (`runtime::turn::execute_tool_inner`,
+    /// `runtime::dispatch::dispatch_tool_calls`) previously hardcoded
+    /// `defaults_for("unknown")` here, silently discarding whatever the user
+    /// actually configured in `settings.json` (permission mode, sandbox
+    /// policy, `disable_skill_shell_execution`, etc.) for every single tool
+    /// call. Starts from `defaults_for()`'s baseline and overlays every field
+    /// `Settings` actually carries; fields `Settings` has no equivalent for
+    /// (e.g. `strong_model`, `file_limits`, `max_agent_depth`) are left at
+    /// their `defaults_for()` value, same as before this existed.
+    pub fn from_settings(settings: &crate::interface::settings::Settings) -> Self {
+        let mut c = Self::defaults_for(settings.model.model_name.clone());
+        c.max_tokens = settings.model.max_tokens;
+        c.fallback_model = settings.model.fallback_model.clone();
+        c.thinking_mode = match settings.model.thinking_mode {
+            crate::interface::settings::ThinkingMode::Auto => ThinkingModeConfig::Auto,
+            crate::interface::settings::ThinkingMode::Off => ThinkingModeConfig::Off,
+            crate::interface::settings::ThinkingMode::On => ThinkingModeConfig::On,
+            crate::interface::settings::ThinkingMode::OnBudget(n) => ThinkingModeConfig::OnBudget(n),
+        };
+
+        c.max_parallelism = settings.execution.max_parallelism;
+        c.max_api_calls_per_turn = settings.execution.max_api_calls_per_turn;
+
+        // `Settings.permission_mode` (`interface::settings::PermissionMode`,
+        // serde/JSON-schema-facing) and `EngineConfig.permission_mode`
+        // (`permission::PermissionMode`, what `PermissionGate` actually
+        // dispatches on) are two distinct types with identical variant sets
+        // — a pre-existing split, not something to unify here. Conversion
+        // lives on `permission::PermissionMode` (`impl From<...>`) so other
+        // call sites (e.g. daemon's per-session `RuleSetPermission`) share it.
+        c.permission_mode = settings.permission_mode.into();
+        c.dangerously_disable_sandbox = settings.sandbox.dangerously_disable_sandbox;
+        // `Settings.sandbox.deny_read` is a plain `Vec`, empty when the user
+        // never configured it — mapping that to `Some(vec![])` would read as
+        // "use exactly this empty list", which *disables* the sandbox's
+        // built-in deny defaults (~/.ssh, ~/.aws, etc). Empty must map to
+        // `None` ("use built-in defaults"), matching `SandboxPolicyConfig`'s
+        // own documented Option semantics.
+        c.sandbox_policy = SandboxPolicyConfig {
+            allow_read: Vec::new(),
+            deny_read: if settings.sandbox.deny_read.is_empty() {
+                None
+            } else {
+                Some(settings.sandbox.deny_read.clone())
+            },
+            network_mode: NetworkModeConfig::default(),
+            allowed_domains: settings.sandbox.allowed_domains.clone(),
+        };
+        c.disable_skill_shell_execution = settings.disable_skill_shell_execution;
+
+        c.compact = CompactSettings {
+            threshold_tokens: settings.compaction.threshold_tokens,
+            micro_keep_recent: settings.compaction.keep_recent,
+            ..c.compact
+        };
+        c.system_prompt = SystemPromptSettings {
+            append: settings.prompt_append.clone(),
+            override_text: settings.prompt_override.clone(),
+            ..c.system_prompt
+        };
+
+        c
     }
 }
 

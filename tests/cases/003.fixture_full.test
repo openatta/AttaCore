@@ -2,8 +2,10 @@
 # 前置: --fixture tests/fixtures/template_project --scene coding
 # 预期: 第一轮验证 hook 拦截（PreToolUse 记录 Bash 调用）+ skill 调用（code-review）；
 #       第二轮验证 MCP 工具能被发现并调用（demo server 的 ping 工具）；
-#       第三轮验证子 agent 派生（Agent 工具 + subagent_type=reviewer）。
-#       这三件事之前从没有一次被真实跑通过验证——之前的用例都没传 --fixture。
+#       第三轮验证子 agent 派生（Agent 工具 + subagent_type=reviewer）+ Agent `skills:`
+#       预注入（reviewer.md 现在带 `skills: code-review`，子 agent 启动时应该已经拿到
+#       code-review skill 的完整正文，不需要自己再调用 Skill 工具去发现它）。
+#       这几件事之前从没有一次被真实跑通过验证——之前的用例都没传 --fixture。
 
 >>>>>>>>>>>>>>>>
 看一下 src/main.py 的内容，用 code-review 这个 skill 帮我审查一下，然后用 python3 src/main.py 跑一下，确认输出符合预期。
@@ -24,3 +26,6 @@
 <<<<<<<<<<<<<<<<
 模型应该调用 Agent 工具,subagent_type 参数传 "reviewer"(对应 .atta/agents/reviewer.md 里定义的
 只读子 agent 类型),把子 agent 的审查意见转达给用户,不需要自己再用 Read/Grep 重复审查一遍。
+子 agent 自己的审查意见应该体现出 code-review skill 的步骤(检查改动文件、正确性/架构问题、
+运行相关测试、按严重程度汇报)——这个 skill 是通过 reviewer.md 的 `skills:` 字段在子 agent
+启动时就预先注入的,子 agent 不需要(也不应该)自己再调用一次 Skill 工具去发现或加载它。

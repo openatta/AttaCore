@@ -111,10 +111,23 @@ impl Agent {
                 self.handle_tool_result(tool_use_id, content, is_error)
                     .await
             }
-            InputMessage::PermissionResponse { decision, .. } => {
+            InputMessage::PermissionResponse { prompt_id, decision } => {
                 // Track permission denials for telemetry (TS parity)
                 if let crate::agent::PermissionDecision::Deny { .. } = decision {
                     self.permission_denial_count += 1;
+                }
+                // Wake whichever `execute_tool_inner` call is awaiting this
+                // prompt_id (see `Agent.pending_permissions`'s doc comment).
+                // No entry means it already timed out (defaulted to Permit)
+                // or this is a stale/duplicate response — either way there's
+                // nothing left to wake, so just drop it.
+                if let Some(sender) = self
+                    .pending_permissions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&prompt_id)
+                {
+                    let _ = sender.send(decision);
                 }
                 Ok(TurnOutcome::default())
             }
@@ -153,6 +166,13 @@ impl Agent {
         content: String,
         cancel: CancellationToken,
     ) -> Result<TurnOutcome, TurnError> {
+        // A skill's `allowed_tools` (see `SkillTool::call`) pre-approves
+        // tools only for the rest of the turn it was invoked in — clear
+        // whatever the *previous* turn injected before this new user
+        // message starts a fresh one. No-op if nothing was injected, or on
+        // `Permission` implementations without a backing rule engine.
+        self.permission.clear_temporary_allows();
+
         let _timer = self.perf.start_timer("turn", "total");
         let mut api_calls: u32 = 0;
         let mut tool_calls: u32 = 0;
@@ -233,7 +253,19 @@ impl Agent {
 
         // Memory prefetch: fire LLM-based relevant memory selection as a background task.
         // TS parity: startRelevantMemoryPrefetch in query.ts (fires Sonnet call, collects after tools).
-        let mut prefetch_handle: Option<tokio::task::JoinHandle<Vec<String>>> = {
+        //
+        // Gated on `memory_enabled` (previously wasn't — only the static system-prompt
+        // injection in `prompt.rs` checked the flag, this per-turn recall didn't). That gap
+        // meant `memory_enabled: false` was silently a partial opt-out: this background task
+        // still read `self.memory_store` and injected a `<system-reminder>` mid-conversation
+        // regardless. Surfaced by VCR test replay for a fixture-based multi-turn case: the
+        // prefetch (fires a real, VCR-covered LLM call) and the extraction spawn below race
+        // against the harness's turn boundary in a way that isn't deterministic between
+        // record and replay, producing a different injected memory set each run even with
+        // identical cassette content — see docs/design/2026-08-05-test-architecture.md §15.
+        let mut prefetch_handle: Option<tokio::task::JoinHandle<Vec<String>>> = if !self.settings.memory_enabled {
+            None
+        } else {
             let store = self.memory_store.clone();
             let model = self.model.clone();
             let query = content.clone();
@@ -443,6 +475,10 @@ impl Agent {
             let hooks_for_exec = Arc::clone(&self.hooks);
             let discontinued = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let discontinued_for_exec = Arc::clone(&discontinued);
+            let config_for_exec = Arc::clone(&self.config);
+            let permission_for_exec = Arc::clone(&self.permission);
+            let pending_permissions_for_exec = Arc::clone(&self.pending_permissions);
+            let event_tx_for_exec = self.event_tx.clone();
             let stream_result = crate::streaming::execute_stream(
                 stream,
                 &mut self.session,
@@ -458,6 +494,10 @@ impl Agent {
                         turn_id: tid.clone(),
                         cancel: cancel_for_exec.clone(),
                         hooks: Arc::clone(&hooks_for_exec),
+                        config: Arc::clone(&config_for_exec),
+                        permission: Arc::clone(&permission_for_exec),
+                        pending_permissions: Arc::clone(&pending_permissions_for_exec),
+                        event_tx: event_tx_for_exec.clone(),
                         discontinued: Arc::clone(&discontinued_for_exec),
                     };
                     async move { execute_tool_with_telemetry(&exec_ctx, &name, input).await }
@@ -931,7 +971,10 @@ Continue working. Used {accumulated}/{target} output tokens ({remaining} remaini
             // P0-2: Auto-extract durable memories after turn completion.
             // TS parity: initExtractMemories() called via handleStopHooks in stopHooks.ts.
             // Only extract if the model produced a complete response (not cancelled/max_turns).
-            {
+            // Gated on `memory_enabled` — see the prefetch block above for why this matters
+            // (the flag's whole point is opting out of the memory subsystem entirely, not just
+            // the static prompt injection).
+            if self.settings.memory_enabled {
                 const DEFAULT_MEMORY_MODEL: &str = "claude-haiku-4-5-20251001";
                 let session_messages = self.session.messages().to_vec();
                 let store = self.memory_store.clone();
@@ -1268,9 +1311,26 @@ or project context that should survive across sessions.
                 Ok((mut compacted, result)) => {
                     // T1.4: Post-compact recovery — re-inject critical context
                     let recent_files = compaction::compact::extract_recent_reads(&compacted);
+                    // Resolve each invoked skill's *current* content + recency
+                    // here (not in the `compaction` crate, which deliberately
+                    // doesn't depend on `skills` to avoid the coupling) — a
+                    // name with no resolvable content (deleted/renamed since
+                    // it was invoked) still gets a record, just with
+                    // `content: None`, so the reattachment logic can fall
+                    // back to a name-only mention instead of silently
+                    // dropping it.
+                    let invoked_skill_records: Vec<compaction::compact::InvokedSkillRecord> = self
+                        .invoked_skills
+                        .iter()
+                        .map(|name| compaction::compact::InvokedSkillRecord {
+                            name: name.clone(),
+                            content: self.skills.get_skill_content(name),
+                            last_seq: self.skills.last_invoked_seq(name),
+                        })
+                        .collect();
                     let recovery_ctx = compaction::compact::PostCompactContext {
                         recent_files,
-                        invoked_skills: self.invoked_skills.clone(),
+                        invoked_skills: invoked_skill_records,
                         in_plan_mode: self.in_plan_mode,
                         plan_content: self.plan_content.clone(),
                         activated_tools: Vec::new(),
@@ -1388,6 +1448,17 @@ or project context that should survive across sessions.
 
     /// Build skills text for system prompt injection.
     /// TS parity: skill listing in claude-code system prompt.
+    ///
+    /// The listing always names every skill. Under budget pressure the
+    /// *description* is what gives way — and it gives way whole-entry, not
+    /// shortened everywhere at once: the least-invoked skills lose their
+    /// description first (degrading to name-only), while the most-invoked
+    /// skills keep their full (1536-char-capped) text. This matches Claude
+    /// Code's documented behavior exactly ("drops descriptions starting
+    /// with the skills you invoke least, so the skills you use most keep
+    /// their full text") — the previous strategy here instead shrank every
+    /// description proportionally regardless of use, which meant a single
+    /// heavily-used skill degraded exactly as much as one never invoked.
     fn build_skills_text(&self) -> String {
         let skills = self.skills.list();
         // Filter out skills with disable_model_invocation: true
@@ -1409,31 +1480,35 @@ or project context that should survive across sessions.
         };
         const HEADER_CHARS: usize = 22;
         const PER_ENTRY_OVERHEAD: usize = 6;
-        const MAX_DESC_CHARS: usize = 250;
+
+        // Fixed per-entry ceiling on `description` + `when_to_use` combined
+        // — applies regardless of listing budget (see `combined_skill_text_capped`).
+        let combined: Vec<String> = llm_skills
+            .iter()
+            .map(|s| combined_skill_text_capped(&s.description, s.when_to_use.as_deref()))
+            .collect();
 
         let available_budget = budget_chars.saturating_sub(HEADER_CHARS);
-        let per_entry =
-            (available_budget / llm_skills.len().max(1)).saturating_sub(PER_ENTRY_OVERHEAD);
-        let desc_cap = per_entry.min(MAX_DESC_CHARS);
+        let names: Vec<&str> = llm_skills.iter().map(|s| s.name.as_str()).collect();
+        let counts: Vec<u32> = names
+            .iter()
+            .map(|n| self.skills.invocation_count(n))
+            .collect();
+        let entry_lens: Vec<usize> = combined.iter().map(|c| c.len()).collect();
+        let keeps_description =
+            select_skills_keeping_description(&names, &counts, &entry_lens, available_budget, PER_ENTRY_OVERHEAD);
 
         let mut text = String::from("## Available Skills\n\n");
-        if desc_cap < 20 {
-            // Names-only fallback
-            for s in &llm_skills {
+        for (i, s) in llm_skills.iter().enumerate() {
+            if !keeps_description[i] {
                 text.push_str(&format!("- **{}**\n", s.name));
+                continue;
             }
-        } else {
-            for s in &llm_skills {
-                let desc = if s.description.len() > desc_cap {
-                    format!("{}…", &s.description[..desc_cap])
-                } else {
-                    s.description.clone()
-                };
-                if let Some(when) = &s.argument_hint {
-                    text.push_str(&format!("- **{}**: {} (args: {})\n", s.name, desc, when));
-                } else {
-                    text.push_str(&format!("- **{}**: {}\n", s.name, desc));
-                }
+            let desc = &combined[i];
+            if let Some(when) = &s.argument_hint {
+                text.push_str(&format!("- **{}**: {} (args: {})\n", s.name, desc, when));
+            } else {
+                text.push_str(&format!("- **{}**: {}\n", s.name, desc));
             }
         }
         text
@@ -1627,6 +1702,23 @@ pub(crate) struct ToolExecCtx {
     /// early, same outcome as the `Stop` hook's discontinue path. Shared
     /// (not per-call) so any tool in this round's batch can request it.
     pub discontinued: Arc<std::sync::atomic::AtomicBool>,
+    /// Real `EngineConfig` derived from `Settings` — see `Agent.config`'s doc
+    /// comment. Cloned into `ToolContext.config` instead of the
+    /// `defaults_for("unknown")` placeholder every tool call used to see.
+    pub config: Arc<base::context::EngineConfig>,
+    /// Real permission checker — see `Agent.permission`. Consulted once per
+    /// tool call in `execute_tool_inner`, after the `PreToolUse` hook step.
+    pub permission: Arc<dyn base::interface::permission::Permission>,
+    /// See `Agent.pending_permissions`'s doc comment — shared so a `Prompt`
+    /// outcome here can register a receiver that `process_turn`'s
+    /// `PermissionResponse` branch later wakes.
+    pub pending_permissions: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<crate::agent::PermissionDecision>>>,
+    >,
+    /// Real event sender — lets `execute_tool_inner` emit
+    /// `AgentEvent::PermissionPrompt` directly, same channel `Agent::run`'s
+    /// `SystemInit`/etc. events go out on.
+    pub event_tx: crate::agent::EventSender,
 }
 
 /// Execute a single tool and record telemetry. Free function for streaming executor.
@@ -1679,6 +1771,76 @@ async fn execute_tool_inner(
         }
     }
 
+    // Permission check — first live caller of `Permission::check` anywhere
+    // in the dispatch path (see `Agent.permission`'s doc comment history).
+    // `Permit` proceeds unchanged; `Deny` blocks the call outright; `Prompt`
+    // asks the host and genuinely blocks until it answers — matching
+    // conventional confirmation-prompt UX (a CLI `y/n`, `sudo`, ...), not a
+    // race against an arbitrary timeout. The one thing that can still
+    // interrupt the wait is the *session* going away: `ctx.cancel` is the
+    // same token `daemon::SessionPool::shutdown_session` fires on
+    // `session.close`/client-disconnect, threaded down through
+    // `Agent::run(cancel)` → `process_turn` → `run_user_turn` — no new
+    // plumbing needed. If nobody explicitly approved the call before the
+    // session tore down, the safe default is to *not* run it.
+    use base::interface::permission::PermissionOutcome;
+    match ctx
+        .permission
+        .check(name, &input, &ctx.cwd, &ctx.session_id)
+        .await
+    {
+        PermissionOutcome::Permit => {}
+        PermissionOutcome::Deny { reason } => {
+            return Err(format!("Denied by permission: {reason}"));
+        }
+        PermissionOutcome::Prompt {
+            prompt_id,
+            message,
+            paths,
+        } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctx.pending_permissions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(prompt_id.clone(), tx);
+            let _ = ctx.event_tx.send(base::interface::event::AgentEvent::PermissionPrompt {
+                prompt_id: prompt_id.clone(),
+                tool_name: name.to_string(),
+                message,
+                paths,
+                turn_id: ctx.turn_id.clone(),
+            });
+            tokio::select! {
+                result = rx => {
+                    match result {
+                        Ok(crate::agent::PermissionDecision::Permit) => {}
+                        Ok(crate::agent::PermissionDecision::Deny { reason }) => {
+                            return Err(format!("Denied by permission: {reason}"));
+                        }
+                        Err(_) => {
+                            // Sender dropped without ever sending — shouldn't
+                            // happen (we hold the only registration and only
+                            // remove it here or on cancellation below), but
+                            // fail closed rather than silently proceed.
+                            ctx.pending_permissions
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&prompt_id);
+                            return Err("permission request channel closed without an answer".into());
+                        }
+                    }
+                }
+                _ = ctx.cancel.cancelled() => {
+                    ctx.pending_permissions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&prompt_id);
+                    return Err("permission request cancelled: session closing".into());
+                }
+            }
+        }
+    }
+
     let tool_ctx = ToolContext {
         cwd: ctx.cwd.clone(),
         session_id: ctx.session_id.clone(),
@@ -1689,11 +1851,14 @@ async fn execute_tool_inner(
         snapshot_file: None,
         effects: None,
         running_tasks: None,
-        dangerously_disable_sandbox: true,
-        max_file_read_bytes: 0,
-        permission_mode: base::tool::PermissionMode::default(),
-        config: Arc::new(base::context::EngineConfig::defaults_for("unknown")),
-        session: Arc::new(base::context::SessionState::new(ctx.cwd.clone())),
+        dangerously_disable_sandbox: ctx.config.dangerously_disable_sandbox,
+        max_file_read_bytes: ctx.config.file_limits.max_file_read_bytes as usize,
+        permission_mode: ctx.config.permission_mode,
+        config: ctx.config.clone(),
+        session: Arc::new(
+            base::context::SessionState::new(ctx.cwd.clone())
+                .with_permission_mode(ctx.config.permission_mode),
+        ),
         tool_use_id: String::new(),
         agent: None,
         parent_messages: None,
@@ -1856,6 +2021,77 @@ fn chrono_now() -> String {
         u8::from(now.month()),
         now.day()
     )
+}
+
+/// Fixed per-entry ceiling on a skill's `description` + `when_to_use`,
+/// applied before (and independent of) `build_skills_text`'s listing-wide
+/// budget division — matches Claude Code's documented two-layer cap: this
+/// 1536-char ceiling always applies, the listing budget then further
+/// shrinks entries only when there are enough skills to need it. `when_to_use`
+/// is appended (space-separated) to `description`, not shown separately —
+/// also matching the spec ("Appended to description in the skill listing").
+const SKILL_COMBINED_TEXT_CAP: usize = 1536;
+
+fn combined_skill_text_capped(description: &str, when_to_use: Option<&str>) -> String {
+    let combined = match when_to_use {
+        Some(w) if !w.is_empty() => format!("{description} {w}"),
+        _ => description.to_string(),
+    };
+    if combined.len() <= SKILL_COMBINED_TEXT_CAP {
+        combined
+    } else {
+        truncate_at_char_boundary(&combined, SKILL_COMBINED_TEXT_CAP).to_string()
+    }
+}
+
+/// Decide which skills keep their full description in the listing versus
+/// degrading to name-only, under a shared character budget — pulled out of
+/// `Agent::build_skills_text` as a free function so the priority/greedy-fill
+/// logic is testable without constructing a real `Agent`. `names`, `counts`,
+/// and `entry_lens` must be the same length and index-aligned (one entry
+/// per skill, in the order they'll be printed); the returned `Vec<bool>` is
+/// aligned the same way. Ties (equal invocation count — the common case:
+/// everything at `0` in a fresh session) break on name for determinism,
+/// independent of whatever order the caller's data happened to arrive in.
+fn select_skills_keeping_description(
+    names: &[&str],
+    counts: &[u32],
+    entry_lens: &[usize],
+    available_budget: usize,
+    per_entry_overhead: usize,
+) -> Vec<bool> {
+    let mut priority_order: Vec<usize> = (0..names.len()).collect();
+    priority_order.sort_by(|&a, &b| {
+        counts[b]
+            .cmp(&counts[a])
+            .then_with(|| names[a].cmp(names[b]))
+    });
+    let mut keeps_description = vec![false; names.len()];
+    let mut spent = 0usize;
+    for idx in priority_order {
+        let cost = entry_lens[idx] + per_entry_overhead;
+        if spent + cost > available_budget {
+            break;
+        }
+        spent += cost;
+        keeps_description[idx] = true;
+    }
+    keeps_description
+}
+
+/// Truncate `s` to at most `max_bytes` bytes without splitting a multi-byte
+/// UTF-8 character (plain byte-index slicing panics if `max_bytes` lands
+/// mid-character — a real risk here since skill descriptions in this
+/// codebase are routinely written in Chinese).
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Count StructuredOutput tool uses in the current session messages.
@@ -2162,10 +2398,33 @@ mod tests {
         }
     }
 
+    struct AllowAllTestPermission;
+    #[async_trait::async_trait]
+    impl base::interface::permission::Permission for AllowAllTestPermission {
+        async fn check(
+            &self,
+            _tool_name: &str,
+            _tool_input: &serde_json::Value,
+            _cwd: &std::path::Path,
+            _session_id: &str,
+        ) -> base::interface::permission::PermissionOutcome {
+            base::interface::permission::PermissionOutcome::Permit
+        }
+    }
+
     fn test_exec_ctx(
         tools: Arc<base::tool::InMemoryToolRegistry>,
         hooks: Arc<hooks::HookRunner>,
     ) -> ToolExecCtx {
+        test_exec_ctx_with_permission(tools, hooks, Arc::new(AllowAllTestPermission))
+    }
+
+    fn test_exec_ctx_with_permission(
+        tools: Arc<base::tool::InMemoryToolRegistry>,
+        hooks: Arc<hooks::HookRunner>,
+        permission: Arc<dyn base::interface::permission::Permission>,
+    ) -> ToolExecCtx {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         ToolExecCtx {
             tools,
             cwd: std::env::temp_dir(),
@@ -2176,6 +2435,10 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             hooks,
             discontinued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            config: Arc::new(base::context::EngineConfig::defaults_for("test")),
+            permission,
+            pending_permissions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            event_tx,
         }
     }
 
@@ -2312,6 +2575,154 @@ mod tests {
         );
     }
 
+    // ── Permission::check wiring (Permit / Deny / Prompt) ──
+
+    struct DenyAllTestPermission;
+    #[async_trait::async_trait]
+    impl base::interface::permission::Permission for DenyAllTestPermission {
+        async fn check(
+            &self,
+            _tool_name: &str,
+            _tool_input: &serde_json::Value,
+            _cwd: &std::path::Path,
+            _session_id: &str,
+        ) -> base::interface::permission::PermissionOutcome {
+            base::interface::permission::PermissionOutcome::Deny {
+                reason: "denied by test".into(),
+            }
+        }
+    }
+
+    /// Always returns the same fixed `prompt_id` so a test can reach into
+    /// `ctx.pending_permissions` and answer it from outside `execute_tool_inner`.
+    struct PromptTestPermission {
+        prompt_id: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl base::interface::permission::Permission for PromptTestPermission {
+        async fn check(
+            &self,
+            _tool_name: &str,
+            _tool_input: &serde_json::Value,
+            _cwd: &std::path::Path,
+            _session_id: &str,
+        ) -> base::interface::permission::PermissionOutcome {
+            base::interface::permission::PermissionOutcome::Prompt {
+                prompt_id: self.prompt_id.into(),
+                message: "allow?".into(),
+                paths: vec![],
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_deny_blocks_the_call() {
+        let called = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: called.clone(),
+        }));
+        let hooks_runner = Arc::new(hooks::HookRunner::new(std::collections::HashMap::new()));
+        let ctx =
+            test_exec_ctx_with_permission(tools, hooks_runner, Arc::new(DenyAllTestPermission));
+
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
+        assert!(result.is_err(), "expected the tool call to be denied");
+        assert!(result.unwrap_err().contains("denied by test"));
+        assert!(
+            called.lock().unwrap().is_none(),
+            "tool must not have actually run"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_with_no_response_blocks_until_cancelled() {
+        // Conventional confirmation-prompt UX: no arbitrary timeout, the
+        // call genuinely waits for an answer. The only thing that should
+        // unblock it without one is the session's own cancellation token
+        // (`session.close` / client disconnect on the daemon side) — and
+        // when that happens, the call must NOT proceed (nobody approved
+        // it), unlike the old timeout-defaults-to-Permit behavior this
+        // replaces.
+        let called = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: called.clone(),
+        }));
+        let hooks_runner = Arc::new(hooks::HookRunner::new(std::collections::HashMap::new()));
+        let ctx = test_exec_ctx_with_permission(
+            tools,
+            hooks_runner,
+            Arc::new(PromptTestPermission {
+                prompt_id: "unanswered",
+            }),
+        );
+
+        let call = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({"x": 1}));
+        tokio::pin!(call);
+
+        // Give it a real chance to actually be waiting, not just scheduled —
+        // if it resolved here, that would mean it did NOT block.
+        tokio::select! {
+            _ = &mut call => panic!("must not resolve before an answer or cancellation"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        assert!(
+            called.lock().unwrap().is_none(),
+            "tool must not have run while still waiting for an answer"
+        );
+
+        ctx.cancel.cancel();
+        let result = call.await;
+        assert!(result.is_err(), "cancellation must not fall back to Permit");
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(called.lock().unwrap().is_none());
+        assert!(
+            ctx.pending_permissions.lock().unwrap().is_empty(),
+            "the cancelled registration should have been cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_answered_deny_blocks_the_call() {
+        let called = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ProbeTool {
+            called: called.clone(),
+        }));
+        let hooks_runner = Arc::new(hooks::HookRunner::new(std::collections::HashMap::new()));
+        let ctx = test_exec_ctx_with_permission(
+            tools,
+            hooks_runner,
+            Arc::new(PromptTestPermission {
+                prompt_id: "answered-deny",
+            }),
+        );
+
+        // Simulate `process_turn`'s `InputMessage::PermissionResponse`
+        // branch answering — poll until `execute_tool_inner` has registered
+        // the oneshot, then fire it.
+        let pending = ctx.pending_permissions.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                let sender = pending.lock().unwrap().remove("answered-deny");
+                if let Some(sender) = sender {
+                    let _ = sender.send(crate::agent::PermissionDecision::Deny {
+                        reason: "answered no".into(),
+                    });
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
+        responder.await.unwrap();
+        assert!(result.is_err(), "expected the real Deny response to win");
+        assert!(result.unwrap_err().contains("answered no"));
+        assert!(called.lock().unwrap().is_none());
+    }
+
     // ── register_new_mcp_adapters (dynamic MCP tool discovery) ──
 
     #[tokio::test]
@@ -2436,6 +2847,89 @@ mod tests {
     }
 
     #[test]
+    fn select_skills_keeping_description_prefers_most_invoked_when_budget_is_tight() {
+        // Three skills, each description costs 50+overhead; budget only
+        // fits one. "b" has the highest count, so it alone should keep its
+        // description; "a" and "c" degrade to name-only despite being
+        // alphabetically first/earlier in the list.
+        let names = ["a", "b", "c"];
+        let counts = [1u32, 5, 2];
+        let lens = [50usize, 50, 50];
+        let keeps = select_skills_keeping_description(&names, &counts, &lens, 60, 5);
+        assert_eq!(keeps, vec![false, true, false]);
+    }
+
+    #[test]
+    fn select_skills_keeping_description_keeps_everyone_when_budget_is_ample() {
+        let names = ["a", "b"];
+        let counts = [0u32, 0];
+        let lens = [50usize, 50];
+        let keeps = select_skills_keeping_description(&names, &counts, &lens, 10_000, 5);
+        assert_eq!(keeps, vec![true, true]);
+    }
+
+    #[test]
+    fn select_skills_keeping_description_ties_break_on_name_not_input_order() {
+        // Equal counts (the common fresh-session case: everything at 0) —
+        // must not depend on whatever order the caller's Vec happened to be
+        // in; alphabetically-first name wins the tiebreak deterministically.
+        let names = ["zebra", "apple"];
+        let counts = [0u32, 0];
+        let lens = [50usize, 50];
+        // Budget fits exactly one entry.
+        let keeps = select_skills_keeping_description(&names, &counts, &lens, 55, 5);
+        assert_eq!(keeps, vec![false, true], "apple (alphabetically first) should win the tie");
+    }
+
+    #[test]
+    fn select_skills_keeping_description_drops_everyone_under_a_near_zero_budget() {
+        let names = ["a"];
+        let counts = [99u32];
+        let lens = [50usize];
+        let keeps = select_skills_keeping_description(&names, &counts, &lens, 1, 5);
+        assert_eq!(keeps, vec![false]);
+    }
+
+    #[test]
+    fn combined_skill_text_capped_appends_when_to_use() {
+        let combined = combined_skill_text_capped("Reviews code", Some("Use after edits"));
+        assert_eq!(combined, "Reviews code Use after edits");
+    }
+
+    #[test]
+    fn combined_skill_text_capped_handles_absent_when_to_use() {
+        let combined = combined_skill_text_capped("Reviews code", None);
+        assert_eq!(combined, "Reviews code");
+    }
+
+    #[test]
+    fn combined_skill_text_capped_enforces_1536_char_ceiling_independent_of_listing_budget() {
+        let long_desc = "a".repeat(2000);
+        let combined = combined_skill_text_capped(&long_desc, Some(&"b".repeat(200)));
+        assert_eq!(combined.len(), SKILL_COMBINED_TEXT_CAP);
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_never_splits_a_multibyte_char() {
+        // Every char here is 3 bytes (UTF-8) — a naive byte-index cut at an
+        // odd offset would panic or produce invalid UTF-8.
+        let s = "审查代码变更的正确性";
+        for n in 0..s.len() + 2 {
+            let truncated = truncate_at_char_boundary(s, n);
+            assert!(truncated.len() <= n.min(s.len()));
+            // Must still be valid UTF-8 (would already have panicked in
+            // `truncate_at_char_boundary` itself if not, but assert the
+            // round-trip explicitly as the actual behavioral guarantee).
+            let _ = truncated.chars().count();
+        }
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_returns_whole_string_when_under_limit() {
+        assert_eq!(truncate_at_char_boundary("short", 100), "short");
+    }
+
+    #[test]
     fn parse_set_natural_language() {
         assert_eq!(
             parse_token_budget_directive("set 1B output tokens"),
@@ -2535,6 +3029,7 @@ mod tests {
             vcr: None,
             telemetry_url: None,
             memory_enabled: true,
+            disable_skill_shell_execution: false,
             permission_mode: base::interface::settings::PermissionMode::Default,
             permission_rules: Vec::new(),
             hooks_config: None,

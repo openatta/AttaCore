@@ -1811,6 +1811,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]
@@ -2359,6 +2360,7 @@ dependencies = [
  "history",
  "hooks",
  "mcp",
+ "notify",
  "plugin",
  "reqwest 0.12.28",
  "scene",
@@ -2947,6 +2949,7 @@ dependencies = [
  "shellexpand",
  "skills",
  "telemetry",
+ "tempfile",
  "time",
  "tokio",
  "tokio-util",

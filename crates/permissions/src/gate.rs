@@ -150,6 +150,11 @@ impl PermissionGate {
         self.rules.write().unwrap().extend(additional);
     }
 
+    /// Drop every rule from `source` — see `RuleSet::remove_by_source`.
+    pub fn remove_rules_by_source(&self, source: base::permission::RuleSource) {
+        self.rules.write().unwrap().remove_by_source(source);
+    }
+
     /// Produce a human-readable explanation of what permission decision
     /// the rule engine would make for a given tool call.
     ///

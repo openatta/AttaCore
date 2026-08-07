@@ -51,6 +51,16 @@ pub struct Settings {
     #[serde(default = "default_memory_enabled")]
     pub memory_enabled: bool,
 
+    /// Disable skill dynamic-content-injection shell commands (`` !`cmd` ``
+    /// and fenced ` ```! ` blocks in `SKILL.md` bodies). Default: false
+    /// (enabled) — matches Claude Code's `disableSkillShellExecution`.
+    /// When true, each such placeholder is replaced with
+    /// `[shell command execution disabled by policy]` instead of running.
+    /// Most useful set in managed/org-wide settings where individual users
+    /// can't override it.
+    #[serde(default)]
+    pub disable_skill_shell_execution: bool,
+
     /// Permission mode for tool execution.
     /// TS parity: `PermissionMode` in `types/permissions.ts`.
     #[serde(default)]
@@ -286,7 +296,7 @@ fn default_true() -> bool {
 }
 
 /// Model thinking/reasoning mode.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingMode {
     Auto,
@@ -435,6 +445,7 @@ impl Settings {
             telemetry_url: None,
             session_dir: None,
             memory_enabled: true,
+            disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,

@@ -97,7 +97,20 @@ where
     // Not-yet-flushed tool_use/tool_result blocks for the current batch — see
     // the "Session message grouping" doc above.
     let mut pending_use_blocks: Vec<ModelContentBlock> = Vec::new();
-    let mut pending_result_blocks: Vec<ModelContentBlock> = Vec::new();
+    // `(original tool_index, block)` — concurrency-safe tools finish in
+    // completion order, not submission order (`FuturesUnordered::next()`),
+    // so the index is carried alongside each block and used to restore
+    // submission order at flush time (see `flush_tool_batch`). The API
+    // itself doesn't care about tool_result order within the message (only
+    // that the *set* of ids matches the preceding ToolUse blocks), but VCR
+    // replay does: the exact message content feeds `hash_request`, so two
+    // runs of the same turn with the same tools completing in a different
+    // real-world order used to hash differently and desync every replay
+    // after that point — found via a real multi-Glob turn missing on strict
+    // replay for no code-level reason. `dispatch.rs::dispatch_tool_calls`
+    // already solved this the same way (`results[idx] = ...`); this mirrors
+    // it for the streaming/concurrent-batch path.
+    let mut pending_result_blocks: Vec<(usize, ModelContentBlock)> = Vec::new();
     let mut pending_new_msgs: Vec<Vec<serde_json::Value>> = Vec::new();
 
     // Phase 1: Consume stream, spawn concurrent-safe tools immediately
@@ -136,6 +149,22 @@ where
                     turn_id: turn_id.clone(),
                 });
 
+                // This ToolUse's position among every ToolUse this turn has
+                // emitted so far (duplicate or not) — the one stable,
+                // deterministic ordering key available (unlike real-world
+                // completion time for concurrency-safe tools). `queued_tools`
+                // gets an entry here too, unconditionally, so `idx` always
+                // indexes it correctly at drain time below.
+                let idx = tool_index;
+                tool_index += 1;
+                let safe = is_concurrency_safe(&name, &input);
+                queued_tools.push(QueuedTool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    concurrency_safe: safe,
+                });
+
                 // P1: Dedup consecutive identical tool calls within a turn.
                 // TS parity: deduplicateToolCalls in query.ts.
                 let dedup_key = format!("({name},{input})");
@@ -152,6 +181,7 @@ where
                         event_tx,
                         &turn_id,
                         &mut pending_result_blocks,
+                        idx,
                         &id,
                         &name,
                         "[Duplicate tool call skipped — identical call was already made this turn.]",
@@ -160,19 +190,10 @@ where
                     continue;
                 }
 
-                let safe = is_concurrency_safe(&name, &input);
-                queued_tools.push(QueuedTool {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    concurrency_safe: safe,
-                });
-
                 if safe {
                     // Spawn immediately into the current concurrent batch
                     let exec = execute_tool(name.clone(), input);
                     let abort = batch_abort.clone();
-                    let idx = tool_index;
                     batch_futures.push(async move {
                         let result = tokio::select! {
                             _ = abort.cancelled() => Err("cancelled by sibling error".to_string()),
@@ -195,7 +216,7 @@ where
                                 batch_abort.cancel();
                             }
                             let tname = queued_tools.get(idx).map(|t| t.name.clone()).unwrap_or_default();
-                            buffer_result(event_tx, &turn_id, &mut pending_result_blocks, &tid, &tname, &content, is_err);
+                            buffer_result(event_tx, &turn_id, &mut pending_result_blocks, idx, &tid, &tname, &content, is_err);
                             if let Some(msgs) = new_msgs {
                                 pending_new_msgs.push(msgs);
                             }
@@ -208,7 +229,7 @@ where
                         Ok((t, msgs)) => (t.clone(), msgs.clone()),
                         Err(e) => (e.clone(), None),
                     };
-                    buffer_result(event_tx, &turn_id, &mut pending_result_blocks, &id, &name, &content, is_err);
+                    buffer_result(event_tx, &turn_id, &mut pending_result_blocks, idx, &id, &name, &content, is_err);
                     if let Some(msgs) = new_msgs {
                         pending_new_msgs.push(msgs);
                     }
@@ -228,7 +249,6 @@ where
                 }
 
                 tool_calls += 1;
-                tool_index += 1;
             }
             ModelEvent::EndTurn {
                 stop_reason: sr,
@@ -259,7 +279,7 @@ where
             Err(e) => (e.clone(), None),
         };
         let tname = queued_tools.get(idx).map(|t| t.name.clone()).unwrap_or_default();
-        buffer_result(event_tx, &turn_id, &mut pending_result_blocks, &tid, &tname, &content, is_err);
+        buffer_result(event_tx, &turn_id, &mut pending_result_blocks, idx, &tid, &tname, &content, is_err);
         if let Some(msgs) = new_msgs {
             pending_new_msgs.push(msgs);
         }
@@ -284,20 +304,28 @@ where
 /// Buffer a tool result (not yet pushed to the session — see
 /// `flush_tool_batch`) and emit the live `AgentEvent::ToolResult` for UI
 /// feedback immediately (that's independent of session message structure).
+/// `idx` is the tool's original submission index (its position among this
+/// turn's `ToolUse` events) — used to restore a deterministic order at flush
+/// time regardless of real completion order.
+#[allow(clippy::too_many_arguments)]
 fn buffer_result(
     event_tx: &EventSender,
     turn_id: &str,
-    pending_result_blocks: &mut Vec<ModelContentBlock>,
+    pending_result_blocks: &mut Vec<(usize, ModelContentBlock)>,
+    idx: usize,
     tool_use_id: &str,
     tool_name: &str,
     content: &str,
     is_error: bool,
 ) {
-    pending_result_blocks.push(ModelContentBlock::ToolResult {
-        tool_use_id: tool_use_id.to_string(),
-        content: content.to_string(),
-        is_error: Some(is_error),
-    });
+    pending_result_blocks.push((
+        idx,
+        ModelContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: content.to_string(),
+            is_error: Some(is_error),
+        },
+    ));
     let _ = event_tx.send(AgentEvent::ToolResult {
         id: tool_use_id.to_string(),
         name: tool_name.to_string(),
@@ -309,15 +337,18 @@ fn buffer_result(
 
 /// Flush the current batch: one assistant message with every buffered
 /// `ToolUse` block, immediately followed by one user message with every
-/// buffered `ToolResult` block (same ids, order doesn't need to match — the
-/// API only requires the *set* to line up), then any deferred `new_messages`
-/// in resolution order. No-op if nothing is pending.
+/// buffered `ToolResult` block — sorted back into original submission order
+/// first (see `pending_result_blocks`'s doc comment: the API tolerates any
+/// order since it only checks the *set* of ids, but VCR hash determinism
+/// doesn't, so this restores a canonical order even though it's not
+/// API-required), then any deferred `new_messages` in resolution order.
+/// No-op if nothing is pending.
 fn flush_tool_batch(
     session: &mut session::session::SessionManager,
     event_tx: &EventSender,
     turn_id: &str,
     pending_use_blocks: &mut Vec<ModelContentBlock>,
-    pending_result_blocks: &mut Vec<ModelContentBlock>,
+    pending_result_blocks: &mut Vec<(usize, ModelContentBlock)>,
     pending_new_msgs: &mut Vec<Vec<serde_json::Value>>,
 ) {
     if pending_use_blocks.is_empty() {
@@ -327,9 +358,11 @@ fn flush_tool_batch(
         role: MessageRole::Assistant,
         content: std::mem::take(pending_use_blocks),
     });
+    let mut results = std::mem::take(pending_result_blocks);
+    results.sort_by_key(|(idx, _)| *idx);
     session.push_message(ModelMessage {
         role: MessageRole::User,
-        content: std::mem::take(pending_result_blocks),
+        content: results.into_iter().map(|(_, block)| block).collect(),
     });
     for msgs in pending_new_msgs.drain(..) {
         inject_new_messages(session, event_tx, turn_id, &msgs);
@@ -528,6 +561,91 @@ mod tests {
 
         assert_adjacent_tool_pairing(session.messages());
         assert_eq!(session.messages().len(), 2);
+    }
+
+    /// Regression for a real VCR-replay-determinism bug: three
+    /// concurrency-safe tools submitted in order A, B, C but made to
+    /// *finish* in the reverse order C, B, A (artificial per-call delays,
+    /// simulating real-world scheduling where a fast `Glob` beats a slower
+    /// one). Before the fix, `pending_result_blocks` was pushed to in
+    /// `FuturesUnordered` completion order, so the flushed `ToolResult`
+    /// message came out C, B, A — same *set* of ids (the API doesn't care),
+    /// but a different exact message, which changes `VcrModel::hash_request`
+    /// for every request after this point. Found via a real recorded turn
+    /// (3 parallel `Glob` calls) that missed on strict replay for no
+    /// code-level reason — the model's own request was identical, only the
+    /// tool completion timing differed between record and replay. The fix
+    /// (`idx`-sorting at flush time, mirroring `dispatch.rs`) must produce
+    /// A, B, C regardless of completion order.
+    #[tokio::test]
+    async fn concurrent_tool_results_flush_in_submission_order_not_completion_order() {
+        let events: Vec<Result<ModelEvent, ModelError>> = vec![
+            Ok(ModelEvent::ToolUse {
+                id: "a".into(),
+                name: "Glob".into(),
+                input: serde_json::json!({"pattern": "*.a"}),
+            }),
+            Ok(ModelEvent::ToolUse {
+                id: "b".into(),
+                name: "Glob".into(),
+                input: serde_json::json!({"pattern": "*.b"}),
+            }),
+            Ok(ModelEvent::ToolUse {
+                id: "c".into(),
+                name: "Glob".into(),
+                input: serde_json::json!({"pattern": "*.c"}),
+            }),
+            Ok(ModelEvent::EndTurn {
+                stop_reason: "tool_use".into(),
+                usage: Usage::default(),
+            }),
+        ];
+        let stream: base::interface::model::ModelStream =
+            Box::new(futures::stream::iter(events));
+
+        let mut session = session::session::SessionManager::in_memory(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        execute_stream(
+            stream,
+            &mut session,
+            &tx,
+            "test-turn".into(),
+            |_name, input| async move {
+                // Reverse completion order relative to submission: the tool
+                // matching "*.a" (submitted first) sleeps longest, "*.c"
+                // (submitted last) doesn't sleep at all — so real completion
+                // order is c, b, a, the exact opposite of submission order a, b, c.
+                let pattern = input["pattern"].as_str().unwrap_or("").to_string();
+                let delay_ms: u64 = match pattern.as_str() {
+                    "*.a" => 30,
+                    "*.b" => 15,
+                    _ => 0,
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                Ok((format!("done:{pattern}"), None))
+            },
+            |_name, _input| true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("execute_stream should succeed");
+
+        assert_adjacent_tool_pairing(session.messages());
+        let result_msg = &session.messages()[1];
+        let ids: Vec<&str> = result_msg
+            .content
+            .iter()
+            .map(|b| match b {
+                ModelContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                other => panic!("expected ToolResult, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b", "c"],
+            "tool_result blocks must stay in original submission order regardless of completion timing"
+        );
     }
 
     /// Two separate sequential tools back-to-back: two independent

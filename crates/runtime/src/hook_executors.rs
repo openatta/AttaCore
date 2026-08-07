@@ -112,7 +112,7 @@ impl AgentHookExecutor for AgentSpawnerHookExecutor {
         let full_prompt = format!("{prompt}\n\nContext:\n{payload_json}");
         let cancel = tokio_util::sync::CancellationToken::new();
         self.spawner
-            .spawn_agent(full_prompt, vec![], self.cwd.clone(), cancel)
+            .spawn_agent(full_prompt, vec![], self.cwd.clone(), cancel, None)
             .await
             .map_err(|e| e.to_string())
     }
@@ -193,8 +193,21 @@ mod tests {
             _allowed_tools: Vec<String>,
             _cwd: std::path::PathBuf,
             _cancel: tokio_util::sync::CancellationToken,
+            _agent_type: Option<String>,
         ) -> Result<String, Box<dyn std::error::Error + Send>> {
             Ok(self.response.to_string())
+        }
+
+        async fn spawn_agent_background(
+            &self,
+            _prompt: String,
+            _allowed_tools: Vec<String>,
+            _cwd: std::path::PathBuf,
+            _cancel: tokio_util::sync::CancellationToken,
+            _agent_type: Option<String>,
+            _session: Arc<base::context::SessionState>,
+        ) -> Result<String, Box<dyn std::error::Error + Send>> {
+            Ok("stub-task-id".to_string())
         }
     }
 

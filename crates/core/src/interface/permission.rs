@@ -34,4 +34,16 @@ pub trait Permission: Send + Sync {
         cwd: &Path,
         session_id: &str,
     ) -> PermissionOutcome;
+
+    /// Temporarily allow `tool_name` without going through the normal
+    /// Allow/Deny/Ask flow — used by a skill's `allowed_tools` frontmatter
+    /// field while that skill is active. Default no-op: implementations
+    /// with no backing rule engine (an always-permit or bubble-to-parent
+    /// implementation, say) have nothing meaningful to add a temporary
+    /// override on top of — `check` already decides everything for them.
+    fn add_temporary_allow(&self, _tool_name: &str) {}
+
+    /// Clear every temporary allow `add_temporary_allow` added. Same
+    /// no-op default as above.
+    fn clear_temporary_allows(&self) {}
 }

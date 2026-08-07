@@ -7,6 +7,7 @@ pub mod cli_runner;
 pub mod comparator;
 pub mod config;
 pub mod fixture;
+pub mod mutations;
 pub mod plugin_fixture;
 pub mod reporter;
 pub mod script;

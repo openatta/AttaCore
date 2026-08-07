@@ -82,6 +82,14 @@ impl RuleSet {
         self.rules.extend(rs);
     }
 
+    /// Drop every rule whose `source` is `source` — used to clear temporary
+    /// rules (`RuleSource::Command`) a skill's `allowed_tools` injected once
+    /// the skill goes inactive, without disturbing rules from any other
+    /// source (`settings.json`, CLI flags, etc).
+    pub fn remove_by_source(&mut self, source: base::permission::RuleSource) {
+        self.rules.retain(|r| r.source != source);
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.rules.len()

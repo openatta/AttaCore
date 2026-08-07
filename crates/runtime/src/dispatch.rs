@@ -23,6 +23,12 @@ pub struct DispatchParams<'a> {
     pub max_parallelism: usize,
     pub events: &'a EventSender,
     pub cancel: &'a CancellationToken,
+    /// Real config, threaded the same way `turn::execute_tool_inner` now
+    /// does — this function currently has zero production callers (see its
+    /// module doc), but that's exactly why it shouldn't keep hardcoding
+    /// `defaults_for("unknown")`: whoever eventually wires it up shouldn't
+    /// have to rediscover this bug.
+    pub config: &'a Arc<base::context::EngineConfig>,
 }
 
 pub async fn dispatch_tool_calls(
@@ -52,6 +58,7 @@ pub async fn dispatch_tool_calls(
         let events = params.events.clone();
         let cancel = params.cancel.clone();
         let sibling_abort = sibling_abort.clone();
+        let config = Arc::clone(params.config);
 
         futs.push(async move {
             let _permit = match &sem {
@@ -63,7 +70,7 @@ pub async fn dispatch_tool_calls(
                 _ = cancel.cancelled() => None,
                 result = async {
                     let tool = tools.get(&name)?;
-                    let ctx = ToolContext { cwd, session_id: sid, turn_no, sandbox: Default::default(), cancel: cancel.clone(), additional_writable_dirs: vec![], snapshot_file: None, effects: None, running_tasks: None, dangerously_disable_sandbox: true, max_file_read_bytes: 0, permission_mode: base::tool::PermissionMode::default(), config: Arc::new(base::context::EngineConfig::defaults_for("unknown")), session: Arc::new(base::context::SessionState::new(std::path::PathBuf::from("/tmp"))), tool_use_id: String::new(), agent: None, parent_messages: None, agent_depth: 0, events_tx: None };
+                    let ctx = ToolContext { cwd, session_id: sid, turn_no, sandbox: Default::default(), cancel: cancel.clone(), additional_writable_dirs: vec![], snapshot_file: None, effects: None, running_tasks: None, dangerously_disable_sandbox: config.dangerously_disable_sandbox, max_file_read_bytes: config.file_limits.max_file_read_bytes as usize, permission_mode: config.permission_mode, config: config.clone(), session: Arc::new(base::context::SessionState::new(std::path::PathBuf::from("/tmp")).with_permission_mode(config.permission_mode)), tool_use_id: String::new(), agent: None, parent_messages: None, agent_depth: 0, events_tx: None };
                     match tool.call(input, ctx, ProgressSender::noop("")).await {
                         Ok(r) => {
                             let _ = events.send(AgentEvent::ToolResult {
@@ -130,6 +137,7 @@ use tools::file_read::FileReadTool as ReadTool;
             "Read".into(),
             serde_json::json!({"file_path": "Cargo.toml", "limit": 3}),
         )];
+        let config = Arc::new(base::context::EngineConfig::defaults_for("test"));
         let (results, has_error) = dispatch_tool_calls(DispatchParams {
             tools: &reg,
             tool_uses: &tool_uses,
@@ -140,6 +148,7 @@ use tools::file_read::FileReadTool as ReadTool;
             max_parallelism: 4,
             events: &tx,
             cancel: &cancel,
+            config: &config,
         })
         .await;
         assert!(!has_error);

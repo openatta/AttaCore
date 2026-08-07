@@ -172,13 +172,26 @@
   "turn_id": "custom-turn-id",   // 可选：不传则自动生成（base58 UUID，21-22 字符）
   "options": {                    // 可选，仅在*新建* session 时生效，已有 session 忽略
     "vcr": {"mode": "record", "scenario": "demo", "dir": "/path/to/fixtures"},
-    "telemetry": {"output": "/path/to/telemetry.jsonl"}
+    "telemetry": {"output": "/path/to/telemetry.jsonl"},
+    // 不传 permission_mode（缺省）= 今天的行为：AllowAllPermission，工具调用
+    // 全部直接放行，永远不会收到 kind:"prompt" 事件。只有显式传了才会切成
+    // 真实权限检查——按 session 粒度 opt-in，不是全局开关。
+    "permission_mode": "default",  // Default/Plan/AcceptEdits/BypassPermissions/DontAsk/...
+    "permission_rules": [
+      {"source":"session","behavior":"deny","tool_name":"Bash","rule_content":"rm -rf:*"}
+    ]
   }
 }}
 
 // 流式帧（同一条连接，可能多条，method 都是 "session.event"）
 {"jsonrpc":"2.0","method":"session.event","params":{"session_id":"...","turn_id":"...","event":{"kind":"text_delta","text":"让我看"}}}
 {"jsonrpc":"2.0","method":"session.event","params":{"session_id":"...","turn_id":"...","event":{"kind":"tool_use","id":"...","name":"Read","input":{...}}}}
+// 需要人工确认的工具调用（见下方 session.respondToPrompt）——不是终止帧，
+// turn 停在这里等回应，之后正常继续 tool_use/tool_result
+{"jsonrpc":"2.0","method":"session.event","params":{"session_id":"...","turn_id":"...","event":{
+  "kind":"prompt","prompt_type":"permission","prompt_id":"p1",
+  "tool_name":"Bash","message":"Allow Bash?","paths":[]
+}}}
 {"jsonrpc":"2.0","method":"session.event","params":{"session_id":"...","turn_id":"...","event":{"kind":"tool_result","id":"...","name":"Read","content":"...","is_error":false}}}
 {"jsonrpc":"2.0","method":"session.event","params":{"session_id":"...","turn_id":"...","event":{"kind":"turn_complete","stop_reason":"end_turn","api_calls":3,"usage":{"input_tokens":1200,"output_tokens":340}}}}
 
@@ -198,6 +211,23 @@
 - 缺 `message` → `INVALID_PARAMS`。
 - Agent 运行时报错（`AgentEvent::Error`）→ `ENGINE_ERROR`，`message` 形如 `"<code>: <message>"`。
 - **调用方在 turn 进行中断开连接** → daemon 检测到写失败，立即取消该 session（杀掉子进程等），响应体是 `{"session_id":...,"turn_id":...,"disconnected":true}`（此时你已经断开了，收不到这条响应——这条是写给"万一还有人在读"的收尾语义，实际效果主要是内部清理）。
+
+### `session.respondToPrompt`
+
+回应一个 `session.event` 里的 `kind:"prompt"` 帧（目前只有 `prompt_type:"permission"` 一种）。方法名和参数形状故意做成通用的——以后如果有别的"停下来问一句"场景，复用同一个方法、加一个新的 `prompt_type`，不需要新增 RPC 方法。
+
+```jsonc
+{"jsonrpc":"2.0","method":"session.respondToPrompt","id":2,"params":{
+  "session_id": "abc123...",
+  "prompt_id": "p1",
+  "prompt_type": "permission",              // 可选，缺省 "permission"
+  "decision": {"type":"permit"}
+  // 或者拒绝： "decision": {"type":"deny","reason":"不要跑这个命令"}
+}}
+// {"jsonrpc":"2.0","id":2,"result":{"prompt_id":"p1"}}
+```
+
+**没有超时**——引擎侧会一直等这条回应，直到收到、或者 session 被 `session.close`/断线取消（那种情况下这次工具调用直接失败，不会自动放行）。`session_id` 不存在 → `SESSION_NOT_FOUND`（这里比 `session.close` 严格——回应一个不存在的 session 是调用方的真实错误，不能安全忽略）；缺 `session_id`/`prompt_id`/`decision`，或 `decision` 解析不出 `{"type":"permit"}`/`{"type":"deny","reason":"..."}` → `INVALID_PARAMS`；`prompt_type` 传了但不是 `"permission"` → `INVALID_PARAMS`（还没有别的类型）。`prompt_id` 已经被回应过、或者对应的等待已经因为 session 关闭而清理掉 → 这次调用仍然返回成功（`Ok`），只是引擎那边已经没人在等了，是个静默的空操作，不会报错。
 
 ---
 
@@ -399,5 +429,5 @@
 
 - **没有 `config.getSettings`/读取完整 `Settings`**——`config.getProvider` 只暴露 provider/task_models 部分,`daemon.doctor` 只给压缩摘要,想看 `sandbox`/`permission_rules` 等其他字段的完整内容,目前只能自己读 `settings.json` 文件。
 - **没有 `mcp.removeServer`**——只能加,不能通过 RPC 删除一个已配置的 MCP server（能直接改 `settings.json` 手动删）。
-- **没有权限模式/规则的读写 RPC**——`permission_rules` 解析了但连业务判断都还没接（见 `docs/CONFIG_LAYOUT.md` §13.1),自然也没有对应 RPC。
+- **权限模式/规则现在是按 session 创建时一次性配置的**（`session.run_turn` 的 `options.permission_mode`/`options.permission_rules`，见上），不是独立的读写 RPC——没有"运行中途查看/修改某个 session 当前生效的规则"这个能力，也没有 daemon 级别的全局默认值配置入口（全局默认永远是 `AllowAllPermission`，这是刻意的零风险默认值，不是缺口）。想要"运行中途改规则"或者"daemon 级别切换默认策略"，需要额外设计,这次没做。
 - **没有 skills/agents/hooks 的列出/管理 RPC**——这些子系统本身的加载/业务逻辑是完备的（见完备性审查记录),但没有对应的只读 RPC 把"当前生效的 skill/agent 类型/hook 列表"暴露出来,想看只能翻文件系统或读 `AgentTool`/`SkillTool` 面向模型的描述文本。

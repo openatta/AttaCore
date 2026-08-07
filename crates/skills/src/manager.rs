@@ -15,15 +15,30 @@ use std::sync::RwLock;
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    /// Additional trigger context appended to `description` in the model-
+    /// facing listing (e.g. example phrasings) — was parsed into
+    /// `SkillEntry` but never carried through to this runtime-facing struct
+    /// until the listing actually needed it.
+    pub when_to_use: Option<String>,
     pub source: SkillSource,
     pub path: PathBuf,
     // -- Extended fields (TS parity) --
     /// Restrict tools this skill can invoke (whitelist of tool names)
     pub allowed_tools: Option<Vec<String>>,
+    /// Tools removed from the pool while this skill is active (denylist)
+    pub disallowed_tools: Option<Vec<String>>,
+    /// Named positional arguments for `$name` substitution
+    pub arguments: Option<Vec<String>>,
     /// Override model for this skill
     pub model: Option<String>,
+    /// Effort/thinking-mode override while this skill is active
+    pub effort: Option<String>,
     /// Execution context: "fork" (sub-agent in worktree) or "inline" (default)
     pub context: Option<String>,
+    /// Which agent type to run as when `context: "fork"` is set
+    pub agent: Option<String>,
+    /// `false` waits for the forked result in the invoking turn; default `true`
+    pub background: Option<bool>,
     /// Hint shown to user for arguments (e.g. "commit message")
     pub argument_hint: Option<String>,
     /// Glob patterns for conditional activation
@@ -41,11 +56,17 @@ impl From<SkillEntry> for SkillInfo {
         SkillInfo {
             name: e.name,
             description: e.description,
+            when_to_use: e.when_to_use,
             source: SkillSource::from(e.source),
             path: e.path,
             allowed_tools: e.allowed_tools,
+            disallowed_tools: e.disallowed_tools,
+            arguments: e.arguments,
             model: e.model,
+            effort: e.effort,
             context: e.context,
+            agent: e.agent,
+            background: e.background,
             argument_hint: e.argument_hint,
             paths: e.paths,
             disable_model_invocation: e.disable_model_invocation,
@@ -82,10 +103,29 @@ impl From<FrozenSkillSource> for SkillSource {
     }
 }
 
+/// A skill's invocation history within this `SkillManager`'s lifetime
+/// (i.e. session-scoped, not persisted across process restarts — matches
+/// Claude Code's listing-budget behavior, which is itself a per-session
+/// heuristic, not a cross-session preference). `last_seq` is a monotonic
+/// counter rather than a wall-clock timestamp deliberately: recency only
+/// needs a total order among invocations, and a counter is exact + free of
+/// the timestamp-based VCR non-determinism this session already hit once
+/// (see `docs/design/2026-08-05-test-architecture.md` §15.1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InvocationStats {
+    pub count: u32,
+    pub last_seq: u64,
+}
+
 /// Manages loaded skills at runtime. Skills are .md files with YAML frontmatter.
 pub struct SkillManager {
     skills: RwLock<HashMap<String, SkillInfo>>,
     watcher: RwLock<Option<crate::watcher::SkillWatcher>>,
+    /// Keyed by skill name (not tied to a particular `SkillInfo` instance,
+    /// so a reload — which replaces the `SkillInfo` wholesale — doesn't
+    /// wipe the count for a skill whose content just changed).
+    invocation_stats: RwLock<HashMap<String, InvocationStats>>,
+    invocation_seq: std::sync::atomic::AtomicU64,
 }
 
 impl SkillManager {
@@ -93,7 +133,53 @@ impl SkillManager {
         Self {
             skills: RwLock::new(HashMap::new()),
             watcher: RwLock::new(None),
+            invocation_stats: RwLock::new(HashMap::new()),
+            invocation_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Record that `name` was just invoked (via the Skill tool, a slash
+    /// command, or a subagent preload) — call on success only, not on a
+    /// failed/not-found lookup. Feeds `recall_priority` and, transitively,
+    /// `build_skills_text`'s budget-overflow drop order.
+    pub fn record_invocation(&self, name: &str) {
+        let seq = self
+            .invocation_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let mut stats = self.invocation_stats.write().unwrap();
+        let entry = stats.entry(name.to_string()).or_default();
+        entry.count += 1;
+        entry.last_seq = seq;
+    }
+
+    /// Total times `name` has been invoked this session. `0` for a
+    /// never-invoked skill. Deliberately **count**, not recency — Claude
+    /// Code's documented listing-overflow behavior drops "the skills you
+    /// invoke least" (frequency), a different metric from the
+    /// most-recent-invocation ordering compaction reattachment uses (see
+    /// `last_invoked_seq`). Feeds `build_skills_text`'s drop order.
+    pub fn invocation_count(&self, name: &str) -> u32 {
+        self.invocation_stats
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|s| s.count)
+            .unwrap_or(0)
+    }
+
+    /// Monotonic sequence number of `name`'s most recent invocation, `0` if
+    /// never invoked. Higher = more recent; used to order compaction
+    /// reattachment (most-recently-invoked skill's content restored first,
+    /// within the shared token budget), a different axis from
+    /// `invocation_count`'s frequency-based listing-drop order.
+    pub fn last_invoked_seq(&self, name: &str) -> u64 {
+        self.invocation_stats
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|s| s.last_seq)
+            .unwrap_or(0)
     }
 
     /// Load skills from a directory (user skills: ~/.atta/<scope>/skills/;
@@ -486,6 +572,96 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Regression test for a real production bug: every startup skill scan
+    /// (`runtime::agent::Builder::build()`'s three call sites,
+    /// `Agent::warmup()`'s three, and `daemon::session_pool::build_shared_commands`'s
+    /// three — nine call sites total) used to call `load_dir`, which only
+    /// recognizes flat `<name>.md` files. The `<name>/SKILL.md` subdirectory
+    /// convention — the one Claude Code itself uses, and what this project's
+    /// own template fixture and `discover_for_paths`/`reload_skill` already
+    /// supported — was silently invisible at startup: such a skill only
+    /// became invocable after a live-reload watcher event fired for it once
+    /// (see `reload_skill`'s doc comment, which already handled both
+    /// formats). Found via VCR replay of a real test case: the fixture
+    /// project's `code-review/SKILL.md` skill never appeared in any recorded
+    /// system prompt. `load_dir_subdirs` is the fix — it handles both
+    /// formats in one pass — and is now what every production call site uses.
+    #[test]
+    fn load_dir_subdirs_finds_skill_md_in_a_named_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("code-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let mut f = std::fs::File::create(skill_dir.join("SKILL.md")).unwrap();
+        writeln!(
+            f,
+            "---\nname: code-review\ndescription: Review code changes.\n---\n\nBody."
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new();
+        // The flat-only loader must NOT find it — this is the exact bug.
+        mgr.load_dir(dir.path(), SkillSource::Project).unwrap();
+        assert!(
+            mgr.get("code-review").is_none(),
+            "sanity: load_dir is flat-only and should miss the subdirectory-format skill"
+        );
+
+        let count = mgr.load_dir_subdirs(dir.path(), SkillSource::Project).unwrap();
+        assert_eq!(count, 1);
+        let info = mgr.get("code-review").expect("load_dir_subdirs must find skills/<name>/SKILL.md");
+        assert_eq!(info.description, "Review code changes.");
+    }
+
+    #[test]
+    fn invocation_count_and_last_invoked_seq_start_at_zero() {
+        let mgr = SkillManager::new();
+        assert_eq!(mgr.invocation_count("never-called"), 0);
+        assert_eq!(mgr.last_invoked_seq("never-called"), 0);
+    }
+
+    #[test]
+    fn record_invocation_increments_count_and_advances_seq() {
+        let mgr = SkillManager::new();
+        mgr.record_invocation("a");
+        mgr.record_invocation("a");
+        mgr.record_invocation("b");
+        assert_eq!(mgr.invocation_count("a"), 2);
+        assert_eq!(mgr.invocation_count("b"), 1);
+        // "b" was recorded after "a"'s second call, so it's more recent —
+        // count and recency are independent axes (frequency vs recency),
+        // this is the case that distinguishes them: "a" has a higher count
+        // but "b" has a higher (more recent) seq.
+        assert!(mgr.last_invoked_seq("b") > mgr.last_invoked_seq("a"));
+    }
+
+    #[test]
+    fn invocation_stats_survive_a_reload_of_the_same_named_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("code-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: v1\n---\nBody v1.",
+        )
+        .unwrap();
+        let mgr = SkillManager::new();
+        mgr.load_dir_subdirs(dir.path(), SkillSource::Project).unwrap();
+        mgr.record_invocation("code-review");
+        assert_eq!(mgr.invocation_count("code-review"), 1);
+
+        // Reload (as the live-reload watcher's `reload_skill` would do)
+        // replaces the `SkillInfo` instance wholesale — invocation stats
+        // are keyed by name, not tied to that instance, so they survive.
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: v2\n---\nBody v2.",
+        )
+        .unwrap();
+        mgr.reload_skill(&skill_dir.join("SKILL.md")).unwrap();
+        assert_eq!(mgr.get("code-review").unwrap().description, "v2");
+        assert_eq!(mgr.invocation_count("code-review"), 1);
+    }
+
     #[test]
     fn get_skill_content_resolves_bundled_sentinel_path() {
         // Regression test: a bundled skill's `path` is a `(bundled:name)`
@@ -770,5 +946,60 @@ mod tests {
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"rust-helper"));
         assert!(names.contains(&"md-helper"));
+    }
+
+    /// Regression: `enable_watching`/`check_for_changes`/`SkillWatcher` were
+    /// all fully implemented but `enable_watching` had no caller anywhere in
+    /// production code, so a skill file edited after a session started was
+    /// never picked up without a full session rebuild. This exercises the
+    /// real `notify` watcher end to end — not just the reload logic in
+    /// isolation — since that's exactly the part that was silently inert.
+    #[test]
+    fn editing_a_watched_skill_file_is_picked_up_without_a_manual_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_path = dir.path().join("watched-skill.md");
+        std::fs::write(
+            &skill_path,
+            "---\ndescription: original description\n---\nOriginal body.",
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new();
+        mgr.load_dir(dir.path(), SkillSource::User).unwrap();
+        assert_eq!(
+            mgr.get("watched-skill").unwrap().description,
+            "original description"
+        );
+
+        mgr.enable_watching(&[dir.path().to_path_buf()])
+            .expect("watcher setup should succeed in a test tempdir");
+
+        // Edit the file after watching has started — this is the part that
+        // used to have no effect at all on a running session.
+        std::fs::write(
+            &skill_path,
+            "---\ndescription: updated description\n---\nUpdated body.",
+        )
+        .unwrap();
+
+        // `notify` delivers events asynchronously via a background thread —
+        // poll with a bounded timeout instead of a single fixed sleep, to
+        // keep this fast on a quiet CI box without being flaky on a loaded one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut picked_up = false;
+        while std::time::Instant::now() < deadline {
+            if mgr.check_for_changes() > 0 {
+                picked_up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(picked_up, "watcher never reported the file change within 5s");
+        assert_eq!(
+            mgr.get("watched-skill").unwrap().description,
+            "updated description",
+            "check_for_changes reported a change but the skill content wasn't actually reloaded"
+        );
     }
 }

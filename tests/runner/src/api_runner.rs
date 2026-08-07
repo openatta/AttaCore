@@ -8,7 +8,7 @@ use base::interface::scene::AgentScene;
 use base::interface::settings::{PermissionMode, ThinkingMode, VcrConfig, VcrMode};
 use base::provider::ApiType;
 use base::tool::InMemoryToolRegistry;
-use runtime::agent::{Builder, InputMessage};
+use runtime::agent::{Builder, EventReceiver, InputMessage, InputSender};
 use std::path::PathBuf;
 use std::sync::Arc;
 use telemetry::vcr::VcrModel;
@@ -54,7 +54,16 @@ pub async fn run_test_case(
 
     let mut results = Vec::new();
     for turn in &case.turns {
-        let out = run_one_turn(&config, turn).await?;
+        let (input_tx, mut event_rx, cancel) =
+            build_agent(&config, &tmp, format!("test-turn-{}", turn.index)).await?;
+        let out = send_and_collect(
+            &input_tx,
+            &mut event_rx,
+            &cancel,
+            turn,
+            format!("turn_{}", turn.index),
+        )
+        .await?;
         results.push(out);
     }
 
@@ -64,12 +73,97 @@ pub async fn run_test_case(
     Ok(results)
 }
 
-async fn run_one_turn(
-    config: &AgentRunnerConfig,
-    turn: &crate::script::Turn,
-) -> anyhow::Result<TurnOutput> {
+/// Like `run_test_case`, but builds **one** `Agent` for the whole case and
+/// sends every turn to it in sequence — no rebuild between turns, same
+/// `input_tx`/`event_rx` throughout.
+///
+/// Why this exists as a separate function rather than a flag on
+/// `run_test_case`: that function (and every case recorded against it so
+/// far) builds a *fresh* `Agent` per turn, each with its own fresh
+/// `SkillManager`/`AgentTool` — so mutating the fixture between turns and
+/// seeing turn 2 pick it up proves nothing about the Skills/Agent-type
+/// `notify` watchers added this session (a cold `Builder::build()` sees
+/// current disk state regardless of whether a watcher exists — that was
+/// never in question). Only a *shared* `Agent` across turns can actually
+/// exercise "the watcher fired and updated already-running state without a
+/// rebuild," which is the specific guarantee those watchers exist to
+/// provide. Kept as a separate entry point (not a retrofit of
+/// `run_test_case`) so every existing recorded cassette — whose request hash
+/// depends on the exact per-turn-isolated message history — stays valid
+/// unchanged.
+///
+/// `mutations`, if given, describes filesystem edits to apply to the
+/// fixture's copied workdir between specific turns (see `crate::mutations`)
+/// — applied after the named turn completes, with a short grace period
+/// before the next turn's message goes out so the watcher's background
+/// thread has time to observe and react to the change.
+pub async fn run_test_case_same_session(
+    config: AgentRunnerConfig,
+    case: &TestCase,
+    mutations: Option<&crate::mutations::MutationManifest>,
+) -> anyhow::Result<Vec<TurnOutput>> {
     let tmp = PathBuf::from("/tmp/atta_test_runner");
+    let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::create_dir_all(&tmp);
+
+    if let Some(fixture) = &config.fixture_dir {
+        let workdir = tmp.join("workdir");
+        crate::fixture::copy_dir_recursive(fixture, &workdir)?;
+        crate::fixture::resolve_mcp_toy_server_placeholder(&workdir)?;
+    }
+
+    let (input_tx, mut event_rx, cancel) =
+        build_agent(&config, &tmp, "test-session".to_string()).await?;
+
+    let mut results = Vec::new();
+    for turn in &case.turns {
+        let out = send_and_collect(
+            &input_tx,
+            &mut event_rx,
+            &cancel,
+            turn,
+            format!("turn_{}", turn.index),
+        )
+        .await?;
+        results.push(out);
+
+        if let Some(manifest) = mutations {
+            if let Some(m) = manifest.mutations.iter().find(|m| m.after_turn == turn.index) {
+                let workdir = tmp.join("workdir");
+                crate::mutations::apply(&workdir, m)?;
+                eprintln!(
+                    "Applied {} mutation(s) after turn {} — waiting for watcher pickup",
+                    m.ops.len(),
+                    turn.index
+                );
+                // `notify` delivers file events on a background thread; the
+                // Skills/Agent-type watchers have no debounce, but the OS
+                // event itself isn't synchronous with this process. A fixed
+                // grace period (not a poll — there's nothing in this process
+                // to poll, the watcher lives inside the spawned `Agent` task)
+                // is the only externally-observable option; generous since
+                // this only runs during a one-off recording, never on a hot
+                // path.
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    Ok(results)
+}
+
+/// Build one `Agent`, spawn its run loop, and hand back the channels to
+/// drive it — shared by `run_test_case` (fresh agent per turn) and
+/// `run_test_case_same_session` (one agent for the whole case). `session_id`
+/// is the only thing that varies between those two callers' usage.
+async fn build_agent(
+    config: &AgentRunnerConfig,
+    tmp: &std::path::Path,
+    session_id: String,
+) -> anyhow::Result<(InputSender, EventReceiver, CancellationToken)> {
+    let _ = std::fs::create_dir_all(tmp);
 
     // ATTA_VCR_STRICT=1 disables the network fallback on a replay miss — fails
     // immediately with the hash that didn't match instead of silently eating a
@@ -137,7 +231,7 @@ async fn run_one_turn(
         .model(vcr_model)
         .tools(tools_registry)
         .settings(settings.clone())
-        .session_id(format!("test-turn-{}", turn.index))
+        .session_id(session_id)
         .skip_warmup(true);
 
     // Connect any MCP servers the fixture's settings.json configured — without
@@ -189,7 +283,7 @@ async fn run_one_turn(
         builder = builder.telemetry_handle(telemetry::TelemetryHandle::new(tx));
     }
 
-    let (agent, mut event_rx, input_tx) = builder
+    let (agent, event_rx, input_tx) = builder
         .build()
         .map_err(|e| anyhow::anyhow!("build agent: {e}"))?;
 
@@ -200,10 +294,25 @@ async fn run_one_turn(
         let _ = agent.run(agent_cancel).await;
     });
 
+    Ok((input_tx, event_rx, cancel))
+}
+
+/// Send one turn's input to an already-built agent and collect its response
+/// until `TurnComplete`/`Error`/timeout. Reusable across multiple turns
+/// against the same `event_rx` (see `run_test_case_same_session`) — each
+/// call only drains events belonging to its own turn because `Agent::run()`
+/// only ever has one turn in flight at a time.
+async fn send_and_collect(
+    input_tx: &InputSender,
+    event_rx: &mut EventReceiver,
+    cancel: &CancellationToken,
+    turn: &crate::script::Turn,
+    turn_id: String,
+) -> anyhow::Result<TurnOutput> {
     let _ = input_tx.send(InputMessage::User {
         content: turn.input.clone(),
         attachments: vec![],
-        turn_id: format!("turn_{}", turn.index),
+        turn_id,
     });
 
     // 没有这层超时的话，网络卡住（比如沙箱环境出不了网、endpoint 无响应）会导致

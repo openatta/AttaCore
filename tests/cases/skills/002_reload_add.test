@@ -1,0 +1,21 @@
+# 测试用例：Skills —— 会话中途新增的 skill 文件，下一轮不重建会话就能被调用
+# 前置: --fixture tests/fixtures/template_project --scene coding --same-session
+#       （有 .mutations.json 同名 sidecar，main.rs 会自动切到 run_test_case_same_session）
+# 预期: 第一轮 flaky-fixer 这个 skill 还不存在（不应该被调用/提及）；after_turn=0 时
+#       mutations 往 .agents/skills/flaky-fixer/SKILL.md 写入一个新 skill 文件；
+#       第二轮问同一个会话（同一个 Agent/SkillManager，没有重建）能不能调用它，验证
+#       crates/skills/src/watcher.rs::SkillWatcher（本轮之前未接线，这个会话新增
+#       enable_watching() 调用是本次修复的一部分）真的在跑，新增文件不需要重启进程/
+#       重建 session 就能在下一轮生效。
+
+>>>>>>>>>>>>>>>>
+不用读任何文件，直接告诉我：现在有没有一个叫 flaky-fixer 的 skill 可以用？
+<<<<<<<<<<<<<<<<
+模型的回答表明当前没有 flaky-fixer 这个 skill（不存在/找不到），没有编造一个不存在的 skill
+描述,也没有把它跟其他 skill 混淆。
+>>>>>>>>>>>>>>>>
+现在再检查一下：有没有一个叫 flaky-fixer 的 skill 了？如果有，调用一下看看它是干什么用的。
+<<<<<<<<<<<<<<<<
+模型这次成功调用了 Skill 工具（skill 参数为 "flaky-fixer"），没有报 "not found"，并且转述了
+该 skill 的用途（诊断/稳定 flaky 测试：重跑确认、定位非确定性来源、给出去除非确定性的修复
+方案），证明会话中途新增的 skill 文件在没有重建会话的情况下、下一轮就被发现并可以调用。

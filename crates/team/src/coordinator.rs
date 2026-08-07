@@ -395,6 +395,7 @@ impl Coordinator for DefaultCoordinator {
                         vec![], // allowed_tools: empty = all tools
                         ctx.cwd.clone(),
                         cancel,
+                        None, // agent teams don't carry a named agent-type concept
                     ).await {
                         Ok(text) => {
                             sections.push((agent_spec.label.clone(), text, false));

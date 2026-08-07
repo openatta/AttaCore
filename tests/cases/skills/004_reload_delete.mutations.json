@@ -1,0 +1,13 @@
+{
+  "mutations": [
+    {
+      "after_turn": 0,
+      "ops": [
+        {
+          "op": "delete",
+          "path": ".agents/skills/code-review/SKILL.md"
+        }
+      ]
+    }
+  ]
+}

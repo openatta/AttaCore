@@ -678,13 +678,34 @@ impl Compactor for LlmCompactor {
 
 // ── Post-compact recovery (T1.4) ──
 
+/// One skill invoked before compaction, with enough to re-attach its actual
+/// body (not just its name) afterward. Built by the caller (`runtime`,
+/// which has the `SkillManager` this crate deliberately doesn't depend on)
+/// from its own `invoked_skills: Vec<String>` tracking, resolving each name
+/// to its current content and last-invoked ordering.
+#[derive(Debug, Clone)]
+pub struct InvokedSkillRecord {
+    pub name: String,
+    /// The skill's current full body. `None` if it couldn't be resolved
+    /// (deleted/renamed since it was invoked) — falls back to a name-only
+    /// mention rather than being dropped silently, so the reminder that it
+    /// was used at all survives even when the content can't.
+    pub content: Option<String>,
+    /// Monotonic recency ordering (`SkillManager::last_invoked_seq`) — higher
+    /// is more recent. Used to decide which skills get first claim on the
+    /// shared reattachment budget when not everything fits.
+    pub last_seq: u64,
+}
+
 /// Context that can be recovered after compaction.
 #[derive(Debug, Clone, Default)]
 pub struct PostCompactContext {
     /// Recently read files (paths and their content)
     pub recent_files: Vec<(String, String)>,
-    /// Skill names that were invoked before compaction
-    pub invoked_skills: Vec<String>,
+    /// Skills that were invoked before compaction, most-recent-first
+    /// priority decided by `last_seq` (the caller doesn't need to
+    /// pre-sort — `build_post_compact_recovery` does it).
+    pub invoked_skills: Vec<InvokedSkillRecord>,
     /// Whether plan mode was active
     pub in_plan_mode: bool,
     /// Plan file content (if plan mode was active)
@@ -699,8 +720,27 @@ pub struct PostCompactContext {
 const MAX_RECOVER_FILES: usize = 5;
 /// Maximum characters per recovered file.
 const MAX_CHARS_PER_FILE: usize = 5_000;
-/// Maximum total characters for recovered skills.
-const MAX_CHARS_SKILLS: usize = 25_000;
+/// Per-skill and shared-total character budgets for reattached skill
+/// content — 5,000 / 25,000 *tokens* per Claude Code's documented behavior,
+/// converted with this codebase's existing ~4-chars-per-token heuristic
+/// (see `turn.rs::build_skills_text`'s listing budget, same conversion).
+const MAX_CHARS_PER_SKILL: usize = 20_000;
+const MAX_CHARS_SKILLS_TOTAL: usize = 100_000;
+
+/// Truncate `s` to at most `max_bytes` bytes without splitting a multi-byte
+/// UTF-8 character (plain byte-index slicing panics if the cut lands
+/// mid-character — recovered file/skill content routinely contains
+/// non-ASCII text in this codebase).
+fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Build post-compact recovery messages.
 ///
@@ -718,7 +758,10 @@ pub fn build_post_compact_recovery(
             .take(MAX_RECOVER_FILES)
             .map(|(path, content)| {
                 let truncated = if content.len() > MAX_CHARS_PER_FILE {
-                    format!("{}...\n[content truncated]", &content[..MAX_CHARS_PER_FILE])
+                    format!(
+                        "{}...\n[content truncated]",
+                        truncate_str_at_char_boundary(content, MAX_CHARS_PER_FILE)
+                    )
                 } else {
                     content.clone()
                 };
@@ -739,15 +782,46 @@ pub fn build_post_compact_recovery(
         }
     }
 
-    // 2. Invoked skills
+    // 2. Invoked skills — re-attach actual body content (not just names),
+    // most-recently-invoked first, within the shared budget. Matches Claude
+    // Code: "re-attaches the most recent invocation of each skill after the
+    // summary, keeping the first 5,000 tokens of each... a combined budget
+    // of 25,000 tokens... starting from the most recently invoked skill, so
+    // older skills can be dropped entirely."
     if !ctx.invoked_skills.is_empty() {
-        let skills_text = ctx.invoked_skills.join(", ");
-        let mut body = format!(
-            "The following skills were invoked before compaction and their instructions may still apply: {skills_text}"
+        let mut by_recency = ctx.invoked_skills.clone();
+        by_recency.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
+
+        let mut sections = Vec::new();
+        let mut spent = 0usize;
+        let mut dropped_names = Vec::new();
+        for skill in &by_recency {
+            let Some(content) = &skill.content else {
+                dropped_names.push(skill.name.clone());
+                continue;
+            };
+            let capped = if content.len() > MAX_CHARS_PER_SKILL {
+                format!("{}...[truncated]", truncate_str_at_char_boundary(content, MAX_CHARS_PER_SKILL))
+            } else {
+                content.clone()
+            };
+            if spent + capped.len() > MAX_CHARS_SKILLS_TOTAL {
+                dropped_names.push(skill.name.clone());
+                continue;
+            }
+            spent += capped.len();
+            sections.push(format!("## {}\n\n{}", skill.name, capped));
+        }
+
+        let mut body = String::from(
+            "The following skills were invoked before compaction — their instructions may still apply. Full content for the most recently used ones is repeated below; re-invoke any skill via the Skill tool if you need the exact steps again.\n\n",
         );
-        if body.len() > MAX_CHARS_SKILLS {
-            body.truncate(MAX_CHARS_SKILLS);
-            body.push_str("...");
+        body.push_str(&sections.join("\n\n---\n\n"));
+        if !dropped_names.is_empty() {
+            body.push_str(&format!(
+                "\n\n(Also invoked before compaction, but dropped here for budget — re-invoke if needed: {})",
+                dropped_names.join(", ")
+            ));
         }
         recovery.push(ModelMessage {
             role: MessageRole::User,
@@ -761,7 +835,10 @@ pub fn build_post_compact_recovery(
     if ctx.in_plan_mode {
         if let Some(ref plan) = ctx.plan_content {
             let truncated = if plan.len() > MAX_CHARS_PER_FILE {
-                format!("{}...\n[plan content truncated]", &plan[..MAX_CHARS_PER_FILE])
+                format!(
+                    "{}...\n[plan content truncated]",
+                    truncate_str_at_char_boundary(plan, MAX_CHARS_PER_FILE)
+                )
             } else {
                 plan.clone()
             };
@@ -1132,5 +1209,104 @@ mod tests {
     #[test]
     fn extract_summary_no_tags_returns_trimmed() {
         assert_eq!(extract_summary_tag("  plain text  "), Some("plain text"));
+    }
+
+    fn recovery_text(messages: &[ModelMessage]) -> String {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ModelContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn post_compact_recovery_reattaches_full_skill_content() {
+        let ctx = PostCompactContext {
+            invoked_skills: vec![InvokedSkillRecord {
+                name: "code-review".into(),
+                content: Some("1. Inspect changed files.\n2. Check correctness.".into()),
+                last_seq: 1,
+            }],
+            ..Default::default()
+        };
+        let text = recovery_text(&build_post_compact_recovery(&ctx));
+        assert!(text.contains("code-review"));
+        assert!(text.contains("Inspect changed files"));
+    }
+
+    #[test]
+    fn post_compact_recovery_orders_by_most_recently_invoked_first() {
+        let ctx = PostCompactContext {
+            invoked_skills: vec![
+                InvokedSkillRecord { name: "old-skill".into(), content: Some("old body".into()), last_seq: 1 },
+                InvokedSkillRecord { name: "new-skill".into(), content: Some("new body".into()), last_seq: 5 },
+            ],
+            ..Default::default()
+        };
+        let text = recovery_text(&build_post_compact_recovery(&ctx));
+        let new_pos = text.find("new-skill").expect("new-skill present");
+        let old_pos = text.find("old-skill").expect("old-skill present");
+        assert!(new_pos < old_pos, "most recently invoked skill must appear first");
+    }
+
+    #[test]
+    fn post_compact_recovery_falls_back_to_name_only_when_content_unresolved() {
+        let ctx = PostCompactContext {
+            invoked_skills: vec![InvokedSkillRecord {
+                name: "deleted-skill".into(),
+                content: None,
+                last_seq: 1,
+            }],
+            ..Default::default()
+        };
+        let text = recovery_text(&build_post_compact_recovery(&ctx));
+        assert!(text.contains("deleted-skill"));
+    }
+
+    #[test]
+    fn post_compact_recovery_caps_a_single_oversized_skill() {
+        let huge = "x".repeat(MAX_CHARS_PER_SKILL + 5_000);
+        let ctx = PostCompactContext {
+            invoked_skills: vec![InvokedSkillRecord {
+                name: "verbose-skill".into(),
+                content: Some(huge),
+                last_seq: 1,
+            }],
+            ..Default::default()
+        };
+        let text = recovery_text(&build_post_compact_recovery(&ctx));
+        assert!(text.len() < MAX_CHARS_PER_SKILL + 1_000, "must be capped near the per-skill limit, got {} chars", text.len());
+        assert!(text.contains("truncated"));
+    }
+
+    #[test]
+    fn post_compact_recovery_drops_least_recent_skills_over_shared_budget() {
+        // Six skills, each at the per-skill cap (so 6 * MAX_CHARS_PER_SKILL
+        // comfortably exceeds MAX_CHARS_SKILLS_TOTAL, which only fits 5) —
+        // the least-recently-invoked one must be the one dropped.
+        let big = "y".repeat(MAX_CHARS_PER_SKILL - 100);
+        let invoked_skills: Vec<InvokedSkillRecord> = (1..=6)
+            .map(|seq| InvokedSkillRecord {
+                name: format!("skill-{seq}"),
+                content: Some(big.clone()),
+                last_seq: seq,
+            })
+            .collect();
+        let ctx = PostCompactContext { invoked_skills, ..Default::default() };
+        let text = recovery_text(&build_post_compact_recovery(&ctx));
+        assert!(text.contains("## skill-6"), "most recent skill must keep full content");
+        assert!(text.contains("skill-1"), "dropped skill must still be named");
+        assert!(!text.contains("## skill-1"), "dropped skill must not have a full-content section");
+    }
+
+    #[test]
+    fn post_compact_recovery_is_empty_when_no_skills_invoked() {
+        let ctx = PostCompactContext::default();
+        let recovery = build_post_compact_recovery(&ctx);
+        assert!(recovery.is_empty());
     }
 }

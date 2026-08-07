@@ -524,6 +524,64 @@ async fn session_close_rejects_missing_session_id() {
     let _ = handle.await;
 }
 
+/// Unlike `session.close` (idempotent no-op on an unknown id — see above),
+/// answering a prompt for a session that isn't running is a real caller
+/// error: there's no pending wait to silently no-op.
+#[tokio::test]
+async fn respond_to_prompt_rejects_unknown_session() {
+    let (_server, sock, _dir, handle) = start_server().await;
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{"session_id":"doesnotexist","prompt_id":"p1","decision":{"type":"permit"}},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::SESSION_NOT_FOUND, "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn respond_to_prompt_rejects_missing_params() {
+    let (_server, sock, _dir, handle) = start_server().await;
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{"prompt_id":"p1","decision":{"type":"permit"}},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "missing session_id, resp: {v}");
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{"session_id":"x","decision":{"type":"permit"}},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "missing prompt_id, resp: {v}");
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{"session_id":"x","prompt_id":"p1"},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "missing decision, resp: {v}");
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{"session_id":"x","prompt_id":"p1","prompt_type":"something_else","decision":{"type":"permit"}},"id":1}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "unsupported prompt_type, resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn import_list_detects_claude_md_in_project_dir() {
     let (_server, sock, dir, handle) = start_server().await;
@@ -1199,6 +1257,68 @@ async fn config_reload_picks_up_a_hand_edited_settings_file() {
     assert_eq!(v["result"]["routing"]["ok"], true, "resp: {v}");
     assert_eq!(v["result"]["routing"]["router_rebuilt"], true, "resp: {v}");
     assert_eq!(v["result"]["routing"]["router_error"], serde_json::Value::Null, "resp: {v}");
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn config_reload_attempts_to_connect_a_hand_edited_mcp_server() {
+    // Regression: `config.reload` used to re-read `mcp_servers` into the new
+    // `Settings` (so `doctor`/`get_providers`-style inspection would show it)
+    // but never actually connect it — `apply_reloaded_settings` never
+    // touched `self.mcp` at all. A hand-edited `mcp_servers` entry was
+    // invisible to every session (including ones later rebuilt via
+    // `config_generation`, since `create()` sources MCP from the untouched
+    // central cache, not from `Settings` directly) — the only way to
+    // actually connect it was `mcp.addServer` or a full daemon restart.
+    //
+    // Uses the same "definitely not a real binary" pattern as
+    // `mcp_add_server_writes_settings_and_reports_connect_failure` — the
+    // point isn't a successful connection (that needs a real MCP server
+    // process), it's proving `config.reload` now genuinely *attempts* one
+    // and reports the outcome. Before this fix, `mcp_failed` didn't exist as
+    // a field at all: the server would never appear in the response either
+    // way, connect attempted or not, so its mere presence here is the proof.
+    let (_server, sock, dir, handle) = start_server().await;
+
+    let settings_path = dir.path().join(".atta").join("settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({
+            "mcp_servers": {
+                "hand-edited": {
+                    "type": "stdio",
+                    "command": "definitely-not-a-real-binary-xyz"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"config.reload","id":1}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"].is_object(), "expected success, got: {v}");
+    let failed = v["result"]["routing"]["mcp_failed"]
+        .as_array()
+        .expect("mcp_failed should be an array");
+    assert!(
+        failed.iter().any(|s| s == "hand-edited"),
+        "expected 'hand-edited' in mcp_failed, got: {v}"
+    );
+    assert!(v["result"]["routing"]["mcp_connected"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // And `mcp.status` — which reads the same `self.mcp` this reconcile call
+    // writes to — agrees: still nothing connected (the binary doesn't
+    // exist), but the attempt happened, which is what actually matters here.
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"mcp.status","id":2}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["result"]["servers"].as_array().unwrap().is_empty());
 
     _server.shutdown_token().cancel();
     let _ = handle.await;

@@ -43,6 +43,33 @@ fn find_closing_marker(s: &str) -> Option<usize> {
     None
 }
 
+/// Fallback description when frontmatter omits it: the first markdown
+/// *paragraph* of the body (consecutive non-blank lines, joined with a
+/// space), not just the first line — matches Claude Code's documented
+/// "uses the first paragraph of markdown content" behavior. A leading `#`
+/// heading prefix is stripped from the paragraph's first line only, so a
+/// lone heading line (heading, blank line, then body) still yields just the
+/// heading text, same as before this was widened from "first line" to
+/// "first paragraph".
+pub fn first_paragraph(body: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for line in body.lines().skip_while(|l| l.trim().is_empty()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let text = if parts.is_empty() {
+            trimmed.trim_start_matches('#').trim()
+        } else {
+            trimmed
+        };
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
 fn strip_quotes(s: &str) -> &str {
     if s.len() >= 2 {
         let first = s.as_bytes()[0];
@@ -54,8 +81,11 @@ fn strip_quotes(s: &str) -> &str {
     s
 }
 
-/// Parse a YAML inline list value: `[a, b, c]` or bare `a, b, c`.
-pub(crate) fn parse_yaml_list(raw: &str) -> Vec<String> {
+/// Parse a YAML inline list value: `[a, b, c]`, comma-separated `a, b, c`, or
+/// space-separated `a b c` (Claude Code frontmatter fields like
+/// `allowed-tools`/`arguments`/`skills` all document accepting "a space- or
+/// comma-separated string, or a YAML list" — this must match all three).
+pub fn parse_yaml_list(raw: &str) -> Vec<String> {
     let s = raw.trim();
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
@@ -67,6 +97,11 @@ pub(crate) fn parse_yaml_list(raw: &str) -> Vec<String> {
     } else if s.contains(',') {
         s.split(',')
             .map(|item| strip_quotes(item.trim()).to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    } else if s.split_whitespace().count() > 1 {
+        s.split_whitespace()
+            .map(|item| strip_quotes(item).to_string())
             .filter(|item| !item.is_empty())
             .collect()
     } else {
@@ -118,14 +153,25 @@ pub fn parse_skill_file(
                 "description" => entry.description = value.to_string(),
                 "when_to_use" | "whenToUse" => entry.when_to_use = Some(value.to_string()),
                 "argument_hint" | "argumentHint" => entry.argument_hint = Some(value.to_string()),
-                "allowed_tools" | "allowedTools" => {
+                "allowed_tools" | "allowedTools" | "allowed-tools" => {
                     entry.allowed_tools = Some(parse_yaml_list(value));
                 }
-                "allowed-tools" => {
-                    entry.allowed_tools = Some(parse_yaml_list(value));
+                "disallowed_tools" | "disallowedTools" | "disallowed-tools" => {
+                    entry.disallowed_tools = Some(parse_yaml_list(value));
+                }
+                "arguments" => {
+                    entry.arguments = Some(parse_yaml_list(value));
                 }
                 "model" => entry.model = Some(value.to_string()),
+                "effort" => entry.effort = Some(value.to_string()),
                 "context" => entry.context = Some(value.to_string()),
+                "agent" => entry.agent = Some(value.to_string()),
+                "background" => {
+                    entry.background = Some(!matches!(
+                        value.to_lowercase().as_str(),
+                        "false" | "no" | "0"
+                    ));
+                }
                 "disable_model_invocation" | "disableModelInvocation" => {
                     entry.disable_model_invocation = matches!(
                         value.to_lowercase().as_str(),
@@ -153,18 +199,7 @@ pub fn parse_skill_file(
         }
     }
     if entry.description.is_empty() {
-        // fallback: first non-empty body line (strip # heading prefix)
-        for line in body.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let stripped = trimmed.trim_start_matches('#').trim();
-            if !stripped.is_empty() {
-                entry.description = stripped.to_string();
-            }
-            break;
-        }
+        entry.description = first_paragraph(body);
     }
     if entry.description.is_empty() {
         return None;
@@ -272,6 +307,57 @@ mod tests {
             SkillSource::User,
         );
         assert!(entry.is_none());
+    }
+
+    #[test]
+    fn parse_skill_falls_back_to_first_paragraph_not_just_first_line() {
+        // Multi-line opening paragraph, no leading heading — must join every
+        // line up to the first blank line, not just the first one.
+        let content = "---\nname: foo\n---\nThis is a skill\nthat does X.\n\nMore text below.";
+        let entry = parse_skill_file(
+            content,
+            "foo".into(),
+            Path::new("/x/SKILL.md"),
+            SkillSource::User,
+        )
+        .unwrap();
+        assert_eq!(entry.description, "This is a skill that does X.");
+    }
+
+    #[test]
+    fn parse_yaml_list_accepts_space_separated_bare_string() {
+        let content = "---\nname: foo\ndescription: d\nallowed-tools: Read Grep Glob\n---\nbody";
+        let entry = parse_skill_file(
+            content,
+            "foo".into(),
+            Path::new("/x/SKILL.md"),
+            SkillSource::User,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.allowed_tools,
+            Some(vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_skill_extracts_disallowed_tools_and_arguments() {
+        let content = "---\nname: foo\ndescription: d\ndisallowed-tools: AskUserQuestion\narguments: issue, branch\neffort: high\nagent: Explore\nbackground: false\n---\nbody";
+        let entry = parse_skill_file(
+            content,
+            "foo".into(),
+            Path::new("/x/SKILL.md"),
+            SkillSource::User,
+        )
+        .unwrap();
+        assert_eq!(entry.disallowed_tools, Some(vec!["AskUserQuestion".to_string()]));
+        assert_eq!(
+            entry.arguments,
+            Some(vec!["issue".to_string(), "branch".to_string()])
+        );
+        assert_eq!(entry.effort.as_deref(), Some("high"));
+        assert_eq!(entry.agent.as_deref(), Some("Explore"));
+        assert_eq!(entry.background, Some(false));
     }
 
     #[test]

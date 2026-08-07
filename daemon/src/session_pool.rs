@@ -83,15 +83,15 @@ fn build_shared_commands(
 ) -> Arc<runtime::commands::CommandRegistry> {
     let skill_mgr = skills::manager::SkillManager::new();
     let project_skills_dir = settings.paths.project_root().join(".agents").join("skills");
-    let _ = skill_mgr.load_dir(
+    let _ = skill_mgr.load_dir_subdirs(
         &settings.paths.global_data_dir.join("skills"),
         skills::manager::SkillSource::User,
     );
-    let _ = skill_mgr.load_dir(
+    let _ = skill_mgr.load_dir_subdirs(
         &settings.paths.user_data_dir.join("skills"),
         skills::manager::SkillSource::User,
     );
-    let _ = skill_mgr.load_dir(&project_skills_dir, skills::manager::SkillSource::Project);
+    let _ = skill_mgr.load_dir_subdirs(&project_skills_dir, skills::manager::SkillSource::Project);
     for bundled in skills::bundled::bundled_skills() {
         skill_mgr.register_bundled(bundled);
     }
@@ -287,6 +287,14 @@ struct ReloadReport {
     error: Option<String>,
     router_rebuilt: bool,
     router_error: Option<String>,
+    /// MCP servers from the freshly-reloaded config that are now actually
+    /// connected — see `SessionPool::reconcile_mcp_servers`.
+    mcp_connected: Vec<String>,
+    /// MCP servers from the freshly-reloaded config that failed to connect
+    /// (or had an invalid config) — specific reasons are in the daemon log
+    /// and the `mcp_connect_failed` async notification, same contract as
+    /// startup connection failures.
+    mcp_failed: Vec<String>,
 }
 
 impl ReloadReport {
@@ -297,6 +305,8 @@ impl ReloadReport {
             "error": self.error,
             "router_rebuilt": self.router_rebuilt,
             "router_error": self.router_error,
+            "mcp_connected": self.mcp_connected,
+            "mcp_failed": self.mcp_failed,
         })
     }
 }
@@ -586,6 +596,75 @@ impl SessionPool {
             }
             *pool.mcp.write().await = Arc::new(manager);
         });
+    }
+
+    /// Reconnect MCP servers to match `mcp_servers` (from freshly-reloaded
+    /// `Settings`) — the `config.reload`/`config.setProvider` counterpart to
+    /// `connect_mcp_servers_in_background`, which only ever ran once at
+    /// daemon startup. Before this, `apply_reloaded_settings` re-read
+    /// `mcp_servers` into the new `Settings` (so it was visible to
+    /// `doctor`/`get_providers`) but never actually reconnected anything —
+    /// a hand-edited `mcp_servers` entry picked up via `config.reload` was
+    /// invisible to every session, including ones rebuilt afterward via
+    /// `config_generation` (`create()` sources MCP from this same
+    /// `self.mcp` cache, not from `Settings` directly) — only `mcp.addServer`
+    /// or a full daemon restart actually connected it.
+    ///
+    /// Runs a full `connect_all` over the *complete* new config rather than
+    /// an incremental diff against the old one — simpler and still correct:
+    /// `connect_all` doesn't special-case an empty map, so a config that
+    /// removed every server naturally produces an empty `McpManager`,
+    /// cleanly disconnecting everything. Awaited inline (not backgrounded
+    /// like the startup path) since `config.reload`/`config.setProvider` are
+    /// already explicit, human-triggered operations where the caller
+    /// reasonably wants the RPC response to reflect the *actual* post-reload
+    /// connection state rather than a "kicked off, check back later" status.
+    ///
+    /// Returns `(connected, failed)` server names for `ReloadReport`.
+    async fn reconcile_mcp_servers(
+        &self,
+        mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut parsed = HashMap::new();
+        let mut invalid = Vec::new();
+        for (name, v) in mcp_servers {
+            match serde_json::from_value::<mcp::config::McpServerConfig>(v.clone()) {
+                Ok(cfg) => {
+                    parsed.insert(name.clone(), cfg);
+                }
+                Err(e) => {
+                    tracing::warn!(server = %name, error = %e, "invalid mcp_servers config, skipping");
+                    invalid.push(name.clone());
+                }
+            }
+        }
+
+        let requested: std::collections::HashSet<String> = parsed.keys().cloned().collect();
+        let manager = McpManager::connect_all(parsed).await;
+        let statuses = manager.server_statuses();
+        let connected: Vec<String> = statuses.iter().map(|s| s.name.clone()).collect();
+        let connected_set: std::collections::HashSet<String> = connected.iter().cloned().collect();
+        let mut failed: Vec<String> = requested.difference(&connected_set).cloned().collect();
+        failed.extend(invalid);
+
+        for status in &statuses {
+            self.emit_event(serde_json::json!({
+                "kind": "mcp_connected",
+                "server": status.name,
+                "transport": status.transport,
+                "tool_count": status.tool_count,
+            }));
+        }
+        for name in &failed {
+            self.emit_event(serde_json::json!({
+                "kind": "mcp_connect_failed",
+                "server": name,
+                "error": "connect failed — see daemon log for the specific reason",
+            }));
+        }
+
+        *self.mcp.write().await = Arc::new(manager);
+        (connected, failed)
     }
 
     /// Merge an MCP server config patch into the project-tier settings.json
@@ -1014,6 +1093,10 @@ impl SessionPool {
             }
         }
 
+        let (mcp_connected, mcp_failed) = self.reconcile_mcp_servers(&reloaded.mcp_servers).await;
+        report.mcp_connected = mcp_connected;
+        report.mcp_failed = mcp_failed;
+
         let reloaded = Arc::new(reloaded);
         *self.settings.write().await = reloaded.clone();
         self.config_generation
@@ -1055,12 +1138,14 @@ impl SessionPool {
                 None => self.model.clone(),
             };
 
+        let permission = resolve_session_permission(&self.permission, &self.tools, options);
+
         let mut builder = Builder::new()
             .scene(scene)
             .model(model)
             .tools(self.tools.clone())
             .settings(self.settings.read().await.clone())
-            .permission(self.permission.clone())
+            .permission(permission)
             .memory_store(self.memory_store.clone())
             .session_id(session_id.clone())
             .plugins(self.plugins.read().await.clone())
@@ -1322,6 +1407,38 @@ impl SessionPool {
                         }
                     }
                 }
+                Some(AgentEvent::PermissionPrompt {
+                    prompt_id,
+                    tool_name,
+                    message,
+                    paths,
+                    ..
+                }) => {
+                    // NOT a terminal event — the turn is still in progress,
+                    // waiting on `session.respondToPrompt` (or session
+                    // cancellation) before the tool call resolves and
+                    // `tool_use`/`tool_result` continue as normal. Same
+                    // `kind: "prompt"` / `prompt_type` shape documented in
+                    // `docs/DAEMON_RPC.md`, deliberately generic so a future
+                    // non-permission "stop and ask" need can reuse it
+                    // without a new RPC method.
+                    let f = StreamFrame::event(
+                        &sid,
+                        &turn_id,
+                        serde_json::json!({
+                            "kind":"prompt","prompt_type":"permission","prompt_id":prompt_id,
+                            "tool_name":tool_name,"message":message,
+                            "paths":paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+                        }),
+                    );
+                    if let Ok(mut b) = serde_json::to_vec(&f) {
+                        b.push(b'\n');
+                        if writer.lock().await.write_all(&b).await.is_err() {
+                            writer_broken = true;
+                            break;
+                        }
+                    }
+                }
                 Some(AgentEvent::TurnComplete {
                     stop_reason,
                     api_calls: ac,
@@ -1466,6 +1583,32 @@ impl SessionPool {
             live.cancel.cancel();
             info!(%session_id, "session removed");
         }
+    }
+
+    /// `session.respondToPrompt` — deliver a decision for a pending
+    /// `AgentEvent::PermissionPrompt` (see `session_pool.rs`'s `run_turn`
+    /// event loop). Unlike `shutdown_session`, an unknown `session_id` here
+    /// is a real caller error (answering a prompt for a session that isn't
+    /// running can't silently no-op the way closing an already-closed
+    /// session can) — `Err` on a miss rather than treating it as done.
+    pub async fn respond_to_prompt(
+        &self,
+        session_id: &str,
+        prompt_id: String,
+        decision: runtime::agent::PermissionDecision,
+    ) -> Result<(), String> {
+        let input_tx = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(session_id) {
+                Some(live) => live.input_tx.clone(),
+                None => return Err(format!("session not found: {session_id}")),
+            }
+        };
+        let _ = input_tx.send(InputMessage::PermissionResponse {
+            prompt_id,
+            decision,
+        });
+        Ok(())
     }
 
     /// 关闭所有 session。
@@ -1659,6 +1802,36 @@ fn format_instant(t: Instant) -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
+/// Which `Permission` a new session gets, per `SessionOptions.permission_mode`.
+///
+/// `None` (the default — no `permission_mode` in `session.run_turn`'s
+/// `options`) returns the exact same `Arc` as `default` — not just an
+/// equivalent `AllowAllPermission`, the literal same shared instance — so
+/// existing callers that don't know about `session.respondToPrompt` see
+/// zero behavior change. `Some(mode)` builds a fresh, session-owned
+/// `RuleSetPermission` from `options.permission_rules` instead — opt-in,
+/// per session, not a pool-wide switch. Free function (not inlined into
+/// `create()`) specifically so this decision is unit-testable without
+/// spinning up a real session.
+fn resolve_session_permission(
+    default: &Arc<dyn Permission>,
+    tools: &Arc<base::tool::InMemoryToolRegistry>,
+    options: Option<&SessionOptions>,
+) -> Arc<dyn Permission> {
+    match options.and_then(|o| o.permission_mode) {
+        Some(mode) => Arc::new(permissions::rule_set_permission::RuleSetPermission::new(
+            Arc::new(permissions::gate::PermissionGate::new(
+                permissions::ruleset::RuleSet::new(
+                    options.map(|o| o.permission_rules.clone()).unwrap_or_default(),
+                ),
+            )),
+            tools.clone(),
+            mode.into(),
+        )),
+        None => default.clone(),
+    }
+}
+
 /// Redact a secret to `***<last 4 chars>` (char-boundary safe — slices by
 /// `char`, not byte, so this never panics on non-ASCII input); too-short
 /// secrets (≤4 chars) redact to a bare `***` rather than revealing the
@@ -1693,6 +1866,55 @@ mod redact_tests {
         // panic here; char-based slicing must not.
         let s = "sk-😀😀😀😀";
         assert_eq!(redact_secret(s), "***😀😀😀😀");
+    }
+}
+
+#[cfg(test)]
+mod resolve_session_permission_tests {
+    use super::*;
+
+    struct AllowAllTestPermission;
+    #[async_trait::async_trait]
+    impl base::interface::permission::Permission for AllowAllTestPermission {
+        async fn check(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &std::path::Path,
+            _: &str,
+        ) -> base::interface::permission::PermissionOutcome {
+            base::interface::permission::PermissionOutcome::Permit
+        }
+    }
+
+    #[test]
+    fn no_permission_mode_reuses_the_exact_default_instance() {
+        let default: Arc<dyn Permission> = Arc::new(AllowAllTestPermission);
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        let resolved = resolve_session_permission(&default, &tools, None);
+        assert!(
+            Arc::ptr_eq(&default, &resolved),
+            "must be the literal same shared instance, not just an equivalent one"
+        );
+
+        let opts = SessionOptions::default();
+        let resolved2 = resolve_session_permission(&default, &tools, Some(&opts));
+        assert!(Arc::ptr_eq(&default, &resolved2));
+    }
+
+    #[test]
+    fn permission_mode_set_builds_a_fresh_rule_set_permission() {
+        let default: Arc<dyn Permission> = Arc::new(AllowAllTestPermission);
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        let opts = SessionOptions {
+            permission_mode: Some(base::interface::settings::PermissionMode::Default),
+            ..Default::default()
+        };
+        let resolved = resolve_session_permission(&default, &tools, Some(&opts));
+        assert!(
+            !Arc::ptr_eq(&default, &resolved),
+            "opting in must construct a session-owned instance, not reuse the default"
+        );
     }
 }
 

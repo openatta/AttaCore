@@ -15,7 +15,7 @@
 //!   --mode daemon --socket /tmp/attacored.sock --case tests/cases/c_project.test
 //! ```
 
-use test_runner::{api_runner, cli_runner, comparator, config, reporter, script};
+use test_runner::{api_runner, cli_runner, comparator, config, mutations, reporter, script};
 
 use base::interface::settings::VcrMode;
 use std::path::{Path, PathBuf};
@@ -75,6 +75,18 @@ struct Args {
     /// until this flag existed.
     #[clap(long, default_value = "coding")]
     scene: String,
+
+    /// Build one `Agent` for the whole case and send every turn to it in
+    /// sequence, instead of a fresh `Agent` per turn — see
+    /// `api_runner::run_test_case_same_session`'s doc comment for why this
+    /// is the only way to actually exercise the Skills/Agent-type live-reload
+    /// watchers (a fresh per-turn `Agent` sees current disk state regardless
+    /// of whether a watcher exists). Auto-enabled when the case has a
+    /// `.mutations.json` sidecar (see `--case`) even without this flag, since
+    /// a reload test always needs both; the flag exists for a same-session
+    /// case that doesn't need mutations too.
+    #[clap(long)]
+    same_session: bool,
 }
 
 /// Mirrors `daemon/src/main.rs::resolve_scene` — kept as a small independent
@@ -117,14 +129,27 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let scenario = args.scenario.clone().unwrap_or_else(|| {
-        args.case
+        let short = args
+            .case
             .file_stem()
             .and_then(|s| s.to_str())
-            .map(|s| {
-                // Extract numeric prefix: "000.c_project" → "000"
-                s.split('.').next().unwrap_or(s).to_string()
-            })
-            .unwrap_or_else(|| "unknown".to_string())
+            // Extract numeric prefix: "000.c_project" → "000" (legacy flat
+            // naming under tests/cases/ directly; new mechanism-focused cases
+            // under tests/cases/{skills,agents,mcp,rules,hooks}/ don't use
+            // dots in the stem, so this is a no-op for them).
+            .map(|s| s.split('.').next().unwrap_or(s).to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        // Cases living in a subdirectory of tests/cases/ (e.g.
+        // tests/cases/skills/001_startup.test) get that subdirectory folded
+        // into the scenario name ("skills/001_startup") so the cassette tree
+        // mirrors the case tree (tests/fixtures/cassettes/skills/001_startup/...)
+        // and two mechanisms can both have a "001_startup" case without their
+        // cassettes colliding. Cases directly under tests/cases/ (parent name
+        // "cases") keep the old bare scenario name unchanged.
+        match args.case.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+            Some(parent) if parent != "cases" => format!("{parent}/{short}"),
+            _ => short,
+        }
     });
 
     let round = config::resolve_vcr_round(args.round.clone());
@@ -191,19 +216,36 @@ async fn run_api_mode(
     );
     let model = build_model(&model_config)?;
 
-    let telemetry_path = output_dir.join(format!("{scenario}.telemetry.md"));
+    // `cassette_dir`/`output_dir` (built by `main()`) are already scoped by the
+    // full scenario path (e.g. `.../skills/001_startup/agent/<round>/`), so the
+    // *filename* written inside them only needs the leaf component — using the
+    // full `scenario` (with a `/` in it) here would make `VcrModel` try to
+    // `.join("skills/001_startup.jsonl")` onto an already-`skills/001_startup`-
+    // scoped directory, i.e. write to a nonexistent nested subdirectory that
+    // nothing ever creates, silently losing every recorded entry (`save_entry`
+    // swallows the open() error) while `--mode agent` itself reports success —
+    // caught by a real recording that "passed" but replayed as 100% miss.
+    let scenario_leaf = scenario.rsplit('/').next().unwrap_or(scenario);
+    let telemetry_path = output_dir.join(format!("{scenario_leaf}.telemetry.md"));
 
     let runner_config = api_runner::AgentRunnerConfig {
         model: model.clone(),
         vcr_mode: vcr_mode.clone(),
-        vcr_scenario: scenario.to_string(),
+        vcr_scenario: scenario_leaf.to_string(),
         vcr_dir: cassette_dir.clone(),
         telemetry_path: Some(telemetry_path),
         fixture_dir: args.fixture.clone(),
         scene: resolve_scene(&args.scene)?,
     };
 
-    let outputs = api_runner::run_test_case(runner_config, case).await?;
+    let case_mutations = mutations::load_for_case(&args.case)?;
+    let outputs = if args.same_session || case_mutations.is_some() {
+        eprintln!("Same-session mode: one Agent for the whole case (live-reload testable)");
+        api_runner::run_test_case_same_session(runner_config, case, case_mutations.as_ref())
+            .await?
+    } else {
+        api_runner::run_test_case(runner_config, case).await?
+    };
 
     if args.compare {
         let compare_model = build_model(&model_config)?;

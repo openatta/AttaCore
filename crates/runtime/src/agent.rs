@@ -51,7 +51,11 @@ pub struct Attachment {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+/// Wire shape: `{"type":"permit"}` / `{"type":"deny","reason":"..."}` —
+/// what `session.respondToPrompt` (daemon RPC) parses out of its
+/// `decision` param and what `InputMessage::PermissionResponse` carries.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PermissionDecision {
     Permit,
     Deny { reason: String },
@@ -78,7 +82,22 @@ pub struct Agent {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) tools: Arc<InMemoryToolRegistry>,
     pub(crate) settings: Arc<Settings>,
+    /// Real `EngineConfig` derived from `settings` via `EngineConfig::from_settings`
+    /// — the tool-dispatch closure (`ToolExecCtx.config`) clones this instead of
+    /// the `defaults_for("unknown")` placeholder it used to hardcode, so every
+    /// tool call sees the actual configured sandbox/permission/shell-execution
+    /// settings, not silent defaults.
+    pub(crate) config: Arc<base::context::EngineConfig>,
     pub(crate) permission: Arc<dyn Permission>,
+    /// Permission requests currently awaiting a host response, keyed by
+    /// `prompt_id`. `execute_tool_inner` registers a `oneshot` sender here
+    /// when `Permission::check` returns `PermissionOutcome::Prompt`, then
+    /// awaits the paired receiver (with a timeout); the
+    /// `InputMessage::PermissionResponse` branch below looks the sender up
+    /// by `prompt_id` and fires it. A `prompt_id` with no entry (already
+    /// timed out, or a stale/duplicate response) is silently ignored.
+    pub(crate) pending_permissions:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>>>,
     pub(crate) memory_store: Arc<MemoryStore>,
     pub(crate) session: SessionManager,
     pub(crate) perf: Arc<PerfCollector>,
@@ -257,7 +276,7 @@ impl Agent {
         let cwd = self.settings.paths.project_root();
         let scope = self.settings.paths.scope.clone();
         // Skills: global default (flat, cross-scene) + scene-specific override
-        // (same name wins — `SkillManager::load_dir` overwrites by name, so
+        // (same name wins — `SkillManager::load_dir_subdirs` overwrites by name, so
         // loading global first then scene lets the scene tier win).
         let global_skills_dir = self.settings.paths.global_data_dir.join("skills");
         let scene_skills_dir = self.settings.paths.user_data_dir.join("skills");
@@ -273,10 +292,10 @@ impl Agent {
             // 2. Re-scan skills directories for newly added skills.
             async move {
                 let count0 =
-                    skills.load_dir(&global_skills_dir, skills::manager::SkillSource::User);
-                let count1 = skills.load_dir(&scene_skills_dir, skills::manager::SkillSource::User);
+                    skills.load_dir_subdirs(&global_skills_dir, skills::manager::SkillSource::User);
+                let count1 = skills.load_dir_subdirs(&scene_skills_dir, skills::manager::SkillSource::User);
                 let count2 =
-                    skills.load_dir(&local_skills_dir, skills::manager::SkillSource::Project);
+                    skills.load_dir_subdirs(&local_skills_dir, skills::manager::SkillSource::Project);
                 (count0.ok(), count1.ok(), count2.ok())
             },
             // 3. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
@@ -935,22 +954,35 @@ impl Builder {
         });
         // MCP: use pre-built manager if injected, else empty (no servers).
         let mcp = self.mcp_manager_override.unwrap_or_else(McpManager::empty);
+        // Hand `agent_tool_arc` a snapshot of the connected MCP tools now,
+        // for `AgentTypeDefinition.mcp_servers` — see
+        // `Inner::mcp_tool_adapters`'s doc comment for why a snapshot Vec,
+        // not a live `McpManager` reference.
+        agent_tool_arc.set_mcp_tool_adapters(mcp.tool_adapters().to_vec());
         // Skill auto-loading: scan ~/.atta/skills/ (global default), then
         // ~/.atta/scenes/<scope>/skills/ (scene override — same name wins,
-        // `load_dir` overwrites by name), then project/.agents/skills/
+        // `load_dir_subdirs` overwrites by name), then project/.agents/skills/
         // (project — external fact standard, also scanned by Codex).
+        // `load_dir_subdirs` (not the flat-only `load_dir`) so both
+        // `<name>.md` and the `<name>/SKILL.md` subdirectory convention (the
+        // one Claude Code itself uses, and what `discover_for_paths`/
+        // `reload_skill` already supported) are picked up at startup — a
+        // project skill authored the SKILL.md way used to silently never
+        // load until its first live-reload edit. Found via the new VCR test
+        // suite: the fixture project's `code-review` skill (subdirectory
+        // format) was completely absent from every recorded system prompt.
         let skill_mgr = skills::manager::SkillManager::new();
         let project_skills_dir = settings.paths.project_root().join(".agents").join("skills");
         let skill_load_results = [
-            skill_mgr.load_dir(
+            skill_mgr.load_dir_subdirs(
                 &settings.paths.global_data_dir.join("skills"),
                 skills::manager::SkillSource::User,
             ),
-            skill_mgr.load_dir(
+            skill_mgr.load_dir_subdirs(
                 &settings.paths.user_data_dir.join("skills"),
                 skills::manager::SkillSource::User,
             ),
-            skill_mgr.load_dir(&project_skills_dir, skills::manager::SkillSource::Project),
+            skill_mgr.load_dir_subdirs(&project_skills_dir, skills::manager::SkillSource::Project),
         ];
         let loaded_count: usize = skill_load_results
             .iter()
@@ -964,19 +996,54 @@ impl Builder {
         let total_skills = skill_mgr.list().len();
         tracing::info!(loaded_count, total_skills, "skills loaded (incl. bundled)");
 
+        // Live skill reload: `SkillManager::enable_watching` + `check_for_changes`
+        // (the latter already called once per turn — `turn.rs`'s
+        // `run_user_turn`) were both fully implemented but `enable_watching`
+        // had no caller anywhere, so the watcher never actually started —
+        // every session was silently stuck on the one-time `warmup()` rescan
+        // for the rest of its life. `notify` setup can fail (inotify/kqueue
+        // limits, permissions); that's degraded-but-safe (skills still work,
+        // edits just need a session rebuild to show up, same as before this
+        // fix), so a warning, not a hard error.
+        if let Err(e) = skill_mgr.enable_watching(&[
+            settings.paths.global_data_dir.join("skills"),
+            settings.paths.user_data_dir.join("skills"),
+            project_skills_dir.clone(),
+        ]) {
+            tracing::warn!(error = %e, "failed to enable skill file watching; live skill reload disabled for this session");
+        }
+
         // Build command registry from skill manager + built-in local commands
         // — unless the caller already built one to share across many
         // sessions (see `Builder::commands_override`), which also carries
         // any plugin-contributed slash commands (daemon builds that catalog
         // once at startup, not per session).
         let skill_mgr_arc = std::sync::Arc::new(skill_mgr);
+        // `agent_tool_arc` was built before skills finished loading (see the
+        // comment at its own construction site) — hand it the manager now,
+        // via interior mutability, so `AgentTypeDefinition.skills` (preload)
+        // can resolve when a subagent is spawned later in this session.
+        agent_tool_arc.set_skill_manager(skill_mgr_arc.clone());
         let command_registry = self.commands_override.clone().unwrap_or_else(|| {
             std::sync::Arc::new(crate::commands::CommandRegistry::from_skill_manager(
                 &skill_mgr_arc,
             ))
         });
-        // Register SkillTool using the populated skill manager
-        tools::register_skill_tool(&tools, Arc::clone(&skill_mgr_arc));
+        // Register SkillTool using the populated skill manager. Also gives
+        // it a real `AgentSpawner` — previously `register_skill_tool` never
+        // received one at all, so a `context: fork` skill's spawner branch
+        // (`SkillTool::call`) was unreachable in every real session; it
+        // silently fell through to running inline instead of forking, no
+        // matter what the skill's frontmatter said.
+        let skill_tool_spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner> = Arc::new(
+            crate::agent_spawner_impl::RuntimeAgentSpawner::new(agent_tool_arc.clone()),
+        );
+        tools::register_skill_tool(
+            &tools,
+            Arc::clone(&skill_mgr_arc),
+            Some(skill_tool_spawner),
+            permission.clone(),
+        );
         // Register TaskStopTool — stop running background tasks by ID
         tools.register(std::sync::Arc::new(tools::task_stop::TaskStopTool));
         // Register TaskOutputTool — retrieve output from running/completed tasks
@@ -1022,6 +1089,7 @@ impl Builder {
 
         // Capture feature flags before settings is moved into the Agent struct
         let cached_mc_enabled = settings.feature_flags.cached_microcompact;
+        let config = Arc::new(base::context::EngineConfig::from_settings(&settings));
 
         Ok((
             Agent {
@@ -1029,7 +1097,9 @@ impl Builder {
                 model,
                 tools,
                 settings,
+                config,
                 permission,
+                pending_permissions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 memory_store,
                 session,
                 perf: Arc::new(PerfCollector::new()),
@@ -1113,6 +1183,7 @@ mod tests {
             telemetry_url: None,
             session_dir: None,
             memory_enabled: true,
+            disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,

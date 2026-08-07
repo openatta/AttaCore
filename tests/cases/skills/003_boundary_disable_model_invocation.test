@@ -1,0 +1,15 @@
+# 测试用例：Skills —— disable_model_invocation: true 的 skill，模型主动调用必须被拒绝
+# 前置: --fixture tests/fixtures/template_project --scene coding
+# 预期: fixture 里的 release-notes skill 带 disable_model_invocation: true，因此它
+#       从 "## Available Skills" 系统提示词里被过滤掉（build_skills_text 的既有行为），
+#       模型不会自己主动想到调用它——这里直接在用户消息里点名让模型调用，绕开"模型能不能
+#       发现它"这个问题，专测 SkillTool::call() 里的真实拒绝逻辑
+#       （crates/tools/src/skill_tool.rs：disable_model_invocation 为 true 时返回
+#       ToolError::Denied，不管是不是模型自己发现的）。
+
+>>>>>>>>>>>>>>>>
+不用读任何文件。直接调用一下 release-notes 这个 skill。
+<<<<<<<<<<<<<<<<
+模型调用了 Skill 工具，skill 参数为 "release-notes"，但工具返回了拒绝/错误（提示这个 skill
+的 disable_model_invocation 被设置了、只能通过用户手动的 slash command 调用，模型不能自己
+调用），模型没有假装调用成功、也没有编造该 skill 的执行结果。

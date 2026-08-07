@@ -189,6 +189,7 @@ mod tests {
             vcr: None,
             telemetry_url: None,
             memory_enabled: true,
+            disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
             hooks_config: None,

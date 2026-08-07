@@ -318,8 +318,12 @@ pub fn expand_skill_for_command(entry: &SkillEntry, args: &str) -> String {
             .unwrap_or_else(|_| format!("# {}\n\n{}", entry.name, entry.description))
     };
 
-    // Expand variables: {args}, $ARGUMENTS, etc.
-    let expanded = base::frozen::expand_skill_vars(&body, args);
+    // Expand variables: {args}, $ARGUMENTS, $name (named `arguments:`), etc.
+    let expanded = base::frozen::skill::expand_skill_vars_named(
+        &body,
+        args,
+        entry.arguments.as_deref().unwrap_or(&[]),
+    );
 
     // Wrap with invocation header (TS parity: command-message/command-name XML tags)
     format!(

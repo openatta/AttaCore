@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod agent_spawner_impl;
 pub mod agent_tool;
+mod agent_type_watcher;
 pub mod hook_executors;
 pub mod turn;
 pub mod request;

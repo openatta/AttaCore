@@ -80,8 +80,17 @@ pub fn assemble_tool_pool_refs<'a>(
     pool.into_values().collect()
 }
 
-pub fn register_skill_tool(r: &base::tool::InMemoryToolRegistry, m: std::sync::Arc<skills::manager::SkillManager>) {
-    r.register(std::sync::Arc::new(crate::skill_tool::SkillTool::new(m)));
+pub fn register_skill_tool(
+    r: &base::tool::InMemoryToolRegistry,
+    m: std::sync::Arc<skills::manager::SkillManager>,
+    spawner: Option<std::sync::Arc<dyn base::interface::agent_spawner::AgentSpawner>>,
+    permission: std::sync::Arc<dyn base::interface::permission::Permission>,
+) {
+    let mut tool = crate::skill_tool::SkillTool::new(m).with_permission(permission);
+    if let Some(spawner) = spawner {
+        tool = tool.with_spawner(spawner);
+    }
+    r.register(std::sync::Arc::new(tool));
 }
 
 /// Register the standard set of self-contained built-in tools — no host-specific

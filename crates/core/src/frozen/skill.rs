@@ -31,10 +31,29 @@ pub struct SkillEntry {
     pub argument_hint: Option<String>,
     /// Restrict tools this skill can invoke (whitelist of tool names)
     pub allowed_tools: Option<Vec<String>>,
+    /// Tools removed from the pool while this skill is active (denylist,
+    /// applied before `allowed_tools`). Clears on the next user message,
+    /// same lifecycle as `allowed_tools`.
+    pub disallowed_tools: Option<Vec<String>>,
+    /// Named positional arguments (`arguments: [issue, branch]`) for `$name`
+    /// substitution in the skill body, in addition to the existing
+    /// positional `$1`..`$9`/`$ARGUMENTS` forms.
+    pub arguments: Option<Vec<String>>,
     /// Override model for this skill
     pub model: Option<String>,
-    /// Execution context: "fork" (sub-agent in worktree) or "inline" (default)
+    /// Effort/thinking-mode override while this skill is active. Maps onto
+    /// `base::interface::settings::ThinkingMode` — AttaCore has no separate
+    /// "effort" axis, so this is not a new concept, just this field's name.
+    pub effort: Option<String>,
+    /// Execution context: "fork" (sub-agent) or "inline" (default)
     pub context: Option<String>,
+    /// Which agent type to run as when `context: "fork"` is set. Defaults to
+    /// `general-purpose` when unset, matching Claude Code.
+    pub agent: Option<String>,
+    /// Only meaningful with `context: "fork"`. `false` waits for the forked
+    /// result in the invoking turn instead of running it in the background.
+    /// Default: `true` (background).
+    pub background: Option<bool>,
     /// If true, model cannot invoke this skill directly (only user via slash)
     pub disable_model_invocation: bool,
     /// If false, skill is hidden from user-facing slash command list
@@ -64,8 +83,13 @@ impl Default for SkillEntry {
             path: PathBuf::new(),
             argument_hint: None,
             allowed_tools: None,
+            disallowed_tools: None,
+            arguments: None,
             model: None,
+            effort: None,
             context: None,
+            agent: None,
+            background: None,
             disable_model_invocation: false,
             user_invocable: true,
             paths: None,
@@ -360,7 +384,11 @@ pub async fn try_expand_skill_command(
     Some(format_skill_invocation(skill, args).await)
 }
 
-/// **P6 **: expand skill variables in `body`.
+/// **P6 **: expand skill variables in `body`. Equivalent to
+/// `expand_skill_vars_named(body, args, &[])` — no named-argument
+/// substitution, only positional/legacy forms. Kept as the simple entry
+/// point for the many call sites (and tests) that don't have a skill's
+/// `arguments` frontmatter list on hand.
 ///
 /// Substitution rules (applied in order):
 /// 1. `{ARGS}` -> full `args` string (legacy attacode convention)
@@ -370,9 +398,31 @@ pub async fn try_expand_skill_command(
 /// 4. If none of 1-3 substituted **anything** and `args` is non-empty, append
 ///    "\n\nUser arguments: {args}" at the end (legacy fallback).
 pub fn expand_skill_vars(body: &str, args: &str) -> String {
+    expand_skill_vars_named(body, args, &[])
+}
+
+/// Same as `expand_skill_vars`, plus named-argument substitution: for each
+/// name in `arg_names` (the skill's `arguments:` frontmatter list, in
+/// order), `$name` in the body is replaced with the positional argument at
+/// that index (whitespace-separated, same splitting as `$1`..`$9`). A name
+/// with no corresponding argument expands to an empty string — matching
+/// Claude Code's documented behavior for named placeholders (as opposed to
+/// an *indexed* placeholder with no argument, which is left unchanged; that
+/// asymmetry is intentional and matches the spec, not a bug).
+pub fn expand_skill_vars_named(body: &str, args: &str, arg_names: &[String]) -> String {
     let positions: Vec<&str> = args.split_whitespace().collect();
     let mut out = body.to_string();
     let mut substituted = false;
+
+    // Named args: $name -> positional value by declared order.
+    for (i, name) in arg_names.iter().enumerate() {
+        let placeholder = format!("${name}");
+        if out.contains(&placeholder) {
+            let value = positions.get(i).copied().unwrap_or("");
+            out = out.replace(&placeholder, value);
+            substituted = true;
+        }
+    }
 
     // Legacy: {ARGS} placeholder
     if out.contains("{ARGS}") {
@@ -428,7 +478,11 @@ pub async fn format_skill_invocation(skill: &SkillEntry, args: &str) -> Result<S
     //   - `$1`..`$9` -- positional args split on whitespace
     // If none of the above are present and args is non-empty, args is appended
     // verbatim at the end (legacy behavior).
-    let body_with_args = expand_skill_vars(&body, args);
+    let body_with_args = expand_skill_vars_named(
+        &body,
+        args,
+        skill.arguments.as_deref().unwrap_or(&[]),
+    );
     let mut s = String::with_capacity(body_with_args.len() + 256);
     s.push_str(&format!(
         "Apply the skill `{}` ({}). Follow the playbook below.\n\n",
@@ -653,6 +707,31 @@ mod tests {
     fn expand_missing_positional_becomes_empty() {
         let body = "first=$1 second=$2";
         assert_eq!(expand_skill_vars(body, "only"), "first=only second=");
+    }
+
+    #[test]
+    fn expand_named_args_substitute_by_declared_order() {
+        let body = "Migrate $component from $from to $to.";
+        let names = vec!["component".to_string(), "from".to_string(), "to".to_string()];
+        let r = expand_skill_vars_named(body, "SearchBar React Vue", &names);
+        assert_eq!(r, "Migrate SearchBar from React to Vue.");
+    }
+
+    #[test]
+    fn expand_named_arg_with_no_matching_positional_becomes_empty() {
+        let body = "value=$only";
+        let names = vec!["only".to_string()];
+        let r = expand_skill_vars_named(body, "", &names);
+        assert_eq!(r, "value=");
+    }
+
+    #[test]
+    fn expand_skill_vars_with_empty_names_matches_unnamed_variant() {
+        let body = "Run with {ARGS}.";
+        assert_eq!(
+            expand_skill_vars_named(body, "x y z", &[]),
+            expand_skill_vars(body, "x y z")
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ impl AgentSpawner for RuntimeAgentSpawner {
         _allowed_tools: Vec<String>,
         cwd: PathBuf,
         cancel: CancellationToken,
+        agent_type: Option<String>,
     ) -> Result<String, Box<dyn std::error::Error + Send>> {
         // Delegate to AgentTool::run_sub with all tools available.
         // allowed_tools filtering is not yet implemented — the sub-agent gets
@@ -39,12 +40,25 @@ impl AgentSpawner for RuntimeAgentSpawner {
         let perm = self.agent_tool.sub_permission();
 
         self.agent_tool
-            // No subagent_type here — `AgentSpawner` is the generic
-            // cross-crate spawning interface (team/skill-fork), it has no
-            // concept of a named agent type, so no per-type model override
-            // applies; the parent's model is used, matching prior behavior.
-            .run_sub(prompt, tools, cwd, cancel, perm, None)
+            .run_sub(prompt, tools, cwd, cancel, perm, agent_type.as_deref())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)
+    }
+
+    async fn spawn_agent_background(
+        &self,
+        prompt: String,
+        _allowed_tools: Vec<String>,
+        cwd: PathBuf,
+        cancel: CancellationToken,
+        agent_type: Option<String>,
+        session: Arc<base::context::SessionState>,
+    ) -> Result<String, Box<dyn std::error::Error + Send>> {
+        let tools = self.agent_tool.sub_tools();
+        let task_id = self
+            .agent_tool
+            .spawn_background(prompt, tools, cwd, cancel, agent_type.as_deref(), session)
+            .await;
+        Ok(task_id)
     }
 }

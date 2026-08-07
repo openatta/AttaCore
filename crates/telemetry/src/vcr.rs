@@ -380,6 +380,42 @@ fn dehydrate(s: &str) -> String {
     });
     result = RE_LS_TIMESTAMP.replace_all(&result, "[LS_TIMESTAMP]").to_string();
 
+    // ── "Today's date is X" (chat/research scene preambles, and the
+    // `<system-reminder># currentDate` block `turn.rs` injects once per
+    // session) ── Unlike the `Date: \S+` field above (a different, less
+    // common format), this string is a real `chrono_now()`/wall-clock value
+    // baked into the very first system prompt of every session, so — unlike
+    // the `ls -l` case above, which only bites turns that actually ran a
+    // listing command — this desyncs the hash of *every single cassette's
+    // first turn* the day after it was recorded (found while investigating
+    // why every one of §14's freshly-verified 23/23-hit cassettes started
+    // missing again with no code change: the sandbox clock had simply
+    // advanced a day). Matches both `is 2026-08-07.` and `is 2026-08-07\.
+    // Host OS: ...` forms without needing two patterns.
+    static RE_TODAYS_DATE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Today's date is \S+\.").unwrap());
+    result = RE_TODAYS_DATE.replace_all(&result, "Today's date is [TODAY].").to_string();
+
+    // ── UUIDs embedded in tool_result content ── Same class of bug as the
+    // `ls -l` timestamp case above, different trigger: a model can decide
+    // *on its own* (not prompted to) to run something like
+    // `python3 -c "import uuid; print(uuid.uuid4())"` to generate a task ID
+    // before delegating to a subagent, and that value is genuinely random
+    // every real execution — no dehydration of the *skill/agent* content
+    // itself would catch this, since the randomness originates from the
+    // model's own tool call, not from anything this codebase renders.
+    // Found via a real recording (agent delegation turn) that missed on
+    // strict replay immediately after being recorded, with the miss traced
+    // to a `uuid.uuid4()`-generated string in a Bash tool_result — see
+    // docs/design/2026-08-05-test-architecture.md §18. Matches standard
+    // 8-4-4-4-12 hex UUID form (v1-v5, case-insensitive), which is
+    // specific enough to not risk false-positive matches on unrelated hex
+    // content.
+    static RE_UUID: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").unwrap()
+    });
+    result = RE_UUID.replace_all(&result, "[UUID]").to_string();
+
     result
 }
 
@@ -501,6 +537,52 @@ mod tests {
         assert!(dehydrated.contains("[LS_TIMESTAMP]"));
         let hydrated = hydrate(&dehydrated);
         assert!(!hydrated.contains("[LS_TIMESTAMP]"));
+    }
+
+    /// The chat/research scene preamble and the `<system-reminder>#
+    /// currentDate` block both bake a real wall-clock date into the very
+    /// first system prompt of a session — must normalize so a cassette
+    /// recorded on one day still replays cleanly on any later day.
+    #[test]
+    fn dehydrate_normalizes_todays_date_line_so_replay_survives_a_day_boundary() {
+        let recorded = "Today's date is 2026-08-06. Host OS: macos. Shell: /bin/bash.";
+        let replayed = "Today's date is 2026-08-07. Host OS: macos. Shell: /bin/bash.";
+        assert_ne!(recorded, replayed, "sanity: the two raw strings actually differ");
+        assert_eq!(
+            dehydrate(recorded),
+            dehydrate(replayed),
+            "the 'Today's date is X' preamble must dehydrate identically regardless of the actual date"
+        );
+    }
+
+    /// Same normalization, for the other call site's slightly different
+    /// sentence (`turn.rs`'s `<system-reminder># currentDate` block, no
+    /// trailing "Host OS/Shell" clause).
+    #[test]
+    fn dehydrate_normalizes_todays_date_line_in_system_reminder_form_too() {
+        let recorded = "# currentDate\nToday's date is 2026-08-06.\n\nIMPORTANT: ...";
+        let replayed = "# currentDate\nToday's date is 2026-08-07.\n\nIMPORTANT: ...";
+        assert_eq!(dehydrate(recorded), dehydrate(replayed));
+    }
+
+    /// A model can spontaneously run something like
+    /// `python3 -c "import uuid; print(uuid.uuid4())"` before delegating to
+    /// a subagent — the resulting UUID in that tool_result is genuinely
+    /// random every real execution, no different between two runs of
+    /// "the same" recorded conversation than the ls -l timestamp case.
+    #[test]
+    fn dehydrate_normalizes_uuids_so_a_models_own_random_generation_hashes_the_same() {
+        let recorded = "ToolResult content: 7e71e056-c7f9-4d61-8731-431cc023b43b\n";
+        let replayed = "ToolResult content: a1b2c3d4-e5f6-4789-a012-3456789abcde\n";
+        assert_ne!(recorded, replayed, "sanity: the two raw UUIDs actually differ");
+        assert_eq!(dehydrate(recorded), dehydrate(replayed));
+    }
+
+    #[test]
+    fn dehydrate_uuid_normalization_is_case_insensitive() {
+        let lower = "id: 7e71e056-c7f9-4d61-8731-431cc023b43b";
+        let upper = "id: 7E71E056-C7F9-4D61-8731-431CC023B43B";
+        assert_eq!(dehydrate(lower), dehydrate(upper));
     }
 
     struct MockModel;

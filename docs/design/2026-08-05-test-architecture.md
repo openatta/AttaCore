@@ -615,3 +615,154 @@ VCR 只是把它以"哈希对不上"的形式最先暴露出来。
 `cargo test -p skills --lib`（20 个，含本轮新增 1 个排序测试）全部通过；`cargo build --workspace`
 通过；`cargo test --workspace --lib` 除既有的 `team::remote_agent` 失败集合外全部通过。真实录制
 + 严格模式回放如 §14.1 所述，23/23 命中，已用真实凭证验证，不是推测。
+
+## 15. `api_runner.rs` 重构后的回归核查：两个新根因（同日晚些时候）
+
+在 §14 之后新增 `run_test_case_same_session`/`build_agent`/`send_and_collect`（为 mutation
+manifest 的同会话 reload 测试铺路，§16）时，对既有 000/001/002/003 四份 cassette 做
+`ATTA_VCR_STRICT=1` 回归核查，结果不稳定：同一条命令连续跑两次报出两种不同的错误
+（一次"prompt too long"，一次哈希 miss）。怀疑是重构引入的会话隔离 bug，逐一排查后确认
+**与 `api_runner.rs` 的改动无关**，是两个独立的真实 bug：
+
+### 15.1 根因一：系统提示词里的日期没有被 dehydrate
+
+`turn.rs`/`chat.rs`/`research.rs` 都会把 `chrono_now()` 的真实日期拼进系统提示词
+（"Today's date is 2026-08-06."），`dehydrate()` 只处理了 `ls -l` 时间戳（§13），没处理这一行——
+录制当天能回放,过了午夜（沙箱时钟推进到第二天）就 100% miss，且是**每个 cassette 的第一轮就
+miss**，比 §14 的 skills 顺序问题更基础。修复：`crates/telemetry/src/vcr.rs::dehydrate()` 新增
+`RE_TODAYS_DATE`，把 `Today's date is \S+\.` 统一替换成 `Today's date is [TODAY].`，覆盖
+`chat.rs`/`research.rs` 的" Host OS/Shell"变体和 `turn.rs` 的 `<system-reminder># currentDate`
+变体。新增 2 个回归测试。
+
+**副作用（预期内)**：dehydrate() 的输出变了，意味着 hash_request 的输入变了，**旧 round 下所有
+已录制 cassette 的哈希全部失效**——这是这类归一化修复的固有代价（§14 修复时同理），不是本次
+新引入的问题。四份 cassette 在 round `2026-08-06` 下用真实凭证重新录制。
+
+### 15.2 根因二：VCR record 模式是 append-only，重录前没清空旧文件
+
+`VcrModel` 写 cassette 用 `OpenOptions::new().create(true).append(true)`——重新录制 000/003
+时没有先删掉旧文件，导致新录制的条目追加在 §15.1 修复之前的旧条目后面，同一个 `.jsonl` 里混了
+两代不完全一致的对话分支（LLM 在多步工具调用路径上的采样有天然变数，两次录制不保证走完全
+相同的步骤）。回放时按精确哈希查找，找不到"当前这次实际发生的分支"对应的记录就 miss。修复：
+重录前先 `rm` 旧 cassette 文件，不能依赖"record 模式会覆盖"这个错误假设。
+
+### 15.3 根因三：memory 子系统的后台任务没有接 `memory_enabled` 开关
+
+修完 15.1/15.2 后 003（唯一带 `--fixture`、真正启用了 project skills/rules 的用例）仍然
+偶发 miss。用 `ATTA_DEBUG_VCR_MISS=1` 揪出来：miss 点是一条被注入的
+`<system-reminder>Relevant memories for this query: ...</system-reminder>`，内容是上一轮
+对话里刚被 `memory_extraction_prompt()`（本轮新功能）提炼出的记忆。追查发现
+`crates/runtime/src/turn.rs` 里有两处后台任务——记忆预取（"Memory prefetch" 块,约行 236）和
+轮次结束后的自动记忆提炼（"P0-2: Auto-extract durable memories" 块,约行 934）——**都没有检查
+`self.settings.memory_enabled`**，只有 `crates/core/src/interface/prompt.rs` 里的静态系统
+提示词注入检查了这个开关。`tests/runner/src/api_runner.rs::build_agent()` 一直显式设置
+`settings.memory_enabled = false`，一直没生效在这两处。
+
+这两个后台任务是 `tokio::spawn` 出去的 fire-and-forget，与"轮次何时算完成"之间没有强同步，
+录制和回放两次运行里谁先谁后、要不要得及在下一轮开始前把记忆落盘,是真实的时序竞争——即使
+两次运行内容上完全一致，回放也可能因为这条竞争的结果不同而 miss。这不是"测试专属"的问题：
+生产环境里任何显式关闭 `memory_enabled` 的场景（比如一次性/隐私敏感的会话）之前也没有真正
+被这个开关保护到。
+
+修复：两处都加上 `if self.settings.memory_enabled { ... }` 门禁（预取块用 `if ... { None } else
+{ ... }` 的形式，因为它是表达式位置）。`cargo test -p runtime --lib` 75 个全过。
+
+### 15.4 验证
+
+三个修复叠加后，000/001/002/003 四份 cassette 全部在 round `2026-08-06` 下用真实凭证重新
+录制，`ATTA_VCR_STRICT=1` 连续两轮（8 次运行）全部零 miss——回归检查到此才真正证明
+`api_runner.rs` 的 `build_agent`/`send_and_collect`/`run_test_case_same_session` 重构本身
+没有引入任何行为差异,此前两次不一致的报错完全是本节这两个独立 bug 的症状,不是重构的锅。
+
+## 16. §15 验证过程中顺带挖到的第四个真实 bug：`load_dir` 是 flat-only,`SKILL.md` 子目录格式在启动时从不被扫描
+
+在 §15.4 验证通过之后，为了给 Batch 1 的 Skills 用例设计一个"启动时能被真实调用"的最小样例，
+去看 `tests/fixtures/template_project/.agents/skills/code-review/SKILL.md`——按子目录约定
+（`<name>/SKILL.md`,Claude Code 自己也用这个约定）写的。003 用例第一轮的录制历史里，模型确实
+尝试调用了 `code-review`，但工具返回 `"Skill 'code-review' not found."`。
+
+排查：`crates/skills/src/manager.rs` 里同时有 `load_dir`（只认平铺的 `<name>.md`）和
+`load_dir_subdirs`（同时认 `<name>/SKILL.md` 子目录格式和平铺格式，`reload_skill`/
+`discover_for_paths` 早就在用后者）。但 **`crates/runtime/src/agent.rs`（`Builder::build()`
+三处 + `warmup()` 三处）和 `daemon/src/session_pool.rs::build_shared_commands`（三处）—— 全部
+九个生产环境的启动期扫描调用点,清一色调的是 `load_dir`**。子目录格式的 skill 在启动时被
+完全无视,只有等它第一次被 `SkillWatcher` 的文件变更事件命中（走 `reload_skill`，两种格式都
+认）才会第一次真正进入内存——也就是说这不是"测试专属"的边角案例,是**每一个按官方约定写
+`SKILL.md` 子目录的项目级/用户级 skill,在全新进程启动的第一个 session 里都不可用**的生产
+bug,一直没被发现是因为之前从没有一个真实录制的用例包含"启动就调用一个子目录格式的项目
+skill"这个路径。
+
+修复：九个调用点全部把 `load_dir` 换成 `load_dir_subdirs`（后者是超集,平铺格式行为不变）。
+新增回归测试 `load_dir_subdirs_finds_skill_md_in_a_named_subdirectory`（先证明 `load_dir`
+确实找不到,再证明 `load_dir_subdirs` 能找到,把"为什么不能退回 flat-only"这个契约钉死）。
+
+### 16.1 验证
+
+`cargo test -p runtime -p skills --lib` 全过（75 + 22）；`cargo test -p daemon --test
+daemon_e2e` 38 个全过（`build_shared_commands` 改动没破协议层测试）。000/003 两份
+`--fixture` cassette 因为 Available Skills 列表内容变了（多了 `code-review`）需要重新录制，
+重录后 `ATTA_VCR_STRICT=1` 连续两轮（000/001/002/003 共 8 次运行）零 miss——四份 cassette
+在这一串修复（§15 的两个 + 本节这个）叠加之后,第一次真正做到"随便跑几次都一样",可以作为
+Batch 1 之后所有新用例的可信基线。
+
+## 17. 第五个真实 bug：并发 tool_result 按完成顺序而不是提交顺序落进 session message
+
+给 skills 用例设计"启动即可调用"的最小样例（001_startup_invocation）时，模型主动发起 3 个
+并发 Glob 调用来探索项目结构，严格回放偶发 miss，且连续两次运行给出的 hash 都不一样——用
+`ATTA_DEBUG_VCR_MISS=1` 对比两次的完整 dump，system_text/tools/messages 打印出来的文本
+**完全一致**，但 hash 就是不同,说明问题出在打印没覆盖到的细节上。
+
+根因：`crates/runtime/src/streaming.rs::execute_stream`——并发安全的 tool（比如同一条回复
+里的多个 Glob）会立刻 spawn 进 `FuturesUnordered`，批次结束时用
+`while let Some(...) = batch_futures.next().await` 排空，`FuturesUnordered::next()` 按
+**完成顺序**（不是提交顺序）出结果，而排空循环直接把每个结果 `push` 进
+`pending_result_blocks`，最终整批打包成一条 `ToolResult` 消息落进 session。
+`flush_tool_batch` 原来的注释写得很清楚："order doesn't need to match — the API only
+requires the *set* to line up"——这话对 Anthropic 兼容 API 是对的（确实不检查
+`tool_result` 顺序，只检查 id 集合是否对得上），但对 VCR 回放不成立：
+`VcrModel::hash_request` 是把 dehydrate 之后的完整消息内容摊平进哈希的，同一批工具在
+record 和 replay 两次真实调用里完成的先后顺序不保证一致（尤其是像 Glob 这种耗时和实际
+文件系统状态相关的调用），messages 内容顺序一变,这条消息之后每一条请求的哈希全部跟着变。
+
+修复：给 `pending_result_blocks` 每个条目挂上它在这一轮里的原始提交序号（复用
+`crates/runtime/src/dispatch.rs::dispatch_tool_calls` 早就用对的手法——那边用
+`results[idx] = ...` 按下标写回一个预分配好长度的 Vec，`streaming.rs` 这边此前是唯一
+一处没照抄这个模式的并发结果收集点），`flush_tool_batch` 落盘前按序号排序,`不管三个
+Glob 谁先跑完,最终消息里的顺序永远是模型本来提交的顺序。新增回归测试
+`concurrent_tool_results_flush_in_submission_order_not_completion_order`：故意让"最先
+提交"的那个工具人为睡最久、"最后提交"的睡最短，断言排空之后 `ToolResult` 顺序仍然是
+提交顺序，不是完成顺序（不加这个人为延迟差,测试本身就是假阳性——两者顺序偶然相同的概率
+不低，必须真的制造出完成顺序与提交顺序相反才能验证排序真的生效）。
+
+### 17.1 验证
+
+`cargo test -p runtime --lib` 76 个全过（75 + 本节新增 1 个）。000 用例（案发现场——第二轮
+"构建并运行"会触发模型自己发起多个并行 Glob/Bash）重新录制后连续 **5 次** 严格回放零 miss
+（此前哪怕录制刚完成、立刻回放都能不稳定复现两种不同的 miss）——这是这一串 §15/§16/§17
+三轮真实 bug 修完之后，第一个连续跑 5 次都没有任何波动的用例，可以放心作为后续所有新用例的
+参照基线。
+
+## 18. Skills/Agents 对齐 Claude Code 实现完成后的回归验证：第六个真实 bug——模型自己生成的 UUID
+
+给 003 用例的第三轮（reviewer 子 agent 委派）加上 `skills:` 预注入验证后重新录制,严格回放
+**刚录完立刻就 miss**——用 `ATTA_DEBUG_VCR_MISS=1` 定位到:模型在调用 `Agent` 工具委派给
+`reviewer` 之前,自己决定先跑了一条 `python3 -c "import uuid; print(str(uuid.uuid4()))"`
+生成一个"task id"。`uuid.uuid4()` 每次真实执行都是真随机,这个值被写进 `tool_result`,进了
+消息历史,后续每一条请求的哈希都跟着遭殃——跟本文档前面 §13(ls -l 时间戳)、§15.1(日期行)、
+§17(并发工具结果乱序)是完全同一类问题的第四次出现:**发给模型的历史里混进了任何一处
+真随机内容,回放就必然对不上**,区别只在于这次随机性的源头是**模型自己主动决定要跑的
+命令**,不是引擎/系统提示词里的什么字段,没法靠"字段级别加一个正确的解析/展示逻辑"来防,
+只能在 `dehydrate()` 里加一条通用的归一化规则。
+
+修复：`crates/telemetry/src/vcr.rs::dehydrate()` 新增 `RE_UUID`,匹配标准 8-4-4-4-12 十六
+进制 UUID 形式（大小写不敏感）,统一替换成 `[UUID]`。新增 2 个回归测试。
+
+### 18.1 验证
+
+`cargo test -p telemetry --lib` 115 个全过（含本节新增 2 个）;`cargo test -p runtime --lib`
+99 个全过。003（案发用例,同时也是本轮验证 Agent `skills:` 预注入的用例——reviewer.md 加了
+`skills: code-review` 之后,子 agent 应该不需要自己再调用 Skill 工具就能体现 code-review 的
+审查步骤,--compare 的 LLM 裁判确认了这一点)修完后连续 3 次严格回放零 miss。全部 8 份
+cassette（000/001/002/003 + skills/001-004）在这一轮 Skills/Agents 对齐工作全部完成之后,
+两轮严格回放（共 16 次运行）零 miss——这是本次会话第六个、也是目前为止最后一个通过真实
+录制而不是猜测发现的 VCR 非确定性根因。
