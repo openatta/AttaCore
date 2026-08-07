@@ -817,7 +817,7 @@ impl SessionPool {
     /// `source` values `list_import_sources` returns) and record the
     /// decision so the automatic startup detection doesn't ask again.
     pub async fn run_import(&self, source: &str) -> Result<serde_json::Value, String> {
-        let kind = base::frozen::ImportSourceKind::from_str(source).ok_or_else(|| {
+        let kind = base::frozen::ImportSourceKind::try_parse(source).ok_or_else(|| {
             format!("unknown source `{source}` — expected claude_code, codex, or cursor")
         })?;
         let sources = base::frozen::detect_import_sources(&self.cwd).await;

@@ -111,7 +111,10 @@ impl Agent {
                 self.handle_tool_result(tool_use_id, content, is_error)
                     .await
             }
-            InputMessage::PermissionResponse { prompt_id, decision } => {
+            InputMessage::PermissionResponse {
+                prompt_id,
+                decision,
+            } => {
                 // Track permission denials for telemetry (TS parity)
                 if let crate::agent::PermissionDecision::Deny { .. } = decision {
                     self.permission_denial_count += 1;
@@ -263,32 +266,33 @@ impl Agent {
         // against the harness's turn boundary in a way that isn't deterministic between
         // record and replay, producing a different injected memory set each run even with
         // identical cassette content — see docs/design/2026-08-05-test-architecture.md §15.
-        let mut prefetch_handle: Option<tokio::task::JoinHandle<Vec<String>>> = if !self.settings.memory_enabled {
-            None
-        } else {
-            let store = self.memory_store.clone();
-            let model = self.model.clone();
-            let query = content.clone();
-            let already_surfaced: HashSet<String> = self
-                .frozen
-                .as_ref()
-                .map(|f| f.already_surfaced.clone())
-                .unwrap_or_default();
-            let recent_tools = self.tools.names();
-            let model_name = self.settings.model.model_name.clone();
-            Some(tokio::spawn(async move {
-                base::interface::memory::select_memories_with_llm(
-                    &store,
-                    &query,
-                    model.as_ref(),
-                    5,
-                    &already_surfaced,
-                    &recent_tools,
-                    &model_name,
-                )
-                .await
-            }))
-        };
+        let mut prefetch_handle: Option<tokio::task::JoinHandle<Vec<String>>> =
+            if !self.settings.memory_enabled {
+                None
+            } else {
+                let store = self.memory_store.clone();
+                let model = self.model.clone();
+                let query = content.clone();
+                let already_surfaced: HashSet<String> = self
+                    .frozen
+                    .as_ref()
+                    .map(|f| f.already_surfaced.clone())
+                    .unwrap_or_default();
+                let recent_tools = self.tools.names();
+                let model_name = self.settings.model.model_name.clone();
+                Some(tokio::spawn(async move {
+                    base::interface::memory::select_memories_with_llm(
+                        &store,
+                        &query,
+                        model.as_ref(),
+                        5,
+                        &already_surfaced,
+                        &recent_tools,
+                        &model_name,
+                    )
+                    .await
+                }))
+            };
         let prefetch_started_at: std::time::Instant = std::time::Instant::now();
 
         // Skill discovery prefetch: scan workspace for matching skills as a
@@ -1495,8 +1499,13 @@ or project context that should survive across sessions.
             .map(|n| self.skills.invocation_count(n))
             .collect();
         let entry_lens: Vec<usize> = combined.iter().map(|c| c.len()).collect();
-        let keeps_description =
-            select_skills_keeping_description(&names, &counts, &entry_lens, available_budget, PER_ENTRY_OVERHEAD);
+        let keeps_description = select_skills_keeping_description(
+            &names,
+            &counts,
+            &entry_lens,
+            available_budget,
+            PER_ENTRY_OVERHEAD,
+        );
 
         let mut text = String::from("## Available Skills\n\n");
         for (i, s) in llm_skills.iter().enumerate() {
@@ -1713,7 +1722,12 @@ pub(crate) struct ToolExecCtx {
     /// outcome here can register a receiver that `process_turn`'s
     /// `PermissionResponse` branch later wakes.
     pub pending_permissions: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<crate::agent::PermissionDecision>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::oneshot::Sender<crate::agent::PermissionDecision>,
+            >,
+        >,
     >,
     /// Real event sender — lets `execute_tool_inner` emit
     /// `AgentEvent::PermissionPrompt` directly, same channel `Agent::run`'s
@@ -1803,17 +1817,60 @@ async fn execute_tool_inner(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(prompt_id.clone(), tx);
-            let _ = ctx.event_tx.send(base::interface::event::AgentEvent::PermissionPrompt {
-                prompt_id: prompt_id.clone(),
-                tool_name: name.to_string(),
-                message,
-                paths,
-                turn_id: ctx.turn_id.clone(),
-            });
+            let _ = ctx
+                .event_tx
+                .send(base::interface::event::AgentEvent::PermissionPrompt {
+                    prompt_id: prompt_id.clone(),
+                    tool_name: name.to_string(),
+                    message,
+                    paths,
+                    turn_id: ctx.turn_id.clone(),
+                });
             tokio::select! {
                 result = rx => {
                     match result {
                         Ok(crate::agent::PermissionDecision::Permit) => {}
+                        Ok(crate::agent::PermissionDecision::PermitAlways { scope }) => {
+                            // Same content derivation the rule engine itself
+                            // uses to match a tool call against a rule (see
+                            // `PermissionGate::check` step 3 — `RuleHit`
+                            // evaluation) — this is what makes the persisted
+                            // pattern actually match future calls the same
+                            // way the one the user just answered did.
+                            let match_content = tool.permission_match_content(&input);
+                            ctx.permission
+                                .add_persistent_allow(name, match_content.as_deref());
+                            if let crate::agent::PersistScope::Local = scope {
+                                let local_settings_path = ctx.cwd.join("settings.local.json");
+                                match permissions::settings_patch::build_rule_string(
+                                    name,
+                                    match_content.as_deref(),
+                                ) {
+                                    Some(rule_string) => {
+                                        if let Err(e) = permissions::settings_patch::append_permission_rule(
+                                            &local_settings_path,
+                                            permissions::settings_patch::AppendTarget::Allow,
+                                            &rule_string,
+                                        ) {
+                                            tracing::warn!(
+                                                path = %local_settings_path.display(),
+                                                error = %e,
+                                                "failed to persist permit-always rule to settings.local.json; \
+                                                 in-memory allow for this session still applies"
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            tool_name = %name,
+                                            "permit-always with scope=local but no rule content could be \
+                                             derived — nothing written to settings.local.json; \
+                                             in-memory allow for this session still applies"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         Ok(crate::agent::PermissionDecision::Deny { reason }) => {
                             return Err(format!("Denied by permission: {reason}"));
                         }
@@ -2723,6 +2780,153 @@ mod tests {
         assert!(called.lock().unwrap().is_none());
     }
 
+    /// Like `ProbeTool`, but overrides `permission_match_content` so the
+    /// derived rule pattern is non-empty — needed to exercise the
+    /// `PermitAlways` disk-write path, since `settings_patch::build_rule_string`
+    /// returns `None` (nothing to write) for empty/absent content.
+    struct ContentProbeTool {
+        called: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl base::tool::Tool for ContentProbeTool {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn permission_match_content(&self, _input: &serde_json::Value) -> Option<String> {
+            Some("git status".into())
+        }
+        async fn call(
+            &self,
+            input: serde_json::Value,
+            _ctx: base::tool::ToolContext,
+            _progress: base::tool::ProgressSender,
+        ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+            *self.called.lock().unwrap() = Some(input);
+            Ok(base::tool::ToolResult::text("probe-ran"))
+        }
+    }
+
+    /// Records every `add_persistent_allow` call it receives, and always
+    /// prompts on `check` (fixed `prompt_id`) so a test can drive the
+    /// `InputMessage::PermissionResponse` -> `PermitAlways` path the same
+    /// way a real interactive "always allow" answer would.
+    struct PromptThenRecordPersistentAllow {
+        prompt_id: &'static str,
+        recorded: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl base::interface::permission::Permission for PromptThenRecordPersistentAllow {
+        async fn check(
+            &self,
+            _tool_name: &str,
+            _tool_input: &serde_json::Value,
+            _cwd: &std::path::Path,
+            _session_id: &str,
+        ) -> base::interface::permission::PermissionOutcome {
+            base::interface::permission::PermissionOutcome::Prompt {
+                prompt_id: self.prompt_id.into(),
+                message: "allow?".into(),
+                paths: vec![],
+            }
+        }
+        fn add_persistent_allow(&self, tool_name: &str, rule_content: Option<&str>) {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((tool_name.to_string(), rule_content.map(|s| s.to_string())));
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_answered_permit_always_local_persists_rule_to_disk() {
+        // End-to-end: a `PermitAlways{scope: Local}` response must (1) call
+        // `Permission::add_persistent_allow` so the in-memory rule engine
+        // allows the rest of this session immediately, using the same
+        // `tool.permission_match_content` derivation the rule engine itself
+        // uses to match calls, and (2) write the equivalent rule string to
+        // `<cwd>/settings.local.json` (NOT `settings.json` — that's the
+        // shared/committed project tier) — and (3) still let the pending
+        // tool call proceed, same as a plain `Permit` would.
+        let dir = tempfile::tempdir().unwrap();
+        let called = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
+        tools.register(std::sync::Arc::new(ContentProbeTool {
+            called: called.clone(),
+        }));
+        let hooks_runner = Arc::new(hooks::HookRunner::new(std::collections::HashMap::new()));
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let permission = Arc::new(PromptThenRecordPersistentAllow {
+            prompt_id: "permit-always-local",
+            recorded: recorded.clone(),
+        });
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolExecCtx {
+            tools,
+            cwd: dir.path().to_path_buf(),
+            session_id: "test-session".into(),
+            turn_no: 1,
+            telemetry_handle: telemetry::TelemetryHandle::noop(),
+            turn_id: "test-turn".into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            hooks: hooks_runner,
+            discontinued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            config: Arc::new(base::context::EngineConfig::defaults_for("test")),
+            permission,
+            pending_permissions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            event_tx,
+        };
+
+        let pending = ctx.pending_permissions.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                let sender = pending.lock().unwrap().remove("permit-always-local");
+                if let Some(sender) = sender {
+                    let _ = sender.send(crate::agent::PermissionDecision::PermitAlways {
+                        scope: crate::agent::PersistScope::Local,
+                    });
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
+        responder.await.unwrap();
+
+        assert!(
+            result.is_ok(),
+            "PermitAlways must let the pending tool call proceed: {result:?}"
+        );
+        assert!(
+            called.lock().unwrap().is_some(),
+            "the tool must actually have run"
+        );
+        assert_eq!(
+            recorded.lock().unwrap().as_slice(),
+            &[("Probe".to_string(), Some("git status".to_string()))],
+            "add_persistent_allow must be called with the tool's derived match content"
+        );
+
+        let settings_local_path = dir.path().join("settings.local.json");
+        let content = std::fs::read_to_string(&settings_local_path)
+            .unwrap_or_else(|e| panic!("expected {} to exist: {e}", settings_local_path.display()));
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = v["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow should be an array");
+        assert_eq!(allow.as_slice(), &[serde_json::json!("Probe(git status)")]);
+
+        // Not written to the shared/committed settings.json tier.
+        assert!(
+            !dir.path().join("settings.json").exists(),
+            "must not touch the shared/committed settings.json tier"
+        );
+    }
+
     // ── register_new_mcp_adapters (dynamic MCP tool discovery) ──
 
     #[tokio::test]
@@ -2878,7 +3082,11 @@ mod tests {
         let lens = [50usize, 50];
         // Budget fits exactly one entry.
         let keeps = select_skills_keeping_description(&names, &counts, &lens, 55, 5);
-        assert_eq!(keeps, vec![false, true], "apple (alphabetically first) should win the tie");
+        assert_eq!(
+            keeps,
+            vec![false, true],
+            "apple (alphabetically first) should win the tie"
+        );
     }
 
     #[test]

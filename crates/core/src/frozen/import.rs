@@ -39,7 +39,7 @@ impl ImportSourceKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn try_parse(s: &str) -> Option<Self> {
         match s {
             "claude_code" => Some(Self::ClaudeCode),
             "codex" => Some(Self::Codex),
@@ -676,8 +676,8 @@ mod tests {
     #[tokio::test]
     async fn kind_str_roundtrip() {
         for kind in [ImportSourceKind::ClaudeCode, ImportSourceKind::Codex, ImportSourceKind::Cursor] {
-            assert_eq!(ImportSourceKind::from_str(kind.as_str()), Some(kind));
+            assert_eq!(ImportSourceKind::try_parse(kind.as_str()), Some(kind));
         }
-        assert_eq!(ImportSourceKind::from_str("bogus"), None);
+        assert_eq!(ImportSourceKind::try_parse("bogus"), None);
     }
 }

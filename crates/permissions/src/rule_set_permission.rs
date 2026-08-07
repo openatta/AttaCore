@@ -96,6 +96,21 @@ impl Permission for RuleSetPermission {
         self.gate
             .remove_rules_by_source(base::permission::RuleSource::Command);
     }
+
+    fn add_persistent_allow(&self, tool_name: &str, rule_content: Option<&str>) {
+        // `RuleSource::Session` (50), not `Command` (45) — `Command`-sourced
+        // rules get bulk-deleted by `clear_temporary_allows` (called from
+        // `turn.rs` per-turn skill cleanup via `RuleSet::remove_by_source`)
+        // whenever a skill goes inactive, and a "permit always" decision
+        // from a user's interactive prompt answer must survive that
+        // unrelated cleanup for the rest of the session.
+        self.gate.add_rules(vec![base::permission::PermissionRule {
+            source: base::permission::RuleSource::Session,
+            behavior: base::permission::RuleBehavior::Allow,
+            tool_name: tool_name.to_string(),
+            rule_content: rule_content.map(|s| s.to_string()),
+        }]);
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +159,55 @@ mod tests {
     }
 
     fn registry_with(tool: FakeTool) -> Arc<InMemoryToolRegistry> {
+        let reg = Arc::new(InMemoryToolRegistry::new());
+        reg.register(Arc::new(tool));
+        reg
+    }
+
+    /// Like `FakeTool`, but with a settable `permission_match_content` —
+    /// needed to exercise `add_persistent_allow`'s content-aware rule
+    /// (`FakeTool` always derives `None`, which only a blanket/no-content
+    /// rule would match).
+    struct ContentAwareFakeTool {
+        name: &'static str,
+        content: Option<&'static str>,
+    }
+
+    #[async_trait2]
+    impl Tool for ContentAwareFakeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn prompt(&self, _: &base::tool::PromptContext) -> String {
+            "fake".into()
+        }
+        fn is_read_only(&self, _: &serde_json::Value) -> bool {
+            false
+        }
+        async fn check_permissions(
+            &self,
+            _: &serde_json::Value,
+            _: &ToolContext,
+        ) -> ToolPermissionDecision {
+            ToolPermissionDecision::ask("?")
+        }
+        fn permission_match_content(&self, _: &serde_json::Value) -> Option<String> {
+            self.content.map(|s| s.to_string())
+        }
+        async fn call(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: base::tool::ProgressSender,
+        ) -> Result<base::tool::ToolResult, ToolError> {
+            Ok(base::tool::ToolResult::text("ok"))
+        }
+    }
+
+    fn registry_with_content_tool(tool: ContentAwareFakeTool) -> Arc<InMemoryToolRegistry> {
         let reg = Arc::new(InMemoryToolRegistry::new());
         reg.register(Arc::new(tool));
         reg
@@ -225,11 +289,75 @@ mod tests {
             tool_name: "Bash".into(),
             rule_content: None,
         }]);
-        let perm =
-            RuleSetPermission::new(Arc::new(PermissionGate::new(rules)), tools, PermissionMode::Default);
+        let perm = RuleSetPermission::new(
+            Arc::new(PermissionGate::new(rules)),
+            tools,
+            PermissionMode::Default,
+        );
         let outcome = perm
             .check("Bash", &json!({}), Path::new("/tmp"), "s1")
             .await;
         assert!(matches!(outcome, PermissionOutcome::Permit));
+    }
+
+    #[tokio::test]
+    async fn add_persistent_allow_permits_matching_content_without_prompting() {
+        // The tool derives "git status" as its match content for any input
+        // (a stand-in for e.g. Bash's command-line extraction) — matching
+        // what a real "always allow" prompt answer would persist for the
+        // specific call the user just approved.
+        let tools = registry_with_content_tool(ContentAwareFakeTool {
+            name: "Bash",
+            content: Some("git status"),
+        });
+        let perm = RuleSetPermission::new(
+            Arc::new(PermissionGate::empty()),
+            tools,
+            PermissionMode::Default,
+        );
+
+        // Before: no rule, Default mode with a real tool asks.
+        let outcome = perm
+            .check("Bash", &json!({}), Path::new("/tmp"), "s1")
+            .await;
+        assert!(matches!(outcome, PermissionOutcome::Prompt { .. }));
+
+        perm.add_persistent_allow("Bash", Some("git status"));
+
+        let outcome = perm
+            .check("Bash", &json!({}), Path::new("/tmp"), "s1")
+            .await;
+        assert!(
+            matches!(outcome, PermissionOutcome::Permit),
+            "expected immediate Permit after add_persistent_allow, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_persistent_allow_survives_clear_temporary_allows() {
+        // Regression guard for the priority/source choice: a Session-sourced
+        // persistent allow must NOT be wiped by `clear_temporary_allows`
+        // (which only removes `Command`-sourced rules — see
+        // `RuleSetPermission::clear_temporary_allows` and the skill
+        // deactivation cleanup in `turn.rs` that calls it).
+        let tools = registry_with(FakeTool {
+            name: "Bash",
+            read_only: false,
+        });
+        let perm = RuleSetPermission::new(
+            Arc::new(PermissionGate::empty()),
+            tools,
+            PermissionMode::Default,
+        );
+        perm.add_persistent_allow("Bash", None);
+        perm.clear_temporary_allows();
+
+        let outcome = perm
+            .check("Bash", &json!({}), Path::new("/tmp"), "s1")
+            .await;
+        assert!(
+            matches!(outcome, PermissionOutcome::Permit),
+            "persistent allow must survive clear_temporary_allows, got {outcome:?}"
+        );
     }
 }

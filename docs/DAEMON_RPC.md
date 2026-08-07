@@ -223,11 +223,19 @@
   "prompt_type": "permission",              // 可选，缺省 "permission"
   "decision": {"type":"permit"}
   // 或者拒绝： "decision": {"type":"deny","reason":"不要跑这个命令"}
+  // 或者一次性放行 + 记住这个决定，会话剩余时间都不用再问：
+  //   "decision": {"type":"permit_always","scope":"session"}
+  // 或者同上，并且额外把等价的规则字符串写进本项目的
+  //   `.atta/settings.local.json`（gitignored 的本地覆盖层，不是共享/
+  //   提交的 `settings.json`），这样以后这个项目的新 session 也直接放行：
+  //   "decision": {"type":"permit_always","scope":"local"}
 }}
 // {"jsonrpc":"2.0","id":2,"result":{"prompt_id":"p1"}}
 ```
 
-**没有超时**——引擎侧会一直等这条回应，直到收到、或者 session 被 `session.close`/断线取消（那种情况下这次工具调用直接失败，不会自动放行）。`session_id` 不存在 → `SESSION_NOT_FOUND`（这里比 `session.close` 严格——回应一个不存在的 session 是调用方的真实错误，不能安全忽略）；缺 `session_id`/`prompt_id`/`decision`，或 `decision` 解析不出 `{"type":"permit"}`/`{"type":"deny","reason":"..."}` → `INVALID_PARAMS`；`prompt_type` 传了但不是 `"permission"` → `INVALID_PARAMS`（还没有别的类型）。`prompt_id` 已经被回应过、或者对应的等待已经因为 session 关闭而清理掉 → 这次调用仍然返回成功（`Ok`），只是引擎那边已经没人在等了，是个静默的空操作，不会报错。
+**没有超时**——引擎侧会一直等这条回应，直到收到、或者 session 被 `session.close`/断线取消（那种情况下这次工具调用直接失败，不会自动放行）。`session_id` 不存在 → `SESSION_NOT_FOUND`（这里比 `session.close` 严格——回应一个不存在的 session 是调用方的真实错误，不能安全忽略）；缺 `session_id`/`prompt_id`/`decision`，或 `decision` 解析不出 `{"type":"permit"}`/`{"type":"deny","reason":"..."}`/`{"type":"permit_always","scope":"session"|"local"}` → `INVALID_PARAMS`；`prompt_type` 传了但不是 `"permission"` → `INVALID_PARAMS`（还没有别的类型）。`prompt_id` 已经被回应过、或者对应的等待已经因为 session 关闭而清理掉 → 这次调用仍然返回成功（`Ok`），只是引擎那边已经没人在等了，是个静默的空操作，不会报错。
+
+**`permit_always`**：跟 `permit` 一样放行这一次调用，同时把一条 Allow 规则加进当前 session 内存里的规则引擎（`RuleSource::Session`，优先级高于 `LocalSettings`/`ProjectSettings`/`UserSettings`，但不会被技能失活时的临时规则清理误删——那只清 `RuleSource::Command`），规则的匹配内容取自触发这次 prompt 的那次工具调用本身（跟规则引擎自己判定 Allow/Deny/Ask 时用的是同一套内容提取逻辑，所以持久化下来的模式跟用户当时看到的那次调用是一致的）。`scope:"session"` 只影响这一个 session（进程重启/新开一个 session 就没了）；`scope:"local"` 额外把等价的规则字符串原子追加进 `<project_root>/.atta/settings.local.json` 的 `permissions.allow` 数组（已存在则跳过，不会重复写）——这一步是尽力而为：磁盘写入失败只记一条 `tracing::warn!`，不会让这次工具调用失败或撤销刚刚生效的内存放行；如果这次工具调用本身提取不出可用的匹配内容（`match_content` 为空），同样只是跳过磁盘写入并打警告，内存里的放行依然生效。
 
 ---
 

@@ -73,7 +73,7 @@ impl Tool for ImportTool {
         match serde_json::from_value::<ImportInput>(input.clone()) {
             Ok(parsed) => match parsed.source.as_deref() {
                 None => ValidationResult::Ok,
-                Some(s) if ImportSourceKind::from_str(s).is_some() => ValidationResult::Ok,
+                Some(s) if ImportSourceKind::try_parse(s).is_some() => ValidationResult::Ok,
                 Some(s) => ValidationResult::err(
                     format!("unknown source `{s}` — expected claude_code, codex, or cursor"),
                     1,
@@ -116,7 +116,7 @@ impl Tool for ImportTool {
             return Ok(ToolResult::text(lines.join("\n")));
         };
 
-        let Some(kind) = ImportSourceKind::from_str(requested) else {
+        let Some(kind) = ImportSourceKind::try_parse(requested) else {
             return Ok(ToolResult::error_text(format!(
                 "unknown source `{requested}` — expected claude_code, codex, or cursor"
             )));

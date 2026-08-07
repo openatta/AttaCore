@@ -4,10 +4,10 @@
 //!     checks disable_model_invocation, uses full expand_skill_vars substitution.
 //!     Supports forked execution via AgentSpawner when skill.context = "fork".
 
+use async_trait::async_trait;
 use base::error::ToolError;
 use base::interface::agent_spawner::AgentSpawner;
 use base::tool::{ProgressSender, PromptContext, Tool, ToolContext, ToolResult, ToolResultContent};
-use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -47,7 +47,8 @@ pub struct SkillTool {
     /// (from `ToolContext`) since one `SkillTool` instance is shared across
     /// however many sessions the process serves — a `SkillTool` isn't
     /// per-session itself, so this can't just be a bare `HashSet`.
-    already_injected: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
+    already_injected:
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
 }
 
 impl SkillTool {
@@ -108,7 +109,12 @@ impl Tool for SkillTool {
         include_str!("prompts/coding/skill_tool.prompt.md").to_string()
     }
 
-    async fn call(&self, input: Value, _ctx: ToolContext, _progress: ProgressSender) -> Result<ToolResult, ToolError> {
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSender,
+    ) -> Result<ToolResult, ToolError> {
         let skill_name = input["skill"]
             .as_str()
             .ok_or_else(|| ToolError::Validation("skill name required".into()))?;
@@ -129,16 +135,46 @@ impl Tool for SkillTool {
             }
         }
 
+        // Bundled reference files (`files:` frontmatter): resolved, safety-
+        // validated (must stay inside the skill's own folder), read, and
+        // budget-capped once here — shared by both the fork and inline paths
+        // below, since neither should silently skip a declared file that
+        // escapes its folder or can't be read (see
+        // `build_bundled_files_injection`'s doc comment).
+        let bundled_files_text = match skill_info {
+            Some(info) => match build_bundled_files_injection(&info.path, skill_name).await {
+                Ok(text) => text,
+                Err(msg) => {
+                    return Ok(ToolResult {
+                        content: ToolResultContent::Text(msg),
+                        is_error: true,
+                        ..Default::default()
+                    });
+                }
+            },
+            None => String::new(),
+        };
+
         // P2-10: Forked skill execution. When context="fork" and spawner is available,
         // run the skill in a sub-agent with isolated context.
         if context_mode.as_deref() == Some("fork") {
             if let Some(ref spawner) = self.spawner {
-                let body = self.skill_manager.get_skill_content(skill_name)
-                    .ok_or_else(|| ToolError::NotFound(format!(
-                        "Skill '{skill_name}' not found."
-                    )))?;
-                let arg_names = skill_info.and_then(|s| s.arguments.clone()).unwrap_or_default();
-                let expanded = base::frozen::skill::expand_skill_vars_named(&body, args, &arg_names);
+                let body = self
+                    .skill_manager
+                    .get_skill_content(skill_name)
+                    .ok_or_else(|| {
+                        ToolError::NotFound(format!("Skill '{skill_name}' not found."))
+                    })?;
+                let arg_names = skill_info
+                    .and_then(|s| s.arguments.clone())
+                    .unwrap_or_default();
+                let expanded =
+                    base::frozen::skill::expand_skill_vars_named(&body, args, &arg_names);
+                // Bundled files are a separate, additional budget — not part
+                // of (and not stealing from) any body truncation. The fork
+                // path doesn't truncate the body at all today, so this stays
+                // that way; only the bundled-files text is appended.
+                let expanded = format!("{expanded}{bundled_files_text}");
                 let cancel = _ctx.cancel.clone();
                 // `agent:` frontmatter — which subagent type to fork into.
                 // `None` (unset) falls through to the spawner's own default
@@ -183,7 +219,10 @@ impl Tool for SkillTool {
                     };
                 }
 
-                match spawner.spawn_agent(expanded, vec![], _ctx.cwd.clone(), cancel, agent_type).await {
+                match spawner
+                    .spawn_agent(expanded, vec![], _ctx.cwd.clone(), cancel, agent_type)
+                    .await
+                {
                     Ok(output) => {
                         self.skill_manager.record_invocation(skill_name);
                         return Ok(ToolResult {
@@ -209,10 +248,10 @@ impl Tool for SkillTool {
         }
 
         // Get the skill body content
-        let body = self.skill_manager.get_skill_content(skill_name)
-            .ok_or_else(|| ToolError::NotFound(format!(
-                "Skill '{skill_name}' not found."
-            )))?;
+        let body = self
+            .skill_manager
+            .get_skill_content(skill_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Skill '{skill_name}' not found.")))?;
 
         // Dynamic context injection (`` !`command` ``, ` ```! ` blocks) runs
         // first, over the raw body, before variable substitution — matches
@@ -223,15 +262,28 @@ impl Tool for SkillTool {
         let body = expand_dynamic_context(&body, &_ctx).await;
 
         // Use full expand_skill_vars (TS parity: $1..$9, $@, $ARGUMENTS, {ARGS}, etc.)
-        let arg_names = skill_info.and_then(|s| s.arguments.clone()).unwrap_or_default();
+        let arg_names = skill_info
+            .and_then(|s| s.arguments.clone())
+            .unwrap_or_default();
         let expanded = base::frozen::skill::expand_skill_vars_named(&body, args, &arg_names);
 
-        // Truncate at 8000 chars to prevent context explosion
-        let truncated = if expanded.len() > 8000 {
-            format!("{}...[truncated]", &expanded[..8000])
-        } else {
-            expanded
+        // Truncate at 8000 chars to prevent context explosion. Cut at a
+        // char boundary via `char_indices().nth(n)` rather than slicing by
+        // raw byte index — `expanded.len()` is a byte count, and slicing at
+        // an arbitrary byte offset panics on non-ASCII content (e.g.
+        // Chinese skill bodies) whose 8000th byte doesn't land on a char
+        // boundary. Same fix as `build_bundled_files_injection`'s per-file
+        // truncation below.
+        const SKILL_BODY_CHAR_CAP: usize = 8000;
+        let truncated = match expanded.char_indices().nth(SKILL_BODY_CHAR_CAP) {
+            Some((byte_idx, _)) => format!("{}...[truncated]", &expanded[..byte_idx]),
+            None => expanded,
         };
+
+        // Bundled files (`files:` frontmatter) get their own separate
+        // budget, appended after the body's 8000-char cap — not stolen from
+        // it and not counted against it.
+        let truncated = format!("{truncated}{bundled_files_text}");
 
         // Build a user message with the expanded skill content wrapped in command-message tags.
         // TS parity: Claude Code's SkillTool injects expanded skill content as user messages
@@ -250,9 +302,10 @@ impl Tool for SkillTool {
         // team `PermissionBridge`, never the parent's), so injecting a rule
         // into `_ctx.permission` here wouldn't reach it — see
         // `AgentTool::permission_handler`.
-        if let (Some(allowed), Some(permission)) =
-            (skill_info.and_then(|s| s.allowed_tools.clone()), &self.permission)
-        {
+        if let (Some(allowed), Some(permission)) = (
+            skill_info.and_then(|s| s.allowed_tools.clone()),
+            &self.permission,
+        ) {
             for tool_name in &allowed {
                 permission.add_temporary_allow(tool_name);
             }
@@ -286,6 +339,135 @@ impl Tool for SkillTool {
             ..Default::default()
         })
     }
+}
+
+/// Per-file cap for bundled reference material (`files:` frontmatter) — see
+/// `build_bundled_files_injection`.
+const BUNDLED_FILE_CHAR_CAP: usize = 2000;
+/// Total cap across all of a skill's bundled files combined, separate from
+/// (and on top of) the skill body's own 8000-char cap.
+const BUNDLED_TOTAL_CHAR_CAP: usize = 6000;
+
+/// Resolves, safety-validates, reads, and budget-caps a skill's `files:`
+/// frontmatter (reference material bundled alongside SKILL.md), returning
+/// ready-to-append injection text on success.
+///
+/// `Err(message)` is returned — naming both the offending skill and the
+/// declared path — when a declared file escapes the skill's own folder
+/// (e.g. via `..`) or doesn't exist / can't be read. These are surfaced as
+/// visible tool errors by the caller, never silently skipped.
+///
+/// `skill_path` is the skill's SKILL.md path (`SkillInfo::path`). This
+/// re-reads and re-parses that file directly rather than widening
+/// `SkillManager::list()`'s `SkillInfo` projection with a `files` field:
+/// `SkillInfo` is a runtime-facing view of `SkillEntry` used across the
+/// whole `skills` crate, and `SkillEntry` (which already carries `files`,
+/// see `crates/core/src/frozen/skill.rs`) is cheaply reconstructed here with
+/// a single read-plus-parse, cheaper than a cross-crate struct change for
+/// one field only this call site needs. Bundled/MCP sentinel skills
+/// (paths like `(bundled:name)` or `(mcp:...)`) simply fail this read and
+/// fall through to "no bundled files," which is correct — those skills
+/// have no real folder to bundle files alongside.
+async fn build_bundled_files_injection(
+    skill_path: &std::path::Path,
+    skill_name: &str,
+) -> Result<String, String> {
+    let Ok(content) = tokio::fs::read_to_string(skill_path).await else {
+        return Ok(String::new());
+    };
+    let dir_name = skill_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(entry) = base::frozen::frontmatter::parse_skill_file(
+        &content,
+        dir_name,
+        skill_path,
+        base::frozen::skill::SkillSource::Project,
+    ) else {
+        return Ok(String::new());
+    };
+
+    let declared = entry.files.clone().unwrap_or_default();
+    if declared.is_empty() {
+        return Ok(String::new());
+    }
+    let candidates = entry.resolve_bundled_files();
+
+    let Some(skill_dir) = skill_path.parent() else {
+        return Ok(String::new());
+    };
+    // Canonicalize once: the root every candidate must stay inside.
+    let Ok(canonical_skill_dir) = tokio::fs::canonicalize(skill_dir).await else {
+        return Ok(String::new());
+    };
+
+    let mut out = String::new();
+    let mut total_used = 0usize;
+    for (relative, absolute) in declared.iter().zip(candidates.iter()) {
+        if total_used >= BUNDLED_TOTAL_CHAR_CAP {
+            out.push_str(&format!(
+                "\n\n---\n## Bundled file: {relative}\n\n\
+                 [skipped: total bundled-files budget ({BUNDLED_TOTAL_CHAR_CAP} chars) \
+                 already reached by earlier files]\n"
+            ));
+            continue;
+        }
+
+        // Safety: the resolved real path must still be inside the skill's
+        // own (canonicalized) folder — this is what rejects `..` traversal.
+        // A failed canonicalize (file doesn't exist / not readable) is
+        // reported the same way: a named, visible error, not a silent skip.
+        let real_path = match tokio::fs::canonicalize(absolute).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(format!(
+                    "Skill '{skill_name}' declares bundled file `{relative}` \
+                     (resolved to {}) which does not exist or could not be read: {e}",
+                    absolute.display()
+                ));
+            }
+        };
+        if !permissions::path_safety::is_path_within_root(&real_path, &canonical_skill_dir) {
+            return Err(format!(
+                "Skill '{skill_name}' declares bundled file `{relative}` which resolves \
+                 outside the skill's own folder ({}): {} — rejected.",
+                canonical_skill_dir.display(),
+                real_path.display()
+            ));
+        }
+
+        let file_content = match tokio::fs::read_to_string(&real_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "Skill '{skill_name}' declares bundled file `{relative}` \
+                     which could not be read: {e}"
+                ));
+            }
+        };
+
+        // Caps are char counts, not byte counts — slicing by raw byte index
+        // (`file_content.len()` / `&file_content[..n]`) panics on non-ASCII
+        // content whose cut point doesn't land on a UTF-8 char boundary
+        // (very reachable here: skill reference docs in this repo are
+        // routinely Chinese). `char_indices().nth(n)` finds the byte offset
+        // of the n-th character, giving a boundary-safe cut.
+        let per_file_cap = BUNDLED_FILE_CHAR_CAP.min(BUNDLED_TOTAL_CHAR_CAP - total_used);
+        let (chunk, was_truncated) = match file_content.char_indices().nth(per_file_cap) {
+            Some((byte_idx, _)) => (&file_content[..byte_idx], true),
+            None => (file_content.as_str(), false),
+        };
+        total_used += chunk.chars().count();
+
+        out.push_str(&format!("\n\n---\n## Bundled file: {relative}\n\n{chunk}"));
+        if was_truncated {
+            out.push_str("...[truncated]");
+        }
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Cheap, non-cryptographic hash of rendered skill content for the
@@ -332,9 +514,8 @@ async fn expand_dynamic_context(body: &str, ctx: &ToolContext) -> String {
         return body.to_string();
     }
 
-    static FENCED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?s)```!\n(.*?)\n```").unwrap()
-    });
+    static FENCED: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)```!\n(.*?)\n```").unwrap());
     static INLINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         // `!` at start-of-line or preceded by a space/tab only — matches
         // Claude Code's rule that `KEY=!\`cmd\`` (no separating whitespace)
@@ -576,7 +757,10 @@ mod tests {
             .expect("call should not error");
 
         assert!(!result.is_error);
-        assert!(result.new_messages.is_some(), "expanded skill content should be injected as a new message");
+        assert!(
+            result.new_messages.is_some(),
+            "expanded skill content should be injected as a new message"
+        );
     }
 
     /// `allowed_tools` end to end: before the skill runs, `Bash` has no
@@ -647,7 +831,12 @@ mod tests {
         ));
 
         let sanity = real_permission
-            .check("Bash", &serde_json::json!({}), std::path::Path::new("/tmp"), "s1")
+            .check(
+                "Bash",
+                &serde_json::json!({}),
+                std::path::Path::new("/tmp"),
+                "s1",
+            )
             .await;
         assert!(
             matches!(sanity, PermissionOutcome::Prompt { .. }),
@@ -666,7 +855,12 @@ mod tests {
         assert!(!result.is_error);
 
         let after = real_permission
-            .check("Bash", &serde_json::json!({}), std::path::Path::new("/tmp"), "s1")
+            .check(
+                "Bash",
+                &serde_json::json!({}),
+                std::path::Path::new("/tmp"),
+                "s1",
+            )
             .await;
         assert!(
             matches!(after, PermissionOutcome::Permit),
@@ -938,5 +1132,223 @@ mod tests {
             .expect_err("unknown skill should error");
 
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    // ── Bundled reference files (`files:` frontmatter) ─────────────────
+
+    /// A skill with `files: [notes.md]` gets that file's content read and
+    /// injected alongside the body, wrapped in a `## Bundled file:` header.
+    #[tokio::test]
+    async fn bundled_file_content_is_injected() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("bundled-notes");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: has bundled notes\nfiles: [notes.md]\n---\nBody text.",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("notes.md"), "KNOWN_MARKER_CONTENT_XYZ").unwrap();
+
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        mgr.register_bundled(SkillEntry {
+            name: "bundled-notes".into(),
+            description: "has bundled notes".into(),
+            source: FrozenSkillSource::Project,
+            path: skill_dir.join("SKILL.md"),
+            files: Some(vec!["notes.md".into()]),
+            ..Default::default()
+        });
+        let tool = SkillTool::new(mgr);
+
+        let result = tool
+            .call(
+                serde_json::json!({"skill": "bundled-notes"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("call should not error");
+
+        assert!(!result.is_error);
+        let messages = result.new_messages.expect("expected injected message");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("KNOWN_MARKER_CONTENT_XYZ"),
+            "bundled file content missing from injected message: {content}"
+        );
+        assert!(content.contains("## Bundled file: notes.md"));
+    }
+
+    /// A skill body itself (not a bundled file) that's multi-byte UTF-8 and
+    /// exceeds the 8000-char cap must be truncated without panicking, at a
+    /// valid char boundary — regression test for the same byte-index-slice
+    /// bug as `bundled_file_truncation_does_not_panic_on_multibyte_content`,
+    /// in the main body-truncation path this time.
+    #[tokio::test]
+    async fn skill_body_truncation_does_not_panic_on_multibyte_content() {
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        // Each "你" is a 3-byte UTF-8 char; 9000 of them is well over the
+        // 8000-char body cap and, at a byte-index cut, lands mid-char for
+        // almost any cap value that isn't a multiple of 3.
+        let long_cjk_body = "你".repeat(9000);
+        register_test_skill(&mgr, "cjk-body", &long_cjk_body, false);
+        let tool = SkillTool::new(mgr);
+
+        let result = tool
+            .call(
+                serde_json::json!({"skill": "cjk-body"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("call should not error (must not panic on truncation)");
+
+        assert!(!result.is_error);
+        let messages = result.new_messages.expect("expected injected message");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("...[truncated]"));
+        // Exactly 8000 valid "你" chars should have survived the cut, no
+        // partial/garbled character.
+        assert!(content.contains(&"你".repeat(8000)));
+        assert!(!content.contains(&"你".repeat(8001)));
+    }
+
+    /// A bundled file whose content is multi-byte UTF-8 (Chinese) and
+    /// exceeds `BUNDLED_FILE_CHAR_CAP` must be truncated without panicking,
+    /// at a valid char boundary — regression test for slicing by raw byte
+    /// index instead of char count.
+    #[tokio::test]
+    async fn bundled_file_truncation_does_not_panic_on_multibyte_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("cjk-notes");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: has cjk bundled notes\nfiles: [notes.md]\n---\nBody text.",
+        )
+        .unwrap();
+        // Each "你" is a 3-byte UTF-8 char; 2500 of them is well over the
+        // 2000-char per-file cap and, at a byte-index cut, lands mid-char
+        // for almost any cap value that isn't a multiple of 3.
+        let long_cjk = "你".repeat(2500);
+        std::fs::write(skill_dir.join("notes.md"), &long_cjk).unwrap();
+
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        mgr.register_bundled(SkillEntry {
+            name: "cjk-notes".into(),
+            description: "has cjk bundled notes".into(),
+            source: FrozenSkillSource::Project,
+            path: skill_dir.join("SKILL.md"),
+            files: Some(vec!["notes.md".into()]),
+            ..Default::default()
+        });
+        let tool = SkillTool::new(mgr);
+
+        let result = tool
+            .call(
+                serde_json::json!({"skill": "cjk-notes"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("call should not error (must not panic on truncation)");
+
+        assert!(!result.is_error);
+        let messages = result.new_messages.expect("expected injected message");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("## Bundled file: notes.md"));
+        assert!(content.contains("...[truncated]"));
+        // Exactly 2000 valid "你" chars should have survived the cut, no
+        // partial/garbled character.
+        assert!(content.contains(&"你".repeat(2000)));
+        assert!(!content.contains(&"你".repeat(2001)));
+    }
+
+    /// A skill declaring a `files:` entry that escapes its own folder (via
+    /// `..`) must be rejected with a visible `is_error: true` result naming
+    /// both the skill and the offending path — and none of the outside
+    /// file's content may leak into the result.
+    #[tokio::test]
+    async fn bundled_file_escaping_skill_folder_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("escaping-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // `outside.md` lives one level above the skill's own folder.
+        std::fs::write(dir.path().join("outside.md"), "SECRET_SHOULD_NOT_LEAK").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: tries to escape\nfiles: [../outside.md]\n---\nBody text.",
+        )
+        .unwrap();
+
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        mgr.register_bundled(SkillEntry {
+            name: "escaping-skill".into(),
+            description: "tries to escape".into(),
+            source: FrozenSkillSource::Project,
+            path: skill_dir.join("SKILL.md"),
+            files: Some(vec!["../outside.md".into()]),
+            ..Default::default()
+        });
+        let tool = SkillTool::new(mgr);
+
+        let result = tool
+            .call(
+                serde_json::json!({"skill": "escaping-skill"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("validation failure surfaces as is_error, not Err");
+
+        assert!(result.is_error);
+        let ToolResultContent::Text(text) = result.content else {
+            panic!("expected text content");
+        };
+        assert!(
+            text.contains("escaping-skill"),
+            "error should name the skill: {text}"
+        );
+        assert!(
+            text.contains("outside.md"),
+            "error should name the offending path: {text}"
+        );
+        assert!(
+            !text.contains("SECRET_SHOULD_NOT_LEAK"),
+            "content from outside the skill folder must never leak: {text}"
+        );
+        assert!(
+            result.new_messages.is_none(),
+            "a rejected bundled file must not still inject a message"
+        );
+    }
+
+    /// A skill with no `files` field at all must behave byte-identically to
+    /// before this change — no `## Bundled file:` section, exact same
+    /// `<command-name>`/`<command-args>`-wrapped message.
+    #[tokio::test]
+    async fn skill_without_files_field_is_unaffected() {
+        let mgr = Arc::new(skills::manager::SkillManager::new());
+        register_test_skill(&mgr, "no-files", "Just a plain skill body.", false);
+        let tool = SkillTool::new(mgr);
+
+        let result = tool
+            .call(
+                serde_json::json!({"skill": "no-files"}),
+                ToolContext::for_test(std::env::temp_dir()),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("call should not error");
+
+        assert!(!result.is_error);
+        let messages = result.new_messages.expect("expected injected message");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(!content.contains("## Bundled file:"));
+        assert_eq!(
+            content,
+            "<command-name>no-files</command-name>\n<command-args></command-args>\n\nJust a plain skill body."
+        );
     }
 }

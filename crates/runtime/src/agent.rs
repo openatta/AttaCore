@@ -51,14 +51,37 @@ pub struct Attachment {
     pub content: Option<String>,
 }
 
-/// Wire shape: `{"type":"permit"}` / `{"type":"deny","reason":"..."}` —
-/// what `session.respondToPrompt` (daemon RPC) parses out of its
-/// `decision` param and what `InputMessage::PermissionResponse` carries.
+/// Where a `PermitAlways` decision's effect should be retained.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistScope {
+    /// In-memory only, this session.
+    Session,
+    /// In-memory for this session AND written to `.atta/settings.local.json`
+    /// so future sessions in this project also allow it.
+    Local,
+}
+
+/// Wire shape: `{"type":"permit"}` / `{"type":"deny","reason":"..."}` /
+/// `{"type":"permit_always","scope":"session"}` /
+/// `{"type":"permit_always","scope":"local"}` — what
+/// `session.respondToPrompt` (daemon RPC) parses out of its `decision`
+/// param and what `InputMessage::PermissionResponse` carries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PermissionDecision {
     Permit,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
+    /// Like `Permit`, but also persists an Allow rule beyond this single
+    /// tool call — see `base::interface::permission::Permission::add_persistent_allow`.
+    /// `scope: Session` keeps it in-memory only (rest of this session);
+    /// `scope: Local` additionally writes it to `.atta/settings.local.json`
+    /// so future sessions in this project inherit it too.
+    PermitAlways {
+        scope: PersistScope,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +119,11 @@ pub struct Agent {
     /// `InputMessage::PermissionResponse` branch below looks the sender up
     /// by `prompt_id` and fires it. A `prompt_id` with no entry (already
     /// timed out, or a stale/duplicate response) is silently ignored.
-    pub(crate) pending_permissions:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>>>,
+    pub(crate) pending_permissions: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>,
+        >,
+    >,
     pub(crate) memory_store: Arc<MemoryStore>,
     pub(crate) session: SessionManager,
     pub(crate) perf: Arc<PerfCollector>,
@@ -293,9 +319,10 @@ impl Agent {
             async move {
                 let count0 =
                     skills.load_dir_subdirs(&global_skills_dir, skills::manager::SkillSource::User);
-                let count1 = skills.load_dir_subdirs(&scene_skills_dir, skills::manager::SkillSource::User);
-                let count2 =
-                    skills.load_dir_subdirs(&local_skills_dir, skills::manager::SkillSource::Project);
+                let count1 =
+                    skills.load_dir_subdirs(&scene_skills_dir, skills::manager::SkillSource::User);
+                let count2 = skills
+                    .load_dir_subdirs(&local_skills_dir, skills::manager::SkillSource::Project);
                 (count0.ok(), count1.ok(), count2.ok())
             },
             // 3. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
@@ -1099,7 +1126,9 @@ impl Builder {
                 settings,
                 config,
                 permission,
-                pending_permissions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                pending_permissions: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
                 memory_store,
                 session,
                 perf: Arc::new(PerfCollector::new()),
@@ -1459,5 +1488,67 @@ pre_tool_use = "hooks/pre.sh"
     fn channel_types_construct() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let _sender: EventSender = tx;
+    }
+
+    #[test]
+    fn permission_decision_wire_format_round_trips() {
+        let permit = PermissionDecision::Permit;
+        let s = serde_json::to_value(&permit).unwrap();
+        assert_eq!(s, serde_json::json!({"type": "permit"}));
+        assert!(matches!(
+            serde_json::from_value::<PermissionDecision>(s).unwrap(),
+            PermissionDecision::Permit
+        ));
+
+        let deny = PermissionDecision::Deny {
+            reason: "no".into(),
+        };
+        let s = serde_json::to_value(&deny).unwrap();
+        assert_eq!(s, serde_json::json!({"type": "deny", "reason": "no"}));
+        match serde_json::from_value::<PermissionDecision>(s).unwrap() {
+            PermissionDecision::Deny { reason } => assert_eq!(reason, "no"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+
+        let permit_always_session = PermissionDecision::PermitAlways {
+            scope: PersistScope::Session,
+        };
+        let s = serde_json::to_value(&permit_always_session).unwrap();
+        assert_eq!(
+            s,
+            serde_json::json!({"type": "permit_always", "scope": "session"})
+        );
+        match serde_json::from_value::<PermissionDecision>(s).unwrap() {
+            PermissionDecision::PermitAlways {
+                scope: PersistScope::Session,
+            } => {}
+            other => panic!("expected PermitAlways{{scope: Session}}, got {other:?}"),
+        }
+
+        let permit_always_local = PermissionDecision::PermitAlways {
+            scope: PersistScope::Local,
+        };
+        let s = serde_json::to_value(&permit_always_local).unwrap();
+        assert_eq!(
+            s,
+            serde_json::json!({"type": "permit_always", "scope": "local"})
+        );
+        match serde_json::from_value::<PermissionDecision>(s).unwrap() {
+            PermissionDecision::PermitAlways {
+                scope: PersistScope::Local,
+            } => {}
+            other => panic!("expected PermitAlways{{scope: Local}}, got {other:?}"),
+        }
+
+        // Also verify direct JSON string parsing of the exact wire shapes
+        // named in the RPC docs, not just round-tripping our own output.
+        let from_str: PermissionDecision =
+            serde_json::from_str(r#"{"type":"permit_always","scope":"local"}"#).unwrap();
+        assert!(matches!(
+            from_str,
+            PermissionDecision::PermitAlways {
+                scope: PersistScope::Local
+            }
+        ));
     }
 }

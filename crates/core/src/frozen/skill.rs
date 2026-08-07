@@ -125,6 +125,27 @@ impl SkillEntry {
         let (_front, body) = split_frontmatter(&content);
         Ok(body.trim().to_string())
     }
+
+    /// Resolves `self.files` (paths relative to the skill's folder) to
+    /// absolute paths. `self.path` is the SKILL.md file itself, so the
+    /// skill folder is `self.path.parent()`. Returns an empty `Vec` if
+    /// `files` is `None`/empty.
+    ///
+    /// Purely mechanical path joining — no existence checks or
+    /// traversal/symlink-escape validation happen here. Callers that need
+    /// those (e.g. `SkillTool`, which must surface a visible error for any
+    /// declared file that escapes the skill folder) run them separately via
+    /// `permissions::path_safety`, which this `core` crate deliberately does
+    /// not depend on.
+    pub fn resolve_bundled_files(&self) -> Vec<PathBuf> {
+        let Some(files) = &self.files else {
+            return Vec::new();
+        };
+        let Some(skill_dir) = self.path.parent() else {
+            return Vec::new();
+        };
+        files.iter().map(|f| skill_dir.join(f)).collect()
+    }
 }
 
 /// Skill 来源 -- user / project；同名时后入者覆盖先入者（见下方扫描顺序）
@@ -149,7 +170,11 @@ async fn collect_skills(home: &Path, cwd: &Path, scope: &str) -> Vec<SkillEntry>
     let scene_dir = home.join(".atta").join("scenes").join(scope).join("skills");
     let project_dir = cwd.join(".agents").join("skills");
     let global_plugins_dir = home.join(".atta").join("plugins");
-    let scene_plugins_dir = home.join(".atta").join("scenes").join(scope).join("plugins");
+    let scene_plugins_dir = home
+        .join(".atta")
+        .join("scenes")
+        .join(scope)
+        .join("plugins");
     let mut all = Vec::new();
     all.extend(scan_skills_dir(&scene_dir, SkillSource::User).await);
     all.extend(scan_skills_dir(&global_dir, SkillSource::User).await);
@@ -374,7 +399,8 @@ pub async fn try_expand_skill_command(
 ) -> Option<Result<String, std::io::Error>> {
     let trimmed = line.trim();
     // Support both /skill and !skill prefix conventions
-    let stripped = trimmed.strip_prefix('/')
+    let stripped = trimmed
+        .strip_prefix('/')
         .or_else(|| trimmed.strip_prefix('!'))?;
     let (cmd, args) = match stripped.split_once(char::is_whitespace) {
         Some((c, a)) => (c, a.trim()),
@@ -470,7 +496,10 @@ pub fn expand_skill_vars_named(body: &str, args: &str, arg_names: &[String]) -> 
     }
 }
 
-pub async fn format_skill_invocation(skill: &SkillEntry, args: &str) -> Result<String, std::io::Error> {
+pub async fn format_skill_invocation(
+    skill: &SkillEntry,
+    args: &str,
+) -> Result<String, std::io::Error> {
     let body = skill.read_body().await?;
     // **P6 **: variable expansion supports:
     //   - `{ARGS}` -- full args string (legacy; we keep it for backwards compat)
@@ -478,11 +507,8 @@ pub async fn format_skill_invocation(skill: &SkillEntry, args: &str) -> Result<S
     //   - `$1`..`$9` -- positional args split on whitespace
     // If none of the above are present and args is non-empty, args is appended
     // verbatim at the end (legacy behavior).
-    let body_with_args = expand_skill_vars_named(
-        &body,
-        args,
-        skill.arguments.as_deref().unwrap_or(&[]),
-    );
+    let body_with_args =
+        expand_skill_vars_named(&body, args, skill.arguments.as_deref().unwrap_or(&[]));
     let mut s = String::with_capacity(body_with_args.len() + 256);
     s.push_str(&format!(
         "Apply the skill `{}` ({}). Follow the playbook below.\n\n",
@@ -590,7 +616,10 @@ mod tests {
         .unwrap();
 
         let skills = collect_skills(home.path(), cwd.path(), "code").await;
-        assert!(skills.is_empty(), "`.atta/code/skills/` must not be scanned");
+        assert!(
+            skills.is_empty(),
+            "`.atta/code/skills/` must not be scanned"
+        );
     }
 
     #[tokio::test]
@@ -616,6 +645,62 @@ mod tests {
         assert!(body.contains("Line 2."));
         assert!(!body.contains("---"));
         assert!(!body.contains("description"));
+    }
+
+    #[test]
+    fn resolve_bundled_files_joins_relative_to_skill_dir() {
+        let skill = SkillEntry {
+            name: "foo".into(),
+            path: PathBuf::from("/skills/foo/SKILL.md"),
+            files: Some(vec!["notes.md".into(), "ref/extra.md".into()]),
+            ..Default::default()
+        };
+        let resolved = skill.resolve_bundled_files();
+        assert_eq!(
+            resolved,
+            vec![
+                PathBuf::from("/skills/foo/notes.md"),
+                PathBuf::from("/skills/foo/ref/extra.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_bundled_files_empty_when_files_is_none() {
+        let skill = SkillEntry {
+            name: "foo".into(),
+            path: PathBuf::from("/skills/foo/SKILL.md"),
+            files: None,
+            ..Default::default()
+        };
+        assert!(skill.resolve_bundled_files().is_empty());
+    }
+
+    #[test]
+    fn resolve_bundled_files_empty_when_files_is_empty_vec() {
+        let skill = SkillEntry {
+            name: "foo".into(),
+            path: PathBuf::from("/skills/foo/SKILL.md"),
+            files: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(skill.resolve_bundled_files().is_empty());
+    }
+
+    #[test]
+    fn resolve_bundled_files_does_not_reject_traversal_paths() {
+        // Purely mechanical joining — traversal rejection is the caller's
+        // job (SkillTool, via permissions::path_safety), not this method's.
+        let skill = SkillEntry {
+            name: "foo".into(),
+            path: PathBuf::from("/skills/foo/SKILL.md"),
+            files: Some(vec!["../../outside.md".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            skill.resolve_bundled_files(),
+            vec![PathBuf::from("/skills/foo/../../outside.md")]
+        );
     }
 
     #[tokio::test]
@@ -712,7 +797,11 @@ mod tests {
     #[test]
     fn expand_named_args_substitute_by_declared_order() {
         let body = "Migrate $component from $from to $to.";
-        let names = vec!["component".to_string(), "from".to_string(), "to".to_string()];
+        let names = vec![
+            "component".to_string(),
+            "from".to_string(),
+            "to".to_string(),
+        ];
         let r = expand_skill_vars_named(body, "SearchBar React Vue", &names);
         assert_eq!(r, "Migrate SearchBar from React to Vue.");
     }
@@ -765,12 +854,9 @@ mod tests {
     async fn try_expand_substitutes_args_placeholder() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("SKILL.md");
-        tokio::fs::write(
-            &p,
-            "---\ndescription: test\n---\nReview {ARGS} and report.",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(&p, "---\ndescription: test\n---\nReview {ARGS} and report.")
+            .await
+            .unwrap();
         let skills = vec![SkillEntry {
             name: "x".into(),
             description: "test".into(),

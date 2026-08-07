@@ -300,16 +300,14 @@ impl MemoryStore {
     fn parse_memory_file(raw: &str) -> Option<DurableMemory> {
         // Parse YAML frontmatter between --- delimiters
         let trimmed = raw.trim();
-        let frontmatter = if let Some(after_first) = trimmed.strip_prefix("---") {
+        let frontmatter = {
+            let after_first = trimmed.strip_prefix("---")?;
             if let Some(end) = after_first.find("\n---") {
                 &after_first[..end]
-            } else if let Some(end) = after_first.find("---") {
-                &after_first[..end]
             } else {
-                return None;
+                let end = after_first.find("---")?;
+                &after_first[..end]
             }
-        } else {
-            return None;
         };
 
         // Try serde_yaml parsing first (flat format: name/description/type at top level)

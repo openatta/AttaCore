@@ -46,4 +46,12 @@ pub trait Permission: Send + Sync {
     /// Clear every temporary allow `add_temporary_allow` added. Same
     /// no-op default as above.
     fn clear_temporary_allows(&self) {}
+
+    /// Persist an Allow decision for `tool_name` beyond this single check —
+    /// unlike `add_temporary_allow`, this is NOT cleared by
+    /// `clear_temporary_allows` and is meant to last for the rest of the
+    /// session (and, separately, the caller is responsible for any on-disk
+    /// persistence — this method only affects in-memory/live behavior).
+    /// Default no-op for implementations without a backing rule engine.
+    fn add_persistent_allow(&self, _tool_name: &str, _rule_content: Option<&str>) {}
 }

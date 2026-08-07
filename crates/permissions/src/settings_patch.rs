@@ -8,6 +8,21 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Serializes concurrent callers of [`append_permission_rule`] within this
+/// process. The function itself is read-modify-write (read whole file,
+/// mutate in memory, write via tmp+rename) with no cross-call atomicity —
+/// two calls racing on the *same* settings file (e.g. two tool calls in one
+/// turn both answered with an "always allow" decision concurrently, see
+/// `crates/runtime/src/turn.rs`'s `PermitAlways` handling) can otherwise
+/// silently lose one of the two appended rules. A single global lock is
+/// enough: this path is a rare, user-interactive event, not a hot loop, so
+/// serializing it process-wide costs nothing measurable. Does not protect
+/// against a *different process* writing the same file concurrently — that
+/// remains an accepted, documented limitation (see `settings_patch`'s
+/// design notes).
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Which behavior bucket to append to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +63,8 @@ pub fn append_permission_rule(
     target: AppendTarget,
     rule_string: &str,
 ) -> Result<bool, AppendError> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     if let Some(parent) = settings_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -111,6 +128,36 @@ pub fn build_rule_string(tool_name: &str, match_content: Option<&str>) -> Option
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Regression guard for the read-modify-write race: N threads appending
+    /// distinct rules to the *same* settings file concurrently must all
+    /// survive — without `WRITE_LOCK` serializing them, this reliably loses
+    /// updates (a thread reads the file before an earlier thread's rename
+    /// lands, then overwrites it on its own write).
+    #[test]
+    fn concurrent_appends_to_the_same_file_do_not_lose_updates() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("settings.json");
+        let n = 12;
+
+        std::thread::scope(|scope| {
+            for i in 0..n {
+                let p = &p;
+                scope.spawn(move || {
+                    append_permission_rule(p, AppendTarget::Allow, &format!("Bash(cmd{i})"))
+                        .unwrap();
+                });
+            }
+        });
+
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        let arr = v["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            n,
+            "expected all {n} concurrently-appended rules to survive, got {arr:?}"
+        );
+    }
 
     #[test]
     fn append_creates_file_if_absent() {

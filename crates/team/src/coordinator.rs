@@ -3,18 +3,18 @@
 //! Also provides [`PermissionBridge`] — intercepts sub-agent permission prompts
 //! and forwards them to the parent agent via the team mailbox (Bubble mode).
 
+use async_trait::async_trait;
+use base::context::EngineConfig;
+use base::error::ToolError;
 use base::interface::agent_spawner::AgentSpawner;
 use base::interface::model::{Model, ModelEvent, StreamParams};
 use base::interface::permission::{Permission, PermissionOutcome};
 use base::interface::prompt::{BlockRole, PromptBlock};
 use base::interface::settings::ThinkingMode;
 use base::tool::InMemoryToolRegistry;
-use async_trait::async_trait;
-use base::context::EngineConfig;
-use base::tool::ToolResultContent;
 use base::tool::ToolContext;
 use base::tool::ToolResult;
-use base::error::ToolError;
+use base::tool::ToolResultContent;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -305,7 +305,9 @@ impl DefaultCoordinator {
     /// The spawner wraps the runtime's `AgentTool` logic and is safe to pass
     /// across crate boundaries because both sides depend only on the trait in `base`.
     pub fn with_agent_spawner(spawner: Arc<dyn AgentSpawner>) -> Self {
-        Self { spawner: Some(spawner) }
+        Self {
+            spawner: Some(spawner),
+        }
     }
 }
 
@@ -318,14 +320,30 @@ impl Default for DefaultCoordinator {
 #[async_trait]
 impl Coordinator for DefaultCoordinator {
     async fn orchestrate(&self, req: OrchestrateRequest) -> Result<ToolResult, ToolError> {
-        let OrchestrateRequest { model, config, parent_tools: _, sub_tools: _, stages, name, scratchpad, ctx } = req;
+        /// Maximum number of agents dispatched concurrently within a single stage.
+        const STAGE_CONCURRENCY_LIMIT: usize = 6;
 
-        let all_labels: Vec<String> = stages.iter()
-            .flat_map(|s| s.agents.iter().map(|a| a.label.clone())).collect();
+        let OrchestrateRequest {
+            model,
+            config,
+            parent_tools: _,
+            sub_tools: _,
+            stages,
+            name,
+            scratchpad,
+            ctx,
+        } = req;
+
+        let all_labels: Vec<String> = stages
+            .iter()
+            .flat_map(|s| s.agents.iter().map(|a| a.label.clone()))
+            .collect();
         let team_id = format!("team-{}-{}", name, chrono_id());
         let team_dir = ctx.session.cwd.join(".atta/teams").join(&team_id);
         let sp_path = team_dir.join("SCRATCHPAD.md");
-        if let Some(p) = sp_path.parent() { let _ = tokio::fs::create_dir_all(p).await; }
+        if let Some(p) = sp_path.parent() {
+            let _ = tokio::fs::create_dir_all(p).await;
+        }
 
         // P1-9: Write team metadata (config.json) for tool discoverability.
         // TS parity: TeamFile in teamHelpers.ts.
@@ -345,20 +363,21 @@ impl Coordinator for DefaultCoordinator {
                 })
             })).collect::<Vec<_>>(),
         });
-        let _ = tokio::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default()).await;
+        let _ = tokio::fs::write(
+            &meta_path,
+            serde_json::to_string_pretty(&meta).unwrap_or_default(),
+        )
+        .await;
 
         let mailbox = Arc::new(crate::mailbox::MailboxStore::with_persistence(
-            all_labels, team_dir.join("mailbox"),
+            all_labels,
+            team_dir.join("mailbox"),
         ));
 
         // Create permission bridges for each agent in the team.
         // These bridges are used when spawning team members to bubble
         // permission decisions up to the coordinator.
-        let _permission_bridges = create_permission_bridges(
-            mailbox.clone(),
-            &stages,
-            &name,
-        );
+        let _permission_bridges = create_permission_bridges(mailbox.clone(), &stages, &name);
 
         // Inject coordinator system prompt (TS parity: coordinatorMode.ts)
         let stage_names: Vec<String> = stages.iter().map(|s| s.name.clone()).collect();
@@ -375,10 +394,11 @@ impl Coordinator for DefaultCoordinator {
         let _ = tokio::fs::write(&sp_path, &scratch).await;
 
         // P1-8: Teammate lifecycle tracking. TS parity: InProcessTeammateTask.
-        let mut lifecycles: std::collections::HashMap<String, TeammateLifecycle> =
-            stages.iter().flat_map(|s| s.agents.iter())
-                .map(|a| (a.label.clone(), TeammateLifecycle::Idle))
-                .collect();
+        let mut lifecycles: std::collections::HashMap<String, TeammateLifecycle> = stages
+            .iter()
+            .flat_map(|s| s.agents.iter())
+            .map(|a| (a.label.clone(), TeammateLifecycle::Idle))
+            .collect();
 
         let mut any_err = false;
         for (si, stage) in stages.iter().enumerate() {
@@ -386,25 +406,50 @@ impl Coordinator for DefaultCoordinator {
 
             // Spawn agents in this stage using the AgentSpawner (if provided)
             if let Some(ref spawner) = self.spawner {
+                // Transition every agent in this stage to Active up front —
+                // the concurrent futures below don't need to mutate `lifecycles`.
                 for agent_spec in &stage.agents {
-                    // Transition to Active
                     lifecycles.insert(agent_spec.label.clone(), TeammateLifecycle::Active);
+                }
+
+                let permits = Arc::new(tokio::sync::Semaphore::new(STAGE_CONCURRENCY_LIMIT));
+                let futs = stage.agents.iter().map(|agent_spec| {
+                    let permits = permits.clone();
+                    let spawner = spawner.clone();
+                    let label = agent_spec.label.clone();
+                    let prompt = agent_spec.prompt.clone();
+                    let cwd = ctx.cwd.clone();
                     let cancel = ctx.cancel.child_token();
-                    match spawner.spawn_agent(
-                        agent_spec.prompt.clone(),
-                        vec![], // allowed_tools: empty = all tools
-                        ctx.cwd.clone(),
-                        cancel,
-                        None, // agent teams don't carry a named agent-type concept
-                    ).await {
-                        Ok(text) => {
-                            sections.push((agent_spec.label.clone(), text, false));
-                        }
-                        Err(e) => {
-                            sections.push((agent_spec.label.clone(), format!("ERROR: {e}"), true));
-                            any_err = true;
+                    async move {
+                        let _permit = permits.acquire_owned().await.expect("semaphore closed");
+                        let result = spawner
+                            .spawn_agent(
+                                prompt,
+                                vec![], // allowed_tools: empty = all tools
+                                cwd,
+                                cancel,
+                                None, // agent teams don't carry a named agent-type concept
+                            )
+                            .await;
+                        drop(_permit);
+                        match result {
+                            Ok(text) => (label, text, false),
+                            Err(e) => (label, format!("ERROR: {e}"), true),
                         }
                     }
+                });
+                let results = futures::future::join_all(futs).await;
+
+                // Bulk-mark every agent in this stage Completed after the join.
+                for agent_spec in &stage.agents {
+                    lifecycles.insert(agent_spec.label.clone(), TeammateLifecycle::Completed);
+                }
+
+                for (label, text, is_error) in results {
+                    if is_error {
+                        any_err = true;
+                    }
+                    sections.push((label, text, is_error));
                 }
             } else {
                 // No spawner available — log a warning that agents cannot be spawned.
@@ -417,7 +462,8 @@ impl Coordinator for DefaultCoordinator {
                 for agent_spec in &stage.agents {
                     sections.push((
                         agent_spec.label.clone(),
-                        "[AgentSpawner not available — team coordination requires daemon wiring]".to_string(),
+                        "[AgentSpawner not available — team coordination requires daemon wiring]"
+                            .to_string(),
                         true,
                     ));
                     any_err = true;
@@ -426,21 +472,33 @@ impl Coordinator for DefaultCoordinator {
 
             if let Some(mode) = stage.aggregate {
                 if !sections.is_empty() {
-                    sections = aggregate(&*model, &config.model, mode, &stage.name, &sections).await;
+                    sections =
+                        aggregate(&*model, &config.model, mode, &stage.name, &sections).await;
                 }
             }
 
             let mut md = format!("\n## {}_{}\n\n", si + 1, stage.name);
             for (l, b, e) in &sections {
-                md.push_str(&format!("### {}{}\n{b}\n\n", l, if *e { " (ERROR)" } else { "" }));
+                md.push_str(&format!(
+                    "### {}{}\n{b}\n\n",
+                    l,
+                    if *e { " (ERROR)" } else { "" }
+                ));
             }
             scratch.push_str(&md);
             let _ = tokio::fs::write(&sp_path, &scratch).await;
         }
 
         Ok(ToolResult {
-            content: ToolResultContent::Text(format!("{}\n\n_(scratchpad: {})_", scratch, sp_path.display())),
-            is_error: any_err, structured_content: None, mcp_meta: None, new_messages: None,
+            content: ToolResultContent::Text(format!(
+                "{}\n\n_(scratchpad: {})_",
+                scratch,
+                sp_path.display()
+            )),
+            is_error: any_err,
+            structured_content: None,
+            mcp_meta: None,
+            new_messages: None,
         })
     }
 
@@ -475,7 +533,8 @@ impl Coordinator for DefaultCoordinator {
 
         // Identify the last completed stage heading
         let last_stage: &str = scratchpad
-            .lines().rfind(|l| l.starts_with("## "))
+            .lines()
+            .rfind(|l| l.starts_with("## "))
             .map(|l| l.trim_start_matches("## ").trim())
             .unwrap_or("(none)");
 
@@ -513,21 +572,33 @@ impl Coordinator for DefaultCoordinator {
 // ═══════════════════════════════════════════════════════════
 
 pub async fn aggregate(
-    model: &dyn Model, model_name: &str, mode: AggregateMode,
-    stage_name: &str, sections: &[(String, String, bool)],
+    model: &dyn Model,
+    model_name: &str,
+    mode: AggregateMode,
+    stage_name: &str,
+    sections: &[(String, String, bool)],
 ) -> Vec<(String, String, bool)> {
     match mode {
         AggregateMode::Concat => sections.to_vec(),
         AggregateMode::Best => {
             if let Some(label) = pick_best(model, model_name, stage_name, sections).await {
-                sections.iter().filter(|(l,_,_)| *l == label).cloned().collect()
-            } else { sections.to_vec() }
+                sections
+                    .iter()
+                    .filter(|(l, _, _)| *l == label)
+                    .cloned()
+                    .collect()
+            } else {
+                sections.to_vec()
+            }
         }
         AggregateMode::Aggregate => {
-            let text = merge(model, model_name, stage_name, sections).await
+            let text = merge(model, model_name, stage_name, sections)
+                .await
                 .unwrap_or_else(|| {
                     let mut a = String::new();
-                    for (l, b, _) in sections { a.push_str(&format!("### {l}\n{b}\n\n")); }
+                    for (l, b, _) in sections {
+                        a.push_str(&format!("### {l}\n{b}\n\n"));
+                    }
                     a
                 });
             vec![("(aggregated)".into(), text, false)]
@@ -536,20 +607,28 @@ pub async fn aggregate(
 }
 
 pub async fn aggregate_stage_results(
-    model: &dyn Model, model_name: &str, mode: AggregateMode,
-    stage_name: &str, sections: &[(String, String, bool)],
+    model: &dyn Model,
+    model_name: &str,
+    mode: AggregateMode,
+    stage_name: &str,
+    sections: &[(String, String, bool)],
 ) -> Vec<(String, String, bool)> {
     aggregate(model, model_name, mode, stage_name, sections).await
 }
 
 async fn pick_best(
-    model: &dyn Model, model_name: &str, stage_name: &str,
+    model: &dyn Model,
+    model_name: &str,
+    stage_name: &str,
     sections: &[(String, String, bool)],
 ) -> Option<String> {
-    let formatted: Vec<String> = sections.iter().map(|(l, b, e)| {
-        let s = if *e { " (ERROR)" } else { "" };
-        format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
-    }).collect();
+    let formatted: Vec<String> = sections
+        .iter()
+        .map(|(l, b, e)| {
+            let s = if *e { " (ERROR)" } else { "" };
+            format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
+        })
+        .collect();
     let prompt = format!(
         "You are evaluating results of a team of AI agents on stage \"{stage_name}\".\n\n\
          Results:\n{}\n\n\
@@ -558,17 +637,26 @@ async fn pick_best(
     );
     let label = drain(model, model_name, prompt, 100).await?;
     let label = label.trim().to_string();
-    if sections.iter().any(|(l,_,_)| l == &label) { Some(label) } else { None }
+    if sections.iter().any(|(l, _, _)| l == &label) {
+        Some(label)
+    } else {
+        None
+    }
 }
 
 async fn merge(
-    model: &dyn Model, model_name: &str, stage_name: &str,
+    model: &dyn Model,
+    model_name: &str,
+    stage_name: &str,
     sections: &[(String, String, bool)],
 ) -> Option<String> {
-    let formatted: Vec<String> = sections.iter().map(|(l, b, e)| {
-        let s = if *e { " (ERROR)" } else { "" };
-        format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
-    }).collect();
+    let formatted: Vec<String> = sections
+        .iter()
+        .map(|(l, b, e)| {
+            let s = if *e { " (ERROR)" } else { "" };
+            format!("<agent label=\"{l}{s}\">\n{b}\n</agent>")
+        })
+        .collect();
     let prompt = format!(
         "Synthesize results of AI agents on stage \"{stage_name}\".\n\nResults:\n{}\n\n\
          Combine into one document. Capture best insights, remove redundancy, preserve facts.",
@@ -577,7 +665,12 @@ async fn merge(
     drain(model, model_name, prompt, 4096).await
 }
 
-async fn drain(model: &dyn Model, model_name: &str, prompt: String, max_tokens: u32) -> Option<String> {
+async fn drain(
+    model: &dyn Model,
+    model_name: &str,
+    prompt: String,
+    max_tokens: u32,
+) -> Option<String> {
     let blocks = vec![PromptBlock {
         role: BlockRole::System,
         content: "You are a strict judge. Output only the requested text, nothing else.".into(),
@@ -588,12 +681,17 @@ async fn drain(model: &dyn Model, model_name: &str, prompt: String, max_tokens: 
         content: vec![base::interface::model::ModelContentBlock::Text { text: prompt }],
     }];
     let params = StreamParams {
-        model: model_name.to_string(), max_tokens,
-        thinking_mode: ThinkingMode::Off, fallback_model: None,
+        model: model_name.to_string(),
+        max_tokens,
+        thinking_mode: ThinkingMode::Off,
+        fallback_model: None,
         cache_edits: vec![],
     };
     let cancel = tokio_util::sync::CancellationToken::new();
-    let mut stream = model.stream(blocks, vec![], messages, params, cancel).await.ok()?;
+    let mut stream = model
+        .stream(blocks, vec![], messages, params, cancel)
+        .await
+        .ok()?;
     let mut text = String::new();
     while let Some(ev) = stream.next().await {
         match ev.ok()? {
@@ -602,11 +700,252 @@ async fn drain(model: &dyn Model, model_name: &str, prompt: String, max_tokens: 
             _ => {}
         }
     }
-    if text.trim().is_empty() { None } else { Some(text) }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn chrono_id() -> String {
     let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!("{n:x}")
+}
+
+// ═══════════════════════════════════════════════════════════
+// Tests — stage concurrency (bounded parallel dispatch)
+// ═══════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::TeamAgentSpec;
+    use base::interface::model::{ModelError, ModelStream};
+    use base::provider::ApiType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A `Model` stub that is never actually invoked by these tests (all
+    /// test stages use `aggregate: None`, so `aggregate()` never calls it).
+    struct UnusedModel;
+
+    #[async_trait]
+    impl Model for UnusedModel {
+        fn api_type(&self) -> ApiType {
+            ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: StreamParams,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<ModelStream, ModelError> {
+            panic!("UnusedModel::stream should not be called by these tests");
+        }
+    }
+
+    /// A fake `AgentSpawner` whose `spawn_agent` sleeps for a duration
+    /// encoded in the agent's `prompt` (as a plain millisecond count),
+    /// tracking in-flight concurrency via an `AtomicUsize`.
+    struct FakeSpawner {
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+    }
+
+    impl FakeSpawner {
+        fn new() -> Self {
+            Self {
+                in_flight: AtomicUsize::new(0),
+                peak_in_flight: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentSpawner for FakeSpawner {
+        async fn spawn_agent(
+            &self,
+            prompt: String,
+            _allowed_tools: Vec<String>,
+            _cwd: std::path::PathBuf,
+            _cancel: tokio_util::sync::CancellationToken,
+            _agent_type: Option<String>,
+        ) -> Result<String, Box<dyn std::error::Error + Send>> {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(cur, Ordering::SeqCst);
+
+            let delay_ms: u64 = prompt.parse().unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(format!("done-{prompt}"))
+        }
+
+        async fn spawn_agent_background(
+            &self,
+            _prompt: String,
+            _allowed_tools: Vec<String>,
+            _cwd: std::path::PathBuf,
+            _cancel: tokio_util::sync::CancellationToken,
+            _agent_type: Option<String>,
+            _session: Arc<base::context::SessionState>,
+        ) -> Result<String, Box<dyn std::error::Error + Send>> {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    fn make_ctx() -> (tempfile::TempDir, ToolContext) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::for_test(dir.path().to_path_buf());
+        (dir, ctx)
+    }
+
+    fn make_request(ctx: ToolContext, stages: Vec<TeamStage>) -> OrchestrateRequest {
+        OrchestrateRequest {
+            model: Arc::new(UnusedModel),
+            config: Arc::new(EngineConfig::defaults_for("test")),
+            parent_tools: Arc::new(InMemoryToolRegistry::new()),
+            sub_tools: Arc::new(InMemoryToolRegistry::new()),
+            stages,
+            name: "test-team".to_string(),
+            scratchpad: None,
+            ctx,
+        }
+    }
+
+    /// (a) A stage with N agents, each sleeping D ms, should complete in
+    /// wall-clock time much closer to D than to N*D — proving the agents
+    /// run concurrently rather than sequentially.
+    #[tokio::test]
+    async fn stage_agents_run_concurrently() {
+        let n = 6usize;
+        let delay_ms: u64 = 100;
+
+        let agents: Vec<TeamAgentSpec> = (0..n)
+            .map(|i| TeamAgentSpec {
+                label: format!("agent{i}"),
+                prompt: delay_ms.to_string(),
+                agent_type: None,
+            })
+            .collect();
+        let stages = vec![TeamStage {
+            name: "stage0".into(),
+            agents,
+            aggregate: None,
+        }];
+
+        let (_dir, ctx) = make_ctx();
+        let spawner = Arc::new(FakeSpawner::new());
+        let coordinator = DefaultCoordinator::with_agent_spawner(spawner);
+        let req = make_request(ctx, stages);
+
+        let start = std::time::Instant::now();
+        let result = coordinator.orchestrate(req).await.expect("orchestrate ok");
+        let elapsed = start.elapsed();
+
+        assert!(!result.is_error, "no agent should have errored");
+        let sequential_upper_bound = Duration::from_millis(delay_ms * n as u64);
+        assert!(
+            elapsed < sequential_upper_bound.mul_f64(0.6),
+            "expected concurrent dispatch (~{delay_ms}ms), got {elapsed:?} \
+             (sequential would be ~{sequential_upper_bound:?})"
+        );
+    }
+
+    /// (b) The section order in the coordinator's output must match the
+    /// declaration order of `stage.agents`, even when later-declared agents
+    /// finish first (i.e. output order is NOT completion order).
+    #[tokio::test]
+    async fn stage_output_preserves_declaration_order_not_completion_order() {
+        // Agent 0 sleeps longest, last agent sleeps shortest — so completion
+        // order is the reverse of declaration order.
+        let delays_ms: [u64; 4] = [150, 100, 50, 10];
+        let agents: Vec<TeamAgentSpec> = delays_ms
+            .iter()
+            .enumerate()
+            .map(|(i, d)| TeamAgentSpec {
+                label: format!("agent{i}"),
+                prompt: d.to_string(),
+                agent_type: None,
+            })
+            .collect();
+        let stages = vec![TeamStage {
+            name: "stage0".into(),
+            agents,
+            aggregate: None,
+        }];
+
+        let (_dir, ctx) = make_ctx();
+        let spawner = Arc::new(FakeSpawner::new());
+        let coordinator = DefaultCoordinator::with_agent_spawner(spawner);
+        let req = make_request(ctx, stages);
+
+        let result = coordinator.orchestrate(req).await.expect("orchestrate ok");
+        let text = match &result.content {
+            ToolResultContent::Text(t) => t.clone(),
+            ToolResultContent::Blocks(_) => panic!("expected text content"),
+        };
+
+        // Assert each label's heading appears in the text in declaration
+        // order (agent0 before agent1 before agent2 before agent3), which
+        // is the reverse of completion order.
+        let positions: Vec<usize> = (0..delays_ms.len())
+            .map(|i| {
+                text.find(&format!("### agent{i}"))
+                    .unwrap_or_else(|| panic!("missing section for agent{i} in:\n{text}"))
+            })
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(
+            positions, sorted,
+            "expected output sections in declaration order agent0..agent3, got positions {positions:?}"
+        );
+    }
+
+    /// (c) With more agents than the semaphore has permits, the observed
+    /// peak in-flight concurrency must never exceed the permit count (6).
+    #[tokio::test]
+    async fn stage_dispatch_is_bounded_by_semaphore() {
+        let n = 10usize;
+        let delay_ms: u64 = 40;
+
+        let agents: Vec<TeamAgentSpec> = (0..n)
+            .map(|i| TeamAgentSpec {
+                label: format!("agent{i}"),
+                prompt: delay_ms.to_string(),
+                agent_type: None,
+            })
+            .collect();
+        let stages = vec![TeamStage {
+            name: "stage0".into(),
+            agents,
+            aggregate: None,
+        }];
+
+        let (_dir, ctx) = make_ctx();
+        let spawner = Arc::new(FakeSpawner::new());
+        let coordinator = DefaultCoordinator::with_agent_spawner(spawner.clone());
+        let req = make_request(ctx, stages);
+
+        let result = coordinator.orchestrate(req).await.expect("orchestrate ok");
+        assert!(!result.is_error, "no agent should have errored");
+
+        let peak = spawner.peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= 6,
+            "expected peak in-flight <= 6 permits, observed {peak}"
+        );
+        // Sanity: with 10 agents and a limit of 6 we expect the bound to
+        // actually be exercised (otherwise the test proves nothing).
+        assert!(
+            peak >= 2,
+            "test setup produced no real concurrency (peak={peak})"
+        );
+    }
 }
