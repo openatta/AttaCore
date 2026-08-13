@@ -1,0 +1,30 @@
+[package]
+name = "telemetry"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — telemetry, usage stats, VCR, perf"
+
+[dependencies]
+base          = { workspace = true }
+tokio         = { workspace = true }
+tokio-util    = { workspace = true }
+# Only used by feature_flags.rs to pull flag *definitions* — unrelated to
+# sending telemetry data, which this crate never does on its own (see lib.rs).
+reqwest       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+time          = { workspace = true }
+async-trait   = { workspace = true }
+futures       = { workspace = true }
+sha2          = { workspace = true }
+regex         = { workspace = true }
+hex           = { workspace = true }
+
+[dev-dependencies]
+model       = { workspace = true }

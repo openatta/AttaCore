@@ -1,0 +1,47 @@
+# Rust build output
+target/
+
+# Reference source copies
+3rds/
+
+# Backup files
+*.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test output (generated, not committed)
+tests/output/
+
+# VCR cassette cache (local/CI-only; see docs/TESTING_GUIDE.md — request hashes bake
+# in exact model name + prompt + tool set, so committed cassettes would go stale on
+# every prompt/model change and produce unreviewable binary-ish diffs)
+tests/fixtures/cassettes/
+
+# Environment
+.env
+.env.local
+
+# Per-session runtime artifacts under the project-local data dir
+# (`local_data_dir = <cwd>/.atta/`). Project-*authored* content there —
+# `.atta/agents/*.md`, `.atta/settings.json` — is meant to be committed, so
+# this ignores the generated subdirectories rather than `.atta/` wholesale.
+# `telemetry/` is new: sessions now record a JSONL transcript by default
+# (previously nothing was recorded unless a caller passed an explicit path).
+.atta/telemetry/
+.atta/sessions/
+.atta/teams/
+
+# Intermediate-process documents (status assessments, comparison analyses,
+# audit reports) — see CLAUDE.md §2. They describe what the system *was like*
+# at a moment, not how it is built, and go stale the day they land. Conclusions
+# belong in code, commit messages, or docs/ design notes.
+.local/

@@ -1,0 +1,63 @@
+[package]
+name = "daemon"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore daemon — JSON-RPC 2.0 over Unix socket / TCP, sample application"
+
+[[bin]]
+name = "attacored"
+path = "src/main.rs"
+
+[dependencies]
+base          = { workspace = true }
+runtime       = { workspace = true }
+model         = { workspace = true }
+mcp           = { workspace = true }
+permissions   = { workspace = true }
+scene         = { workspace = true }
+history       = { workspace = true }
+hooks         = { workspace = true }
+session       = { workspace = true }
+plugin        = { workspace = true }
+skills        = { workspace = true }
+tools         = { workspace = true }
+tokio         = { workspace = true, features = ["full"] }
+tokio-util    = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait   = { workspace = true }
+clap          = { version = "4", features = ["derive"] }
+reqwest       = { workspace = true }
+time          = { workspace = true }
+futures       = { workspace = true }
+telemetry     = { workspace = true }
+notify        = { workspace = true }
+url           = { workspace = true }
+
+# Optional: OpenTelemetry OTLP export (gated by "otel" feature). Lives here,
+# not in `telemetry`, because that crate never talks to the network itself —
+# see `telemetry_otel.rs`.
+opentelemetry      = { version = "0.27", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk  = { version = "0.27", default-features = false, features = ["trace", "metrics", "rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "metrics", "grpc-tonic", "http-proto"], optional = true }
+tonic              = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+compaction = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zip = { workspace = true }
+
+[features]
+# Fan session telemetry out to an OTLP collector in addition to the per-session
+# JSONL file. Off by default: the OTLP SDK is a large dependency tree and the
+# file recorder is what makes a run debuggable out of the box.
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tonic"]

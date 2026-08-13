@@ -1,0 +1,636 @@
+{
+  "$defs": {
+    "ApiType": {
+      "description": "API protocol type.",
+      "enum": [
+        "anthropic",
+        "openai_compatible"
+      ],
+      "type": "string"
+    },
+    "CompactionConfig": {
+      "description": "Context compaction configuration.",
+      "properties": {
+        "keep_recent": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "threshold_tokens": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "threshold_tokens",
+        "keep_recent"
+      ],
+      "type": "object"
+    },
+    "ExecutionSettings": {
+      "description": "Execution constraints.",
+      "properties": {
+        "max_api_calls_per_turn": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_budget_tokens": {
+          "description": "Maximum cumulative tokens (input + output, summed across every API\ncall in a turn) before the turn is aborted with `budget_exceeded`.\n`None` = unlimited.\n\nDeliberately token-based, not a dollar figure: provider prices change\nover time and per contract, so enforcing a dollar budget needs a\nper-model price table that can silently drift out of date — a stale\nor missing price makes the hard cap wrong in either direction. Token\ncounts come straight from the provider's own usage accounting on\nevery response, so there is nothing to keep in sync.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_parallelism": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "permission_prompt_timeout_secs": {
+          "default": 300,
+          "description": "How long a tool call waits for a host to answer a permission prompt\nbefore the call is denied. `0` waits indefinitely (only session\ncancellation interrupts it).\n\nThe wait itself lives in the engine (`execute_tool_inner`), so the\nbound has to be reachable from `EngineConfig` — it previously existed\nonly as a daemon-side flag, which meant any host driving the engine\ndirectly had no timeout at all.\n\nFailing closed (deny, not permit) on expiry is deliberate: a prompt\nthat went unanswered is not consent.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "team_enabled": {
+          "default": false,
+          "description": "Gates whether `TeamCreate`/`TeamDelete` are registered at all for a\nsession (`runtime::agent::Builder::build()`). Default `false`: most\ndeployments never use multi-agent team coordination, and an\nalways-registered tool means its `tool.prompt.md` \"When to Use\"\nsection is always in the system prompt and its `team`/`name` input\nfields are always in the `Agent` tool's schema, whether or not the\noperator ever intends to allow it. Flipping this only affects\nsessions built *after* the change (existing sessions keep whatever\ntool set they were built with — same as every other setting here);\nthere is no separate restart requirement.",
+          "type": "boolean"
+        },
+        "team_max_persistent_members": {
+          "default": 20,
+          "description": "Reclaim policy for persistent team members (`Agent` tool's\n`team_name`+`name` mode): total pool size across a session. When the\npool exceeds this, the oldest-idle members are stopped (never an\n`Active` one) until it's back at or under the cap — reclaims just\nenough, not everything.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "team_member_idle_timeout_secs": {
+          "default": 1800,
+          "description": "Reclaim policy for persistent team members: how long a member may\nsit idle (no message since its last turn finished) before it's\nstopped on its own, independent of the total-count cap above. Either\ncondition triggers a reclaim sweep; they're independent, not\ncombined.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "team_stage_concurrency": {
+          "default": 6,
+          "description": "Maximum number of `TeamCreate` sub-agents dispatched concurrently\nwithin a single stage. Was a hardcoded constant in\n`crates/team/src/coordinator.rs`; default 6 matches the old value.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_parallelism",
+        "max_api_calls_per_turn"
+      ],
+      "type": "object"
+    },
+    "FeatureFlags": {
+      "description": "Runtime-configurable feature flags (loaded from settings JSON or CLI args).",
+      "properties": {
+        "cached_microcompact": {
+          "default": false,
+          "description": "Enable microcompact caching (time-based tool result clearing).",
+          "type": "boolean"
+        },
+        "dream_task": {
+          "default": false,
+          "description": "Enable dream task — background thinking sub-agent that runs without\nblocking the user, writing thoughts to disk for later inspection.",
+          "type": "boolean"
+        },
+        "experimental_agent": {
+          "default": false,
+          "description": "Enable experimental agent routing (model selection by task type).",
+          "type": "boolean"
+        },
+        "extended_memory": {
+          "default": false,
+          "description": "Enable extended memory features (LLM-based relevance selection, team memory sync).",
+          "type": "boolean"
+        },
+        "plugin_marketplace": {
+          "default": false,
+          "description": "Enable plugin marketplace (remote registry + dependency resolution).",
+          "type": "boolean"
+        },
+        "reactive_compact": {
+          "default": false,
+          "description": "Enable reactive compaction — proactive context compression triggered\nbefore the budget is fully exhausted, based on token usage velocity.",
+          "type": "boolean"
+        },
+        "team_mode": {
+          "default": false,
+          "description": "Enable multi-agent team coordination mode.",
+          "type": "boolean"
+        },
+        "vcr_auto_detect": {
+          "default": false,
+          "description": "Enable VCR auto-detection in test environments.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ModelSettings": {
+      "description": "LLM model configuration for a single provider.",
+      "properties": {
+        "api_type": {
+          "$ref": "#/$defs/ApiType"
+        },
+        "auth_token": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "fallback_model": {
+          "default": null,
+          "description": "Fallback model for persistent Overloaded/529 errors (e.g. Opus → Sonnet).\nNone = no fallback.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_tokens": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model_name": {
+          "description": "Resolved model name (upper layer already resolved slot → name).",
+          "type": "string"
+        },
+        "thinking_mode": {
+          "$ref": "#/$defs/ThinkingMode"
+        }
+      },
+      "required": [
+        "api_type",
+        "base_url",
+        "auth_token",
+        "model_name",
+        "max_tokens",
+        "thinking_mode"
+      ],
+      "type": "object"
+    },
+    "NetworkModeConfig": {
+      "enum": [
+        "unrestricted",
+        "deny_all",
+        "allowlist"
+      ],
+      "type": "string"
+    },
+    "PathSettings": {
+      "description": "Path configuration for data directories.",
+      "properties": {
+        "global_data_dir": {
+          "default": "",
+          "description": "User-level, cross-scene global root — flat, shared by every scene\n(e.g. `~/.atta/`). Used by resources that don't have a scene tier\n(`memory`/`sessions`/`vcr`/`mcp`) and as the base layer for resources\nthat do (`settings.json`/`skills`/`plugins`/`agents`/`rules`/`hooks`).\nSee `base::paths::ConfigPaths` module docs for the full breakdown.",
+          "type": "string"
+        },
+        "local_data_dir": {
+          "description": "Local/project data root (e.g. `<cwd>/.atta/`)",
+          "type": "string"
+        },
+        "scope": {
+          "default": "code",
+          "description": "Which product instance's user-level state `user_data_dir` was built\nfor (see `base::paths::ConfigPaths`). Carried alongside the resolved\ndirs so downstream code (e.g. `FrozenContext::collect`) doesn't have\nto re-derive it from the path. Defaults to `\"code\"` on deserialize\nfor settings.json files predating this field — `Settings::merge`\nnever copies a deserialized `paths` value over the one `Settings::load`\nsets explicitly, so this default only matters for standalone\n(de)serialization, not for the daemon's actual startup path.",
+          "type": "string"
+        },
+        "user_data_dir": {
+          "description": "User-level, scene-specific override root (e.g. `~/.atta/scenes/<scope>/`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "user_data_dir",
+        "local_data_dir"
+      ],
+      "type": "object"
+    },
+    "PermissionAction": {
+      "enum": [
+        "allow",
+        "deny",
+        "ask"
+      ],
+      "type": "string"
+    },
+    "PermissionMode": {
+      "description": "Permission mode for tool execution (TS parity).",
+      "oneOf": [
+        {
+          "const": "default",
+          "description": "Prompt user for each tool call that isn't explicitly allowed.",
+          "type": "string"
+        },
+        {
+          "const": "acceptEdits",
+          "description": "Auto-accept edits to files (Write/Edit), prompt for others.",
+          "type": "string"
+        },
+        {
+          "const": "bypassPermissions",
+          "description": "Bypass all permission checks.",
+          "type": "string"
+        },
+        {
+          "const": "plan",
+          "description": "Plan mode — only allow read-only tools.",
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "Auto mode — skip prompts for known-safe operations.\n**Program-only**: requires transcript classifier; cannot be set by user.",
+          "type": "string"
+        },
+        {
+          "const": "dontAsk",
+          "description": "Don't ask — deny any tool not explicitly allowed (no prompt). TS parity: dontAsk.",
+          "type": "string"
+        },
+        {
+          "const": "bubble",
+          "description": "Bubble mode — forward permission requests up to a parent agent.\n**Program-only**: set by team/coordinator runtime; cannot be set by user.\nTS parity: bubble.",
+          "type": "string"
+        },
+        {
+          "const": "yolo",
+          "description": "YOLO mode — aggressive auto-approval for power users.",
+          "type": "string"
+        }
+      ]
+    },
+    "PermissionRule": {
+      "description": "A single permission rule: allow/deny/ask a tool matching a pattern.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/PermissionAction",
+          "description": "Action: \"allow\", \"deny\", or \"ask\"."
+        },
+        "tool": {
+          "description": "Tool name pattern (e.g. \"Bash\", \"Bash(git push:*)\", \"FileWrite\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "action"
+      ],
+      "type": "object"
+    },
+    "ProviderConfig": {
+      "description": "A single provider's connection + model config, as written in settings.json.",
+      "properties": {
+        "api_key": {
+          "default": null,
+          "description": "Stored in plaintext, same as every other settings.json field — see\nthe \"安全提示\" section in `docs/LLM_PROVIDERS.md`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_type": {
+          "default": null,
+          "description": "\"anthropic\" | \"openai_compatible\". Kept as a plain string (not\n`ApiType`) so an unrecognized value degrades to a warning instead of\na hard parse failure of the whole settings.json.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default_model": {
+          "default": null,
+          "description": "Model used when a task_models override doesn't name one explicitly,\nor when a named model fails the `models` allow-list check below.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "default": [],
+          "description": "Allow-list used purely to *filter* an explicitly-requested model name;\nit is not a live catalog fetched from the provider. Empty = no\nfiltering, any model name is accepted as-is.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SandboxConfig": {
+      "description": "Sandbox/security configuration.",
+      "properties": {
+        "allow_read": {
+          "description": "Paths to re-allow reading, on top of the built-in credential deny\ndefaults (`~/.ssh`, `~/.aws`, `~/.npmrc`, ...). Most specific wins.\n\nExists because those defaults are now actually applied to `Bash` (they\nused to be defined and never reached production), and some of them\nsit on legitimate workflows — `npm install` against a private registry\nreads `~/.npmrc`, `docker build` reads `~/.docker/config.json`.\nWithout this there was no way to say \"yes, that one is fine here\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dangerously_disable_sandbox": {
+          "default": false,
+          "description": "Bypass sandbox entirely (TS parity: `dangerouslyDisableSandbox`).\nDefault: false. Only for trusted environments.",
+          "type": "boolean"
+        },
+        "deny_read": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "network_mode": {
+          "$ref": "#/$defs/NetworkModeConfig",
+          "default": "unrestricted",
+          "description": "Outbound network policy for sandboxed `Bash` commands."
+        }
+      },
+      "required": [
+        "deny_read",
+        "allowed_domains"
+      ],
+      "type": "object"
+    },
+    "TaskModelOverride": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "properties": {
+            "model": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "A `task_models.<task>` entry. Accepts either the shorthand `\"provider_id\"`\nstring form or the detailed `{ \"provider\": ..., \"model\": ... }` object form."
+    },
+    "ThinkingMode": {
+      "description": "Model thinking/reasoning mode.",
+      "oneOf": [
+        {
+          "enum": [
+            "auto",
+            "off",
+            "on"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "on_budget": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "on_budget"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VcrConfig": {
+      "description": "VCR (record/replay) configuration.",
+      "properties": {
+        "fallback_on_miss": {
+          "default": true,
+          "description": "On replay, fall back to real API when no match? (default true)",
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/VcrMode",
+          "description": "\"record\" or \"replay\""
+        },
+        "scenario": {
+          "description": "Scenario name (JSONL filename without extension)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "scenario"
+      ],
+      "type": "object"
+    },
+    "VcrMode": {
+      "enum": [
+        "record",
+        "replay"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Complete AGENT configuration. Merged by `Settings::load()` before injection.",
+  "properties": {
+    "allow_client_permission_override": {
+      "default": false,
+      "description": "Whether an RPC client may request a *more permissive* mode than\n`permission_mode` above.\n\nThe daemon's `session.create` takes an optional `permission_mode` in\nits options. That used to override `permission_mode` outright in\neither direction, which made this setting a default rather than a\npolicy: any client that could authenticate could open a\n`bypassPermissions` session no matter how the daemon was configured\n(and `daemon/src/server.rs` notes there is no per-method\nauthorization on that socket). With this `false` — the default — a\nclient can still *tighten* the mode for its own session, but a\nrequest to loosen it is clamped to what is configured here.\n\nSet it to `true` only when every client of this daemon is as trusted\nas the daemon itself.",
+      "type": "boolean"
+    },
+    "compaction": {
+      "$ref": "#/$defs/CompactionConfig",
+      "default": {
+        "keep_recent": 20,
+        "threshold_tokens": 150000
+      }
+    },
+    "default_provider": {
+      "description": "Provider id used for any task with no `task_models` entry, and as the\nfallback target when an entry's provider/model turns out invalid.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "disable_skill_shell_execution": {
+      "default": false,
+      "description": "Disable skill dynamic-content-injection shell commands (`` !`cmd` ``\nand fenced ` ```! ` blocks in `SKILL.md` bodies). Default: false\n(enabled) — matches Claude Code's `disableSkillShellExecution`.\nWhen true, each such placeholder is replaced with\n`[shell command execution disabled by policy]` instead of running.\nMost useful set in managed/org-wide settings where individual users\ncan't override it.",
+      "type": "boolean"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionSettings",
+      "default": {
+        "max_api_calls_per_turn": 200,
+        "max_budget_tokens": null,
+        "max_parallelism": 10,
+        "permission_prompt_timeout_secs": 300,
+        "team_enabled": false,
+        "team_max_persistent_members": 20,
+        "team_member_idle_timeout_secs": 1800,
+        "team_stage_concurrency": 6
+      }
+    },
+    "feature_flags": {
+      "$ref": "#/$defs/FeatureFlags",
+      "default": {
+        "cached_microcompact": false,
+        "dream_task": false,
+        "experimental_agent": false,
+        "extended_memory": false,
+        "plugin_marketplace": false,
+        "reactive_compact": false,
+        "team_mode": false,
+        "vcr_auto_detect": false
+      },
+      "description": "Feature flags — compile-time + runtime gate for experimental features.\nTS parity: GrowthBook feature flags in claude-code."
+    },
+    "hooks_config": {
+      "description": "Hooks configuration (merged from global/scene/project layers)."
+    },
+    "instruction_file": {
+      "default": null,
+      "description": "Path to an instruction file (e.g. AGENTS.md, CLAUDE.md).\nThe AGENT reads the file at its discretion (every turn, on change, etc.).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "language": {
+      "description": "User language preference (e.g. \"zh-CN\", \"ja\").",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_servers": {
+      "additionalProperties": true,
+      "description": "MCP server configurations, keyed by server name (merged from\nglobal/scene/project layers). Kept untyped (`serde_json::Value`\nrather than `mcp::config::McpServerConfig`) — `core` cannot depend on\n`mcp` (which already depends on `core`, for `base::paths::ConfigPaths`)\nwithout a circular dependency; downstream consumers deserialize each\nvalue into `McpServerConfig` themselves.",
+      "type": "object"
+    },
+    "memory_enabled": {
+      "default": true,
+      "description": "Enable the file-based memory system (MEMORY.md + .md files).\nDefault: true. Set to false to disable memory prompt injection and file-based memory.",
+      "type": "boolean"
+    },
+    "model": {
+      "$ref": "#/$defs/ModelSettings"
+    },
+    "paths": {
+      "$ref": "#/$defs/PathSettings"
+    },
+    "permission_mode": {
+      "$ref": "#/$defs/PermissionMode",
+      "default": "default",
+      "description": "Permission mode for tool execution.\nTS parity: `PermissionMode` in `types/permissions.ts`."
+    },
+    "permission_rules": {
+      "description": "Allow/deny/ask rules for specific tools.",
+      "items": {
+        "$ref": "#/$defs/PermissionRule"
+      },
+      "type": "array"
+    },
+    "prompt_append": {
+      "default": null,
+      "description": "Appended to the end of the system prompt.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "prompt_override": {
+      "default": null,
+      "description": "Overrides the entire system prompt if set.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "providers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderConfig"
+      },
+      "description": "Multi-provider LLM registry, keyed by provider id. See\n`docs/LLM_PROVIDERS.md`.",
+      "type": "object"
+    },
+    "sandbox": {
+      "$ref": "#/$defs/SandboxConfig",
+      "default": {
+        "allowed_domains": [],
+        "dangerously_disable_sandbox": false,
+        "deny_read": [],
+        "network_mode": "unrestricted"
+      }
+    },
+    "session_dir": {
+      "default": null,
+      "description": "Session persistence directory. None = no persistence.\nDefault: `Some(user_data_dir/sessions/)`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_models": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TaskModelOverride"
+      },
+      "description": "Per-task-type provider/model routing — see `base::provider::resolve_task_models`.",
+      "type": "object"
+    },
+    "telemetry_enabled": {
+      "default": true,
+      "description": "Whether sessions record a telemetry transcript.\n\nDefaults to **on**: a session writes one JSONL file per session under\n`<local_data_dir>/telemetry/`, which is what makes a run debuggable\nafter the fact (tool calls, permission decisions, turn costs). This\nused to be effectively off — the daemon attached a recorder only when\na caller passed an explicit output path, and the no-recorder fallback\ndropped every event on the floor — so nothing was ever recorded\nunless someone had planned for it in advance.",
+      "type": "boolean"
+    },
+    "telemetry_url": {
+      "default": null,
+      "description": "Telemetry endpoint URL. None = noop.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "vcr": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VcrConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "VCR record/replay configuration. None = pass-through."
+    }
+  },
+  "required": [
+    "model",
+    "paths"
+  ],
+  "title": "Settings",
+  "type": "object"
+}
