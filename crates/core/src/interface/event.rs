@@ -91,6 +91,26 @@ pub enum AgentEvent {
     /// Session was persisted to disk.
     SessionPersisted { session_id: String },
 
+    /// The skill catalog changed on disk — emitted at the top of the turn
+    /// that observed it, right after the reload.
+    ///
+    /// Skill-derived slash commands resolve through the live catalog, so a
+    /// host that caches a command list (a completion popup, a command
+    /// palette) has no other way to learn its copy went stale short of
+    /// polling. Names are skill names, i.e. slash commands without the
+    /// leading `/`.
+    ///
+    /// Content edits to an existing skill are not reported: the reload is
+    /// detected by set difference over the catalog, which sees a rename as
+    /// one removal plus one addition and an in-place body edit as nothing at
+    /// all. That is the honest scope — a consumer that cares about bodies
+    /// should re-read on any change rather than trust this to fire.
+    SkillsChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+        turn_id: String,
+    },
+
     // ── Sub-agent ──
     /// A sub-agent was spawned.
     AgentSpawned {

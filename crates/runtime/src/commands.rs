@@ -15,6 +15,7 @@
 
 use base::frozen::SkillEntry;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── Parsed slash command ──
 
@@ -61,6 +62,7 @@ pub struct CommandResult {
 }
 
 /// A registered slash command.
+#[derive(Clone)]
 pub enum Command {
     /// Prompt command: expand skill content and feed to LLM.
     Prompt { entry: Box<SkillEntry> },
@@ -84,7 +86,7 @@ pub enum Command {
     /// Local command: execute handler, return result, skip LLM.
     Local {
         description: String,
-        handler: Box<dyn Fn(&SlashCommand) -> CommandResult + Send + Sync>,
+        handler: Arc<dyn Fn(&SlashCommand) -> CommandResult + Send + Sync>,
     },
 }
 
@@ -104,55 +106,96 @@ impl Command {
 
 // ── Command registry ──
 
-/// Registry of all available slash commands, built at session start.
+/// Registry of all available slash commands.
+///
+/// Skill-derived commands are **not** stored here — they are resolved
+/// through the live [`SkillManager`](::skills::manager::SkillManager) on
+/// every lookup. That manager reloads changed files in place (the turn loop
+/// polls `check_for_changes()` before each turn), so any copy taken at
+/// construction time is stale as soon as a user adds, edits or deletes a
+/// skill file; a session built at 9am would keep resolving the skill set of
+/// 9am for as long as it lived, and the daemon's pool-wide registry — built
+/// once and shared by every session — never updated at all outside a plugin
+/// refresh.
+///
+/// Precedence on lookup, highest first: [`registered`](Self::insert_prompt)
+/// (plugin- and MCP-contributed) → live skills → [`builtin`](Default) local
+/// commands. This is the order the old insert-everything-into-one-map build
+/// sequence produced, preserved deliberately: `Builder::build`/
+/// `build_shared_commands` inserted skills over the built-ins and then
+/// plugin commands over both.
 pub struct CommandRegistry {
-    commands: HashMap<String, Command>,
+    /// Built-in local commands (`/help`, `/clear`, …). Lowest precedence.
+    builtin: HashMap<String, Command>,
+    /// Plugin-contributed prompts and MCP prompts — everything explicitly
+    /// registered that has no backing entry in the skill catalog.
+    registered: HashMap<String, Command>,
+    skills: Option<Arc<::skills::manager::SkillManager>>,
+}
+
+/// Skill-derived slash commands only exist for `user_invocable` skills.
+fn skill_as_command(skill: &::skills::manager::SkillInfo) -> Option<Command> {
+    if !skill.user_invocable {
+        return None;
+    }
+    Some(Command::Prompt {
+        entry: Box::new(SkillEntry {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            when_to_use: skill.when_to_use.clone(),
+            source: match skill.source {
+                ::skills::manager::SkillSource::User => base::frozen::SkillSource::User,
+                ::skills::manager::SkillSource::Project => base::frozen::SkillSource::Project,
+                ::skills::manager::SkillSource::Plugin => base::frozen::SkillSource::Plugin,
+            },
+            path: skill.path.clone(),
+            argument_hint: skill.argument_hint.clone(),
+            allowed_tools: skill.allowed_tools.clone(),
+            disallowed_tools: skill.disallowed_tools.clone(),
+            arguments: skill.arguments.clone(),
+            model: skill.model.clone(),
+            effort: skill.effort.clone(),
+            context: skill.context.clone(),
+            agent: skill.agent.clone(),
+            background: skill.background,
+            disable_model_invocation: skill.disable_model_invocation,
+            user_invocable: skill.user_invocable,
+            paths: skill.paths.clone(),
+            version: skill.version.clone(),
+            // `SkillInfo` has no counterpart for these two — they are dropped
+            // by `SkillEntry -> SkillInfo` on load, so the catalog cannot
+            // give them back. Fields listed exhaustively (no
+            // `..Default::default()`) so that adding one to `SkillEntry`
+            // fails the build here instead of silently arriving as `None`,
+            // which is how `arguments` went missing and quietly disabled
+            // named-argument expansion for every slash command.
+            files: None,
+            hooks: None,
+        }),
+    })
 }
 
 impl CommandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            commands: HashMap::new(),
+            builtin: HashMap::new(),
+            registered: HashMap::new(),
+            skills: None,
         }
     }
 
-    /// Build a registry from a skill manager (disk + bundled skills), on
-    /// top of the 5 built-in local commands (see `Default`). Each skill
-    /// becomes a `prompt` command. Starting from `Self::default()` (not
-    /// `Self::new()`) matters — this is the constructor the real per-session
-    /// registry is built from (`Builder::build()`), so `Self::new()` here
-    /// previously meant `/help`/`/skills`/`/clear`/`/compact`/`/cost` were
-    /// silently unresolvable and fell through to the LLM as plain text.
-    pub fn from_skill_manager(skill_mgr: &::skills::manager::SkillManager) -> Self {
-        let mut registry = Self::default();
-        for skill in skill_mgr.list() {
-            // Only register user-invocable skills as slash commands
-            if skill.user_invocable {
-                registry.insert_prompt(SkillEntry {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    source: match skill.source {
-                        ::skills::manager::SkillSource::User => base::frozen::SkillSource::User,
-                        ::skills::manager::SkillSource::Project => {
-                            base::frozen::SkillSource::Project
-                        }
-                        ::skills::manager::SkillSource::Plugin => base::frozen::SkillSource::Plugin,
-                    },
-                    path: skill.path.clone(),
-                    allowed_tools: skill.allowed_tools.clone(),
-                    model: skill.model.clone(),
-                    context: skill.context.clone(),
-                    argument_hint: skill.argument_hint.clone(),
-                    paths: skill.paths.clone(),
-                    disable_model_invocation: skill.disable_model_invocation,
-                    user_invocable: skill.user_invocable,
-                    version: skill.version.clone(),
-                    ..Default::default()
-                });
-            }
+    /// Build a registry backed by a skill manager (disk + bundled skills), on
+    /// top of the 5 built-in local commands (see `Default`). Each
+    /// user-invocable skill resolves as a `prompt` command.
+    ///
+    /// Takes the `Arc` rather than a reference because the manager is kept:
+    /// see the type-level comment on why a snapshot is not good enough.
+    pub fn from_skill_manager(skill_mgr: Arc<::skills::manager::SkillManager>) -> Self {
+        Self {
+            skills: Some(skill_mgr),
+            ..Self::default()
         }
-        registry
     }
 
     /// Register every MCP server prompt as a `/mcp__<server>__<prompt>` slash
@@ -166,7 +209,7 @@ impl CommandRegistry {
     pub fn register_mcp_prompts(&mut self, prompts: &[::mcp::manager::McpPromptEntry]) {
         for p in prompts {
             let command = p.command_name();
-            self.commands.insert(
+            self.registered.insert(
                 command.clone(),
                 Command::McpPrompt {
                     command,
@@ -181,9 +224,11 @@ impl CommandRegistry {
         }
     }
 
-    /// Insert a prompt command from a SkillEntry.
+    /// Insert a prompt command from a SkillEntry — for commands that have no
+    /// entry in the skill catalog (plugin-contributed ones); a skill on disk
+    /// needs no registration, it resolves through the manager.
     pub fn insert_prompt(&mut self, entry: SkillEntry) {
-        self.commands.insert(
+        self.registered.insert(
             entry.name.clone(),
             Command::Prompt {
                 entry: Box::new(entry),
@@ -196,9 +241,9 @@ impl CommandRegistry {
         &mut self,
         name: &str,
         description: &str,
-        handler: Box<dyn Fn(&SlashCommand) -> CommandResult + Send + Sync>,
+        handler: Arc<dyn Fn(&SlashCommand) -> CommandResult + Send + Sync>,
     ) {
-        self.commands.insert(
+        self.builtin.insert(
             name.to_string(),
             Command::Local {
                 description: description.to_string(),
@@ -208,40 +253,75 @@ impl CommandRegistry {
     }
 
     /// Look up a command by name.
-    pub fn resolve(&self, name: &str) -> Option<&Command> {
-        self.commands.get(name)
+    ///
+    /// Returns an owned `Command`: skill-derived ones are materialized from
+    /// the live catalog per call, so there is nothing stable to borrow. The
+    /// clone is a `SkillEntry`'s worth of strings, once per slash-command
+    /// invocation.
+    pub fn resolve(&self, name: &str) -> Option<Command> {
+        if let Some(cmd) = self.registered.get(name) {
+            return Some(cmd.clone());
+        }
+        if let Some(cmd) = self
+            .skills
+            .as_ref()
+            .and_then(|s| s.get(name))
+            .as_ref()
+            .and_then(skill_as_command)
+        {
+            return Some(cmd);
+        }
+        self.builtin.get(name).cloned()
     }
 
     /// The `argument_hint` to display next to a command in `/help`, if any.
-    pub fn argument_hint(&self, name: &str) -> Option<&str> {
-        match self.commands.get(name)? {
+    pub fn argument_hint(&self, name: &str) -> Option<String> {
+        match self.resolve(name)? {
             Command::McpPrompt { argument_hint, .. } if !argument_hint.is_empty() => {
                 Some(argument_hint)
             }
-            Command::Prompt { entry } => entry.argument_hint.as_deref(),
+            Command::Prompt { entry } => entry.argument_hint.clone(),
             _ => None,
         }
     }
 
+    /// Every resolvable command, lowest-precedence tier first so that higher
+    /// tiers overwrite by name — the same result `resolve` gives.
+    fn merged(&self) -> HashMap<String, Command> {
+        let mut out = self.builtin.clone();
+        if let Some(skills) = self.skills.as_ref() {
+            for skill in skills.list() {
+                if let Some(cmd) = skill_as_command(&skill) {
+                    out.insert(skill.name.clone(), cmd);
+                }
+            }
+        }
+        out.extend(self.registered.iter().map(|(k, v)| (k.clone(), v.clone())));
+        out
+    }
+
     /// List all commands (for /help).
-    pub fn list(&self) -> Vec<(&str, &str)> {
-        let mut entries: Vec<(&str, &str)> = self
-            .commands
-            .iter()
-            .map(|(name, cmd)| (name.as_str(), cmd.description()))
+    pub fn list(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .merged()
+            .into_iter()
+            .map(|(name, cmd)| {
+                let desc = cmd.description().to_string();
+                (name, desc)
+            })
             .collect();
-        entries.sort_by_key(|(name, _)| *name);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     }
 
-    /// Number of registered commands.
+    /// Number of resolvable commands.
     pub fn len(&self) -> usize {
-        self.commands.len()
+        self.merged().len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
+        self.len() == 0
     }
 
     /// Full command catalog with kind/source metadata (see [`CommandInfo`]) —
@@ -250,8 +330,8 @@ impl CommandRegistry {
     /// daemon's `commands.list` RPC.
     pub fn list_detailed(&self) -> Vec<CommandInfo> {
         let mut entries: Vec<CommandInfo> = self
-            .commands
-            .iter()
+            .merged()
+            .into_iter()
             .map(|(name, cmd)| match cmd {
                 Command::Local { description, .. } => CommandInfo {
                     name: name.clone(),
@@ -311,7 +391,7 @@ impl Default for CommandRegistry {
         registry.insert_local(
             "help",
             "List all available slash commands",
-            Box::new(|_cmd| {
+            Arc::new(|_cmd| {
                 // Handler is filled by the caller with registry reference
                 CommandResult {
                     text: "Use /help to see available commands".into(),
@@ -322,7 +402,7 @@ impl Default for CommandRegistry {
         registry.insert_local(
             "skills",
             "List all available skills",
-            Box::new(|_cmd| CommandResult {
+            Arc::new(|_cmd| CommandResult {
                 text: "Use /skills to see available skills".into(),
                 should_query: false,
             }),
@@ -330,7 +410,7 @@ impl Default for CommandRegistry {
         registry.insert_local(
             "clear",
             "Clear the current session context",
-            Box::new(|_cmd| CommandResult {
+            Arc::new(|_cmd| CommandResult {
                 text: "Session cleared. All messages have been removed.".into(),
                 should_query: false,
             }),
@@ -338,7 +418,7 @@ impl Default for CommandRegistry {
         registry.insert_local(
             "compact",
             "Trigger context compaction now",
-            Box::new(|_cmd| CommandResult {
+            Arc::new(|_cmd| CommandResult {
                 text: "Compaction triggered. Context has been summarized.".into(),
                 should_query: true,
             }),
@@ -346,7 +426,7 @@ impl Default for CommandRegistry {
         registry.insert_local(
             "cost",
             "Show session API cost",
-            Box::new(|_cmd| CommandResult {
+            Arc::new(|_cmd| CommandResult {
                 text: "Cost tracking: use /cost for details".into(),
                 should_query: false,
             }),
@@ -466,13 +546,175 @@ mod tests {
         // constructor in `Builder::build()`) never actually contained the 5
         // built-in local commands — `/help` et al. silently fell through to
         // the LLM instead of executing.
-        let skill_mgr = ::skills::manager::SkillManager::new();
-        let registry = CommandRegistry::from_skill_manager(&skill_mgr);
+        let skill_mgr = Arc::new(::skills::manager::SkillManager::new());
+        let registry = CommandRegistry::from_skill_manager(skill_mgr);
         assert!(registry.resolve("help").is_some());
         assert!(registry.resolve("skills").is_some());
         assert!(registry.resolve("clear").is_some());
         assert!(registry.resolve("compact").is_some());
         assert!(registry.resolve("cost").is_some());
+    }
+
+    fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    /// The registry must reflect skills added to its manager *after* it was
+    /// built. It used to copy `skill_mgr.list()` into a `HashMap` once, so a
+    /// session (or, worse, the daemon's pool-wide catalog, built at startup
+    /// and shared by every session) kept resolving the skill set it saw at
+    /// construction for the rest of its life — a skill file created during
+    /// the session was reloaded into the `SkillManager` by the turn loop and
+    /// still could not be invoked as a slash command.
+    #[test]
+    fn registry_sees_skills_added_after_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_mgr = Arc::new(::skills::manager::SkillManager::new());
+        skill_mgr
+            .load_dir_subdirs(dir.path(), ::skills::manager::SkillSource::Project)
+            .unwrap();
+        let registry = CommandRegistry::from_skill_manager(skill_mgr.clone());
+        assert!(registry.resolve("late-arrival").is_none());
+
+        write_skill(dir.path(), "late-arrival", "shows up mid-session");
+        skill_mgr
+            .load_dir_subdirs(dir.path(), ::skills::manager::SkillSource::Project)
+            .unwrap();
+
+        let cmd = registry
+            .resolve("late-arrival")
+            .expect("a skill loaded after the registry was built must still resolve");
+        assert!(cmd.is_prompt());
+        assert_eq!(cmd.description(), "shows up mid-session");
+        assert!(registry.list().iter().any(|(n, _)| n == "late-arrival"));
+        assert!(registry
+            .list_detailed()
+            .iter()
+            .any(|c| c.name == "late-arrival" && c.source == "project"));
+    }
+
+    /// The other half of liveness: a deleted skill must stop resolving.
+    /// Deletion is what the watcher reports through `check_for_changes`, so
+    /// this goes through the real reload path rather than a second
+    /// `load_dir_subdirs`.
+    #[test]
+    fn registry_drops_skills_removed_after_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "doomed", "about to be deleted");
+        let skill_mgr = Arc::new(::skills::manager::SkillManager::new());
+        skill_mgr
+            .load_dir_subdirs(dir.path(), ::skills::manager::SkillSource::Project)
+            .unwrap();
+        skill_mgr
+            .enable_watching(&[dir.path().to_path_buf()])
+            .unwrap();
+        let registry = CommandRegistry::from_skill_manager(skill_mgr.clone());
+        assert!(registry.resolve("doomed").is_some());
+
+        std::fs::remove_dir_all(dir.path().join("doomed")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && registry.resolve("doomed").is_some() {
+            skill_mgr.check_for_changes();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            registry.resolve("doomed").is_none(),
+            "a deleted skill must stop resolving as a slash command"
+        );
+        assert!(!registry.list().iter().any(|(n, _)| n == "doomed"));
+    }
+
+    /// Skills are not user-facing commands unless they say so — the filter
+    /// moved from build time to lookup time and has to survive the move.
+    #[test]
+    fn non_user_invocable_skills_are_not_commands() {
+        let skill_mgr = Arc::new(::skills::manager::SkillManager::new());
+        skill_mgr.register_bundled(SkillEntry {
+            name: "internal-only".into(),
+            description: "model-facing".into(),
+            user_invocable: false,
+            ..Default::default()
+        });
+        let registry = CommandRegistry::from_skill_manager(skill_mgr);
+        assert!(registry.resolve("internal-only").is_none());
+        assert!(!registry.list().iter().any(|(n, _)| n == "internal-only"));
+    }
+
+    /// Precedence, highest first: explicitly registered (plugin/MCP) →
+    /// skills → built-ins. This is the order the old single-map build
+    /// sequence produced by insertion (`Default` → skills → plugins), and
+    /// the split into tiers has to preserve it.
+    #[test]
+    fn registered_commands_shadow_skills_which_shadow_builtins() {
+        let skill_mgr = Arc::new(::skills::manager::SkillManager::new());
+        skill_mgr.register_bundled(SkillEntry {
+            name: "help".into(),
+            description: "skill help".into(),
+            user_invocable: true,
+            ..Default::default()
+        });
+        skill_mgr.register_bundled(SkillEntry {
+            name: "review".into(),
+            description: "skill review".into(),
+            user_invocable: true,
+            ..Default::default()
+        });
+        let mut registry = CommandRegistry::from_skill_manager(skill_mgr);
+        registry.insert_prompt(SkillEntry {
+            name: "review".into(),
+            description: "plugin review".into(),
+            user_invocable: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            registry.resolve("help").unwrap().description(),
+            "skill help"
+        );
+        assert_eq!(
+            registry.resolve("review").unwrap().description(),
+            "plugin review"
+        );
+        // Shadowed names collapse to one entry, not two.
+        assert_eq!(
+            registry
+                .list()
+                .iter()
+                .filter(|(n, _)| n == "review")
+                .count(),
+            1
+        );
+    }
+
+    /// `arguments:` was silently dropped by the old skill → command copy
+    /// (`..Default::default()` after listing only some fields), so `$name`
+    /// substitution in a skill body never worked through a slash command.
+    #[test]
+    fn skill_derived_commands_carry_named_arguments() {
+        let skill_mgr = Arc::new(::skills::manager::SkillManager::new());
+        skill_mgr.register_bundled(SkillEntry {
+            name: "ship".into(),
+            description: "ship it".into(),
+            arguments: Some(vec!["issue".into(), "branch".into()]),
+            user_invocable: true,
+            ..Default::default()
+        });
+        let registry = CommandRegistry::from_skill_manager(skill_mgr);
+        match registry.resolve("ship").unwrap() {
+            Command::Prompt { entry } => {
+                assert_eq!(
+                    entry.arguments.as_deref(),
+                    Some(&["issue".to_string(), "branch".to_string()][..])
+                );
+            }
+            _ => panic!("expected a prompt command"),
+        }
     }
 
     #[test]
@@ -541,7 +783,7 @@ mod tests {
         assert_eq!(cmd.description(), "Review a pull request");
         assert_eq!(
             registry.argument_hint("mcp__github__review_pr"),
-            Some("repo=<value> [note=<value>]")
+            Some("repo=<value> [note=<value>]".to_string())
         );
         // Discoverable via /help ...
         assert!(registry

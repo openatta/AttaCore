@@ -136,12 +136,6 @@ fn active_plugins(
         .collect()
 }
 
-/// Build the command catalog shared by every session: skill-derived + the 5
-/// built-in local commands (via `CommandRegistry::from_skill_manager`), then
-/// each plugin's `slash_commands` merged in. Scans the same three skill
-/// tiers `runtime::agent::Builder::build()` does (global → scene → project)
-/// — duplicated here rather than shared because this needs to run once at
-/// daemon startup, independent of any particular session.
 /// Global → scene → project `agents/*.md` directories — same three tiers,
 /// same order, as `Builder::build()`'s own (now `SessionPool`-shared) copy of
 /// this computation; see `SessionPool::agent_type_catalog`.
@@ -170,8 +164,15 @@ fn plugin_agent_types(
         .collect()
 }
 
+/// Build the command catalog shared by every session: the 5 built-in local
+/// commands plus a live view of `skill_catalog` (via
+/// `CommandRegistry::from_skill_manager`), with each plugin's
+/// `slash_commands` merged on top. The skill half tracks the catalog, so a
+/// skill file added or deleted after daemon startup is reflected here — and
+/// in `commands.list` — without a rebuild; only the plugin half is a
+/// snapshot, refreshed by `refresh_plugins()`.
 fn build_shared_commands(
-    skill_catalog: &skills::manager::SkillManager,
+    skill_catalog: Arc<skills::manager::SkillManager>,
     plugins: &[plugin::manifest::Plugin],
 ) -> Arc<runtime::commands::CommandRegistry> {
     let mut registry = runtime::commands::CommandRegistry::from_skill_manager(skill_catalog);
@@ -308,7 +309,7 @@ pub struct SessionPool {
     /// This used to be the pool's unconditional default — every daemon
     /// session ran allow-all unless it explicitly asked otherwise. That
     /// trust boundary moved deliberately (see `daemon/src/main.rs`'s
-    /// `AllowAllPermission` doc comment and `docs/DAEMON_RPC.md`): the
+    /// `AllowAllPermission` doc comment and `docs/daemon_rpc_protocol.md`): the
     /// default is now a real `RuleSetPermission` in `ask` mode, and this
     /// `Arc` is what a host that genuinely sandboxes the daemon itself
     /// opts back into.
@@ -553,7 +554,7 @@ impl SessionPool {
         // fallback (used by tests / library embedding without a daemon)
         // does the equivalent scan per-session; a daemon shares one.
         let skill_catalog = Arc::new(runtime::agent::build_default_skill_manager(&settings));
-        let commands = build_shared_commands(&skill_catalog, &plugins);
+        let commands = build_shared_commands(skill_catalog.clone(), &plugins);
 
         let agent_dirs = agent_type_dirs(&settings);
         let agent_dirs_ref: [&std::path::Path; 3] =
@@ -774,7 +775,7 @@ impl SessionPool {
         let all = discover_all_plugins(self.paths.as_ref());
         let plugins = Arc::new(active_plugins(self.paths.as_ref(), &all));
         let settings = self.settings.read().await.clone();
-        let commands = build_shared_commands(&self.skill_catalog, &plugins);
+        let commands = build_shared_commands(self.skill_catalog.clone(), &plugins);
         let agent_dirs = agent_type_dirs(&settings);
         let agent_dirs_ref: [&std::path::Path; 3] =
             [&agent_dirs[0], &agent_dirs[1], &agent_dirs[2]];
@@ -1996,7 +1997,7 @@ impl SessionPool {
                     // waiting on `session.respondToPrompt` before the tool
                     // call resolves and `tool_use`/`tool_result` continue as
                     // normal. Same `kind: "prompt"` / `prompt_type` shape
-                    // documented in `docs/DAEMON_RPC.md`, deliberately
+                    // documented in `docs/daemon_rpc_protocol.md`, deliberately
                     // generic so a future non-permission "stop and ask" need
                     // can reuse it without a new RPC method.
                     //
@@ -2050,6 +2051,27 @@ impl SessionPool {
                             "agent_session_id":agent_session_id,"agent_type":agent_type,
                             "parent_turn":parent_turn,
                             "event":serde_json::to_value(&*event).unwrap_or(serde_json::Value::Null)
+                        }),
+                    );
+                    if let Ok(mut b) = serde_json::to_vec(&f) {
+                        b.push(b'\n');
+                        if writer.lock().await.write_all(&b).await.is_err() {
+                            writer_broken = true;
+                            break;
+                        }
+                    }
+                }
+                // Skill files changed under a live session — forwarded so a
+                // client caching `commands.list` knows to re-fetch. This
+                // match is a whitelist (`_ => continue` at the bottom), so an
+                // unlisted variant never reaches the client no matter what
+                // the engine emits.
+                Some(AgentEvent::SkillsChanged { added, removed, .. }) => {
+                    let f = StreamFrame::event(
+                        &sid,
+                        &turn_id,
+                        serde_json::json!({
+                            "kind":"skills_changed","added":added,"removed":removed
                         }),
                     );
                     if let Ok(mut b) = serde_json::to_vec(&f) {
@@ -2608,7 +2630,7 @@ impl SessionPool {
     }
 
     /// Parse + load one session's raw log, mapping both failure kinds onto
-    /// the error codes `docs/DAEMON_RPC.md` documents.
+    /// the error codes `docs/daemon_rpc_protocol.md` documents.
     async fn load_entries(
         &self,
         session_id: &str,
@@ -2954,7 +2976,7 @@ impl SessionPool {
     /// reject a nonexistent project outright (`session.create`) check that
     /// separately, since resume callers deliberately do **not**: a project
     /// directory that moved after the session was created should still
-    /// resume (`docs/DAEMON_RPC.md` §6.3's `project_root_changed`), not fail.
+    /// resume (`docs/daemon_rpc_protocol.md` §6.3's `project_root_changed`), not fail.
     async fn settings_for_project(&self, project_root: Option<&Path>) -> Arc<Settings> {
         let key = project_root.map(Path::to_path_buf);
         if key.as_deref() == Some(self.cwd.as_path()) {

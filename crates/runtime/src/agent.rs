@@ -110,6 +110,19 @@ pub enum EngineCommand {
     CompactNow,
     RefreshMcp,
     UpdateModel,
+    /// Interrupt the turn in flight and keep the session alive — what a host
+    /// binds to Esc. Distinct from cancelling the token passed to
+    /// [`Agent::run`], which ends the whole session.
+    ///
+    /// Handled in the input demultiplexer, never in the main loop: the loop
+    /// awaits `process_turn` inline, so while a turn is running it is not
+    /// reading the channel and could only act on this once the turn it was
+    /// meant to interrupt had already finished. Same reason
+    /// `PermissionResponse` is handled there.
+    ///
+    /// A no-op when no turn is running (the token it cancels belongs to the
+    /// turn that just ended); it does not arm the next one.
+    CancelTurn,
     Shutdown,
 }
 
@@ -150,6 +163,15 @@ pub struct Agent {
     /// by `prompt_id` and fires it. A `prompt_id` with no entry (already
     /// timed out, or a stale/duplicate response) is silently ignored.
     pub(crate) pending_permissions: PendingPermissions,
+    /// Cancellation token of the turn currently in flight — replaced by
+    /// `run()` before each turn, cancelled by the input demultiplexer on
+    /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
+    /// `pending_permissions` is: the demultiplexer task holds no `&mut self`.
+    ///
+    /// Holds a *finished* turn's token between turns, which is why
+    /// `CancelTurn` arriving while idle does nothing rather than poisoning
+    /// the next turn.
+    pub(crate) current_turn_cancel: Arc<std::sync::Mutex<CancellationToken>>,
     pub(crate) memory_store: Arc<MemoryStore>,
     pub(crate) session: SessionManager,
     /// The session's mutable tool-facing state — one instance for the whole
@@ -262,6 +284,22 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// The slash commands this session will actually resolve.
+    ///
+    /// For a host rendering a completion popup or a command palette: this is
+    /// the same registry the turn loop dispatches against, and its
+    /// skill-derived half is live, so what the user is shown cannot drift
+    /// from what typing it will do. Hosts that keep their own catalog to get
+    /// lower-latency updates should still reconcile against this one when
+    /// [`AgentEvent::SkillsChanged`] arrives.
+    ///
+    /// Hands out the `Arc`, not a borrow: `run()` takes `&mut self` for the
+    /// life of the session, so a host that has spawned the engine has no
+    /// `&Agent` left to ask. Take this before spawning and keep it.
+    pub fn commands(&self) -> Arc<crate::commands::CommandRegistry> {
+        Arc::clone(&self.commands)
+    }
+
     /// Start the agent event loop. Runs until cancelled (caller calls `.cancel()` on the token)
     /// or the input channel closes. Does NOT consume self — the agent can be reused after stop.
     pub async fn run(&mut self, cancel: CancellationToken) {
@@ -350,18 +388,21 @@ impl Agent {
         //
         // This loop `await`s `process_turn` inline, so while a turn is running
         // it is not sitting at `input_rx.recv()`. That is fine for every
-        // message except one: a turn blocked on a permission prompt is waiting
-        // for an `InputMessage::PermissionResponse` that only this loop can
-        // dequeue — and it cannot, because it is inside the very turn that is
-        // waiting. Both halves deadlock, and `session.respondToPrompt` never
-        // worked as a result. Nothing caught it because the daemon defaulted
-        // to allow-all, so the prompt path never ran in production.
+        // message except two, both of which are only meaningful *during* a
+        // turn: a turn blocked on a permission prompt is waiting for an
+        // `InputMessage::PermissionResponse` that only this loop can dequeue —
+        // and it cannot, because it is inside the very turn that is waiting
+        // (both halves deadlock, which is why `session.respondToPrompt` never
+        // worked; nothing caught it because the daemon defaulted to allow-all,
+        // so the prompt path never ran in production) — and `CancelTurn`,
+        // which would otherwise be read only once the turn it was meant to
+        // interrupt had already ended.
         //
-        // Fix: a task owns the real receiver and answers permission responses
-        // itself — it needs only `pending_permissions` and the denial counter,
-        // both `Arc`-shared, never `&mut self`. Everything else is forwarded
-        // untouched to the loop below, which therefore behaves exactly as
-        // before for every other message type.
+        // Fix: a task owns the real receiver and handles those two itself —
+        // it needs only `pending_permissions`, the denial counter and the
+        // current turn's token, all `Arc`-shared, never `&mut self`.
+        // Everything else is forwarded untouched to the loop below, which
+        // therefore behaves exactly as before for every other message type.
         let (fwd_tx, mut fwd_rx) = mpsc::unbounded_channel();
         {
             // `self.input_rx` is moved into the task; the field is left
@@ -371,6 +412,7 @@ impl Agent {
             let mut raw_rx = std::mem::replace(&mut self.input_rx, closed_rx);
             let pending = self.pending_permissions.clone();
             let denials = self.permission_denial_count.clone();
+            let turn_cancel = self.current_turn_cancel.clone();
             tokio::spawn(async move {
                 while let Some(msg) = raw_rx.recv().await {
                     match msg {
@@ -381,6 +423,13 @@ impl Agent {
                             crate::turn::resolve_permission_response(
                                 &pending, &denials, prompt_id, decision,
                             );
+                        }
+                        InputMessage::System {
+                            kind: EngineCommand::CancelTurn,
+                            ..
+                        } => {
+                            tracing::info!("Cancelling in-flight turn");
+                            turn_cancel.lock().unwrap().cancel();
                         }
                         // Receiver gone means the engine loop has exited;
                         // nothing left to forward to.
@@ -411,7 +460,14 @@ impl Agent {
                 msg = fwd_rx.recv() => {
                     match msg {
                         Some(input) => {
-                            match self.process_turn(input, cancel.clone()).await {
+                            // Each turn runs under its own child token, so
+                            // `CancelTurn` interrupts one turn and leaves the
+                            // session able to take the next message.
+                            // Cancelling the session's own token still
+                            // cascades into whatever turn is in flight.
+                            let turn_cancel = cancel.child_token();
+                            *self.current_turn_cancel.lock().unwrap() = turn_cancel.clone();
+                            match self.process_turn(input, turn_cancel).await {
                                 Ok(_) => {}
                                 Err(crate::turn::TurnError::Shutdown) => {
                                     exit_reason = "shutdown_command";
@@ -1409,7 +1465,8 @@ impl Builder {
         // can resolve when a subagent is spawned later in this session.
         agent_tool_arc.set_skill_manager(skill_mgr_arc.clone());
         let command_registry = self.commands_override.clone().unwrap_or_else(|| {
-            let mut registry = crate::commands::CommandRegistry::from_skill_manager(&skill_mgr_arc);
+            let mut registry =
+                crate::commands::CommandRegistry::from_skill_manager(skill_mgr_arc.clone());
             // MCP prompts become `/mcp__<server>__<prompt>` slash commands,
             // the same way skills become slash commands above. `all_prompts()`
             // is already populated — `McpManager::connect_all` runs
@@ -1711,6 +1768,7 @@ impl Builder {
                 config,
                 permission,
                 pending_permissions,
+                current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
                 memory_store,
                 session,
                 session_state,
@@ -2519,12 +2577,36 @@ mod tests {
         }
     }
 
+    /// Test tool that never finishes on its own — it parks until the turn's
+    /// token fires. Stands in for whatever a user presses Esc on: a long
+    /// command, a slow subprocess, a model that won't stop talking.
+    struct HangingTool;
+    #[async_trait::async_trait]
+    impl base::tool::Tool for HangingTool {
+        fn name(&self) -> &str {
+            "Hang"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            ctx: base::tool::ToolContext,
+            _progress: base::tool::ProgressSender,
+        ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+            ctx.cancel.cancelled().await;
+            Err(base::error::ToolError::Cancelled)
+        }
+    }
+
     /// Mock model: 1st call emits a `Probe` tool call, every later call just
     /// ends the turn normally. Used to prove the discontinue path actually
     /// stops the outer loop — if it didn't, the agent would call the model
     /// a 2nd time asking what to do with the tool result.
     struct ToolThenStopModel {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tool: &'static str,
     }
     #[async_trait::async_trait]
     impl Model for ToolThenStopModel {
@@ -2547,7 +2629,7 @@ mod tests {
                 vec![
                     Ok(base::interface::model::ModelEvent::ToolUse {
                         id: "toolu_1".into(),
-                        name: "Probe".into(),
+                        name: self.tool.into(),
                         input: serde_json::json!({}),
                     }),
                     Ok(base::interface::model::ModelEvent::EndTurn {
@@ -2588,6 +2670,7 @@ mod tests {
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
             calls: call_count.clone(),
+            tool: "Probe",
         });
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
         let tools = Arc::new(InMemoryToolRegistry::new());
@@ -2806,6 +2889,7 @@ mod tests {
 
         let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Probe",
         });
         let (mut agent, mut event_rx, input_tx) = Builder::new()
             .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
@@ -2870,6 +2954,210 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
+    /// `EngineCommand::CancelTurn` must interrupt the turn in flight and
+    /// leave the session able to take the next message.
+    ///
+    /// Before per-turn tokens existed there was no way to express this: every
+    /// turn ran under the token passed to `run()`, so the only interrupt a
+    /// host could send took the whole session down with it. The second half
+    /// of this test — a normal turn served *after* the cancellation — is the
+    /// part that would have failed.
+    ///
+    /// It also pins the delivery path. `CancelTurn` is handled in the input
+    /// demultiplexer, not the main loop, because the main loop is inside
+    /// `process_turn().await` for the entire time a turn is running; handled
+    /// there, this test would hang until the timeout with the tool still
+    /// parked.
+    #[tokio::test]
+    async fn cancel_turn_interrupts_the_turn_and_leaves_the_session_usable() {
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(HangingTool));
+
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Hang",
+        });
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(tools)
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let session_cancel = CancellationToken::new();
+        let engine = {
+            let session_cancel = session_cancel.clone();
+            tokio::spawn(async move { agent.run(session_cancel).await })
+        };
+
+        input_tx
+            .send(InputMessage::User {
+                content: "start something long".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        // Wait until the tool is actually running, so the cancel lands
+        // mid-turn rather than before the turn starts.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::ToolUse { name, .. }) if name == "Hang" => break,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before the tool ran"),
+                }
+            }
+        })
+        .await
+        .expect("the hanging tool should have started");
+
+        input_tx
+            .send(InputMessage::System {
+                kind: EngineCommand::CancelTurn,
+                content: String::new(),
+            })
+            .unwrap();
+
+        let stop_reason = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { stop_reason, .. }) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before the turn ended"),
+                }
+            }
+        })
+        .await
+        .expect("CancelTurn must reach the running turn while it is still running");
+        assert_eq!(stop_reason, "cancelled");
+        assert!(
+            !session_cancel.is_cancelled(),
+            "cancelling a turn must not cancel the session"
+        );
+
+        // The session is still live: a second turn runs to completion.
+        input_tx
+            .send(InputMessage::User {
+                content: "still there?".into(),
+                attachments: vec![],
+                turn_id: "t2".into(),
+            })
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { stop_reason, .. }) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed — the engine died with the turn"),
+                }
+            }
+        })
+        .await
+        .expect("the session must still serve turns after one was cancelled");
+        assert_eq!(second, "end_turn");
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+    /// A host takes `Agent::commands()` before spawning the engine and keeps
+    /// it for the life of the session: it must stay a live view of the same
+    /// catalog the turn loop resolves against, including skills that appear
+    /// after the engine has been moved into its task.
+    #[tokio::test]
+    async fn commands_handle_outlives_the_agent_and_stays_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = Arc::new(skills::manager::SkillManager::new());
+        skills
+            .load_dir_subdirs(dir.path(), skills::manager::SkillSource::Project)
+            .unwrap();
+
+        let (agent, _event_rx, _input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel))
+            .settings(Arc::new(test_settings()))
+            .tools(Arc::new(InMemoryToolRegistry::new()))
+            .skill_catalog(skills.clone())
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let commands = agent.commands();
+        drop(agent);
+        assert!(commands.resolve("mid-session").is_none());
+
+        let skill_dir = dir.path().join("mid-session");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: mid-session\ndescription: added while the engine runs\n---\n\nbody\n",
+        )
+        .unwrap();
+        skills
+            .load_dir_subdirs(dir.path(), skills::manager::SkillSource::Project)
+            .unwrap();
+
+        assert!(
+            commands.resolve("mid-session").is_some(),
+            "the handle a host holds must track the catalog, not a snapshot"
+        );
+    }
+
+    /// Cancelling the session's own token still cascades into the turn in
+    /// flight — per-turn tokens are children, not replacements.
+    #[tokio::test]
+    async fn cancelling_the_session_still_stops_the_turn_in_flight() {
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(HangingTool));
+
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Hang",
+        });
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(tools)
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let session_cancel = CancellationToken::new();
+        let engine = {
+            let session_cancel = session_cancel.clone();
+            tokio::spawn(async move { agent.run(session_cancel).await })
+        };
+
+        input_tx
+            .send(InputMessage::User {
+                content: "start something long".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::ToolUse { name, .. }) if name == "Hang" => break,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before the tool ran"),
+                }
+            }
+        })
+        .await
+        .expect("the hanging tool should have started");
+
+        session_cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine)
+            .await
+            .expect("the engine must exit when its own token is cancelled")
+            .expect("engine task panicked");
+    }
+
     /// Regression test: `UserPromptSubmit` was defined in the `HookEvent`
     /// enum but had zero trigger points anywhere — CodingScene's system
     /// prompt told the model to expect `<user-prompt-submit-hook>` feedback
@@ -2887,6 +3175,7 @@ mod tests {
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
             calls: call_count.clone(),
+            tool: "Probe",
         });
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
 

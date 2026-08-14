@@ -41,9 +41,7 @@ impl Agent {
                 if let Some(sc) = crate::commands::parse_slash_command(&content) {
                     // `/mcp__<server>__<prompt>` → `prompts/get` on the owning
                     // server; the returned messages become this turn's
-                    // content. Dispatched ahead of the registry match below
-                    // because it needs `&self.mcp` across an `.await`, which
-                    // can't coexist with a live borrow of `self.commands`.
+                    // content.
                     //
                     // Resolved off the registry when the prompt was registered
                     // there (the normal path — `Builder::build`), otherwise
@@ -54,9 +52,7 @@ impl Agent {
                     // connections, and it also lets prompts picked up by a
                     // later `refresh_prompts` be invocable immediately.
                     let mcp_command: Option<String> = match self.commands.resolve(&sc.name) {
-                        Some(crate::commands::Command::McpPrompt { command, .. }) => {
-                            Some(command.clone())
-                        }
+                        Some(crate::commands::Command::McpPrompt { command, .. }) => Some(command),
                         Some(_) => None,
                         None => self
                             .mcp
@@ -87,14 +83,11 @@ impl Agent {
                         match cmd {
                             crate::commands::Command::Prompt { entry } => {
                                 // Expand skill body → replace content → continue to LLM
-                                let expanded = crate::commands::handle_prompt_command(entry, &sc);
+                                let expanded = crate::commands::handle_prompt_command(&entry, &sc);
                                 return self.run_user_turn(expanded, attachments, cancel).await;
                             }
                             crate::commands::Command::McpPrompt { .. } => {
-                                unreachable!(
-                                    "MCP prompt commands are dispatched above, \
-                                     before this borrow of `self.commands`"
-                                )
+                                unreachable!("MCP prompt commands are dispatched above")
                             }
                             crate::commands::Command::Local { .. } => {
                                 // Handle well-known local commands directly
@@ -398,6 +391,16 @@ impl Agent {
                 self.session.push_message(ModelMessage {
                     role: MessageRole::User,
                     content: vec![ModelContentBlock::Text { text: note }],
+                });
+                // The model is told above; the host is told here. Both need
+                // it for the same reason — a skill list they were shown
+                // earlier is now wrong — but a host cannot read the
+                // conversation, and its slash-command view resolves through
+                // the catalog that just changed underneath it.
+                let _ = self.event_tx.send(AgentEvent::SkillsChanged {
+                    added: added.iter().map(|n| (*n).clone()).collect(),
+                    removed: removed.iter().map(|n| (*n).clone()).collect(),
+                    turn_id: self.current_turn_id.clone(),
                 });
             }
         }
@@ -1703,6 +1706,18 @@ or project context that should survive across sessions.
     /// content worth reporting (`last_tool_name`/`last_tool_was_error` are
     /// always unknown here — the paths that *do* know them build the event
     /// inline instead of calling this).
+    /// End-of-turn notification for the four paths that finish a turn
+    /// without reaching the normal tail: cancelled, max_turns,
+    /// max_structured_output_retries, budget_exceeded.
+    ///
+    /// Emits the `AgentEvent` as well as the telemetry record. It used to do
+    /// telemetry only, which left every one of those paths ending a turn in
+    /// total silence as far as the host was concerned — a client streaming a
+    /// turn (daemon's `session.run`, a TUI spinner) waits for
+    /// `TurnComplete`, so an interrupted or budget-capped turn hung its UI
+    /// until something unrelated came along. There is no
+    /// `AgentEvent::TurnComplete` for these in the normal tail either: that
+    /// tail is exactly what these paths return early to skip.
     fn emit_turn_complete(
         &self,
         stop_reason: &str,
@@ -1711,6 +1726,13 @@ or project context that should survive across sessions.
         start: std::time::Instant,
     ) {
         let tid = self.current_turn_id.clone();
+        let _ = self.event_tx.send(AgentEvent::TurnComplete {
+            stop_reason: stop_reason.to_string(),
+            api_calls,
+            tool_calls,
+            usage: Usage::default(),
+            turn_id: tid.clone(),
+        });
         let _ = self
             .telemetry_handle
             .record(telemetry::TelemetryEvent::turn_complete(
