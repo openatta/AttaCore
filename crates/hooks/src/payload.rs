@@ -1,4 +1,4 @@
-//! Hook 进程 stdin / stdout 协议。见 docs/DATA_FORMATS.md §B.4。
+//! Hook 进程 stdin / stdout 协议。
 //!
 //! - **stdin**：CLI 写一行 JSON `HookInput`
 //! - **stdout**：hook 写一行 JSON `HookResponse`（不合法 → 视为 default {continue: true}）

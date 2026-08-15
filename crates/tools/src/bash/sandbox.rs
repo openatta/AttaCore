@@ -34,7 +34,7 @@
 //!    访问宿主文件系统 / fd。
 //! 4. **Open fd 泄露**：未设 `CLOEXEC`，子进程可读取继承的 fd（git 仓库、socket 等）。
 //!
-//! 强化方向见 `HARDENING.md`。
+//! 以上四条都是已知的、尚未收口的弱点，不是遗漏。
 
 use std::path::{Path, PathBuf};
 
@@ -256,7 +256,7 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
     // they sit inside cwd. Stops Bash-driven sandbox escapes via attacode
     // overwriting its own permission rules. Aligns with TS sandbox-adapter.ts.
     // Project-level settings.json is cwd-relative and flat (no scope
-    // segment) — see docs/design/2026-08-03-agents-config-migration.md.
+    // segment).
     let cwd_str = cwd.display().to_string();
     s.push_str(&format!(
         "(deny file-write* (literal \"{}/.atta/settings.json\"))\n",
@@ -268,9 +268,7 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
     ));
     if let Some(home) = std::env::var_os("HOME") {
         let home_str = std::path::Path::new(&home).display().to_string();
-        // Cross-scene global settings.json — flat, single file (2026-08-04
-        // personal-`.atta`-flattening round, see
-        // `docs/design/2026-08-03-agents-config-migration.md` §10).
+        // Cross-scene global settings.json — flat, single file.
         s.push_str(&format!(
             "(deny file-write* (literal \"{}/.atta/settings.json\"))\n",
             sandbox_escape(&home_str)

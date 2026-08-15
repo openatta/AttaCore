@@ -59,8 +59,7 @@ pub trait DaemonPaths: Send + Sync {
 /// not default anything — callers must pass a value. `daemon`'s own caller
 /// (`daemon/src/main.rs::resolve_scene`) derives that value from the
 /// validated `--scene` CLI flag (`coding`/`chat`/`demo`; unsupported values
-/// fail startup) rather than accepting an arbitrary string — see
-/// `docs/design/2026-08-03-agents-config-migration.md` §9.1.
+/// fail startup) rather than accepting an arbitrary string.
 ///
 /// **2026-08-04**: `global_root` is stored explicitly rather than derived
 /// from `config_root`'s filesystem parent — `config_root` is now nested two

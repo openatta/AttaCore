@@ -1,7 +1,5 @@
 //! 路径写权限校验：FileWrite / FileEdit / Bash 改文件路径前调用，挡掉
 //! 跨域写、`.env*` 等敏感目标。
-//!
-//! 见 docs/DATA_FORMATS.md §A 与 docs/RUST_ARCHITECTURE.md §安全红线。
 
 use std::path::{Component, Path, PathBuf};
 

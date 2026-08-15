@@ -4,8 +4,7 @@
 //! state into this engine's `AGENTS.md` + `.agents/skills/` + `.atta/rules/`
 //! layout.
 //!
-//! See `docs/design/2026-08-03-agents-config-migration.md` §3 for the full
-//! design. Three layers, kept separate on purpose:
+//! Three layers, kept separate on purpose:
 //! - This module: pure detection + execution, no UI, no callback awareness.
 //! - `ImportCallback` (crate::interface::import_callback): automatic,
 //!   process-level trigger for hosts that want to prompt a human.
@@ -466,8 +465,8 @@ async fn copy_skill_dirs(src_dir: &Path, dest_dir: &Path) -> std::io::Result<usi
 /// `alwaysApply`) and produce the `.atta/rules/<slug>.md` body. `globs` is
 /// kept as a documentation comment only — AttaCore's `.atta/rules/` is
 /// lazily loaded (via `AGENTS.md` references), not auto-matched by path, so
-/// there's no live glob-matching behavior to wire it into (see
-/// docs/CONFIG_LAYOUT.md). Returns `(body, always_apply)`.
+/// there's no live glob-matching behavior to wire it into. Returns
+/// `(body, always_apply)`.
 fn convert_mdc_to_rule(content: &str) -> (String, bool) {
     let (front, body) = split_frontmatter(content);
     let mut always_apply = false;
@@ -478,7 +477,7 @@ fn convert_mdc_to_rule(content: &str) -> (String, bool) {
         }
         if let Some(globs) = extract_yaml_field(yaml, "globs") {
             header.push_str(&format!(
-                "<!-- globs: {globs} (imported from Cursor; not auto-matched by AttaCore, see docs/CONFIG_LAYOUT.md) -->\n"
+                "<!-- globs: {globs} (imported from Cursor; not auto-matched by AttaCore) -->\n"
             ));
         }
         if let Some(aa) = extract_yaml_field(yaml, "alwaysApply") {

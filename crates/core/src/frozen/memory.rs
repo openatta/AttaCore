@@ -101,7 +101,7 @@ pub(crate) async fn collect_memdir_files(home: &Path, cwd: &Path) -> Vec<PathBuf
 /// 子目录想隔离父级上下文用。
 ///
 /// **不再读取** `.atta/ATTA.md`（旧的双轨指令文件）——`AGENTS.md` 是唯一权威
-/// 指令文件，见 `docs/design/2026-08-03-agents-config-migration.md` Phase 2。
+/// 指令文件。
 pub(crate) async fn collect_memory_files_with(
     cwd: &Path,
     do_walk_up: bool,

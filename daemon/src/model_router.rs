@@ -4,9 +4,6 @@
 //! resolves *which* provider/model a task should use, as pure data; it
 //! can't construct a `model::adapter::AnthropicModel` itself without `base`
 //! depending on `model`, inverting the crate layering).
-//!
-//! See `docs/design/2026-08-04-multi-provider-llm-migration.md` §5 for the
-//! design this implements ("Phase 3 — Provider 工厂 + 运行时 Router").
 
 use base::provider::{ProviderConfig, ResolvedModel, TaskRouter};
 use model::adapter::AnthropicModel;
@@ -23,7 +20,7 @@ use std::sync::Arc;
 ///
 /// `openai_compatible` used to be a valid *config* value with no `Model` impl
 /// behind it, so configuring one was a hard startup error — which made the
-/// multi-provider story in `docs/LLM_PROVIDERS.md` Anthropic-only in practice
+/// multi-provider story Anthropic-only in practice
 /// (OpenAI, Gemini-via-proxy, vLLM and Ollama were all unreachable).
 ///
 /// Anything else is still a hard error surfaced at startup (via `Err`, which

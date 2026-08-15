@@ -65,20 +65,17 @@ pub struct TokenBudget {
 /// Execution limits a scene imposes on its own turns.
 ///
 /// This type used to carry `max_parallelism` and `max_agent_depth` as well.
-/// Both were removed rather than left as decoration, because neither could be
-/// honoured and a limit that constrains nothing is worse than an absent one —
-/// it reads like a guarantee:
+/// Both were removed rather than left as decoration, because a limit that
+/// constrains nothing is worse than an absent one — it reads like a guarantee:
 ///
-/// - `max_agent_depth`: sub-agent recursion is already bounded at depth 1
-///   *structurally*, not numerically. `AgentTool` excludes itself by name
-///   from every sub-agent's tool set (see `AGENT_TOOL_NAME` in
-///   `runtime::agent_tool`), so a sub-agent has no way to spawn another one.
-///   Every value ≥ 1 a scene could name is therefore identical in effect, and
-///   `ToolContext::agent_depth` is hardcoded to `0` at its one construction
-///   site — there is no counter for a cap to compare against.
 /// - `max_parallelism`: tool-call fan-out is bounded by `EngineConfig`, which
 ///   is derived from `Settings`, not from the scene; there is no scene-level
 ///   consumer to route it to without inverting that ownership.
+/// - `max_agent_depth`: delegation depth *is* enforced now, by
+///   `AgentTool::Inner::spawn_guard` counting against
+///   `EngineConfig::max_agent_depth` on every spawn path. It stays on
+///   `EngineConfig` rather than moving here — the bound belongs to the
+///   engine, and a scene that wants a different one changes that config.
 ///
 /// What remains is honoured — see `runtime::turn`'s `max_calls`.
 #[derive(Debug, Clone)]
@@ -122,6 +119,9 @@ pub trait AgentScene: Send + Sync + 'static {
     fn tools(&self) -> Vec<String>;
 
     /// Tools this scene contributes that no other scene has.
+    ///
+    /// The three-way split between this, `tools()` and `deferred_tools()` is
+    /// laid out in docs/session_and_scene_invariants.md §6.
     ///
     /// [`tools`](Self::tools) can only ever *narrow* — it is a whitelist
     /// intersected with whatever registry the host assembled, so a scene had

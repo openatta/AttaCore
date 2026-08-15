@@ -1,6 +1,6 @@
 //! Git worktree 管理器 —— 给 sub-agent 提供独立 checkout 的隔离运行环境。
 //!
-//! 见 `docs/_WORKTREE.md`。本模块不引入 git 库依赖，全靠 `git` 子命令。
+//! 本模块不引入 git 库依赖，全靠 `git` 子命令。
 //!
 //! ## 用法
 //!

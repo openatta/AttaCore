@@ -154,8 +154,7 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_servers: HashMap<String, serde_json::Value>,
 
-    /// Multi-provider LLM registry, keyed by provider id. See
-    /// `docs/LLM_PROVIDERS.md`.
+    /// Multi-provider LLM registry, keyed by provider id.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub providers: HashMap<String, ProviderConfig>,
     /// Provider id used for any task with no `task_models` entry, and as the
@@ -526,7 +525,7 @@ impl Settings {
     /// `settings.local.json` overlay, which outranks the `settings.json`
     /// beside it. This is the **single canonical settings.json loader** —
     /// `daemon` and any other embedder should call this rather than parsing
-    /// settings.json themselves. See `docs/CONFIG_LAYOUT.md`.
+    /// settings.json themselves.
     ///
     /// Merging is a **generic recursive JSON merge** (later layer's object
     /// keys override/extend the earlier layer's, non-object values fully

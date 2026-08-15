@@ -1,7 +1,6 @@
 //! jsonl 行级数据模型。
 //!
 //! `EnvelopedEntry` = 顶层字段（v / id / ts / session_id）+ flatten 进 `LogEntry`。
-//! 见 docs/DATA_FORMATS.md §A.2 / §A.3。
 
 use base::id::Id;
 use base::message::{ContentBlock, Message, StopReason, ToolResultContent};
@@ -87,7 +86,7 @@ fn default_meta_schema_version() -> u32 {
 
 /// Current `Meta` payload version. Only newly-created sessions write this
 /// value; existing on-disk files keep whatever they were written with and
-/// are never rewritten (see `docs/design/2026-08-11-multi-scene-architecture.md` §12.2).
+/// are never rewritten.
 pub const CURRENT_META_SCHEMA_VERSION: u32 = 2;
 
 /// Primary (user-facing) vs. sidechain (sub-agent / team member) session.
@@ -396,8 +395,7 @@ mod tests {
     /// A pre-v2 `Meta` line (no `scene`/`project_root`/`session_kind`/
     /// `schema_version`) must still deserialize — these fields default to
     /// "unknown" rather than failing the whole file to parse. Callers infer
-    /// the scene from the resume/fork request instead (see
-    /// `docs/design/2026-08-11-multi-scene-architecture.md` §3.4/§12.2).
+    /// the scene from the resume/fork request instead.
     #[test]
     fn meta_entry_missing_v2_fields_defaults_to_inferred() {
         let session = SessionId::new();

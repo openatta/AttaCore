@@ -1,6 +1,4 @@
 //! 权限相关类型 —— `PermissionDecision` 是权限系统**唯一**的判定结果。
-//!
-//! 见 docs/RUST_ARCHITECTURE.md §3.5 与 docs/DATA_FORMATS.md §B.5。
 
 use serde::{Deserialize, Serialize};
 

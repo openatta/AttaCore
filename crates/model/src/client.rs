@@ -1,7 +1,7 @@
 //! AnthropicClient trait + HttpAnthropicClient（reqwest 实现）。
 //!
 //! 重试 / beta header / 多 provider 都在 HttpAnthropicClient 内部；
-//! Engine 只看 trait。详见 docs/RUST_ARCHITECTURE.md §6。
+//! Engine 只看 trait。
 
 use crate::error::AnthropicError;
 use crate::parser::parse_sse;

@@ -4,8 +4,6 @@
 //! 让 API 服务端执行搜索后返回结构化的 `web_search_tool_result` 块。
 //! DeepSeek 兼容模式下同样走 Server-Side Search（差异仅在于 beta header 与
 //! model name）。
-//!
-//! 参见 docs/COMPARISON_EXPERIMENT.md。
 
 use crate::web_search::{
     SearchError, SearchOutput, SearchOutputItem, SearchProvider, SearchResult,

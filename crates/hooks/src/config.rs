@@ -1,7 +1,8 @@
 //! Hook 配置（来自 settings.json `hooks` 字段）。
 //!
-//! 见 docs/DATA_FORMATS.md §B.3 / §B.4。只支持 `command` 变体；
-//! `prompt` / `http` / `agent` 三种推迟到 ，配置加载时遇到会 warn + skip。
+//! 四种变体都会执行（`HookRunner::run_one` 逐一分发）：`command` 与 `http`
+//! 自足；`prompt` 与 `agent` 需要宿主注入 `PromptHookExecutor` /
+//! `AgentHookExecutor`，没注入时该 hook 被 Skip 并附原因，不是静默失败。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

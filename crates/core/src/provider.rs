@@ -4,8 +4,8 @@
 //!
 //! **2026-08-04, second round**: moved here from `daemon::model_routing` so
 //! `core::Settings` (not just `daemon`'s separate `SettingsFile`) can carry
-//! these fields directly — see `docs/design/2026-08-04-multi-provider-llm-migration.md`
-//! for why the two-representation split was a structural risk worth fixing.
+//! these fields directly, rather than keeping two representations of the
+//! same configuration in sync.
 //!
 //! This module resolves *which provider/model a task should use* from
 //! already-merged config (`resolve_task_models`) and, via [`TaskRouter`],
@@ -41,8 +41,7 @@ pub struct ProviderConfig {
     /// a hard parse failure of the whole settings.json.
     pub api_type: Option<String>,
     pub base_url: Option<String>,
-    /// Stored in plaintext, same as every other settings.json field — see
-    /// the "安全提示" section in `docs/LLM_PROVIDERS.md`.
+    /// Stored in plaintext, same as every other settings.json field.
     pub api_key: Option<String>,
     /// Model used when a task_models override doesn't name one explicitly,
     /// or when a named model fails the `models` allow-list check below.
@@ -94,9 +93,7 @@ pub struct ResolvedModel {
 /// resolution used by any task with no entry) against the `providers` map.
 ///
 /// Degrades softly wherever possible — this is deliberate: a config typo
-/// should produce a startup warning, not a crash. See
-/// `docs/design/2026-08-04-multi-provider-llm-migration.md` §3.3 for the
-/// two-tier failure semantics:
+/// should produce a startup warning, not a crash. Two tiers of failure:
 ///
 /// - `default_provider` missing, empty, or not present in `providers` →
 ///   hard error (`Err`); there is no lower fallback left.

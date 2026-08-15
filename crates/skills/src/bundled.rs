@@ -599,7 +599,7 @@ Guide the user through initializing a well-structured AGENTS.md (or equivalent p
 
 1. **Scan the project** — list the top-level directory contents, check for config files (Cargo.toml, package.json, pyproject.toml, go.mod, Makefile, etc.), and identify the project type and language(s).
 
-2. **Determine the file name** — check if the project convention calls for `AGENTS.md`, `CLAUDE.md`, or `README.md`. Default to `AGENTS.md` — it's the shared convention across Codex, this engine, and other agent tools (see `docs/CONFIG_LAYOUT.md`).
+2. **Determine the file name** — check if the project convention calls for `AGENTS.md`, `CLAUDE.md`, or `README.md`. Default to `AGENTS.md` — it's the shared convention across Codex, this engine, and other agent tools.
 
 3. **Gather key info**:
    - Project name and one-line purpose

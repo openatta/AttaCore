@@ -109,8 +109,7 @@ impl From<FrozenSkillSource> for SkillSource {
 /// cross-session preference). `last_seq` is a monotonic
 /// counter rather than a wall-clock timestamp deliberately: recency only
 /// needs a total order among invocations, and a counter is exact + free of
-/// the timestamp-based VCR non-determinism this session already hit once
-/// (see `docs/design/2026-08-05-test-architecture.md` §15.1).
+/// the timestamp-based VCR non-determinism this session already hit once.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InvocationStats {
     pub count: u32,
@@ -319,8 +318,8 @@ impl SkillManager {
     /// prompt's "## Available Skills" section came out in a different order
     /// every single process start — which, since VCR's request hash covers
     /// the full (dehydrated) prompt text, silently desynced the very first
-    /// turn's hash between any two runs of the exact same test case (see
-    /// docs/design/2026-08-05-test-architecture.md §14). Provider-side
+    /// turn's hash between any two runs of the exact same test case.
+    /// Provider-side
     /// prompt caching (most APIs cache by exact prefix match) would have the
     /// same problem in production, independent of testing.
     pub fn list(&self) -> Vec<SkillInfo> {
@@ -866,8 +865,7 @@ mod tests {
     /// skill set, different (randomized, per-process) text order every run.
     /// Since `turn.rs::build_skills_text` renders this straight into the
     /// system prompt, that silently desynced VCR's request hash for the very
-    /// first turn of every replay (see
-    /// docs/design/2026-08-05-test-architecture.md §14). Register in
+    /// first turn of every replay. Register in
     /// deliberately unsorted order and assert the output is alphabetical
     /// regardless — a HashMap-order bug wouldn't reliably fail a single
     /// `cargo test` run (order is only *unstable across* runs, not

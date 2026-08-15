@@ -1,7 +1,5 @@
 //! Message / ContentBlock —— 直接对应 Anthropic Messages API 的形状，
 //! 顺手当作我们的内部 transcript 表示（jsonl 持久化也用同一份 schema）。
-//!
-//! 见 docs/RUST_ARCHITECTURE.md §3.2 与 docs/DATA_FORMATS.md §A.3。
 
 use serde::{Deserialize, Serialize};
 

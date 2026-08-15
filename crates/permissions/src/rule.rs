@@ -1,6 +1,6 @@
 //! 规则字符串与 `PermissionRule` 之间的双向转换。
 //!
-//! grammar（见 docs/DATA_FORMATS.md §B.5）：
+//! grammar：
 //! ```text
 //! RULE      ::= TOOL ( '(' CONTENT ')' )?
 //! TOOL      ::= IDENTIFIER ( '__' IDENTIFIER )*

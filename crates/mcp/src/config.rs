@@ -1,6 +1,4 @@
 //! MCP server 配置。`type` 字段做 enum tag。
-//!
-//! 与 docs/DATA_FORMATS.md §B.2 的 `mcp_servers` 字段一致。
 
 use globset::Glob;
 use serde::{Deserialize, Serialize};

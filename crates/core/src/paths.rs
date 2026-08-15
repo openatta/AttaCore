@@ -14,8 +14,7 @@
 //!
 //! **2026-08-04 restructuring**: the user-level tree used to be entirely
 //! scene-scoped (`~/.atta/<scope>/{memory,sessions,vcr,skills,...}`). It is
-//! now split by resource type — see `docs/design/2026-08-04-multi-provider-llm-migration.md`
-//! §10-ish (personal-`.atta`-flattening round) for the reasoning:
+//! now split by resource type:
 //!
 //! - **Global + scene override** (config-shaped, keyed by name): `settings.json`,
 //!   `skills/`, `plugins/`, `agents/`, `rules/`, `hooks/`. Present at both

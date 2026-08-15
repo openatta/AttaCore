@@ -6,8 +6,6 @@
 //! - **可变运行期** → `Arc<SessionState>`（内部按需 split lock）
 //! - **副作用注入** → `Arc<dyn ToolEffects>`
 //! - **取消** → `CancellationToken`
-//!
-//! 见 docs/RUST_ARCHITECTURE.md §3.4。
 
 pub mod config;
 pub mod prompt;

@@ -1,7 +1,6 @@
 //! BASE58(UUID v4) 字符串身份。
 //!
 //! 与 Atta 顶层 `Cloud/src/store/id.rs::Id` 兼容；合并。
-//! 见 docs/RUST_TECH_STACK.md §10、Atta/ATTA.md "ID 铁律"。
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

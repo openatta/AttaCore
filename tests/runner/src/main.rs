@@ -64,7 +64,7 @@ struct Args {
 
     /// VCR round identifier — cassette data is stored under a per-round
     /// subdirectory so re-recording never overwrites/mixes with an earlier
-    /// round (see docs/TESTING_GUIDE.md). Defaults to $ATTA_VCR_ROUND, or
+    /// round. Defaults to $ATTA_VCR_ROUND, or
     /// today's UTC date (YYYY-MM-DD) if that's unset either.
     #[clap(long)]
     round: Option<String>,

@@ -2,8 +2,7 @@
 //! project)` binding, instead of one `notify` thread per session or per
 //! binding.
 //!
-//! See `docs/design/2026-08-11-multi-scene-architecture.md` §4.4. The hard
-//! invariant this module exists to hold: watched **directories** are
+//! The hard invariant this module exists to hold: watched **directories** are
 //! `1 + M + P` (global + one per scene + one per project), never
 //! `O(会话数)` and never `O(M×P)` — subscriptions to the same path are
 //! deduplicated and refcounted so N subscribers of one directory still cost

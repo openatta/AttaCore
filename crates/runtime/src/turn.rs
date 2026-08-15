@@ -559,7 +559,7 @@ impl Agent {
         // prefetch (fires a real, VCR-covered LLM call) and the extraction spawn below race
         // against the harness's turn boundary in a way that isn't deterministic between
         // record and replay, producing a different injected memory set each run even with
-        // identical cassette content — see docs/design/2026-08-05-test-architecture.md §15.
+        // identical cassette content.
         let mut prefetch_handle: Option<tokio::task::JoinHandle<Vec<String>>> =
             if !self.settings.memory_enabled {
                 None
@@ -5536,8 +5536,7 @@ mod tests {
 ///
 /// `model`/`model_name` are resolved by the caller — normally via
 /// `TaskRouter::model_for("memory")` / `model_name_for("memory")` when a
-/// `task_models.memory` override is configured (see
-/// `docs/design/2026-08-04-multi-provider-llm-migration.md` §3.2), falling
+/// `task_models.memory` override is configured, falling
 /// back to the main conversation model otherwise, mirroring
 /// `AgentTool::Inner::model_for_subagent`'s pattern for the `"subagent"`
 /// task type. `prompt_intro` is the scene's `memory_extraction_prompt()`

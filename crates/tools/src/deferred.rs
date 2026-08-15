@@ -177,10 +177,10 @@ impl Tool for DeferredTool {
 /// dozen built-in tools declare it, so the skip silently voided most of any
 /// scene's policy.
 ///
-/// Wrapping is idempotent in the way that matters (a wrapped tool's schema is
-/// already the stub, and every other method delegates), and this runs once
-/// per session over a freshly listed registry, so there is nothing to guard
-/// against.
+/// Wrapping is idempotent in the way that matters — a wrapped tool's schema
+/// is already the stub and every other method delegates — but nesting is
+/// still pointless indirection, so `Builder::build()` calls this exactly
+/// once, after every tool is registered.
 pub fn apply_deferred_policy(tools: Vec<Arc<dyn Tool>>, deferred: &[String]) -> Vec<Arc<dyn Tool>> {
     if deferred.is_empty() {
         return tools;

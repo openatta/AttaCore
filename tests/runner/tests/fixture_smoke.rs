@@ -1,7 +1,7 @@
 //! 模板项目 fixture 的结构性冒烟测试 —— 不跑真实 Agent/LLM，只验证
 //! `tests/fixtures/template_project/` 里的配置文件能被真实的解析器认出来
 //! （hooks_config / mcp_servers / .atta/agents/*.md），防止 fixture 被改坏
-//! 而没人发现（见 docs/design/2026-08-05-test-architecture.md §6）。
+//! 而没人发现。
 
 use std::path::Path;
 

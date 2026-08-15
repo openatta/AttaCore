@@ -1,5 +1,4 @@
-//! On-disk team formats (`docs/design/2026-08-11-multi-scene-architecture.md`
-//! §6.2/§6.3): `team.json` (write-once declaration), `state.json` (atomic
+//! On-disk team formats: `team.json` (write-once declaration), `state.json` (atomic
 //! rewrite on every lifecycle change), `events.jsonl` (append-only, the
 //! authoritative record a future index rebuild replays).
 //!

@@ -1,6 +1,7 @@
 //! `PermissionGate` —— 权限决策入口。
 //!
-//! 决策顺序（与 docs/RUST_ARCHITECTURE.md §5 一致；hooks 步骤推迟到 ）：
+//! 决策顺序（`PreToolUse` hook 不在此处——由调用方 `runtime::turn` 在进入
+//! 本 gate 之前执行，见 `execute_tool_inner`）：
 //!
 //! 1. `tool.validate_input` —— 输入合法性
 //! 2. `tool.check_permissions` —— 工具自带的判定：

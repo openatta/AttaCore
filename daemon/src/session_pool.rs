@@ -35,8 +35,8 @@ use tracing::{debug, info, warn};
 type Writer = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
 
 /// Outcome of comparing a session's recorded `Meta.scene` (if any) against
-/// every scene this daemon currently serves (`SessionPool::active_scenes`)
-/// — see `docs/design/2026-08-11-multi-scene-architecture.md` §3.4.
+/// every scene this daemon currently serves (`SessionPool::active_scenes`) —
+/// see docs/session_and_scene_invariants.md §1.
 /// Resume/fork/close/delete don't yet take a per-request `scene` param
 /// (every caller implicitly means "whichever active scene this session was
 /// actually recorded under"), so `Mismatch`'s reported `requested_scene`
@@ -76,8 +76,7 @@ pub enum ResumeError {
 /// `session.create`'s `project_root` disambiguated three ways — JSON only
 /// gives "key omitted" vs. "key present" for free; `null` vs. a string
 /// needs an explicit check the wire layer (`server.rs`) does before this
-/// ever reaches `SessionPool`. See
-/// `docs/design/2026-08-11-multi-scene-architecture.md` §3.2/§3.3.
+/// ever reaches `SessionPool`.
 pub enum ProjectSelector {
     /// `project_root` omitted — this pool's default project (`self.cwd`),
     /// unchanged pre-P3 behavior.
@@ -460,7 +459,6 @@ pub struct SessionInfo {
     pub parent_session_id: Option<String>,
     /// `false` only for a sidechain that already ran its one-shot task to
     /// conclusion — `session.resume` against it returns `SIDECHAIN_TERMINAL`.
-    /// See `docs/design/2026-08-11-multi-scene-architecture.md` §5.6.
     pub resumable: bool,
 }
 
@@ -2243,8 +2241,7 @@ impl SessionPool {
     /// when given, ignores `include_children` entirely and instead returns
     /// exactly that session's sidechains (delegating to
     /// `HistoryStore::child_sessions`, the same path `agent.list`'s
-    /// post-restart fallback uses) — see
-    /// `docs/design/2026-08-11-multi-scene-architecture.md` §5.4.
+    /// post-restart fallback uses).
     pub async fn list_all(
         &self,
         include_children: bool,
@@ -2499,8 +2496,7 @@ impl SessionPool {
     }
 
     /// `session.close` — destroys the runtime entity; the parent's
-    /// transcript stays on disk and remains resumable. Per
-    /// `docs/design/2026-08-11-multi-scene-architecture.md` §3.5/§5.6, this
+    /// transcript stays on disk and remains resumable. This
     /// **cascades**: every sidechain of this session (sub-agent / team
     /// member) is deleted too — a closed parent has no path left to reach
     /// them (`session.list {parent_session_id}` only makes sense while the
@@ -2964,8 +2960,8 @@ impl SessionPool {
 
     /// Merged settings for `project_root` (global → scene → project tiers),
     /// built once and cached — see the `projects` field doc comment.
-    /// `None` is the global no-project tier (`docs/design/2026-08-11-
-    /// multi-scene-architecture.md` §3.3): `local_data_dir` becomes
+    /// `None` is the global no-project tier (docs/session_and_scene_invariants.md §2):
+    /// `local_data_dir` becomes
     /// `global_data_dir` itself rather than `<project>/.atta`, so project-
     /// layer settings are skipped entirely, same as the design's "no
     /// specific project" case.
@@ -3019,8 +3015,7 @@ impl SessionPool {
     /// Not deduplicated across projects with an identical `mcp_servers`
     /// config — two projects that happen to declare the same server each
     /// get their own connection. Sharing a handle across projects is future
-    /// work (see `docs/design/2026-08-11-multi-scene-architecture.md`);
-    /// this only needed to stop the wrong thing from happening (a
+    /// work; this only needed to stop the wrong thing from happening (a
     /// non-default project silently inheriting the default project's
     /// connections, or never connecting its own at all).
     async fn mcp_for_project(&self, project_root: Option<&Path>) -> Arc<McpManager> {
@@ -3414,8 +3409,8 @@ impl SessionPool {
     /// `history_store` is configured) or create it fresh under a new id if
     /// that fails. Mirrors `create()`'s `Result<String, String>` shape — a
     /// second failed attempt is a real (if rare) error condition, not a bug,
-    /// so it's propagated to the caller instead of panicking (see
-    /// `docs/design/2026-08-04-...` follow-up: a `create()` failure here is
+    /// so it's propagated to the caller instead of panicking (a
+    /// `create()` failure here is
     /// systemic — e.g. engine construction failing, or a `daemon.shutdown`
     /// racing this call — so retrying under a new id is unlikely to help,
     /// but the caller still deserves a normal JSON-RPC error instead of the

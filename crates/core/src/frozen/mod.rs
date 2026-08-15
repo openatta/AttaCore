@@ -1,8 +1,8 @@
 //! Session-start frozen environment snapshot — the data sources for system prompt
 //! segments [4] and [5].
 //!
-//! See docs/SYSTEM_PROMPT.md SS3.4 / SS3.5. All git subcommands have a 1.5 s timeout;
-//! failures silently skip the related field. **Not refreshed during a session** —
+//! All git subcommands have a 1.5 s timeout; failures silently skip the
+//! related field. **Not refreshed during a session** —
 //! mid-session git commits are not updated.
 
 pub mod frontmatter;

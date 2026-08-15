@@ -1,6 +1,6 @@
 //! Plugin enable/disable state — persisted per plugins tier (global/scene),
-//! same override precedence as everything else in `docs/CONFIG_LAYOUT.md`
-//! §3: scene explicit setting wins over global explicit setting, and an
+//! same override precedence as everything else: scene explicit setting wins
+//! over global explicit setting, and an
 //! absent entry defaults to enabled (matches the pre-existing implicit
 //! behavior where "installed" == "active").
 //!

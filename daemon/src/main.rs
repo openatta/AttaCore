@@ -238,8 +238,7 @@ async fn main() -> anyhow::Result<()> {
     // instance per provider (`daemon::model_router::build_task_router`) so
     // `SessionPool`/`AgentTool`'s sub-agent spawn points can actually route
     // through it (see `crates/runtime/src/agent_tool.rs::model_for_subagent`)
-    // instead of just logging what *would* happen — see
-    // `docs/design/2026-08-04-multi-provider-llm-migration.md` §5/§6 phase 3.
+    // instead of just logging what *would* happen.
     let task_router: Option<Arc<base::provider::TaskRouter>> =
         if daemon_config.settings.providers.is_empty() {
             None

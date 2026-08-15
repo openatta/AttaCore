@@ -1,7 +1,6 @@
 //! Anthropic Messages API 请求体类型。
 //!
 //! 字段名 / 形状对应 API；与 attacode-base::Message / ContentBlock 配合使用。
-//! 详见 docs/RUST_ARCHITECTURE.md §6.1。
 
 use base::message::{ContentBlock, Role};
 use serde::Serialize;
@@ -51,7 +50,6 @@ pub struct MessagesRequest {
     pub max_tokens: u32,
 
     /// system prompt 是字符串数组（每段可独立带 cache_control）。
-    /// 见 docs/SYSTEM_PROMPT.md §1。
     pub system: Vec<SystemBlock>,
 
     pub messages: Vec<MessageParam>,

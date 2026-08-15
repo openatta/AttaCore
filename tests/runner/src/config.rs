@@ -1,6 +1,5 @@
 //! 测试系统的唯一配置源：仓库根 `.env`（`export KEY=VALUE` 格式）。
 //!
-//! 设计见 docs/TESTING_GUIDE.md。
 //! - `ANTHROPIC_MODEL`：Agent 主流程用的正式模型，录制和回放（含 cassette miss 时的
 //!   兜底穿透）都必须用同一个值——VCR 的请求哈希把 model 名字编进去了
 //!   （`crates/telemetry/src/vcr.rs::hash_request`），换了模型名回放必定全 miss。
@@ -55,7 +54,7 @@ pub fn load_env_config(path: &Path) -> anyhow::Result<TestModelConfig> {
 /// 今天的日期（`YYYY-MM-DD`，UTC）。
 ///
 /// 轮次是 cassette 目录的一层（`tests/fixtures/cassettes/{scenario}/{mode}/{round}/`），
-/// 见 docs/TESTING_GUIDE.md §7-9——不同轮次物理上是不同目录，互不覆盖：
+/// 不同轮次物理上是不同目录，互不覆盖：
 /// 换模型/改 prompt 后开新一轮，旧轮次的录制数据原样留在磁盘上，不会被静默覆盖或
 /// 和新数据混在同一个文件里追加。默认按日期分轮，同一天内的多次录制自然归到同一轮
 /// （不用每次手动想一个轮次名），过了这天再录就是新的一轮。

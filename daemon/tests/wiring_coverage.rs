@@ -17,7 +17,7 @@
 //! own crate.
 //!
 //! AttaCore is also a library other embedders build their own composition
-//! root on top of (see `docs/CONFIG_LAYOUT.md`'s "面向 AttaCore 集成方的说明"),
+//! root on top of,
 //! so a function genuinely meant for external embedders — not this repo's
 //! own `daemon` — is a legitimate exception, not a bug. Those go in
 //! `INTENTIONALLY_UNWIRED` below, each with a one-line reason, so adding one

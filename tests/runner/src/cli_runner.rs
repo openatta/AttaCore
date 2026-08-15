@@ -17,8 +17,8 @@ pub struct CliRunnerConfig {
     /// 纯生成物目录（遥测日志），继续被 .gitignore 排除。
     pub output_dir: PathBuf,
     /// 模板项目 fixture 目录。设置后会被拷贝到一个临时工作目录，daemon 子进程
-    /// 以该目录为 cwd 启动（daemon 没有 `--cwd` flag，天然用进程 cwd 当项目根，
-    /// 见 docs/CONFIG_LAYOUT.md）——这样 daemon 侧读到的 `.atta/settings.json`
+    /// 以该目录为 cwd 启动（daemon 没有 `--cwd` flag，天然用进程 cwd 当项目根）
+    /// ——这样 daemon 侧读到的 `.atta/settings.json`
     /// 就是拷贝出来的那份，同一份 fixture 在 api/cli 两种模式下语义一致。
     pub fixture_dir: Option<PathBuf>,
     /// 传给 daemon 子进程的 `--scene`。之前这里完全没传，daemon 一直用它自己

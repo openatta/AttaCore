@@ -230,7 +230,7 @@ async fn build_agent(
     }
     settings.memory_enabled = false;
     // 测试非交互运行,始终旁路权限确认——和 daemon 的生产选择一致（IDE/测试
-    // 宿主自己管沙盒，见 docs/CONFIG_LAYOUT.md §13.1）。
+    // 宿主自己管沙盒）。
     settings.permission_mode = PermissionMode::BypassPermissions;
     let settings = Arc::new(settings);
 

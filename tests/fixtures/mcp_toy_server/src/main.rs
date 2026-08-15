@@ -1,6 +1,6 @@
 //! 最小可用的 stdio MCP 测试服务 —— 只用来让 `tests/fixtures/template_project`
 //! 的 `mcp_servers.demo` 真的能连上、真的有一个工具可调，而不是一个预期失败的占位。
-//! 不是产品代码，只服务于测试基础设施（见 docs/TESTING_GUIDE.md）。
+//! 不是产品代码，只服务于测试基础设施。
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};

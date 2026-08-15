@@ -1,7 +1,6 @@
 //! FileReadTool —— "Read"。
 //!
 //! 第一个具体工具。只读、并发安全、不需要用户确认。
-//! 设计参考 docs/_ACCEPTANCE.md 场景 3。
 
 use async_trait::async_trait;
 use base::error::ToolError;

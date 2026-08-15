@@ -98,7 +98,7 @@ pub struct EngineConfig {
     // ---- system-prompt assembly (grouped 2026-05-09; was 5 flat fields) ----
     /// system prompt overrides + extras (AGENTS.md walk, output styles,
     /// append/override). All affect what gets baked into block [1-5] of
-    /// the system prompt — see docs/SYSTEM_PROMPT.md.
+    /// the system prompt.
     pub system_prompt: SystemPromptSettings,
 
     /// 最大 agent 嵌套深度。主 agent 深度 0，每经 AgentTool spawn 加 1。

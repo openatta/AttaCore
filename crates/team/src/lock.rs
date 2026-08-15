@@ -4,9 +4,8 @@
 //! One project is expected to be worked on by one daemon instance at a
 //! time; a second instance touching the same `teams/` directory (index
 //! rebuild, cross-team scan) concurrently is the rare case this exists to
-//! reject rather than to arbitrate finely. See
-//! `docs/design/2026-08-11-multi-scene-architecture.md` §6.5 — this mirrors
-//! `daemon::discovery`'s single-instance lock (same staleness algorithm,
+//! reject rather than to arbitrate finely. Same staleness rules as
+//! `daemon::discovery`'s single-instance lock (docs/session_and_scene_invariants.md §3) (same staleness algorithm,
 //! same [`base::process_identity::ProcessIdentity`] reuse-safe check) rather
 //! than introducing a second locking mechanism.
 //!

@@ -259,8 +259,7 @@ impl DaemonServer {
     /// need a pass/fail answer (unlike `session.resume`, which also reports
     /// `scene_inferred` on success and so keeps its own inline check) —
     /// `session.close`/`.delete`/`.fork` all reject outright rather than
-    /// operating across a scene boundary they weren't asked to cross; see
-    /// `docs/design/2026-08-11-multi-scene-architecture.md` §3.4/§3.5.
+    /// operating across a scene boundary they weren't asked to cross.
     /// Returns the ready-made error response when the caller should stop,
     /// `None` when it's clear to proceed.
     async fn scene_mismatch_response(
@@ -801,8 +800,7 @@ impl DaemonServer {
     /// `scene` omitted means the pool's default scene (`SessionPool::
     /// resolve_scene`); given, must be currently active
     /// (`SCENE_NOT_FOUND` otherwise — see `scene.list`/`scene.activate`).
-    /// `project_root` disambiguates three ways per
-    /// `docs/design/2026-08-11-multi-scene-architecture.md` §3.2/§3.3 — the
+    /// `project_root` disambiguates three ways — the
     /// key omitted means "this pool's default project"; present as JSON
     /// `null` means a genuine no-project session; present as a string means
     /// that project (rejected with `PROJECT_NOT_FOUND` if it doesn't exist

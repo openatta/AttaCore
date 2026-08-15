@@ -183,9 +183,7 @@ impl VcrModel {
     /// fallback there is a real, slow, non-deterministic network call whose
     /// only visible symptom is "this run took unusually long"; that exact
     /// failure mode is why the hit/miss logging and `ATTA_VCR_STRICT` had to
-    /// be invented in the first place (see
-    /// `docs/design/2026-08-05-test-architecture.md` §12/§13 for the forensic
-    /// trail it cost). Outside those contexts — a developer typing
+    /// be invented in the first place. Outside those contexts — a developer typing
     /// `ATTA_VCR_REPLAY=<case>` by hand — the fallback stays on, so the first
     /// local run of a brand-new case still works without a cassette.
     ///
@@ -343,8 +341,7 @@ impl Model for VcrModel {
                 }
                 // Miss: without this, the only symptom is "replay took way longer
                 // than expected" (silent fallback_on_miss network call) — the
-                // exact scenario that took hours to diagnose forensically (see
-                // docs/design/2026-08-05-test-architecture.md §12/§13). Log
+                // exact scenario that took hours to diagnose forensically. Log
                 // enough to make the *next* miss diagnosable in seconds instead:
                 // whether a cassette even loaded (available_entries), and the
                 // hash that didn't match anything in it. The hash itself can't
@@ -551,9 +548,8 @@ fn dehydrate(s: &str) -> String {
     // Record-time and replay-time are two different real timestamps, so that
     // one field alone desyncs the hash for that turn *and every turn after
     // it* (the model then gets a fresh, real response with a new tool_use id
-    // that can never match the rest of the original cassette either — see
-    // docs/design/2026-08-05-test-architecture.md §13 for the full forensic
-    // trail that found this). Matches both BSD/macOS and GNU `ls -l` default
+    // that can never match the rest of the original cassette either).
+    // Matches both BSD/macOS and GNU `ls -l` default
     // date formats.
     static RE_LS_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
@@ -615,8 +611,7 @@ fn dehydrate(s: &str) -> String {
     // model's own tool call, not from anything this codebase renders.
     // Found via a real recording (agent delegation turn) that missed on
     // strict replay immediately after being recorded, with the miss traced
-    // to a `uuid.uuid4()`-generated string in a Bash tool_result — see
-    // docs/design/2026-08-05-test-architecture.md §18. Matches standard
+    // to a `uuid.uuid4()`-generated string in a Bash tool_result. Matches standard
     // 8-4-4-4-12 hex UUID form (v1-v5, case-insensitive), which is
     // specific enough to not risk false-positive matches on unrelated hex
     // content.
@@ -741,8 +736,7 @@ mod tests {
     /// column differs but everything else is identical), must dehydrate to
     /// the *same* string — otherwise `hash_request()` diverges between
     /// record-time and replay-time purely because of wall-clock timing, not
-    /// because anything about the request actually changed. This is the bug
-    /// from docs/design/2026-08-05-test-architecture.md §13.
+    /// because anything about the request actually changed.
     #[test]
     fn dehydrate_normalizes_ls_l_timestamps_so_repeated_runs_hash_the_same() {
         let recorded = "-rw-r--r--  1 xbitshans  staff  45 Aug  5 22:59 greet.h\n\

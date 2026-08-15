@@ -1,6 +1,4 @@
 //! `TelemetryEvent` 枚举 + 各 payload 结构化定义。
-//!
-//! 文档见 `docs/TELEMETRY_REMOTE_API.md`。
 
 use serde::Serialize;
 use time::OffsetDateTime;

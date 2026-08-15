@@ -20,9 +20,8 @@ use std::sync::RwLock;
 /// `Idle`/`Active`/`Shutdown` for real, over their actual lifetime — for
 /// them, `idle_since_secs` is how long (epoch seconds) the member has been
 /// sitting idle, so `TeamList` can show it without needing any push
-/// notification back to the lead (see `docs/design/
-/// 2026-08-11-team-phase3-persistent-members.md` §3.5 for why polling this
-/// instead of pushing was the deliberate choice). `None` while `Active`, or
+/// notification back to the lead (polling this instead of pushing was the
+/// deliberate choice). `None` while `Active`, or
 /// for batch members (which don't track this at all).
 #[derive(Debug, Clone)]
 pub struct TeamMemberInfo {

@@ -2,8 +2,6 @@
 //!
 //! 设计：每个 store 实例绑定**一个 cwd**。append/load/list 都对该 cwd 的项目目录。
 //! 多 session 共享一份 store；同 session 串行写（mutex 保护，避免并发 partial line）。
-//!
-//! 见 docs/DATA_FORMATS.md §A。
 
 use crate::entry::{EnvelopedEntry, LogEntry, PasteStore};
 use crate::error::HistoryError;

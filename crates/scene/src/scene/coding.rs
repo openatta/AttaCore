@@ -31,7 +31,7 @@ use std::sync::{Mutex, OnceLock};
 /// a tool-level default that predates any scene policy. Deferring the tool
 /// that creates files would put a round trip in front of the first write of
 /// nearly every session.
-const RESIDENT_TOOLS: &[&str] = &[
+pub const RESIDENT_TOOLS: &[&str] = &[
     "Agent",
     "AskUserQuestion",
     "Bash",

@@ -1,7 +1,6 @@
 //! 路径工具：`sanitize_path`、`canonicalize_cwd`、配置目录定位。
 //!
 //! 同一 cwd 产生同一项目目录名，jsonl 文件名也一致。
-//! 见 docs/DATA_FORMATS.md §A.1。
 
 use crate::error::HistoryError;
 use base::session::SessionId;

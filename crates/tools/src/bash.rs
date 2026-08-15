@@ -6,8 +6,6 @@
 //! - stdout / stderr 行级流式喂给 `ProgressSender`
 //! - 超时（默认 120s，上限 600s）+ cancel 通过 kill child 实现
 //! - 命令分类用关键字白名单 / 黑名单（read-only / destructive）
-//!
-//! 见 docs/RUST_ARCHITECTURE.md §8 与 docs/_ACCEPTANCE.md 场景 2 / 6。
 
 mod sandbox;
 pub use sandbox::{sandbox_status, SandboxMode};

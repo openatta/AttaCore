@@ -1,6 +1,4 @@
 //! SSE 流事件类型 —— 严格对应 Anthropic API 的事件格式。
-//!
-//! 详见 docs/RUST_ARCHITECTURE.md §6.2。
 
 use base::message::StopReason;
 use serde::Deserialize;

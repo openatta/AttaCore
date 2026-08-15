@@ -3,7 +3,7 @@
 //! loading their content.
 //!
 //! Rules stay intentionally lazy (Read-tool-on-demand, not auto-injected in
-//! full) — see `docs/CONFIG_LAYOUT.md` core principle 3. This module only
+//! full). This module only
 //! closes the "orphaned rule file" gap: a `.md` file sitting in `.atta/rules/`
 //! that nobody referenced from `AGENTS.md` used to be invisible to the model.
 //! Discovery still only reads each file's first line, never full content.

@@ -588,8 +588,7 @@ fn bg_task_id() -> String {
 /// team member) session, linking it back to its parent via
 /// `parent_session_id` and marking it `session_kind: Sidechain` — this is
 /// what makes it discoverable via `HistoryStore::child_sessions` and hidden
-/// from `session.list` by default (see
-/// `docs/design/2026-08-11-multi-scene-architecture.md` §5.2/§5.4).
+/// from `session.list` by default. See docs/session_and_scene_invariants.md §4.
 ///
 /// `project_root` is left `None` here: this crate has no per-session project
 /// identity yet (single-project daemon, P3's job), so there is nothing
@@ -633,8 +632,8 @@ async fn write_sidechain_meta(
 }
 
 /// Marks a one-shot sub-agent session as having run its task to conclusion
-/// (`docs/design/2026-08-11-multi-scene-architecture.md` §5.6, `SIDECHAIN_TERMINAL`
-/// in `docs/daemon_rpc_protocol.md`). Called only through `mark_sidechain_terminal`
+/// (`SIDECHAIN_TERMINAL` in `docs/daemon_rpc_protocol.md`). Called only
+/// through `mark_sidechain_terminal`
 /// (from `run_sub_inner`/`run_sub_tagged`/`resume_agent`) once their turn has
 /// returned — a session with no such marker was either never a sidechain, is
 /// still running, was cancelled mid-flight, or was cut off from outside
@@ -1307,8 +1306,7 @@ impl Inner {
     /// The model instance a sub-agent spawn should use. All three spawn
     /// points (`run_sub`, `run_sub_inner`, resume) are the same task type —
     /// `task_models` in settings.json is keyed by a small fixed taxonomy
-    /// (`main`/`subagent`/`team`/`classifier`/`compact`/`web_fetch`, see
-    /// `docs/design/2026-08-04-multi-provider-llm-migration.md` §3.2), not
+    /// (`main`/`subagent`/`team`/`classifier`/`compact`/`web_fetch`), not
     /// by `subagent_type` (which agent *kind* — "general-purpose",
     /// "code-reviewer", etc. — a different axis entirely), so the lookup
     /// key here is always the literal `"subagent"` task type regardless of
@@ -2638,7 +2636,7 @@ impl AgentTool {
     /// Called opportunistically before spawning a new member, not on a
     /// separate ticking timer — a session that never spawns another member
     /// after the pool fills up won't self-trim until it does. An accepted
-    /// simplification (see `docs/design/2026-08-11-team-phase3-persistent-members.md`).
+    /// simplification.
     ///
     /// `protect`, when given, excludes that exact `(team_name, member_name)`
     /// key from eviction candidates entirely — used by

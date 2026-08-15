@@ -1,7 +1,7 @@
 //! SSE 字节流 → StreamEvent 流。
 //!
 //! 独立于 HTTP，方便单测：fixture 字节直接喂进来即可断言事件序列。
-//! 见 docs/_ACCEPTANCE.md 场景 7（mock anthropic）也走这条解析。
+//! mock anthropic 的测试也走这条解析。
 
 use crate::error::AnthropicError;
 use crate::stream::StreamEvent;

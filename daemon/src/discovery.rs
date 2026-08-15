@@ -52,9 +52,8 @@ pub struct DaemonLock {
 
 /// Write the lock file with `0600` perms on Unix.
 ///
-/// Staleness check (`docs/design/2026-08-11-multi-scene-architecture.md`
-/// §6.5's table, shared verbatim with the team-directory lock this daemon-
-/// instance lock predates):
+/// Staleness check (docs/session_and_scene_invariants.md §3 — shared verbatim with the
+/// team-directory lock this daemon-instance lock predates):
 /// ```text
 /// 文件不存在                    → 写入，获得锁
 /// 文件存在
