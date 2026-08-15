@@ -77,6 +77,15 @@ pub enum ResumeError {
 /// gives "key omitted" vs. "key present" for free; `null` vs. a string
 /// needs an explicit check the wire layer (`server.rs`) does before this
 /// ever reaches `SessionPool`.
+/// What a per-session settings entry is keyed by: the project it belongs to
+/// (`None` = the global no-project tier) and the scene it runs under.
+///
+/// Both halves matter. The scene contributes a real settings layer
+/// (`~/.atta/scenes/<scene>/settings.json`, plus the skills, agents and
+/// plugins beside it), so one project under two scenes is two different
+/// resolutions, not one.
+type ProjectSceneKey = (Option<PathBuf>, String);
+
 pub enum ProjectSelector {
     /// `project_root` omitted — this pool's default project (`self.cwd`),
     /// unchanged pre-P3 behavior.
@@ -336,7 +345,10 @@ pub struct SessionPool {
     /// still gets its own owned `McpManager` built from the cached entry's
     /// `McpClientHandle`s (cheap `Arc` clones, no new connection) — see
     /// `create()`.
-    mcp_by_project: AsyncMutex<HashMap<Option<PathBuf>, Arc<McpManager>>>,
+    /// Keyed by `(project, scene)` for the same reason `projects` is: a
+    /// scene tier can declare its own `mcp_servers`, so two scenes on one
+    /// project are not interchangeable.
+    mcp_by_project: AsyncMutex<HashMap<ProjectSceneKey, Arc<McpManager>>>,
     /// Daemon-level async notifications (MCP connect outcomes, import
     /// auto-detection, future error events) — see `daemon.subscribeEvents`.
     /// `send()` returning `Err` just means "no subscribers right now", not
@@ -389,18 +401,24 @@ pub struct SessionPool {
     /// `SkillManager` + shared-watcher setup, where each session's own copy
     /// only caught up on its own next `check_for_changes()` poll.
     skill_catalog: Arc<skills::manager::SkillManager>,
-    /// P3: merged settings for every non-default `(project_root)` this pool
-    /// has ever built a session for, keyed the same way `session.create`'s
-    /// `project_root` param is understood: `None` = the global no-project
-    /// tier, `Some(root)` = that project's `settings.json` layered on top
-    /// of the global/scene tiers. The pool's *default* project (`self.cwd`)
-    /// is deliberately **not** cached here — it stays on the existing
-    /// hot-swappable `self.settings` so `config.setProvider`/`config.reload`
-    /// keep working exactly as before for it. Entries here are built once
-    /// and never invalidated (no `config.reload` targets a non-default
-    /// project yet — a project layer changing on disk needs a fresh daemon
-    /// today; wiring that up is `WatchHub`/P4 follow-on work, not P3's).
-    projects: AsyncMutex<HashMap<Option<PathBuf>, Arc<Settings>>>,
+    /// Merged settings for every `(project_root, scene)` pair this pool has
+    /// built a session for. `project_root` is understood exactly as
+    /// `session.create`'s param is: `None` = the global no-project tier,
+    /// `Some(root)` = that project's `settings.json` over the global/scene
+    /// tiers.
+    ///
+    /// Scene is part of the key because the scene tier is a real settings
+    /// layer (`~/.atta/scenes/<scene>/settings.json`, and the skills, agents
+    /// and plugins beside it). Keying by project alone meant every session
+    /// got whichever scene happened to be built first, so a `chat` session
+    /// on a daemon started as `--scene coding` silently read coding's tier.
+    ///
+    /// The pool's default `(cwd, startup scene)` pair is deliberately **not**
+    /// cached here — it stays on the hot-swappable `self.settings` so
+    /// `config.setProvider`/`config.reload` keep working for it. Entries here
+    /// are built once and never invalidated (no `config.reload` targets a
+    /// non-default project yet).
+    projects: AsyncMutex<HashMap<ProjectSceneKey, Arc<Settings>>>,
     /// Bumped by `apply_reloaded_settings()` on every successful reload.
     /// Compared against each `LiveSession::config_generation` at dispatch
     /// time (`run_turn`) to decide whether an already-running session needs
@@ -789,10 +807,11 @@ impl SessionPool {
     /// unconnected (or not-yet-connected) project just reports no servers
     /// rather than paying for a connect attempt on a status query.
     pub async fn mcp_status(&self) -> Vec<serde_json::Value> {
+        let startup_scene = self.settings.read().await.paths.scope.clone();
         self.mcp_by_project
             .lock()
             .await
-            .get(&Some(self.cwd.clone()))
+            .get(&(Some(self.cwd.clone()), startup_scene))
             .cloned()
             .unwrap_or_else(|| Arc::new(McpManager::empty()))
             .server_statuses()
@@ -865,10 +884,11 @@ impl SessionPool {
                     "error": "connect failed — see daemon log for the specific reason",
                 }));
             }
+            let startup_scene = pool.settings.read().await.paths.scope.clone();
             pool.mcp_by_project
                 .lock()
                 .await
-                .insert(Some(pool.cwd.clone()), Arc::new(manager));
+                .insert((Some(pool.cwd.clone()), startup_scene), Arc::new(manager));
         });
     }
 
@@ -944,10 +964,11 @@ impl SessionPool {
             }));
         }
 
-        self.mcp_by_project
-            .lock()
-            .await
-            .insert(project_root.map(Path::to_path_buf), Arc::new(manager));
+        let startup_scene = self.settings.read().await.paths.scope.clone();
+        self.mcp_by_project.lock().await.insert(
+            (project_root.map(Path::to_path_buf), startup_scene),
+            Arc::new(manager),
+        );
         (connected, failed)
     }
 
@@ -1016,8 +1037,11 @@ impl SessionPool {
 
         // `add_mcp_server` only ever writes the default project's
         // settings.json (`project_settings_path()`), so it only ever
-        // mutates that project's cache entry.
-        let default_project = Some(self.cwd.clone());
+        // mutates that project's cache entry, under the daemon's own scene.
+        let default_project = (
+            Some(self.cwd.clone()),
+            self.settings.read().await.paths.scope.clone(),
+        );
         let statuses = {
             let mut cache = self.mcp_by_project.lock().await;
             let current = cache
@@ -1426,11 +1450,23 @@ impl SessionPool {
             ));
         };
 
+        // Settings are resolved against *this session's* scene, not the
+        // daemon's. The `Default` arm goes through the same call as the others
+        // so that a non-startup scene on the default project still picks up
+        // its own tier; `settings_for_project` short-circuits to the
+        // hot-swappable `self.settings` for the one pair that is the pool's
+        // own.
+        let session_scene_id = scene.id().to_string();
         let (base_settings, project_root_for_meta) = match project_root {
-            ProjectSelector::Default => {
-                (self.settings.read().await.clone(), Some(self.cwd.clone()))
-            }
-            ProjectSelector::NoProject => (self.settings_for_project(None).await, None),
+            ProjectSelector::Default => (
+                self.settings_for_project(Some(&self.cwd.clone()), &session_scene_id)
+                    .await,
+                Some(self.cwd.clone()),
+            ),
+            ProjectSelector::NoProject => (
+                self.settings_for_project(None, &session_scene_id).await,
+                None,
+            ),
             ProjectSelector::Path(p) => {
                 if !p.is_dir() {
                     return Err((
@@ -1441,7 +1477,10 @@ impl SessionPool {
                         ),
                     ));
                 }
-                (self.settings_for_project(Some(&p)).await, Some(p))
+                (
+                    self.settings_for_project(Some(&p), &session_scene_id).await,
+                    Some(p),
+                )
             }
         };
 
@@ -1558,7 +1597,9 @@ impl SessionPool {
         // when nothing's connected, so the common "no MCP servers
         // configured" case pays zero cost.
         let mcp_server_count = {
-            let central = self.mcp_for_project(project_root_for_meta.as_deref()).await;
+            let central = self
+                .mcp_for_project(project_root_for_meta.as_deref(), &scene_id)
+                .await;
             let count = central.server_count();
             if count > 0 {
                 let mut per_session = McpManager::from_clients(central.clients().to_vec());
@@ -2772,9 +2813,15 @@ impl SessionPool {
         } else {
             Some(self.cwd.clone())
         };
+        // A fork inherits the source session's scene, so its settings must be
+        // resolved against that scene's tier — not the daemon's startup one.
+        let fork_scene = match source_scene.clone() {
+            Some(s) => s,
+            None => self.settings.read().await.paths.scope.clone(),
+        };
         let settings = match &project_root_for_fork {
-            Some(p) => self.settings_for_project(Some(p)).await,
-            None => self.settings_for_project(None).await,
+            Some(p) => self.settings_for_project(Some(p), &fork_scene).await,
+            None => self.settings_for_project(None, &fork_scene).await,
         };
         let meta = history::entry::LogEntry::Meta {
             cwd: project_root_for_fork
@@ -2973,32 +3020,53 @@ impl SessionPool {
     /// separately, since resume callers deliberately do **not**: a project
     /// directory that moved after the session was created should still
     /// resume (`docs/daemon_rpc_protocol.md` §6.3's `project_root_changed`), not fail.
-    async fn settings_for_project(&self, project_root: Option<&Path>) -> Arc<Settings> {
-        let key = project_root.map(Path::to_path_buf);
-        if key.as_deref() == Some(self.cwd.as_path()) {
+    async fn settings_for_project(
+        &self,
+        project_root: Option<&Path>,
+        scene_id: &str,
+    ) -> Arc<Settings> {
+        let startup_scene = self.settings.read().await.paths.scope.clone();
+        let key = (project_root.map(Path::to_path_buf), scene_id.to_string());
+
+        // The pool's own `(cwd, startup scene)` pair, and only that pair,
+        // answers from the hot-swappable settings `config.reload` mutates.
+        if key.0.as_deref() == Some(self.cwd.as_path()) && scene_id == startup_scene {
             return self.settings.read().await.clone();
         }
         if let Some(existing) = self.projects.lock().await.get(&key) {
             return existing.clone();
         }
 
-        let (scope, default_model) = {
-            let s = self.settings.read().await;
-            (s.paths.scope.clone(), s.model.model_name.clone())
-        };
-        let local_dir = match &key {
+        let default_model = self.settings.read().await.model.model_name.clone();
+        let local_dir = match &key.0 {
             Some(root) => root.join(".atta"),
             None => self.paths.global_root(),
         };
         let built = Arc::new(Settings::load(
             self.paths.global_root(),
-            self.paths.config_root(),
+            self.scene_root(scene_id, &startup_scene),
             local_dir,
-            &scope,
+            scene_id,
             &default_model,
         ));
         self.projects.lock().await.insert(key, built.clone());
         built
+    }
+
+    /// The scene tier directory for `scene_id`.
+    ///
+    /// The daemon's *own* scene keeps whatever `DaemonPaths::config_root()`
+    /// resolves to — tests inject a `StaticDaemonPaths` whose config root is a
+    /// tempdir bearing no relation to `global_root()/scenes/<id>`, and
+    /// recomputing it here would move that scene's settings out from under
+    /// them. Any other scene has no such injected path, so it is derived the
+    /// way `DefaultDaemonPaths::from_env` derives the first one.
+    fn scene_root(&self, scene_id: &str, startup_scene: &str) -> PathBuf {
+        if scene_id == startup_scene {
+            self.paths.config_root()
+        } else {
+            self.paths.global_root().join("scenes").join(scene_id)
+        }
     }
 
     /// This project's centrally-connected `McpManager` — the MCP
@@ -3018,13 +3086,17 @@ impl SessionPool {
     /// work; this only needed to stop the wrong thing from happening (a
     /// non-default project silently inheriting the default project's
     /// connections, or never connecting its own at all).
-    async fn mcp_for_project(&self, project_root: Option<&Path>) -> Arc<McpManager> {
-        let key = project_root.map(Path::to_path_buf);
+    async fn mcp_for_project(
+        &self,
+        project_root: Option<&Path>,
+        scene_id: &str,
+    ) -> Arc<McpManager> {
+        let key = (project_root.map(Path::to_path_buf), scene_id.to_string());
         if let Some(existing) = self.mcp_by_project.lock().await.get(&key) {
             return existing.clone();
         }
 
-        let settings = self.settings_for_project(project_root).await;
+        let settings = self.settings_for_project(project_root, scene_id).await;
         let mut parsed = HashMap::new();
         for (name, v) in &settings.mcp_servers {
             match serde_json::from_value::<mcp::config::McpServerConfig>(v.clone()) {
@@ -3054,17 +3126,24 @@ impl SessionPool {
     /// v2 `Meta` that explicitly recorded `project_root: null` (a genuine
     /// no-project session) is exactly why this returns the raw
     /// `schema_version` instead of collapsing straight to `Option<PathBuf>`.
-    async fn recorded_project(&self, session_id: &str) -> Option<(u32, Option<String>)> {
+    /// The recorded `scene` rides along because it comes from the same
+    /// `Meta` and reattaching needs both: a session's settings are resolved
+    /// against its own project *and* its own scene tier.
+    async fn recorded_project(
+        &self,
+        session_id: &str,
+    ) -> Option<(u32, Option<String>, Option<String>)> {
         let entries = self.load_entries(session_id).await.ok()?;
         let history::entry::LogEntry::Meta {
             schema_version,
             project_root,
+            scene,
             ..
         } = find_meta(&entries)?
         else {
             return None;
         };
-        Some((*schema_version, project_root.clone()))
+        Some((*schema_version, project_root.clone(), scene.clone()))
     }
 
     /// See [`SceneCheck`]. Safe to call unconditionally, including for a
@@ -3441,14 +3520,21 @@ impl SessionPool {
         // `session.create {project_root: X}` would silently come back with
         // project Y's settings the moment it needed reattaching (idle
         // eviction, daemon restart, explicit `session.resume`).
+        let startup_scene = self.settings.read().await.paths.scope.clone();
         let (base_settings, project_root_for_meta) = match self.recorded_project(&sid).await {
-            Some((schema_version, project_root)) if schema_version >= 2 => match project_root {
-                Some(p) => {
-                    let path = PathBuf::from(p);
-                    (self.settings_for_project(Some(&path)).await, Some(path))
+            Some((schema_version, project_root, scene)) if schema_version >= 2 => {
+                let scene = scene.unwrap_or_else(|| startup_scene.clone());
+                match project_root {
+                    Some(p) => {
+                        let path = PathBuf::from(p);
+                        (
+                            self.settings_for_project(Some(&path), &scene).await,
+                            Some(path),
+                        )
+                    }
+                    None => (self.settings_for_project(None, &scene).await, None),
                 }
-                None => (self.settings_for_project(None).await, None),
-            },
+            }
             _ => (self.settings.read().await.clone(), Some(self.cwd.clone())),
         };
 
@@ -4214,7 +4300,7 @@ mod mcp_for_project_tests {
     /// `McpManager` immediately (no subprocess, no network), which is all
     /// these tests need: they're about the *cache* around the connect, not
     /// the connect itself (that's `mcp_toy_server_smoke.rs`'s job).
-    async fn test_pool() -> (SessionPool, tempfile::TempDir) {
+    pub(super) async fn test_pool() -> (SessionPool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -4248,8 +4334,8 @@ mod mcp_for_project_tests {
     #[tokio::test]
     async fn cache_hit_returns_the_same_arc_without_reconnecting() {
         let (pool, _dir) = test_pool().await;
-        let first = pool.mcp_for_project(Some(pool.cwd())).await;
-        let second = pool.mcp_for_project(Some(pool.cwd())).await;
+        let first = pool.mcp_for_project(Some(pool.cwd()), "coding").await;
+        let second = pool.mcp_for_project(Some(pool.cwd()), "coding").await;
         assert!(
             Arc::ptr_eq(&first, &second),
             "a cache hit must return the exact cached Arc, not a freshly connected one"
@@ -4262,15 +4348,15 @@ mod mcp_for_project_tests {
         let other_project = dir.path().join("other");
         std::fs::create_dir_all(&other_project).unwrap();
 
-        let default_manager = pool.mcp_for_project(Some(pool.cwd())).await;
-        let other_manager = pool.mcp_for_project(Some(&other_project)).await;
+        let default_manager = pool.mcp_for_project(Some(pool.cwd()), "coding").await;
+        let other_manager = pool.mcp_for_project(Some(&other_project), "coding").await;
         assert!(
             !Arc::ptr_eq(&default_manager, &other_manager),
             "a project seen for the first time must get its own cache miss and connect, \
              not silently inherit another project's connections"
         );
 
-        let other_again = pool.mcp_for_project(Some(&other_project)).await;
+        let other_again = pool.mcp_for_project(Some(&other_project), "coding").await;
         assert!(
             Arc::ptr_eq(&other_manager, &other_again),
             "the second lookup for the same non-default project must be a cache hit"
@@ -4280,11 +4366,143 @@ mod mcp_for_project_tests {
     #[tokio::test]
     async fn no_project_key_is_cached_independently_of_the_default_project() {
         let (pool, _dir) = test_pool().await;
-        let none_manager = pool.mcp_for_project(None).await;
-        let default_manager = pool.mcp_for_project(Some(pool.cwd())).await;
+        let none_manager = pool.mcp_for_project(None, "coding").await;
+        let default_manager = pool.mcp_for_project(Some(pool.cwd()), "coding").await;
         assert!(
             !Arc::ptr_eq(&none_manager, &default_manager),
             "the no-project tier (`None`) must not share a cache slot with the default project"
+        );
+    }
+}
+
+/// Multiple scenes coexisting in one daemon process.
+#[cfg(test)]
+mod multi_scene_tests {
+    use super::mcp_for_project_tests::test_pool;
+    use super::*;
+
+    /// Two scenes on one daemon must each read their own settings tier.
+    ///
+    /// `settings_for_project` used to key on project alone and take `scope`
+    /// from the pool's own settings, so whichever scene built an entry first
+    /// answered for every scene afterwards: a `chat` session on a daemon
+    /// started as `--scene coding` silently ran on coding's tier.
+    #[tokio::test]
+    async fn each_scene_resolves_its_own_settings_tier() {
+        let (pool, dir) = test_pool().await;
+
+        // `scenes/chat/settings.json` sets a model the pool's own tier never
+        // mentions — if the chat session picks it up, it read chat's tier.
+        let chat_tier = dir.path().join("scenes").join("chat");
+        std::fs::create_dir_all(&chat_tier).unwrap();
+        std::fs::write(
+            chat_tier.join("settings.json"),
+            r#"{"model": {"model_name": "model-from-chat-tier"}}"#,
+        )
+        .unwrap();
+
+        let coding = pool.settings_for_project(None, "coding").await;
+        let chat = pool.settings_for_project(None, "chat").await;
+
+        assert_eq!(chat.model.model_name, "model-from-chat-tier");
+        assert_ne!(
+            coding.model.model_name, chat.model.model_name,
+            "two scenes must not share one settings entry"
+        );
+        assert_eq!(
+            chat.paths.scope, "chat",
+            "scope must be the session's scene"
+        );
+        assert_eq!(coding.paths.scope, "coding");
+    }
+
+    /// The same project under two scenes gets two cache entries, and each is
+    /// stable across calls.
+    #[tokio::test]
+    async fn settings_cache_is_keyed_by_project_and_scene_together() {
+        let (pool, dir) = test_pool().await;
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let a1 = pool.settings_for_project(Some(&other), "coding").await;
+        let a2 = pool.settings_for_project(Some(&other), "coding").await;
+        let b = pool.settings_for_project(Some(&other), "chat").await;
+
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "same (project, scene) must be cached"
+        );
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "one project under two scenes must not collapse to one entry"
+        );
+        assert_eq!(a1.paths.scope, "coding");
+        assert_eq!(b.paths.scope, "chat");
+    }
+
+    /// The daemon's own scene keeps the injected `config_root()`; any other
+    /// scene is derived under `global_root()/scenes/`.
+    ///
+    /// Tests inject a `StaticDaemonPaths` whose config root is a tempdir that
+    /// bears no relation to `global_root()/scenes/<id>`, so recomputing the
+    /// startup scene's directory would move its settings out from under them.
+    #[tokio::test]
+    async fn the_startup_scene_keeps_its_injected_config_root() {
+        let (pool, _dir) = test_pool().await;
+
+        assert_eq!(
+            pool.scene_root("coding", "coding"),
+            pool.paths.config_root(),
+            "the startup scene must not be recomputed"
+        );
+        assert_eq!(
+            pool.scene_root("chat", "coding"),
+            pool.paths.global_root().join("scenes").join("chat"),
+            "another scene is derived the way DefaultDaemonPaths derives one"
+        );
+    }
+
+    /// A scene that was never activated must be refused, not silently served
+    /// by the daemon's default.
+    #[tokio::test]
+    async fn creating_a_session_in_an_inactive_scene_is_refused() {
+        let (pool, _dir) = test_pool().await;
+        assert!(
+            pool.resolve_scene(Some("research")).await.is_none(),
+            "research was never activated on this pool"
+        );
+        assert!(
+            pool.resolve_scene(Some("chat")).await.is_none(),
+            "chat was never activated either"
+        );
+        assert!(
+            pool.resolve_scene(None).await.is_some(),
+            "no scene named falls back to the daemon's own"
+        );
+    }
+
+    /// `scene.activate` makes a second scene usable in the same process, and
+    /// sessions created under each are recorded under their own scene.
+    #[tokio::test]
+    async fn two_scenes_can_be_active_in_one_process() {
+        let (pool, _dir) = test_pool().await;
+
+        pool.activate_scene("chat").await.expect("activate chat");
+
+        let coding = pool.resolve_scene(Some("coding")).await.expect("coding");
+        let chat = pool.resolve_scene(Some("chat")).await.expect("chat");
+        assert_eq!(coding.id(), "coding");
+        assert_eq!(chat.id(), "chat");
+
+        // Distinct scenes, so distinct tool surfaces — this is what makes
+        // running both in one process meaningful rather than cosmetic.
+        assert!(
+            coding.tools().is_empty(),
+            "coding allows every registered tool"
+        );
+        assert!(
+            !chat.tools().is_empty(),
+            "chat restricts its tools to a whitelist"
         );
     }
 }

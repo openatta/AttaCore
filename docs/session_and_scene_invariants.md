@@ -6,13 +6,18 @@
 
 ---
 
-## 1. 场景是进程级的
+## 1. 一个进程可以跑多个场景
 
-场景在 daemon 启动时由 `--scene` 选定，之后不可变：
+场景是无状态的——`CodingScene` / `ChatScene` / `ResearchScene` 都是零字段 unit struct，`Arc<dyn AgentScene>` 只是一组函数。所以同一进程里并存多个场景没有障碍：
 
-- `daemon/src/main.rs` 用校验过的 `--scene` 解析出场景实例，并取 `scene.id()` 作为 `scope`
-- `scope` 决定 `~/.atta/scenes/<scope>/` 这一层用户级覆盖目录（`base::paths::ConfigPaths`）
-- 因此**一个 daemon 进程只服务一个场景**
+- `--scene` 定 daemon 的默认场景，`--scenes chat,research` 追加激活
+- `scene.activate` / `scene.deactivate` 运行期增删（`SessionPool::active_scenes`）
+- `session.create {"scene": "chat"}` 指定该会话用哪个；未激活的场景返回 `SCENE_NOT_FOUND`
+- 每个会话按**自己的场景**解析设置层，包括 `~/.atta/scenes/<scene>/` 下的 settings、skills、agents、plugins
+
+最后一条是后补的。`settings_for_project` 曾按项目单键缓存、并从 pool 自身取 `scope`，于是哪个场景先建好条目，后面所有场景就都读它——`--scene coding` 启动的 daemon 上，一个 `chat` 会话会静默用 coding 的设置层。现在缓存键是 `(project, scene)`，`scope` 取会话自己的场景。
+
+**唯一保留的进程级绑定**：`DaemonPaths::config_root()` 在启动时按首个场景算定。其它场景的目录由 `SessionPool::scene_root` 从 `global_root()/scenes/<id>` 推导；启动场景保留注入的 `config_root()`，因为测试用 `StaticDaemonPaths` 注入的是与该推导无关的临时目录。
 
 ### SCENE_MISMATCH
 
@@ -22,7 +27,7 @@
 
 `Meta.scene` 缺失时（v1 时代的会话）记为 "unknown"，不导致整份文件解析失败；调用方从 resume/fork 请求本身推断场景。
 
-**要点：** 想支持"一个 daemon 跑多场景"，`scope` 的进程级绑定是第一个要拆的东西，不是 `SCENE_MISMATCH` 守卫。
+**要点：** `SCENE_MISMATCH` 守的是"这个会话属于哪个场景"，不是"这个 daemon 只能跑一个场景"。多场景并存与它并不冲突——它恰恰是多场景下保证会话不串台的那道闸。
 
 ---
 
