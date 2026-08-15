@@ -154,6 +154,10 @@ pub struct Agent {
     /// tool call sees the actual configured sandbox/permission/shell-execution
     /// settings, not silent defaults.
     pub(crate) config: Arc<base::context::EngineConfig>,
+    /// This session's own position in the delegation chain — see
+    /// [`Builder::agent_depth`]. Reaches tools as `ToolContext::agent_depth`,
+    /// which was hardcoded to `0` before there was a real depth to report.
+    pub(crate) agent_depth: u32,
     pub(crate) permission: Arc<dyn Permission>,
     /// Permission requests currently awaiting a host response, keyed by
     /// `prompt_id`. `execute_tool_inner` registers a `oneshot` sender here
@@ -903,6 +907,9 @@ pub struct Builder {
     /// callers (tests, library embedding): `build()` self-scans and starts
     /// its own watcher, same as always.
     skill_catalog: Option<Arc<skills::manager::SkillManager>>,
+    /// How many delegation hops separate this agent from the root session —
+    /// see [`Builder::agent_depth`].
+    agent_depth: u32,
 }
 
 /// Scan the three skill-directory tiers from disk and register bundled
@@ -1049,7 +1056,23 @@ impl Builder {
             task_router: None,
             shared_agent_types: None,
             skill_catalog: None,
+            agent_depth: 0,
         }
+    }
+
+    /// Position of the agent being built in the delegation chain: `0` for a
+    /// root session, `parent + 1` for anything spawned through
+    /// `AgentTool::run_sub` and friends.
+    ///
+    /// `build()` stops registering the `Agent` tool once this reaches
+    /// `EngineConfig::max_agent_depth`, so the deepest agents simply never
+    /// see a way to delegate further. The count is what actually bounds the
+    /// chain; `AgentTool::resolve_tools` dropping "Agent" from a sub-agent's
+    /// registry does not, because `build()` re-registers the tool into the
+    /// per-session registry it creates.
+    pub fn agent_depth(mut self, depth: u32) -> Self {
+        self.agent_depth = depth;
+        self
     }
 
     pub fn scene(mut self, s: Arc<dyn AgentScene>) -> Self {
@@ -1088,6 +1111,11 @@ impl Builder {
     /// the session's messages are incrementally appended to disk once per
     /// turn (see `session::session::SessionManager::persist`); `None` (the
     /// default) keeps sessions purely in-memory.
+    ///
+    /// Requires the session id to be a valid `base::session::SessionId` —
+    /// either omit [`Builder::session_id`] and take the generated default, or
+    /// pass one built from `SessionId`. [`Builder::build`] rejects anything
+    /// else rather than persisting nothing.
     pub fn history_store(mut self, store: Arc<dyn history::store::HistoryStore>) -> Self {
         self.history_store = Some(store);
         self
@@ -1315,12 +1343,34 @@ impl Builder {
         // outlive the process, so a sidecar for it would just be orphaned
         // disk state nothing ever reads back). File creation itself happens
         // later, in `warmup()` — this only constructs the handle, no I/O.
+        //
+        // A caller-supplied id that doesn't parse fails the build outright
+        // rather than degrading: `SessionManager::persist` parses the same id
+        // before writing anything, so an unparseable one means transcript
+        // persistence and the sidecar are both dead for the whole session —
+        // previously visible only as a per-turn `warn!` (and, here, as
+        // nothing at all).
         if self.history_store.is_some() {
-            if let Ok(sid) = base::session::SessionId::parse(session.session_id_str()) {
-                let sessions_root = settings.paths.global_data_dir.join("sessions");
-                let path = history::path::session_memory_file(&sessions_root, &sid);
-                session = session.with_session_memory(SessionMemory::new(path));
-            }
+            let sid = base::session::SessionId::parse(session.session_id_str()).map_err(|e| {
+                EngineError::Internal(format!(
+                    "session_id {:?} is not a valid SessionId ({e}); \
+                     a history_store requires a parseable id — use \
+                     `SessionId::new().to_string()` or omit `Builder::session_id`",
+                    session.session_id_str()
+                ))
+            })?;
+            // `history::path::sessions_root()`, not
+            // `paths.global_data_dir.join("sessions")` — the two disagree.
+            // The former is `$ATTA_CONFIG_HOME` or `~/.atta/code/sessions`;
+            // the latter is `$ATTA_DATA_DIR` or `~/.atta/sessions`, one level
+            // short and keyed off a different env var. Everything else that
+            // touches a session sidecar (metadata, input history, prompt
+            // state) goes through `history::path`, so writing the memory file
+            // anywhere else meant nothing could find it again.
+            let sessions_root = history::path::sessions_root()
+                .unwrap_or_else(|_| settings.paths.global_data_dir.join("sessions"));
+            let path = history::path::session_memory_file(&sessions_root, &sid);
+            session = session.with_session_memory(SessionMemory::new(path));
         }
         let compactor = self
             .compactor
@@ -1359,6 +1409,10 @@ impl Builder {
         // happens later, but `InMemoryToolRegistry` is a shared `Arc`, so
         // construction order doesn't affect which tools end up visible to
         // sub-agents (`resolve_tools()` reads the registry at call time).
+        let agent_depth = self.agent_depth;
+        let max_agent_depth =
+            base::context::EngineConfig::defaults_for(settings.model.model_name.clone())
+                .max_agent_depth;
         let agent_tool_arc = {
             let agent_engine_config = Arc::new({
                 let mut c =
@@ -1394,7 +1448,8 @@ impl Builder {
                     &plugin_agent_types,
                 )
             }
-            .with_settings(settings.clone());
+            .with_settings(settings.clone())
+            .with_depth(agent_depth);
             if let Some(router) = self.task_router.clone() {
                 agent_tool = agent_tool.with_task_router(router);
             }
@@ -1514,7 +1569,15 @@ impl Builder {
         // (`agent_tool_arc` itself was constructed earlier, before `hooks`,
         // so its `AgentSpawner` wrapper could be handed to the "agent"-type
         // hook executor — see the `hooks` construction above).
-        tools.register(agent_tool_arc.clone());
+        //
+        // Withheld at the depth limit so the deepest agents are never even
+        // offered the tool. This registry is a fresh per-session one built a
+        // few hundred lines up, *not* the caller's — which is why
+        // `AgentTool::resolve_tools` filtering "Agent" out of what it hands a
+        // sub-agent never had any effect on its own.
+        if agent_depth < max_agent_depth {
+            tools.register(agent_tool_arc.clone());
+        }
         // Register MCP resource tools if clients are available
         if !mcp.clients().is_empty() {
             tools.register(std::sync::Arc::new(mcp::tools::ListMcpResourcesTool::new(
@@ -1766,6 +1829,7 @@ impl Builder {
                 tools,
                 settings,
                 config,
+                agent_depth,
                 permission,
                 pending_permissions,
                 current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
@@ -1859,6 +1923,7 @@ mod tests {
             disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
+            local_permission_rules: Vec::new(),
             allow_client_permission_override: false,
             telemetry_enabled: false,
             hooks_config: None,
@@ -1924,6 +1989,118 @@ mod tests {
         {
             unimplemented!("not exercised by these tests")
         }
+    }
+
+    /// Fails every call, the way an unreachable endpoint or a 5xx does.
+    /// `DummyModel` can't stand in here — it panics rather than returning
+    /// `Err`, so it never reaches the turn's model-error return path.
+    struct FailingModel;
+    #[async_trait::async_trait]
+    impl Model for FailingModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            Err(base::interface::model::ModelError::Api {
+                status: 503,
+                message: "simulated endpoint failure".into(),
+            })
+        }
+    }
+
+    /// A turn that fails still has to leave the user's message on disk.
+    ///
+    /// Persistence used to run only at the successful tail of
+    /// `run_user_turn`, so a session whose turns all failed wrote no file at
+    /// all — `HistoryStore::append` creates it lazily — and `--continue`
+    /// could not find it afterwards. That is exactly the session a user
+    /// wants back: the one that just broke.
+    #[tokio::test]
+    async fn a_failed_turn_still_persists_the_users_message() {
+        let cwd_tmp = tempfile::tempdir().unwrap();
+        let projects_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            history::store::JsonlHistoryStore::with_root(
+                cwd_tmp.path(),
+                projects_tmp.path().to_path_buf(),
+            )
+            .await
+            .expect("store should build"),
+        );
+
+        let settings = Arc::new(test_settings());
+        let model: Arc<dyn Model> = Arc::new(FailingModel);
+        let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+        let sid = base::session::SessionId::new().to_string();
+
+        let (mut agent, _event_rx, _input_tx) = Builder::new()
+            .scene(scene)
+            .model(model)
+            .settings(settings)
+            .history_store(store.clone())
+            .session_id(sid.clone())
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let outcome = agent
+            .run_turn(
+                "remember this".into(),
+                "turn-1".into(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "FailingModel should fail the turn");
+
+        let parsed = base::session::SessionId::parse(&sid).unwrap();
+        let entries = history::store::HistoryStore::load(&*store, parsed)
+            .await
+            .expect("the failed turn must have created a transcript on disk");
+        assert!(
+            entries
+                .iter()
+                .any(|e| format!("{:?}", e.entry).contains("remember this")),
+            "the user's message must survive a failed turn, got: {entries:?}"
+        );
+    }
+
+    /// `/model` has to reach the engine. `UpdateModel` fell through a
+    /// catch-all `_ =>` arm in `process_turn`'s command match and did
+    /// nothing, so a host could send the command, see no error, and keep
+    /// talking to the old model. The match is exhaustive now, so a new
+    /// `EngineCommand` fails the build instead of being swallowed.
+    #[tokio::test]
+    async fn update_model_command_changes_the_model_the_next_turn_uses() {
+        let (mut agent, _event_rx, _input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        assert_eq!(agent.settings.model.model_name, "test");
+
+        agent
+            .process_turn(
+                InputMessage::System {
+                    kind: EngineCommand::UpdateModel,
+                    content: "claude-opus-5".into(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("UpdateModel should be handled");
+
+        assert_eq!(agent.settings.model.model_name, "claude-opus-5");
     }
 
     fn dummy_agent_tool() -> Arc<crate::agent_tool::AgentTool> {
@@ -2158,6 +2335,53 @@ mod tests {
         );
     }
 
+    /// The depth bound has to be asserted on the registry the sub-agent
+    /// actually runs with, which is the one `build()` creates — not on what
+    /// `AgentTool::resolve_tools` returned on the way in.
+    ///
+    /// `resolve_tools_full_access_excludes_agent_itself` (agent_tool.rs)
+    /// checks the latter and passed throughout the period when a sub-agent
+    /// could delegate without limit: `build()` re-registered "Agent" into its
+    /// fresh per-session registry regardless, so the filter it asserts had no
+    /// effect on the running agent. Delegation chains recursed until the
+    /// process hit `fatal runtime error: stack overflow`.
+    #[tokio::test]
+    async fn build_withholds_the_agent_tool_at_the_delegation_depth_limit() {
+        let max_depth =
+            base::context::EngineConfig::defaults_for("test".to_string()).max_agent_depth;
+
+        let build_at = |depth: u32| {
+            let settings = Arc::new(test_settings());
+            let model: Arc<dyn Model> = Arc::new(DummyModel);
+            let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
+            Builder::new()
+                .scene(scene)
+                .model(model)
+                .settings(settings)
+                .agent_depth(depth)
+                .skip_warmup(true)
+                .build()
+                .expect("build should succeed")
+        };
+
+        for depth in 0..max_depth {
+            let (agent, _rx, _tx) = build_at(depth);
+            assert!(
+                agent.tools.get("Agent").is_some(),
+                "depth {depth} is below the limit {max_depth} and should still be able to delegate"
+            );
+            assert_eq!(agent.agent_depth, depth);
+        }
+
+        let (agent, _rx, _tx) = build_at(max_depth);
+        assert!(
+            agent.tools.get("Agent").is_none(),
+            "an agent at the depth limit ({max_depth}) must not be handed the Agent tool, \
+             found: {:?}",
+            agent.tools.names()
+        );
+    }
+
     /// W-1 regression: `WebSearchTool` was never registered anywhere, while
     /// `ChatScene::tools()` and `ResearchScene::tools()` both list
     /// `"WebSearch"`. A scene whitelist is intersected with the registry, so
@@ -2382,12 +2606,17 @@ mod tests {
             .session_memory
             .as_ref()
             .expect("session_memory should be wired when a history_store is set");
-        assert!(
-            sm.path()
-                .ends_with(format!("sessions/{sid}/session_memory.md")),
-            "unexpected path: {}",
-            sm.path().display()
+        // Must land in the same sidecar directory the rest of the history
+        // crate reads and writes (metadata, input history, prompt state).
+        // This used to be built from `paths.global_data_dir`, which is a
+        // level short of `history::path::config_home()` and keyed off a
+        // different env var, so the memory file was written where nothing
+        // would ever look for it.
+        let expected = history::path::session_memory_file(
+            &history::path::sessions_root().expect("sessions_root"),
+            &base::session::SessionId::parse(&sid).unwrap(),
         );
+        assert_eq!(sm.path(), expected);
     }
 
     /// **N-1 regression, and the most important test in this file.**

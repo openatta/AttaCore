@@ -59,6 +59,36 @@ impl RuleSetPermission {
         }
     }
 
+    /// Build one straight from `Settings`, wiring in both permission-rule
+    /// tiers with their own `RuleSource` (see
+    /// `crate::rule::rules_from_all_tiers`).
+    ///
+    /// This is the path that makes `permission_rules` and
+    /// `settings.local.json` actually take effect, and every embedder that
+    /// builds its own `Permission` should come through here rather than
+    /// reassembling gate + ruleset + mode itself — `runtime::agent::Builder`
+    /// takes an injected `Permission` and does not read `Settings` for rules,
+    /// so an embedder that skips this silently gets no configured rules at
+    /// all.
+    ///
+    /// `extra_rules` are appended after both tiers — session-scoped rules a
+    /// caller adds on top (the daemon's `SessionOptions::permission_rules`),
+    /// evaluated alongside the configured ones rather than replacing them.
+    pub fn from_settings(
+        settings: &base::interface::settings::Settings,
+        mode: PermissionMode,
+        tools: Arc<InMemoryToolRegistry>,
+        extra_rules: impl IntoIterator<Item = base::permission::PermissionRule>,
+    ) -> Self {
+        let mut rules = crate::rule::rules_from_all_tiers(settings);
+        rules.extend(extra_rules);
+        Self::new(
+            Arc::new(PermissionGate::new(crate::ruleset::RuleSet::new(rules))),
+            tools,
+            mode,
+        )
+    }
+
     /// The registry currently bound — snapshot of the `Arc`, so a concurrent
     /// `bind_tool_registry` can't hold the lock across an `.await`.
     fn tools(&self) -> Arc<InMemoryToolRegistry> {

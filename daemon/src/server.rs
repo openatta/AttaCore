@@ -23,7 +23,7 @@
 //! defaults to `ask` and raises `session.event{kind:"prompt"}` frames that
 //! `session.respondToPrompt` answers. See `daemon/src/main.rs`'s
 //! `AllowAllPermission` doc comment for why the boundary moved, and
-//! `docs/DAEMON_RPC.md` for the opt-out.
+//! `docs/daemon_rpc_protocol.md` for the opt-out.
 
 use crate::rpc::{codes, RpcRequest, RpcResponse};
 use crate::session_pool::SessionPool;

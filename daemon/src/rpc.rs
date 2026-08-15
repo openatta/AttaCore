@@ -58,7 +58,7 @@ impl RpcResponse {
     }
 
     /// Like [`err`](Self::err), but attaches a structured `data` payload —
-    /// for error codes where `docs/DAEMON_RPC.md` §9.1 documents the shape
+    /// for error codes where `docs/daemon_rpc_protocol.md` §9.1 documents the shape
     /// as part of the contract (clients are meant to read fields off it, not
     /// just display `message`).
     pub fn err_with_data(id: Value, code: i32, message: impl Into<String>, data: Value) -> Self {
@@ -97,22 +97,22 @@ pub mod codes {
     pub const UNAUTHORIZED: i32 = -32003;
     /// `session.resume`/`session.fork`: the session's recorded `Meta.scene`
     /// does not match the scene being resumed into. See
-    /// `docs/DAEMON_RPC.md` §9.1 for the `data` shape this carries.
+    /// `docs/daemon_rpc_protocol.md` §9.1 for the `data` shape this carries.
     pub const SCENE_MISMATCH: i32 = -32006;
     /// `session.create`: the given `project_root` doesn't exist or isn't a
-    /// readable directory. See `docs/DAEMON_RPC.md` §9.1 for the `data`
+    /// readable directory. See `docs/daemon_rpc_protocol.md` §9.1 for the `data`
     /// shape this carries.
     pub const PROJECT_NOT_FOUND: i32 = -32010;
     /// `session.create`/`scene.activate`: the given scene isn't one this
     /// daemon binary registers at all.
     pub const SCENE_NOT_FOUND: i32 = -32004;
     /// `scene.deactivate`: refused because sessions are still recorded
-    /// under this scene. See `docs/DAEMON_RPC.md` §9.1 for the `data` shape
+    /// under this scene. See `docs/daemon_rpc_protocol.md` §9.1 for the `data` shape
     /// this carries.
     pub const SCENE_HAS_ACTIVE_SESSIONS: i32 = -32009;
     /// `session.resume`: the target is a sidechain that already ran its
     /// one-shot task to conclusion — no continuation semantics, re-derive a
-    /// new sub-agent instead. See `docs/DAEMON_RPC.md` §9.1 for the `data`
+    /// new sub-agent instead. See `docs/daemon_rpc_protocol.md` §9.1 for the `data`
     /// shape this carries.
     pub const SIDECHAIN_TERMINAL: i32 = -32014;
 }

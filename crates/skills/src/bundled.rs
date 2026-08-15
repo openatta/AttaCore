@@ -520,7 +520,7 @@ Make a precise change to one of the settings.json layers without nuking adjacent
 
 ## Common edits
 
-- **Add permission rule**: append into `permissions.allow|deny|ask` array (don't replace whole array)
+- **Add permission rule**: append `{"tool": "Bash(git push:*)", "action": "allow"|"deny"|"ask"}` into the `permission_rules` array (don't replace whole array)
 - **Register hook**: append into `hooks.<EventName>[]` (PreToolUse / PostToolUse / Notification / SubagentStop / etc.)
 - **Wire MCP server**: add map entry under `mcp_servers.<name>` with `type` (`stdio` / `streamable_http`) + transport-specific fields
 

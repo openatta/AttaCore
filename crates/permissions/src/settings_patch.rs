@@ -1,6 +1,6 @@
-//! **S1-f **: append a permission rule to a settings.json file
-//! atomically, preserving unknown fields. Used by the TUI's "always allow"
-//! shortcut on the ask dialog.
+//! **S1-f **: append a permission rule to a settings.json /
+//! settings.local.json file atomically, preserving unknown fields. Used by
+//! the interactive ask dialog's "always allow" shortcut.
 //!
 //! Atomicity: write to `<path>.tmp-<pid>` then rename. If the target dir
 //! doesn't exist, it's created.
@@ -33,7 +33,7 @@ pub enum AppendTarget {
 }
 
 impl AppendTarget {
-    fn key(&self) -> &'static str {
+    fn action(&self) -> &'static str {
         match self {
             AppendTarget::Allow => "allow",
             AppendTarget::Deny => "deny",
@@ -52,9 +52,14 @@ pub enum AppendError {
     NotObject,
 }
 
-/// Append `rule_string` to `permissions.<target>` in the given settings.json
-/// file. If the file doesn't exist, it's created with `{}` first. If the
-/// rule is already present (string-equal), the file is left untouched.
+/// Append `rule_string` to `permission_rules` in the given settings.json
+/// file, as `{"tool": <rule_string>, "action": <target>}`. If the file
+/// doesn't exist, it's created with `{}` first. If an identical entry is
+/// already present, the file is left untouched.
+///
+/// The shape here is the one `base::interface::settings::Settings`
+/// deserializes — writing anything else produces a file `Settings::load`
+/// silently drops as an unknown key.
 ///
 /// Returns `Ok(true)` if the file was modified, `Ok(false)` if the rule was
 /// already present.
@@ -85,26 +90,20 @@ pub fn append_permission_rule(
 
     let root = value.as_object_mut().ok_or(AppendError::NotObject)?;
 
-    // permissions: object
-    let perms = root
-        .entry("permissions".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let perms_obj = perms.as_object_mut().ok_or(AppendError::NotObject)?;
-
-    // permissions.<target>: array
-    let arr = perms_obj
-        .entry(target.key().to_string())
+    let arr = root
+        .entry("permission_rules".to_string())
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let arr = arr.as_array_mut().ok_or(AppendError::NotObject)?;
 
-    // Idempotency
-    let already = arr
-        .iter()
-        .any(|v| v.as_str().map(|s| s == rule_string).unwrap_or(false));
+    let action = target.action();
+    let already = arr.iter().any(|v| {
+        v.get("tool").and_then(|t| t.as_str()) == Some(rule_string)
+            && v.get("action").and_then(|a| a.as_str()) == Some(action)
+    });
     if already {
         return Ok(false);
     }
-    arr.push(serde_json::Value::String(rule_string.to_string()));
+    arr.push(serde_json::json!({ "tool": rule_string, "action": action }));
 
     // Atomic write
     let tmp = settings_path.with_extension(format!("tmp-{}", std::process::id()));
@@ -151,11 +150,52 @@ mod tests {
         });
 
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        let arr = v["permissions"]["allow"].as_array().unwrap();
+        let arr = v["permission_rules"].as_array().unwrap();
         assert_eq!(
             arr.len(),
             n,
             "expected all {n} concurrently-appended rules to survive, got {arr:?}"
+        );
+    }
+
+    /// The written shape must be the one `Settings` actually deserializes —
+    /// a file whose rules land under a key `Settings` doesn't know is
+    /// indistinguishable from an empty one once loaded.
+    #[test]
+    fn appended_rules_round_trip_through_settings_load() {
+        let dir = TempDir::new().unwrap();
+        let local = dir
+            .path()
+            .join(base::interface::settings::SETTINGS_LOCAL_FILE);
+        append_permission_rule(&local, AppendTarget::Allow, "Bash(git status)").unwrap();
+        append_permission_rule(&local, AppendTarget::Deny, "Bash(rm -rf:*)").unwrap();
+
+        let empty = TempDir::new().unwrap();
+        let settings = base::interface::settings::Settings::load(
+            empty.path().to_path_buf(),
+            empty.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            "code",
+            "m",
+        );
+
+        let loaded: Vec<_> = settings
+            .local_permission_rules
+            .iter()
+            .map(|r| (r.tool.as_str(), r.action))
+            .collect();
+        assert_eq!(
+            loaded,
+            vec![
+                (
+                    "Bash(git status)",
+                    base::interface::settings::PermissionAction::Allow
+                ),
+                (
+                    "Bash(rm -rf:*)",
+                    base::interface::settings::PermissionAction::Deny
+                ),
+            ]
         );
     }
 
@@ -166,18 +206,38 @@ mod tests {
         let modified = append_permission_rule(&p, AppendTarget::Allow, "Bash(ls)").unwrap();
         assert!(modified);
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        let arr = v["permissions"]["allow"].as_array().unwrap();
+        let arr = v["permission_rules"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0], "Bash(ls)");
+        assert_eq!(
+            arr[0],
+            serde_json::json!({"tool":"Bash(ls)","action":"allow"})
+        );
     }
 
     #[test]
     fn append_idempotent_when_rule_present() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("settings.json");
-        fs::write(&p, r#"{"permissions":{"allow":["Bash(git status)"]}}"#).unwrap();
+        fs::write(
+            &p,
+            r#"{"permission_rules":[{"tool":"Bash(git status)","action":"allow"}]}"#,
+        )
+        .unwrap();
         let modified = append_permission_rule(&p, AppendTarget::Allow, "Bash(git status)").unwrap();
         assert!(!modified);
+    }
+
+    /// Same tool, different action is a different rule — the idempotency
+    /// check keys on both.
+    #[test]
+    fn append_same_tool_with_a_different_action_is_not_a_duplicate() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("settings.json");
+        append_permission_rule(&p, AppendTarget::Allow, "Bash(ls)").unwrap();
+        let modified = append_permission_rule(&p, AppendTarget::Deny, "Bash(ls)").unwrap();
+        assert!(modified);
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["permission_rules"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -186,15 +246,21 @@ mod tests {
         let p = dir.path().join("settings.json");
         fs::write(
             &p,
-            r#"{"model":"x","weird":42,"permissions":{"deny":["Bash(rm:*)"]}}"#,
+            r#"{"model":"x","weird":42,"permission_rules":[{"tool":"Bash(rm:*)","action":"deny"}]}"#,
         )
         .unwrap();
         append_permission_rule(&p, AppendTarget::Allow, "Bash(ls)").unwrap();
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(v["model"], "x");
         assert_eq!(v["weird"], 42);
-        assert_eq!(v["permissions"]["deny"][0], "Bash(rm:*)");
-        assert_eq!(v["permissions"]["allow"][0], "Bash(ls)");
+        assert_eq!(
+            v["permission_rules"][0],
+            serde_json::json!({"tool":"Bash(rm:*)","action":"deny"})
+        );
+        assert_eq!(
+            v["permission_rules"][1],
+            serde_json::json!({"tool":"Bash(ls)","action":"allow"})
+        );
     }
 
     #[test]
@@ -204,8 +270,14 @@ mod tests {
         append_permission_rule(&p, AppendTarget::Deny, "Bash(rm -rf:*)").unwrap();
         append_permission_rule(&p, AppendTarget::Ask, "Bash(git push:*)").unwrap();
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        assert_eq!(v["permissions"]["deny"][0], "Bash(rm -rf:*)");
-        assert_eq!(v["permissions"]["ask"][0], "Bash(git push:*)");
+        assert_eq!(
+            v["permission_rules"][0],
+            serde_json::json!({"tool":"Bash(rm -rf:*)","action":"deny"})
+        );
+        assert_eq!(
+            v["permission_rules"][1],
+            serde_json::json!({"tool":"Bash(git push:*)","action":"ask"})
+        );
     }
 
     #[test]

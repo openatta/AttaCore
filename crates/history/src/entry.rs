@@ -200,7 +200,7 @@ pub enum LogEntry {
     /// either primary, still running, or was cut off externally (process
     /// exit, `agent.stop`, parent crash), all of which stay resumable.
     /// `session.resume` rejects a sidechain that has one with
-    /// `SIDECHAIN_TERMINAL` (docs/DAEMON_RPC.md §3.3/§9).
+    /// `SIDECHAIN_TERMINAL` (docs/daemon_rpc_protocol.md §3.3/§9).
     SessionEnd { state: SessionEndState },
 }
 

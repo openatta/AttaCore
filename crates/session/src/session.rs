@@ -40,14 +40,16 @@ pub struct SessionManager {
 impl SessionManager {
     /// Create a new session manager.
     /// `history_store`: backing store for persistence. None = no persistence.
-    /// `session_id`: optional pre-set ID; if None, a new UUID is generated.
+    /// `session_id`: optional pre-set ID; if None, a fresh [`SessionId`] is
+    /// generated. Must be parseable by [`SessionId::parse`] — `persist()`
+    /// and the `session_memory.md` sidecar both key off the parsed form.
     /// `parent_session_id`: optional ID of the session that spawned this one.
     pub fn new(
         history_store: Option<Arc<dyn HistoryStore>>,
         session_id: Option<String>,
         parent_session_id: Option<String>,
     ) -> Self {
-        let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = session_id.unwrap_or_else(|| SessionId::new().to_string());
         Self {
             messages: Vec::new(),
             message_timestamps: Vec::new(),
@@ -633,6 +635,23 @@ mod tests {
         let mgr = SessionManager::in_memory(None);
         let sessions = mgr.list_sessions().await.unwrap();
         assert!(sessions.is_empty());
+    }
+
+    /// A caller that supplies no id must still get one `persist()` accepts.
+    /// The generated default used to be a hyphenated UUID, which
+    /// `SessionId::parse` rejects — so every `persist()` bailed before
+    /// writing a byte and the only trace was a per-turn `warn!`.
+    #[tokio::test]
+    async fn default_session_id_is_one_persist_accepts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(Some(real_store(tmp.path()).await), None, None);
+        SessionId::parse(&mgr.session_id).expect("the generated default must be a valid SessionId");
+
+        mgr.push_message(make_text_msg("hello"));
+        mgr.persist().await.expect("persist must not fail");
+
+        let sessions = mgr.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1, "the turn must have reached disk");
     }
 
     async fn real_store(tmp: &std::path::Path) -> Arc<dyn HistoryStore> {

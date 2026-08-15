@@ -641,7 +641,7 @@ async fn write_sidechain_meta(
 
 /// Marks a one-shot sub-agent session as having run its task to conclusion
 /// (`docs/design/2026-08-11-multi-scene-architecture.md` §5.6, `SIDECHAIN_TERMINAL`
-/// in `docs/DAEMON_RPC.md`). Called only through `mark_sidechain_terminal`
+/// in `docs/daemon_rpc_protocol.md`). Called only through `mark_sidechain_terminal`
 /// (from `run_sub_inner`/`run_sub_tagged`/`resume_agent`) once their turn has
 /// returned — a session with no such marker was either never a sidechain, is
 /// still running, was cancelled mid-flight, or was cut off from outside
@@ -706,6 +706,10 @@ async fn run_one_turn(
         turn_id: turn_id.clone(),
     });
 
+    if let Some(tag) = &tag {
+        tag.spawned();
+    }
+
     let mut text = String::new();
     let run_turn_fut = agent.run_turn(prompt, turn_id, cancel);
     tokio::pin!(run_turn_fut);
@@ -757,6 +761,13 @@ async fn run_one_turn(
         Ok(_) | Err(crate::turn::TurnError::Shutdown) => Ok(text),
         Err(e) => Err(base::error::ToolError::Execution(anyhow!("sub: {e}"))),
     };
+    if let Some(tag) = &tag {
+        tag.completed(match (&result, cancelled) {
+            (_, true) => "cancelled",
+            (Ok(_), _) => "completed",
+            (Err(_), _) => "failed",
+        });
+    }
     (result, cancelled)
 }
 
@@ -1016,6 +1027,7 @@ fn fallback_settings(
         disable_skill_shell_execution: false,
         permission_mode: PermissionMode::default(),
         permission_rules: Vec::new(),
+        local_permission_rules: Vec::new(),
         allow_client_permission_override: false,
         telemetry_enabled: true,
         hooks_config: None,
@@ -1032,17 +1044,19 @@ fn fallback_settings(
 // Inner state
 // ═══════════════════════════════════════════════════════
 
-/// Sub-agents are not allowed to spawn further sub-agents — a "full access"
-/// tool set (general-purpose/claude/any custom type with an empty
-/// `allowed_tools`) still excludes this tool by name. Without this, a
-/// sub-agent that inherits the parent's complete tool set (which includes
-/// "Agent" itself) could recursively spawn more sub-agents with no depth
-/// limit — `EngineConfig.max_agent_depth` exists as a documented intent but
-/// isn't threaded through `Builder`/`Agent` today (see
-/// `docs/design/2026-08-04-multi-provider-llm-migration.md`-adjacent notes
-/// on `EngineConfig` not being wired end-to-end), so this is a cheap,
-/// self-contained substitute: cap recursion at depth 1 by construction
-/// instead of by counting.
+/// Excluded from the tool set a sub-agent inherits, so a "full access" type
+/// (general-purpose/claude/any custom type with an empty `allowed_tools`)
+/// doesn't hand delegation straight back to the child.
+///
+/// This filter is a convenience, not the bound: what actually stops a
+/// delegation chain is `Inner::depth` counted against
+/// `EngineConfig::max_agent_depth`, enforced in `spawn_guard` on every spawn
+/// path and mirrored by `Builder::build()` withholding this tool at the
+/// limit. Filtering alone cannot bound anything — `build()` creates a fresh
+/// per-session registry and registers `Agent` into it regardless of what
+/// `resolve_tools` handed over, and `RuntimeAgentSpawner` (Skill
+/// `context: fork`, team members) bypasses `resolve_tools` entirely by
+/// passing `sub_tools()` through unfiltered.
 const AGENT_TOOL_NAME: &str = "Agent";
 
 /// A live persistent team member (`Agent` tool's `team_name`+`name` mode).
@@ -1091,6 +1105,9 @@ struct Inner {
     config: Arc<EngineConfig>,
     fallback_tools: Arc<InMemoryToolRegistry>,
     parent_tools: Arc<InMemoryToolRegistry>,
+    /// Delegation depth of the agent that *owns* this tool, not of the
+    /// children it spawns — those get `depth + 1` (see `spawn_guard`).
+    depth: u32,
     mailbox: Option<(std::sync::Arc<team::mailbox::MailboxStore>, String)>,
     /// Built-in types merged with any disk-loaded custom types (see
     /// `merge_agent_types`). Keyed by `subagent_type` name. `RwLock<Arc<..>>`
@@ -1266,6 +1283,34 @@ struct Inner {
 }
 
 impl Inner {
+    /// Depth to build a child at, or the message to hand the model when the
+    /// chain has run out of room.
+    ///
+    /// Every spawn path goes through here — the `Agent` tool, Skill
+    /// `context: fork` and team members via `RuntimeAgentSpawner`, and
+    /// background spawns — because that is the only place all of them share.
+    /// Bounding them individually by tool-registry filtering does not work:
+    /// `RuntimeAgentSpawner` hands `sub_tools()` over unfiltered, and
+    /// `Builder::build()` registers `Agent` into the fresh per-session
+    /// registry it creates for the child regardless.
+    ///
+    /// Refusing with a normal tool error rather than a panic or a silent
+    /// no-op is the point: the model sees "you cannot delegate further" and
+    /// can do the work itself, which is what a runaway retry loop needs in
+    /// order to terminate instead of recursing until the process dies.
+    fn spawn_guard(&self) -> Result<u32, String> {
+        let max = self.config.max_agent_depth;
+        if self.depth >= max {
+            return Err(format!(
+                "Delegation depth limit reached ({max}). This agent is already {} \
+                 level(s) deep and cannot spawn another sub-agent. Complete the \
+                 task directly instead of delegating it.",
+                self.depth
+            ));
+        }
+        Ok(self.depth + 1)
+    }
+
     /// The model instance a sub-agent spawn should use. All three spawn
     /// points (`run_sub`, `run_sub_inner`, resume) are the same task type —
     /// `task_models` in settings.json is keyed by a small fixed taxonomy
@@ -1500,6 +1545,33 @@ impl SubagentTag {
             event: Box::new(event),
         });
     }
+
+    /// Bracket the delegation with `AgentSpawned`/`AgentCompleted` on the
+    /// parent's channel.
+    ///
+    /// Sent unwrapped, not through `forward` — these describe the *parent's*
+    /// timeline ("a delegation started/ended here"), whereas
+    /// `SubagentProgress` wraps events that happened inside the child. An
+    /// embedder tracking sub-agent lifecycle wants the pair; it should not
+    /// have to infer boundaries from the `agent_label` on progress events.
+    ///
+    /// `agent_id` is the same `agent_label` every `SubagentProgress` for
+    /// this run carries, so the three correlate without extra bookkeeping.
+    fn spawned(&self) {
+        let _ = self.parent_tx.send(AgentEvent::AgentSpawned {
+            agent_id: self.agent_label.clone(),
+            parent_turn: self.parent_turn,
+            turn_id: self.agent_session_id.clone(),
+        });
+    }
+
+    fn completed(&self, outcome: &str) {
+        let _ = self.parent_tx.send(AgentEvent::AgentCompleted {
+            agent_id: self.agent_label.clone(),
+            outcome: outcome.to_string(),
+            turn_id: self.agent_session_id.clone(),
+        });
+    }
 }
 
 /// Stable, human-readable label for one sub-agent run — identical on every
@@ -1614,6 +1686,7 @@ impl AgentTool {
                 config,
                 fallback_tools,
                 parent_tools,
+                depth: 0,
                 mailbox: None,
                 agent_types,
                 _agent_type_watcher,
@@ -1673,6 +1746,7 @@ impl AgentTool {
                 config,
                 fallback_tools,
                 parent_tools,
+                depth: 0,
                 mailbox: None,
                 agent_types: shared_agent_types,
                 _agent_type_watcher: None,
@@ -1704,6 +1778,17 @@ impl AgentTool {
     pub fn with_settings(mut self, settings: Arc<Settings>) -> Self {
         let mut inner = (*self.inner).clone();
         inner.parent_settings = Some(settings);
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// Record how deep the owning agent already sits in the delegation
+    /// chain, so `spawn_guard` can refuse to go past
+    /// `EngineConfig::max_agent_depth`. Set by `Builder::build()` from
+    /// `Builder::agent_depth`; `0` (a root session) otherwise.
+    pub fn with_depth(mut self, depth: u32) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.depth = depth;
         self.inner = Arc::new(inner);
         self
     }
@@ -2074,6 +2159,10 @@ impl AgentTool {
         subagent_type: Option<&str>,
         parent: Option<(&str, u32)>,
     ) -> Result<String, base::error::ToolError> {
+        let child_depth = self
+            .inner
+            .spawn_guard()
+            .map_err(base::error::ToolError::Denied)?;
         let cwd_for_meta = cwd.clone();
         let def = subagent_type.and_then(|t| self.inner.agent_type_def(t));
         let model_override = def.as_ref().and_then(|d| d.model.clone());
@@ -2104,6 +2193,7 @@ impl AgentTool {
             .model(self.inner.model_for_subagent())
             .tools(tools)
             .settings(settings.clone())
+            .agent_depth(child_depth)
             .permission(perm);
         // S-4: persist the sub-agent's transcript. Its own fresh session id
         // keeps it in a separate JSONL file from the parent's.
@@ -2310,6 +2400,10 @@ impl AgentTool {
         subagent_type: Option<&str>,
         permission_mode: base::interface::settings::PermissionMode,
     ) -> Result<(Agent, EventReceiver, InputSender), base::error::ToolError> {
+        let child_depth = self
+            .inner
+            .spawn_guard()
+            .map_err(base::error::ToolError::Denied)?;
         let cwd_for_meta = cwd.clone();
         let def = subagent_type.and_then(|t| self.inner.agent_type_def(t));
         let model_override = def.as_ref().and_then(|d| d.model.clone());
@@ -2337,6 +2431,7 @@ impl AgentTool {
             .model(self.inner.model_for_subagent())
             .tools(tools)
             .settings(settings.clone())
+            .agent_depth(child_depth)
             .permission(perm);
         // S-4/§5.2: persist team members' transcripts too — same rationale
         // as `run_sub_tagged`/`run_sub_inner`, previously missing here.
@@ -2619,6 +2714,9 @@ impl AgentTool {
         cancel: tokio_util::sync::CancellationToken,
         subagent_type: Option<&str>,
     ) -> Result<String, base::error::ToolError> {
+        let child_depth = inner
+            .spawn_guard()
+            .map_err(base::error::ToolError::Denied)?;
         // S-3: same resolution as the foreground path — a background spawn
         // used to hardcode `AlwaysPermit`, escaping the parent's rules.
         let perm: Arc<dyn Permission> = inner.permission_handler();
@@ -2649,6 +2747,7 @@ impl AgentTool {
             .model(inner.model_for_subagent())
             .tools(tools)
             .settings(settings.clone())
+            .agent_depth(child_depth)
             .permission(perm);
         let history_store = inner.history_store();
         if let Some(store) = history_store.clone() {
@@ -2698,6 +2797,10 @@ impl AgentTool {
         cwd: std::path::PathBuf,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<String, base::error::ToolError> {
+        let child_depth = self
+            .inner
+            .spawn_guard()
+            .map_err(base::error::ToolError::Denied)?;
         let start = std::time::Instant::now();
 
         // 1. Load transcript from history store
@@ -2781,6 +2884,7 @@ impl AgentTool {
             .model(self.inner.model_for_subagent())
             .tools(tools)
             .settings(settings.clone())
+            .agent_depth(child_depth)
             .permission(perm)
             .history_store(history_store.clone());
         if let Some(store) = self.inner.history_store() {
@@ -5408,7 +5512,12 @@ mod catalog_tests {
         let mut labels = std::collections::HashSet::new();
         let mut kinds = Vec::new();
         let mut saw_probe_tool_use = false;
+        let mut lifecycle = Vec::new();
         while let Ok(ev) = rx.try_recv() {
+            // The run is bracketed by `AgentSpawned`/`AgentCompleted` on the
+            // parent channel; those describe the parent's timeline, so they
+            // arrive unwrapped rather than inside `SubagentProgress`.
+            // Asserted below, after the progress events.
             let AgentEvent::SubagentProgress {
                 agent_label,
                 agent_type,
@@ -5418,7 +5527,19 @@ mod catalog_tests {
                 ..
             } = ev
             else {
-                panic!("only SubagentProgress should be forwarded, got {ev:?}");
+                match ev {
+                    AgentEvent::AgentSpawned { agent_id, .. } => {
+                        lifecycle.push(("spawned", agent_id))
+                    }
+                    AgentEvent::AgentCompleted {
+                        agent_id, outcome, ..
+                    } => {
+                        assert_eq!(outcome, "completed");
+                        lifecycle.push(("completed", agent_id));
+                    }
+                    other => panic!("unexpected event on the parent channel: {other:?}"),
+                }
+                continue;
             };
             assert_eq!(agent_type.as_deref(), Some("explore"));
             assert_eq!(parent_session_id, "parent-session");
@@ -5455,6 +5576,17 @@ mod catalog_tests {
         assert!(
             kinds.contains(&"turn_complete"),
             "the host needs a terminal marker for the sub-agent node, saw {kinds:?}"
+        );
+
+        // `AgentEvent::AgentSpawned`/`AgentCompleted` were declared but never
+        // emitted anywhere, so an embedder wiring itself to them got silence
+        // and had to reconstruct the boundaries from `agent_label` instead.
+        let label = labels.iter().next().unwrap().clone();
+        assert_eq!(
+            lifecycle,
+            vec![("spawned", label.clone()), ("completed", label),],
+            "the delegation must be bracketed by AgentSpawned/AgentCompleted \
+             carrying the same label its progress events use"
         );
     }
 

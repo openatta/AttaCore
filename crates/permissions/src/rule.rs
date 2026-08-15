@@ -63,17 +63,16 @@ pub fn format_rule_string(r: &PermissionRule) -> String {
 
 /// `settings.json` 的 `permission_rules` → 规则引擎认识的 `PermissionRule`。
 ///
-/// 两边是两个不同的类型，长期没有任何转换函数把它们接上：settings 侧是
-/// `{"tool": "Bash(git push:*)", "action": "deny"}`（面向人手写的一行字符
-/// 串），引擎侧是拆好的 `{tool_name, rule_content, behavior, source}`。
-/// `Settings::load()` 一直在解析 `permission_rules` 字段，但全仓库没有一个
-/// 生产调用点消费它——daemon 直接用 `AllowAllPermission`，CLI 侧也没接。
-/// 这个函数是那条线的缺口件；daemon 的 `resolve_session_permission` 现在用
-/// 它把 settings 里的规则喂进 `RuleSet`。
+/// 两边是两个不同的类型：settings 侧是 `{"tool": "Bash(git push:*)",
+/// "action": "deny"}`（面向人手写的一行字符串），引擎侧是拆好的
+/// `{tool_name, rule_content, behavior, source}`。
 ///
 /// 解析不了的条目（空串、括号不配对……）**跳过并 warn**，不整体失败：一条
 /// 手写错的规则不该让整个 session 拒绝启动；跳过的后果是"这条规则不生效"，
 /// 在 `ask` 默认下是更保守的方向（该问的还是会问），不是静默放行。
+///
+/// 多数调用方要的是 [`rules_from_all_tiers`]——它按来源分别调用本函数，
+/// 直接用本函数意味着调用方自己决定 `source`。
 pub fn rules_from_settings(
     rules: &[base::interface::settings::PermissionRule],
     source: RuleSource,
@@ -100,6 +99,21 @@ pub fn rules_from_settings(
             }
         })
         .collect()
+}
+
+/// 一个 `Settings` 里全部两层权限规则，各自带上正确的 [`RuleSource`]。
+///
+/// `settings.local.json` 那层（`RuleSource::LocalSettings`，优先级 40）和
+/// `settings.json` 那层（`ProjectSettings`，30）是**并存**关系而不是覆盖
+/// 关系——两层都进 `RuleSet`，冲突由优先级排序解决。这也是
+/// `RuleSource::LocalSettings` 唯一的生产构造点。
+pub fn rules_from_all_tiers(settings: &base::interface::settings::Settings) -> Vec<PermissionRule> {
+    let mut rules = rules_from_settings(&settings.permission_rules, RuleSource::ProjectSettings);
+    rules.extend(rules_from_settings(
+        &settings.local_permission_rules,
+        RuleSource::LocalSettings,
+    ));
+    rules
 }
 
 #[cfg(test)]

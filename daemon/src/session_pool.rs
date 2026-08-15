@@ -3746,12 +3746,11 @@ fn effective_permission_mode(
 /// the old zero-overhead path back, and the `Arc::ptr_eq` assertion in the
 /// unit test below keeps it that way.
 ///
-/// Rules come from both tiers, settings first: `settings.permission_rules`
-/// (converted by `permissions::rule::rules_from_settings`, which is what
-/// finally gives that long-parsed-but-never-consumed field an effect in the
-/// daemon) then `options.permission_rules` appended, so a session-scoped
-/// rule is evaluated alongside the configured ones rather than replacing
-/// them.
+/// Rules come from every tier, settings first — `settings.permission_rules`
+/// and the `settings.local.json` overlay, each tagged with its own
+/// `RuleSource` (see `RuleSetPermission::from_settings`) — then
+/// `options.permission_rules` appended, so a session-scoped rule is
+/// evaluated alongside the configured ones rather than replacing them.
 ///
 /// An `ask` verdict from the rule engine is turned into a real, answerable
 /// prompt by wrapping the result in `AskingPermission` — see
@@ -3775,22 +3774,18 @@ fn resolve_session_permission(
         return bypass_instance.clone();
     }
 
-    let mut rules = permissions::rule::rules_from_settings(
-        &settings.permission_rules,
-        base::permission::RuleSource::ProjectSettings,
-    );
-    if let Some(o) = options {
-        rules.extend(o.permission_rules.iter().cloned());
-    }
+    let extra = options
+        .map(|o| o.permission_rules.clone())
+        .unwrap_or_default();
 
-    let rule_set: Arc<dyn Permission> =
-        Arc::new(permissions::rule_set_permission::RuleSetPermission::new(
-            Arc::new(permissions::gate::PermissionGate::new(
-                permissions::ruleset::RuleSet::new(rules),
-            )),
-            tools.clone(),
+    let rule_set: Arc<dyn Permission> = Arc::new(
+        permissions::rule_set_permission::RuleSetPermission::from_settings(
+            settings,
             mode.into(),
-        ));
+            tools.clone(),
+            extra,
+        ),
+    );
 
     rule_set
 }

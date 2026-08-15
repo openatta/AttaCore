@@ -198,7 +198,29 @@ impl Agent {
                         });
                         Ok(TurnOutcome::default())
                     }
-                    _ => Ok(TurnOutcome::default()),
+                    // `content` is the model name. Each turn re-reads
+                    // `settings.model.model_name` into its `effective_model`,
+                    // so swapping it here is what makes a host's `/model`
+                    // actually change the model the next turn calls — the
+                    // command used to fall through the catch-all arm below
+                    // and change nothing at all.
+                    EngineCommand::UpdateModel => {
+                        let mut settings = (*self.settings).clone();
+                        settings.model.model_name = content.clone();
+                        self.settings = Arc::new(settings);
+                        let _ = self.event_tx.send(AgentEvent::System {
+                            message: format!("model set to {content}"),
+                        });
+                        Ok(TurnOutcome::default())
+                    }
+                    EngineCommand::RefreshMcp => {
+                        self.mcp.refresh_tools().await;
+                        register_new_mcp_adapters(&self.tools, &self.mcp);
+                        Ok(TurnOutcome::default())
+                    }
+                    // `CancelTurn` is handled by the input demultiplexer, not
+                    // here — see its doc comment on `EngineCommand`.
+                    EngineCommand::CancelTurn => Ok(TurnOutcome::default()),
                 }
             }
         }
@@ -232,7 +254,40 @@ impl Agent {
     }
 
     /// Run a full turn from a user message.
+    /// Runs the turn, then persists whatever ended up in the session — on
+    /// every path, including the ones that didn't finish.
+    ///
+    /// The turn body leaves through a dozen different `return`s (a hook
+    /// block, `cancel`, the max-turns guard, four flavors of model error),
+    /// and persistence used to sit inline just before the one at the
+    /// successful tail. So the single case session resume exists to serve —
+    /// "that broke, let me pick it back up" — was the one case that wrote
+    /// nothing. A session whose turns all failed left no file on disk at all
+    /// (`HistoryStore::append` creates it lazily), so `--continue` could not
+    /// see it; a session that failed on its last turn lost that turn's user
+    /// message, which is precisely the message worth retrying.
+    ///
+    /// A cancelled turn persists too. Ctrl+C means "stop working on this",
+    /// not "un-say that" — the user's message stays in the transcript.
+    ///
+    /// The wrapper exists because Rust has no `defer` and the body holds
+    /// `&mut self` across awaits, so the alternative is repeating the
+    /// persist call before every one of those returns and re-adding it to
+    /// each new one forever.
     async fn run_user_turn(
+        &mut self,
+        content: String,
+        attachments: Vec<crate::agent::Attachment>,
+        cancel: CancellationToken,
+    ) -> Result<TurnOutcome, TurnError> {
+        let outcome = self.run_user_turn_inner(content, attachments, cancel).await;
+        if let Err(e) = self.session.persist().await {
+            tracing::warn!(error = %e, "failed to persist session");
+        }
+        outcome
+    }
+
+    async fn run_user_turn_inner(
         &mut self,
         mut content: String,
         attachments: Vec<crate::agent::Attachment>,
@@ -869,11 +924,13 @@ impl Agent {
             let tools = Arc::clone(&self.tools);
             let tools_for_safety = Arc::clone(&self.tools);
             let cwd = self.settings.paths.project_root();
+            let local_settings_path = self.settings.paths.local_settings_file();
             let session_id = self.session.session_id.clone();
             let turn_no = self.session.turn_count;
             let th = self.telemetry_handle.clone();
             let tid = self.current_turn_id.clone();
             let cancel_for_exec = cancel.clone();
+            let agent_depth_for_exec = self.agent_depth;
             let hooks_for_exec = Arc::clone(&self.hooks);
             let discontinued = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let discontinued_for_exec = Arc::clone(&discontinued);
@@ -894,8 +951,10 @@ impl Agent {
                     let exec_ctx = ToolExecCtx {
                         tools: Arc::clone(&tools),
                         cwd: cwd.clone(),
+                        local_settings_path: local_settings_path.clone(),
                         session_id: session_id.clone(),
                         turn_no,
+                        agent_depth: agent_depth_for_exec,
                         telemetry_handle: th.clone(),
                         turn_id: tid.clone(),
                         cancel: cancel_for_exec.clone(),
@@ -1445,9 +1504,6 @@ or project context that should survive across sessions.
                 }
             }
 
-            if let Err(e) = self.session.persist().await {
-                tracing::warn!(error = %e, "failed to persist session");
-            }
             self.last_had_tool_uses = had_tool_uses_this_turn;
             return Ok(TurnOutcome {
                 stop_reason,
@@ -2603,8 +2659,16 @@ fn estimate_request_overhead(prompt_blocks: &[PromptBlock], tool_defs: &[ToolDef
 pub(crate) struct ToolExecCtx {
     pub tools: Arc<base::tool::InMemoryToolRegistry>,
     pub cwd: std::path::PathBuf,
+    /// Where a `PermitAlways { scope: Local }` answer persists its rule.
+    /// Carried from `settings.paths` rather than derived from `cwd` here —
+    /// see `PathSettings::local_settings_file` for why the exact location
+    /// matters.
+    pub local_settings_path: std::path::PathBuf,
     pub session_id: String,
     pub turn_no: u32,
+    /// Forwarded into every `ToolContext` this turn builds — see
+    /// `Agent::agent_depth`.
+    pub agent_depth: u32,
     pub telemetry_handle: telemetry::TelemetryHandle,
     pub turn_id: String,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -2975,14 +3039,14 @@ async fn execute_tool_inner(
                             ctx.permission
                                 .add_persistent_allow(name, match_content.as_deref());
                             if let crate::agent::PersistScope::Local = scope {
-                                let local_settings_path = ctx.cwd.join("settings.local.json");
+                                let local_settings_path = &ctx.local_settings_path;
                                 match permissions::settings_patch::build_rule_string(
                                     name,
                                     match_content.as_deref(),
                                 ) {
                                     Some(rule_string) => {
                                         if let Err(e) = permissions::settings_patch::append_permission_rule(
-                                            &local_settings_path,
+                                            local_settings_path,
                                             permissions::settings_patch::AppendTarget::Allow,
                                             &rule_string,
                                         ) {
@@ -3101,7 +3165,7 @@ async fn execute_tool_inner(
         tool_use_id: String::new(),
         agent: None,
         parent_messages: None,
-        agent_depth: 0,
+        agent_depth: ctx.agent_depth,
         events_tx: None,
     };
     let input_for_post_hook = input.clone();
@@ -3975,8 +4039,12 @@ mod tests {
         ToolExecCtx {
             tools,
             cwd: std::env::temp_dir(),
+            local_settings_path: std::env::temp_dir()
+                .join(".atta")
+                .join(base::interface::settings::SETTINGS_LOCAL_FILE),
             session_id: "test-session".into(),
             turn_no: 1,
+            agent_depth: 0,
             telemetry_handle: telemetry::TelemetryHandle::noop(),
             turn_id: "test-turn".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -4533,11 +4601,13 @@ mod tests {
         // `Permission::add_persistent_allow` so the in-memory rule engine
         // allows the rest of this session immediately, using the same
         // `tool.permission_match_content` derivation the rule engine itself
-        // uses to match calls, and (2) write the equivalent rule string to
-        // `<cwd>/settings.local.json` (NOT `settings.json` — that's the
-        // shared/committed project tier) — and (3) still let the pending
-        // tool call proceed, same as a plain `Permit` would.
+        // uses to match calls, and (2) write the equivalent rule to
+        // `<project_root>/.atta/settings.local.json` (NOT `settings.json` —
+        // that's the shared/committed project tier), in the shape
+        // `Settings::load` reads back — and (3) still let the pending tool
+        // call proceed, same as a plain `Permit` would.
         let dir = tempfile::tempdir().unwrap();
+        let atta_dir = dir.path().join(".atta");
         let called = std::sync::Arc::new(std::sync::Mutex::new(None));
         let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
         tools.register(std::sync::Arc::new(ContentProbeTool {
@@ -4554,8 +4624,10 @@ mod tests {
         let ctx = ToolExecCtx {
             tools,
             cwd: dir.path().to_path_buf(),
+            local_settings_path: atta_dir.join(base::interface::settings::SETTINGS_LOCAL_FILE),
             session_id: "test-session".into(),
             turn_no: 1,
+            agent_depth: 0,
             telemetry_handle: telemetry::TelemetryHandle::noop(),
             turn_id: "test-turn".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -4600,18 +4672,45 @@ mod tests {
             "add_persistent_allow must be called with the tool's derived match content"
         );
 
-        let settings_local_path = dir.path().join("settings.local.json");
-        let content = std::fs::read_to_string(&settings_local_path)
-            .unwrap_or_else(|e| panic!("expected {} to exist: {e}", settings_local_path.display()));
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let allow = v["permissions"]["allow"]
-            .as_array()
-            .expect("permissions.allow should be an array");
-        assert_eq!(allow.as_slice(), &[serde_json::json!("Probe(git status)")]);
+        let settings_local_path = atta_dir.join(base::interface::settings::SETTINGS_LOCAL_FILE);
+        assert!(
+            settings_local_path.exists(),
+            "expected {} to exist — anywhere else is outside the Bash sandbox's \
+             deny-file-write protection for this file",
+            settings_local_path.display()
+        );
+
+        // The rule has to survive a real load, not just be present as JSON:
+        // a shape `Settings` doesn't deserialize would leave the user
+        // re-answering the same prompt every restart.
+        let empty = tempfile::tempdir().unwrap();
+        let loaded = base::interface::settings::Settings::load(
+            empty.path().to_path_buf(),
+            empty.path().to_path_buf(),
+            atta_dir.clone(),
+            "code",
+            "m",
+        );
+        let rules = permissions::rule::rules_from_all_tiers(&loaded);
+        assert_eq!(
+            rules.len(),
+            1,
+            "expected exactly one loaded rule: {rules:?}"
+        );
+        assert_eq!(rules[0].tool_name, "Probe");
+        assert_eq!(rules[0].rule_content.as_deref(), Some("git status"));
+        assert_eq!(rules[0].behavior, base::permission::RuleBehavior::Allow);
+        assert_eq!(
+            rules[0].source,
+            base::permission::RuleSource::LocalSettings,
+            "must carry the local tier's source so its priority outranks ProjectSettings"
+        );
 
         // Not written to the shared/committed settings.json tier.
         assert!(
-            !dir.path().join("settings.json").exists(),
+            !atta_dir
+                .join(base::interface::settings::SETTINGS_FILE)
+                .exists(),
             "must not touch the shared/committed settings.json tier"
         );
     }
@@ -4929,6 +5028,7 @@ mod tests {
             disable_skill_shell_execution: false,
             permission_mode: base::interface::settings::PermissionMode::Default,
             permission_rules: Vec::new(),
+            local_permission_rules: Vec::new(),
             allow_client_permission_override: false,
             telemetry_enabled: false,
             hooks_config: None,
@@ -5204,6 +5304,7 @@ mod tests {
             disable_skill_shell_execution: false,
             permission_mode: base::interface::settings::PermissionMode::Default,
             permission_rules: Vec::new(),
+            local_permission_rules: Vec::new(),
             allow_client_permission_override: false,
             telemetry_enabled: false,
             hooks_config: None,
@@ -6286,6 +6387,7 @@ mod prompt_assembly_tests {
             disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
+            local_permission_rules: Vec::new(),
             allow_client_permission_override: false,
             telemetry_enabled: false,
             hooks_config: None,

@@ -192,6 +192,7 @@ mod tests {
             disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
+            local_permission_rules: Vec::new(),
             allow_client_permission_override: false,
             telemetry_enabled: false,
             hooks_config: None,

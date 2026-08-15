@@ -2,7 +2,7 @@
 //! JSON 拼接/逐行解析（这曾经导致 `cli_runner.rs` 里调用了一个根本不存在的
 //! `"session.delete"` 方法而没人发现，见 docs/design/2026-08-05-test-architecture.md §2.3）。
 //!
-//! 方法覆盖 `docs/DAEMON_RPC.md` 列出的全部 13 个 daemon RPC。
+//! 方法覆盖 `docs/daemon_rpc_protocol.md` 列出的全部 13 个 daemon RPC。
 //! 复用 `daemon::rpc` 里的 wire 类型（`RpcRequest`/`RpcResponse`/`SessionOptions` 等），
 //! 不重复定义，daemon 侧协议变了这里能在编译期感知到。
 

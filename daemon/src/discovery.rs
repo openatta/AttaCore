@@ -1,5 +1,5 @@
 //! Daemon discovery: `daemon.lock` (single-scene, legacy) and
-//! `instances.d/` (multi-scene, current — see `docs/DAEMON_RPC.md` §2).
+//! `instances.d/` (multi-scene, current — see `docs/daemon_rpc_protocol.md` §2).
 //!
 //! The daemon writes `~/.atta/<scene>/daemon.lock` (mode 0600, `<scene>` is
 //! the `AgentScene` id resolved from `--scene` in `main.rs`, default
@@ -153,12 +153,12 @@ pub enum LockFileError {
 }
 
 /// Protocol version this daemon speaks, as reported in `instances.d/`
-/// entries and `daemon.status` (`docs/DAEMON_RPC.md` §5). Numeric here
+/// entries and `daemon.status` (`docs/daemon_rpc_protocol.md` §5). Numeric here
 /// (unlike `DaemonLock::protocol_version`, which predates v2 and stayed a
 /// string for backward compatibility with existing readers).
 pub const INSTANCE_PROTOCOL_VERSION: u32 = 2;
 
-/// One `~/.atta/daemon/instances.d/<instance>.json` entry — `docs/DAEMON_RPC.md`
+/// One `~/.atta/daemon/instances.d/<instance>.json` entry — `docs/daemon_rpc_protocol.md`
 /// §2. Every daemon instance writes its own file under a shared directory
 /// (no shared write point, so concurrent daemon startups can't clobber each
 /// other's entries via a racing read-modify-write of one shared index).

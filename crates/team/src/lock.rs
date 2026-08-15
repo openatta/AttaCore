@@ -38,7 +38,7 @@ pub struct TeamsDirLock {
 
 /// Who holds the lock, for [`TeamsDirLockError::Locked`] — shaped to drop
 /// straight into the `TEAM_DIR_LOCKED` `error.data` in
-/// `docs/DAEMON_RPC.md` §9.1.
+/// `docs/daemon_rpc_protocol.md` §9.1.
 #[derive(Debug, Clone)]
 pub struct LockHolder {
     pub pid: u32,

@@ -78,7 +78,7 @@ struct Cli {
 
     /// Named identity for this daemon instance — the filename of its
     /// `~/.atta/daemon/instances.d/<instance>.json` discovery entry
-    /// (`docs/DAEMON_RPC.md` §2). Must be unique among daemons running on
+    /// (`docs/daemon_rpc_protocol.md` §2). Must be unique among daemons running on
     /// the same machine; two live instances racing to write the same name
     /// isn't reconciled here (each just overwrites the file — see
     /// `discovery::write_instance_file`), so operators are expected to pick
@@ -139,7 +139,7 @@ fn active_scenes(scene: &str, scenes: &[String]) -> Vec<String> {
 }
 
 /// Default `--instance` name: the active scene set, sorted and joined with
-/// `,` — `docs/DAEMON_RPC.md` §2 specifies "排序后连接" for the analogous
+/// `,` — `docs/daemon_rpc_protocol.md` §2 specifies "排序后连接" for the analogous
 /// default socket name without pinning a delimiter; comma matches
 /// `--scenes`' own list syntax.
 fn default_instance_name(scene: &str, scenes: &[String]) -> String {
@@ -170,7 +170,7 @@ fn default_instance_name(scene: &str, scenes: &[String]) -> String {
 /// (daemon-wide) or `options.permission_mode: "bypassPermissions"` on
 /// `session.run_turn` (one session). Both resolve to *this* instance; see
 /// `daemon::session_pool::resolve_session_permission` and
-/// `docs/DAEMON_RPC.md`'s "权限默认值" section.
+/// `docs/daemon_rpc_protocol.md`'s "权限默认值" section.
 ///
 /// Kept as a distinct type rather than folded into `RuleSetPermission`'s
 /// bypass mode because the two aren't quite the same: `PermissionGate` keeps

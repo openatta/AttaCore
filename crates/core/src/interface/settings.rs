@@ -8,7 +8,37 @@
 use crate::provider::{ApiType, ProviderConfig, TaskModelOverride};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The shared, committed settings file present in every tier.
+pub const SETTINGS_FILE: &str = "settings.json";
+
+/// The gitignored per-machine overlay sitting beside `SETTINGS_FILE` in the
+/// same tier, overriding it.
+pub const SETTINGS_LOCAL_FILE: &str = "settings.local.json";
+
+/// Read and parse one settings file. `None` when it doesn't exist, can't be
+/// read, or doesn't parse — each of the latter two warns rather than
+/// aborting, so one broken file can't stop the process from starting.
+fn read_settings_layer(layer_name: &str, path: &Path) -> Option<serde_json::Value> {
+    if !path.exists() {
+        return None;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to read settings file, skipping this layer");
+            return None;
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to parse settings file, skipping this layer");
+            None
+        }
+    }
+}
 
 /// Complete AGENT configuration. Merged by `Settings::load()` before injection.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -67,6 +97,19 @@ pub struct Settings {
     /// Allow/deny/ask rules for specific tools.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permission_rules: Vec<PermissionRule>,
+
+    /// Rules contributed by the `settings.local.json` overlays, kept apart
+    /// from `permission_rules` rather than merged into it.
+    ///
+    /// Two reasons they can't just go through the generic merge: it replaces
+    /// arrays wholesale, so a local overlay would *shadow* the project tier's
+    /// rules instead of adding to them; and `RuleSource::LocalSettings`'s
+    /// priority (40, above `ProjectSettings`'s 30) only decides anything if
+    /// both sets reach the rule engine carrying their own source. Populated
+    /// by `Settings::load`, never read from a settings file — hence
+    /// `serde(skip)`.
+    #[serde(skip)]
+    pub local_permission_rules: Vec<PermissionRule>,
 
     /// Whether an RPC client may request a *more permissive* mode than
     /// `permission_mode` above.
@@ -295,6 +338,18 @@ impl PathSettings {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.local_data_dir.clone())
     }
+
+    /// The project tier's `settings.local.json` — the file the interactive
+    /// permission prompt's "always allow, this project" writes to.
+    ///
+    /// Inside `local_data_dir` (`<project_root>/.atta/`), not beside it: the
+    /// Bash sandbox's deny-file-write rules (`tools::bash::sandbox`) protect
+    /// exactly this path to stop a sandboxed command from granting itself
+    /// permissions, and a copy written anywhere else would sit outside that
+    /// protection while still being loaded by `Settings::load`.
+    pub fn local_settings_file(&self) -> PathBuf {
+        self.local_data_dir.join(SETTINGS_LOCAL_FILE)
+    }
 }
 
 /// Execution constraints.
@@ -467,7 +522,9 @@ impl Settings {
     /// Load settings from user and local directories, with ENV override.
     /// Priority (low → high): `global_dir/settings.json` (shared by every
     /// scene) → `scene_dir/settings.json` → `local_dir/settings.json`
-    /// (project). This is the **single canonical settings.json loader** —
+    /// (project). Each tier is immediately followed by its own gitignored
+    /// `settings.local.json` overlay, which outranks the `settings.json`
+    /// beside it. This is the **single canonical settings.json loader** —
     /// `daemon` and any other embedder should call this rather than parsing
     /// settings.json themselves. See `docs/CONFIG_LAYOUT.md`.
     ///
@@ -507,35 +564,35 @@ impl Settings {
         let base = Self::defaults_for(default_model);
         let mut merged_json = serde_json::to_value(&base).unwrap_or_else(|_| serde_json::json!({}));
 
+        let mut local_permission_rules: Vec<PermissionRule> = Vec::new();
+
         for (layer_name, dir) in [
             ("global", &global_dir),
             ("scene", &scene_dir),
             ("project", &local_dir),
         ] {
-            let path = dir.join("settings.json");
-            if !path.exists() {
-                continue;
-            }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to read settings.json, skipping this layer");
+            for file in [SETTINGS_FILE, SETTINGS_LOCAL_FILE] {
+                let path = dir.join(file);
+                let Some(mut layer_json) = read_settings_layer(layer_name, &path) else {
                     continue;
+                };
+                if let Some(obj) = layer_json.as_object_mut() {
+                    // `paths` is resolved from this function's own arguments,
+                    // never from settings.json content.
+                    obj.remove("paths");
+                    if file == SETTINGS_LOCAL_FILE {
+                        if let Some(rules) = obj.remove("permission_rules") {
+                            match serde_json::from_value::<Vec<PermissionRule>>(rules) {
+                                Ok(r) => local_permission_rules.extend(r),
+                                Err(e) => {
+                                    tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to parse permission_rules, ignoring them");
+                                }
+                            }
+                        }
+                    }
                 }
-            };
-            let mut layer_json: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to parse settings.json, skipping this layer");
-                    continue;
-                }
-            };
-            // `paths` is resolved from this function's own arguments, never
-            // from settings.json content.
-            if let Some(obj) = layer_json.as_object_mut() {
-                obj.remove("paths");
+                merge_json_values(&mut merged_json, layer_json);
             }
-            merge_json_values(&mut merged_json, layer_json);
         }
 
         let mut settings: Settings = match serde_json::from_value(merged_json) {
@@ -545,6 +602,8 @@ impl Settings {
                 base
             }
         };
+
+        settings.local_permission_rules = local_permission_rules;
 
         settings.paths = PathSettings {
             user_data_dir: scene_dir,
@@ -607,6 +666,7 @@ impl Settings {
             disable_skill_shell_execution: false,
             permission_mode: PermissionMode::default(),
             permission_rules: Vec::new(),
+            local_permission_rules: Vec::new(),
             hooks_config: None,
             mcp_servers: HashMap::new(),
             providers: HashMap::new(),
@@ -737,7 +797,113 @@ mod tests {
 
     fn write_settings(dir: &std::path::Path, content: &str) {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("settings.json"), content).unwrap();
+        std::fs::write(dir.join(SETTINGS_FILE), content).unwrap();
+    }
+
+    fn write_local_settings(dir: &std::path::Path, content: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(SETTINGS_LOCAL_FILE), content).unwrap();
+    }
+
+    #[test]
+    fn local_overlay_outranks_the_settings_json_beside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        write_settings(&project, r#"{"model": {"model_name": "committed"}}"#);
+        write_local_settings(&project, r#"{"model": {"model_name": "machine-local"}}"#);
+
+        let settings = Settings::load(
+            root.path().join("global"),
+            root.path().join("scene"),
+            project,
+            "code",
+            "m",
+        );
+        assert_eq!(settings.model.model_name, "machine-local");
+    }
+
+    /// The local overlay's rules must *add to* the committed tier's, not
+    /// replace them the way the generic array merge would — both sets have to
+    /// reach the rule engine for `RuleSource::LocalSettings`'s higher priority
+    /// to decide anything.
+    #[test]
+    fn local_overlay_permission_rules_add_to_rather_than_replace_the_committed_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        write_settings(
+            &project,
+            r#"{"permission_rules": [{"tool": "Bash(rm:*)", "action": "deny"}]}"#,
+        );
+        write_local_settings(
+            &project,
+            r#"{"permission_rules": [{"tool": "Bash(ls)", "action": "allow"}]}"#,
+        );
+
+        let settings = Settings::load(
+            root.path().join("global"),
+            root.path().join("scene"),
+            project,
+            "code",
+            "m",
+        );
+        assert_eq!(
+            settings
+                .permission_rules
+                .iter()
+                .map(|r| r.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bash(rm:*)"],
+            "the committed tier's rules must survive the overlay"
+        );
+        assert_eq!(
+            settings
+                .local_permission_rules
+                .iter()
+                .map(|r| r.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bash(ls)"]
+        );
+    }
+
+    #[test]
+    fn local_overlay_is_read_from_every_tier() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        let project = root.path().join("project");
+        write_local_settings(
+            &global,
+            r#"{"permission_rules": [{"tool": "Bash(id)", "action": "allow"}]}"#,
+        );
+        write_local_settings(
+            &project,
+            r#"{"permission_rules": [{"tool": "Bash(ls)", "action": "allow"}]}"#,
+        );
+
+        let settings = Settings::load(global, root.path().join("scene"), project, "code", "m");
+        assert_eq!(
+            settings
+                .local_permission_rules
+                .iter()
+                .map(|r| r.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bash(id)", "Bash(ls)"]
+        );
+    }
+
+    #[test]
+    fn local_overlay_can_never_override_paths_either() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        write_local_settings(&global, r#"{"paths": {"scope": "hijacked"}}"#);
+
+        let settings = Settings::load(
+            global,
+            root.path().join("scene"),
+            root.path().join("project"),
+            "real-scope",
+            "m",
+        );
+        assert_eq!(settings.paths.scope, "real-scope");
     }
 
     #[test]

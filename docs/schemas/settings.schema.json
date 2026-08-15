@@ -224,7 +224,7 @@
       "type": "string"
     },
     "PermissionMode": {
-      "description": "Permission mode for tool execution (TS parity).",
+      "description": "Permission mode for tool execution.",
       "oneOf": [
         {
           "const": "default",
@@ -253,12 +253,12 @@
         },
         {
           "const": "dontAsk",
-          "description": "Don't ask — deny any tool not explicitly allowed (no prompt). TS parity: dontAsk.",
+          "description": "Don't ask — deny any tool not explicitly allowed (no prompt).",
           "type": "string"
         },
         {
           "const": "bubble",
-          "description": "Bubble mode — forward permission requests up to a parent agent.\n**Program-only**: set by team/coordinator runtime; cannot be set by user.\nTS parity: bubble.",
+          "description": "Bubble mode — forward permission requests up to a parent agent.\n**Program-only**: set by team/coordinator runtime; cannot be set by user.",
           "type": "string"
         },
         {
@@ -349,7 +349,7 @@
         },
         "dangerously_disable_sandbox": {
           "default": false,
-          "description": "Bypass sandbox entirely (TS parity: `dangerouslyDisableSandbox`).\nDefault: false. Only for trusted environments.",
+          "description": "Bypass sandbox entirely.\nDefault: false. Only for trusted environments.",
           "type": "boolean"
         },
         "deny_read": {
@@ -478,7 +478,7 @@
     },
     "disable_skill_shell_execution": {
       "default": false,
-      "description": "Disable skill dynamic-content-injection shell commands (`` !`cmd` ``\nand fenced ` ```! ` blocks in `SKILL.md` bodies). Default: false\n(enabled) — matches Claude Code's `disableSkillShellExecution`.\nWhen true, each such placeholder is replaced with\n`[shell command execution disabled by policy]` instead of running.\nMost useful set in managed/org-wide settings where individual users\ncan't override it.",
+      "description": "Disable skill dynamic-content-injection shell commands (`` !`cmd` ``\nand fenced ` ```! ` blocks in `SKILL.md` bodies). Default: false\n(enabled). When true, each such placeholder is replaced with\n`[shell command execution disabled by policy]` instead of running.\nMost useful set in managed/org-wide settings where individual users\ncan't override it.",
       "type": "boolean"
     },
     "execution": {
@@ -506,7 +506,7 @@
         "team_mode": false,
         "vcr_auto_detect": false
       },
-      "description": "Feature flags — compile-time + runtime gate for experimental features.\nTS parity: GrowthBook feature flags in claude-code."
+      "description": "Feature flags — compile-time + runtime gate for experimental features."
     },
     "hooks_config": {
       "description": "Hooks configuration (merged from global/scene/project layers)."
@@ -545,7 +545,7 @@
     "permission_mode": {
       "$ref": "#/$defs/PermissionMode",
       "default": "default",
-      "description": "Permission mode for tool execution.\nTS parity: `PermissionMode` in `types/permissions.ts`."
+      "description": "Permission mode for tool execution."
     },
     "permission_rules": {
       "description": "Allow/deny/ask rules for specific tools.",
