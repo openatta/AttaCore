@@ -444,13 +444,45 @@ async fn main() -> anyhow::Result<()> {
     info!(elapsed_ms = _tools_reg_ms, "startup: tools registered");
 
     // ── Session transcript persistence ──────────────────────────────────
-    // `sessions/` follows the same "global + project, no scene" rule as
-    // memory/vcr/mcp (see `base::paths` module docs) — `JsonlHistoryStore`
-    // itself partitions by project under one shared root, so `global_dir`
-    // (not a scene-specific dir) is the right root here.
+    // Transcripts are partitioned by project, so they belong under
+    // `projects/`, not `sessions/`. Passing `global_dir.join("sessions")`
+    // here put `<sanitized-cwd>/` directories in the same root the
+    // session-id-keyed sidecars use, which is how `~/.atta/sessions/` ended
+    // up holding two different naming schemes side by side.
+    //
+    // `history::path::projects_root()` rather than a locally assembled path:
+    // the sidecar helpers in that module derive from the same `config_home()`,
+    // and having one of the two sides build its own root is what let them
+    // drift apart in the first place.
+    // Relocate anything still sitting in the pre-0.1.5 layout, before the
+    // store is built against the new one — otherwise a returning user's
+    // existing sessions are simply not where anything looks for them.
+    // Idempotent and move-only; a clean tree is a no-op.
+    match history::migrate::migrate_default_layout() {
+        Ok(r) if !r.did_nothing() => {
+            info!(
+                transcripts = r.transcripts_moved,
+                sidecars = r.sidecars_moved,
+                skipped = r.skipped_existing,
+                failed = r.failed,
+                "migrated session state to the projects/ + sessions/ layout"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "session layout migration skipped; older sessions may not be listed")
+        }
+    }
+
+    let projects_root = match history::path::projects_root() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot resolve the projects root; falling back to the data dir");
+            global_dir.join("projects")
+        }
+    };
     let history_store: Option<Arc<dyn history::store::HistoryStore>> =
-        match history::store::JsonlHistoryStore::with_root(&cwd, global_dir.join("sessions")).await
-        {
+        match history::store::JsonlHistoryStore::with_root(&cwd, projects_root).await {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to initialize session history store; sessions will be in-memory only for this run");

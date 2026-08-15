@@ -20,28 +20,39 @@ pub fn sanitize_path(name: &str) -> String {
     base::path::sanitize_for_fs(name)
 }
 
-/// `~/.atta/code` 的路径（CLI 与 daemon 共用）。可被 `ATTA_CONFIG_HOME` env 覆盖。
+/// `~/.atta` 的路径（CLI 与 daemon 共用）。可被 `ATTA_CONFIG_HOME` env 覆盖。
+///
+/// 曾经多一段写死的 `code`（产品名，不是场景名——四个场景 id 是
+/// `coding`/`chat`/`demo`/`research`）。去掉之后这里和
+/// `base::paths::ConfigPaths::global_data_dir` 指同一个目录，两套路径体系不再
+/// 各说各话。
 pub fn config_home() -> Result<PathBuf, HistoryError> {
     if let Ok(p) = env::var("ATTA_CONFIG_HOME") {
         return Ok(PathBuf::from(p));
     }
     let home = env::var("HOME").map_err(|_| HistoryError::NoHome)?;
-    Ok(PathBuf::from(home).join(".atta").join("code"))
+    Ok(PathBuf::from(home).join(".atta"))
 }
 
-/// `~/.atta/code/projects`
+/// `~/.atta/projects` —— 按项目分的状态（transcript）。
 pub fn projects_root() -> Result<PathBuf, HistoryError> {
     Ok(config_home()?.join("projects"))
 }
 
-/// `~/.atta/code/sessions`
+/// `~/.atta/sessions` —— 按会话分的状态（sidecar：memory / metadata / 输入历史）。
+///
+/// 和 [`projects_root`] 是两个维度，不是两层：sidecar 只按 session id 索引
+/// （`session_sidecar_paths` 拿不到项目信息），所以它进不了 `projects/<cwd>/`。
+/// 这两个目录以前都叫 `sessions` 且都在用，导致 `~/.atta/sessions/` 下同时躺着
+/// `<sanitized-cwd>/` 和 `<session-id>/` 两种命名的目录。
 pub fn sessions_root() -> Result<PathBuf, HistoryError> {
     Ok(config_home()?.join("sessions"))
 }
 
-/// Project-local state directory (`<cwd>/.atta/code`).
+/// Project-local state directory (`<cwd>/.atta`) —— 与
+/// `ConfigPaths::local_data_dir` 一致。
 pub fn project_local_dir(canonical_cwd: &Path) -> PathBuf {
-    canonical_cwd.join(".atta").join("code")
+    canonical_cwd.join(".atta")
 }
 
 /// Project-local active session pointer.
@@ -160,7 +171,7 @@ mod tests {
         let cwd = PathBuf::from("/Users/me/work");
         assert_eq!(
             project_session_state_file(&cwd),
-            PathBuf::from("/Users/me/work/.atta/code/session.json")
+            PathBuf::from("/Users/me/work/.atta/session.json")
         );
     }
 

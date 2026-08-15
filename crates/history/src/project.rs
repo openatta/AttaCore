@@ -318,9 +318,7 @@ mod tests {
         let metadata = SessionMetadata::new(&cwd, &history, session);
 
         assert_eq!(metadata.session_id, session);
-        assert!(metadata
-            .project_state_file
-            .ends_with(".atta/code/session.json"));
+        assert!(metadata.project_state_file.ends_with(".atta/session.json"));
         assert!(metadata.history_file.ends_with(&format!("{session}.jsonl")));
     }
 

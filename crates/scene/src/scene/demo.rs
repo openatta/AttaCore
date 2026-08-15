@@ -73,8 +73,8 @@ impl AgentScene for DemoScene {
     //   build_system_reminder  → 默认返回空字符串，不注入 <system-reminder>
     //   disallowed_tools       → 默认空列表，不额外排除任何工具
     //   default_skills         → 默认空列表，不自动加载任何 skill
-    //   execution_params       → 默认 ExecutionParams::default()
-    //                             （max_api_calls_per_turn=200）
+    //   execution_params       → 默认 ExecutionParams::default()（不设上限，
+    //                             由 settings.execution 决定）
     //   auto_name_session      → 默认 false，session 名称不会自动生成
     //   session_name_prompt    → 默认 None（配合上面 auto_name_session=false，
     //                             反正也不会被调用）

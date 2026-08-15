@@ -6629,7 +6629,7 @@ mod prompt_assembly_tests {
     fn scene_execution_params_tighten_the_api_call_ceiling() {
         let dir = tempfile::tempdir().unwrap();
         let settings = test_settings(dir.path());
-        assert_eq!(settings.execution.max_api_calls_per_turn, 200);
+        assert_eq!(settings.execution.max_api_calls_per_turn, 25);
 
         let resolve = |scene_limit: u32| {
             let scene = TestScene {
@@ -6645,7 +6645,7 @@ mod prompt_assembly_tests {
         assert_eq!(resolve(3), 3, "a scene tighter than settings must win");
         assert_eq!(
             resolve(5_000),
-            200,
+            25,
             "a scene cannot widen past the deployment-wide setting"
         );
     }

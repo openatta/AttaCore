@@ -265,7 +265,7 @@ impl EngineConfig {
             // to 10). 8 leaves a 2-slot safety margin for tokio scheduler under
             // heavy parallel Read/Glob/Grep batches.
             max_parallelism: 10,
-            max_api_calls_per_turn: 200,
+            max_api_calls_per_turn: 25,
             team_stage_concurrency: 6,
             team_max_persistent_members: 20,
             team_member_idle_timeout_secs: 1800,

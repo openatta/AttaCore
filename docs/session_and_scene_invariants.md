@@ -82,7 +82,28 @@ daemon 实例锁（`daemon/src/discovery.rs`）与 team 目录锁（`crates/team
 
 ---
 
-## 5. 委派深度
+## 5. 磁盘布局
+
+`~/.atta/` 下按**索引维度**分目录，不按产品名或场景分：
+
+| 目录 | 索引键 | 内容 |
+|---|---|---|
+| `projects/<sanitized-cwd>/` | 项目 | `<session-id>.jsonl` transcript |
+| `sessions/<session-id>/` | 会话 | `session_memory.md`、`metadata.json`、输入历史、`prompt_state.json` |
+| `memory/` | 全局 | 跨会话记忆（项目级的在 `<项目>/.atta/memory/`） |
+
+sidecar 之所以不能塞进 `projects/<cwd>/`，是因为 `session_sidecar_paths(session)` 只拿得到 session id——查找时没有项目信息可用。两者是并列的两个维度，不是两层嵌套。
+
+历史包袱有两处，`history::migrate` 在 daemon 启动时一次性搬走，幂等且只移不删：
+
+- transcript 曾写在 `sessions/<sanitized-cwd>/`，和 sidecar 挤在同一个根下，于是 `sessions/` 里同时躺着两种命名规则的目录
+- `history::path::config_home()` 曾多一段写死的 `code`（产品名，不是场景名），导致这个 crate 眼里的数据根比 `ConfigPaths::global_data_dir` 深一层
+
+区分两类目录靠**目录名能否解析成 `SessionId`**：sanitize 后的 cwd 必然以 `-` 开头（绝对路径的首字符是分隔符），解析不成 base58 id。
+
+---
+
+## 6. 委派深度
 
 委派链由 `EngineConfig::max_agent_depth` 计数约束，而非靠从工具集里摘掉 `Agent`：
 
@@ -96,7 +117,7 @@ daemon 实例锁（`daemon/src/discovery.rs`）与 team 目录锁（`crates/team
 
 ---
 
-## 6. 场景的工具面
+## 7. 场景的工具面
 
 场景对工具有三种控制，方向不同：
 

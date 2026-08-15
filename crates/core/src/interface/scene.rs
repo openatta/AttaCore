@@ -87,13 +87,19 @@ pub struct ExecutionParams {
     /// making a statement about its own workload that a deployment-wide
     /// setting should not be able to silently widen, and a deployment that
     /// wants to be stricter than the scene still gets its way.
+    ///
+    /// Defaults to no ceiling, so a scene that says nothing lets the setting
+    /// decide. It used to default to the same number the setting did, which
+    /// made the `min` a no-op in one direction and a silent clamp in the
+    /// other: an operator raising the setting for a long-running task got
+    /// the scene's number back with nothing to indicate why.
     pub max_api_calls_per_turn: u32,
 }
 
 impl Default for ExecutionParams {
     fn default() -> Self {
         Self {
-            max_api_calls_per_turn: 200,
+            max_api_calls_per_turn: u32::MAX,
         }
     }
 }
@@ -121,7 +127,7 @@ pub trait AgentScene: Send + Sync + 'static {
     /// Tools this scene contributes that no other scene has.
     ///
     /// The three-way split between this, `tools()` and `deferred_tools()` is
-    /// laid out in docs/session_and_scene_invariants.md §6.
+    /// laid out in docs/session_and_scene_invariants.md §7.
     ///
     /// [`tools`](Self::tools) can only ever *narrow* — it is a whitelist
     /// intersected with whatever registry the host assembled, so a scene had

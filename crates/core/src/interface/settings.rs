@@ -355,6 +355,20 @@ impl PathSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionSettings {
     pub max_parallelism: usize,
+    /// Ceiling on LLM round trips in one turn, before the turn ends with
+    /// `stop_reason: "max_turns"`.
+    ///
+    /// This is a runaway guard, not a task budget. Every comparable agent
+    /// runtime treats it that way and lands in the same range — the OpenAI
+    /// Agents SDK defaults `max_turns` to 10, LangGraph's `recursion_limit`
+    /// to 25, LangChain's `max_iterations` to 15. A long task is meant to be
+    /// served by compaction, delegation and resuming, not by a high ceiling:
+    /// raising this does not rescue an agent stuck in a loop, it only buys
+    /// the loop more iterations before it stops.
+    ///
+    /// Raise it deliberately for a genuinely long single turn. Nothing here
+    /// detects a *lack of progress* — a model repeating the same failing
+    /// tool call burns the whole allowance either way.
     pub max_api_calls_per_turn: u32,
     /// Maximum cumulative tokens (input + output, summed across every API
     /// call in a turn) before the turn is aborted with `budget_exceeded`.
@@ -433,7 +447,7 @@ impl Default for ExecutionSettings {
     fn default() -> Self {
         Self {
             max_parallelism: 10,
-            max_api_calls_per_turn: 200,
+            max_api_calls_per_turn: 25,
             max_budget_tokens: None,
             permission_prompt_timeout_secs: default_permission_prompt_timeout_secs(),
             team_stage_concurrency: default_team_stage_concurrency(),
@@ -722,7 +736,7 @@ mod tests {
     fn default_execution_settings() {
         let s = ExecutionSettings::default();
         assert_eq!(s.max_parallelism, 10);
-        assert_eq!(s.max_api_calls_per_turn, 200);
+        assert_eq!(s.max_api_calls_per_turn, 25);
     }
 
     #[test]

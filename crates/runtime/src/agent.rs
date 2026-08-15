@@ -1357,14 +1357,14 @@ impl Builder {
                     session.session_id_str()
                 ))
             })?;
-            // `history::path::sessions_root()`, not
-            // `paths.global_data_dir.join("sessions")` — the two disagree.
-            // The former is `$ATTA_CONFIG_HOME` or `~/.atta/code/sessions`;
-            // the latter is `$ATTA_DATA_DIR` or `~/.atta/sessions`, one level
-            // short and keyed off a different env var. Everything else that
-            // touches a session sidecar (metadata, input history, prompt
-            // state) goes through `history::path`, so writing the memory file
-            // anywhere else meant nothing could find it again.
+            // Every other session sidecar (metadata, input history, prompt
+            // state) resolves through `history::path`, so this has to as
+            // well — building the root separately from
+            // `paths.global_data_dir` is how the memory file ended up
+            // somewhere nothing would look for it. The two agree on
+            // `~/.atta` by default now, but they still answer to different
+            // env vars (`ATTA_CONFIG_HOME` vs `ATTA_DATA_DIR`), so the
+            // fallback below is a last resort, not an equivalent path.
             let sessions_root = history::path::sessions_root()
                 .unwrap_or_else(|_| settings.paths.global_data_dir.join("sessions"));
             let path = history::path::session_memory_file(&sessions_root, &sid);
@@ -2262,8 +2262,16 @@ mod tests {
             .await
             .expect("mock tool call succeeds");
 
-        // Async hook dispatch (tokio::spawn inside the sync callback) + shell exec.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The hook is dispatched through `tokio::spawn` from a sync callback
+        // and then shells out, so the marker appears some time after `call`
+        // returns. Poll for it instead of sleeping a fixed amount: a single
+        // 500 ms sleep passes on an idle machine and fails under a loaded
+        // `cargo test --workspace`, where this test competes with ~1900
+        // others for the shell it needs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         assert!(
             marker_path.exists(),

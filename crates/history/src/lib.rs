@@ -2,6 +2,7 @@
 
 pub mod entry;
 pub mod error;
+pub mod migrate;
 pub mod path;
 pub mod project;
 pub mod store;
