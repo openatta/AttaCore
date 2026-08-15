@@ -75,11 +75,6 @@ impl Tool for EnterPlanModeTool {
     }
 
     /// **P3b **: 标 deferred —— 系统 prompt 仅暴露 name + 短描述，模型用
-    /// ToolSearch 激活后下一轮拉 full schema。减少静态 prompt 占用。
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(EnterPlanModeInput))
             .expect("schemars output is valid JSON")
@@ -184,11 +179,6 @@ impl Tool for ExitPlanModeTool {
     }
 
     /// **P3b **: 标 deferred —— 系统 prompt 仅暴露 name + 短描述，模型用
-    /// ToolSearch 激活后下一轮拉 full schema。减少静态 prompt 占用。
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(ExitPlanModeInput))
             .expect("schemars output is valid JSON")

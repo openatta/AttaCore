@@ -39,9 +39,8 @@ pub struct DeferredTool {
 }
 
 impl DeferredTool {
-    /// Wrap `inner`. Wrapping an already-deferred tool is a no-op at the
-    /// behavior level (the inner tool's `is_deferred()` was already `true`),
-    /// but callers should prefer [`apply_deferred_policy`], which skips it.
+    /// Wrap `inner`. Prefer [`apply_deferred_policy`], which applies a whole
+    /// scene policy at once.
     pub fn new(inner: Arc<dyn Tool>) -> Self {
         Self { inner }
     }
@@ -162,11 +161,26 @@ impl Tool for DeferredTool {
 /// Apply a scene's deferred-tool policy to a tool list.
 ///
 /// Tools whose name appears in `deferred` are wrapped in [`DeferredTool`];
-/// everything else passes through untouched, as does anything already
-/// reporting `is_deferred()` (double-wrapping would only add an indirection).
-/// Names in `deferred` that match nothing are ignored — a scene naming a tool
-/// this deployment doesn't register is not an error, the same way a `tools()`
-/// whitelist entry with no matching tool isn't.
+/// everything else passes through untouched. Names in `deferred` that match
+/// nothing are ignored — a scene naming a tool this deployment doesn't
+/// register is not an error, the same way a `tools()` whitelist entry with no
+/// matching tool isn't.
+///
+/// `Tool::is_deferred()` is deliberately **not** consulted. It used to skip
+/// wrapping anything already reporting `true`, on the reasoning that
+/// double-wrapping adds a pointless indirection. That reasoning inverted the
+/// dependency: `is_deferred()` is what `ToolSearchTool` filters on, but the
+/// wrapper is the only thing that collapses `input_schema()`. A tool
+/// declaring `is_deferred()` on itself therefore ended up in the worst of
+/// both states — reported as deferred, so the model was told to fetch it via
+/// `ToolSearch`, while still shipping its full schema on every request. Two
+/// dozen built-in tools declare it, so the skip silently voided most of any
+/// scene's policy.
+///
+/// Wrapping is idempotent in the way that matters (a wrapped tool's schema is
+/// already the stub, and every other method delegates), and this runs once
+/// per session over a freshly listed registry, so there is nothing to guard
+/// against.
 pub fn apply_deferred_policy(tools: Vec<Arc<dyn Tool>>, deferred: &[String]) -> Vec<Arc<dyn Tool>> {
     if deferred.is_empty() {
         return tools;
@@ -174,10 +188,10 @@ pub fn apply_deferred_policy(tools: Vec<Arc<dyn Tool>>, deferred: &[String]) -> 
     tools
         .into_iter()
         .map(|t| {
-            if t.is_deferred() || !deferred.iter().any(|n| n == t.name()) {
-                t
-            } else {
+            if deferred.iter().any(|n| n == t.name()) {
                 Arc::new(DeferredTool::new(t)) as Arc<dyn Tool>
+            } else {
+                t
             }
         })
         .collect()

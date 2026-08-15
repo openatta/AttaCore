@@ -38,10 +38,6 @@ impl Tool for ScheduleWakeupTool {
         "Schedule a delayed wakeup for /loop dynamic mode"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(ScheduleWakeupInput)).expect("schema")
     }
@@ -121,11 +117,6 @@ mod tests {
     #[tokio::test]
     async fn name_matches() {
         assert_eq!(ScheduleWakeupTool.name(), "ScheduleWakeup");
-    }
-
-    #[tokio::test]
-    async fn is_deferred() {
-        assert!(ScheduleWakeupTool.is_deferred());
     }
 
     #[tokio::test]

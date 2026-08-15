@@ -121,6 +121,30 @@ pub trait AgentScene: Send + Sync + 'static {
     /// Tool whitelist for this scene (empty = all registered tools).
     fn tools(&self) -> Vec<String>;
 
+    /// Tools this scene contributes that no other scene has.
+    ///
+    /// [`tools`](Self::tools) can only ever *narrow* — it is a whitelist
+    /// intersected with whatever registry the host assembled, so a scene had
+    /// no way to offer a capability the host did not already know about. This
+    /// is the other direction: the returned tools are registered into the
+    /// session's own registry, so a scene owns its tool surface in both
+    /// directions.
+    ///
+    /// Registered before [`deferred_tools`](Self::deferred_tools) is applied,
+    /// so a scene can defer its own contributions like any other tool.
+    ///
+    /// A name already present in the registry is **rejected**, not
+    /// substituted — silently shadowing `Bash` or `Edit` from a scene
+    /// definition would be indistinguishable from the real thing at the call
+    /// site. `Builder::build()` fails with `EngineError::Internal`. Returning
+    /// tools that need session state (permissions, MCP clients, the spawner)
+    /// is out of scope here: this runs with no session context, so it suits
+    /// self-contained tools, the same constraint
+    /// `tools::register_builtin_tools` works under.
+    fn extra_tools(&self) -> Vec<std::sync::Arc<dyn crate::tool::Tool>> {
+        vec![]
+    }
+
     /// Token budget configuration.
     fn token_budget(&self) -> TokenBudget;
 

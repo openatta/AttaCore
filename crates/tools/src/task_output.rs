@@ -58,10 +58,6 @@ impl Tool for TaskOutputTool {
         "TaskOutput"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(TaskOutputInput)).expect("schema")
     }
@@ -245,7 +241,6 @@ mod tests {
         assert_eq!(tool.name(), "TaskOutput");
         assert!(tool.is_read_only(&Value::Null));
         assert!(tool.is_concurrency_safe(&Value::Null));
-        assert!(tool.is_deferred());
     }
 
     #[tokio::test]

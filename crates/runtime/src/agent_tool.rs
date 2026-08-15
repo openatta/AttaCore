@@ -107,7 +107,6 @@ pub fn builtin_agent_types() -> Vec<AgentTypeDefinition> {
                 "Glob".into(),
                 "WebSearch".into(),
                 "WebFetch".into(),
-                "LSP".into(),
             ],
             model: None,
             system_prompt: EXPLORE_PROMPT.into(),
@@ -147,13 +146,7 @@ pub fn builtin_agent_types() -> Vec<AgentTypeDefinition> {
         AgentTypeDefinition {
             name: "code-reviewer".into(),
             description: "Code review specialist using Read/Grep/Glob/LSP/Bash".into(),
-            allowed_tools: vec![
-                "Read".into(),
-                "Grep".into(),
-                "Glob".into(),
-                "LSP".into(),
-                "Bash".into(),
-            ],
+            allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into(), "Bash".into()],
             model: None,
             system_prompt: CODE_REVIEWER_PROMPT.into(),
             ..Default::default()

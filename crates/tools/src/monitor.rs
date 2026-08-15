@@ -72,10 +72,6 @@ impl Tool for MonitorTool {
         include_str!("prompts/coding/monitor.prompt.md").to_string()
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn is_read_only(&self, _: &Value) -> bool {
         true
     }

@@ -44,10 +44,6 @@ impl Tool for TaskStopTool {
         "TaskStop"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(TaskStopInput)).expect("schema")
     }
@@ -164,7 +160,6 @@ mod tests {
         assert_eq!(tool.name(), "TaskStop");
         assert!(!tool.is_read_only(&Value::Null));
         assert!(tool.is_concurrency_safe(&Value::Null));
-        assert!(tool.is_deferred());
     }
 
     #[tokio::test]

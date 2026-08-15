@@ -16,15 +16,7 @@ use base::permission::{PermissionMode, PermissionRule, RuleBehavior};
 ///
 /// These are auto-allowed even in strict modes (DontAsk, Plan) and are the
 /// only tools auto-allowed in BypassPermissions without path safety checks.
-pub const SAFE_TOOLS: &[&str] = &[
-    "Read",
-    "Glob",
-    "Grep",
-    "LSP",
-    "TaskList",
-    "TaskGet",
-    "ToolSearch",
-];
+pub const SAFE_TOOLS: &[&str] = &["Read", "Glob", "Grep", "TaskList", "TaskGet", "ToolSearch"];
 
 /// Result of the safe-tool / mode-based quick check via `RuleSet::check`.
 ///
@@ -504,10 +496,9 @@ mod tests {
         assert!(SAFE_TOOLS.contains(&"Read"));
         assert!(SAFE_TOOLS.contains(&"Glob"));
         assert!(SAFE_TOOLS.contains(&"Grep"));
-        assert!(SAFE_TOOLS.contains(&"LSP"));
         assert!(SAFE_TOOLS.contains(&"TaskList"));
         assert!(SAFE_TOOLS.contains(&"TaskGet"));
         assert!(SAFE_TOOLS.contains(&"ToolSearch"));
-        assert_eq!(SAFE_TOOLS.len(), 7);
+        assert_eq!(SAFE_TOOLS.len(), 6);
     }
 }

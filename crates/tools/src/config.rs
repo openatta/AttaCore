@@ -46,10 +46,6 @@ impl Tool for ConfigTool {
         "Get or set configuration settings"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(ConfigInput)).expect("schema")
     }

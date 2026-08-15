@@ -39,10 +39,6 @@ impl Tool for CronDeleteTool {
         "Cancel a scheduled cron job by ID"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(CronDeleteInput)).expect("schema")
     }

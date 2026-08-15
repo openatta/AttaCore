@@ -27,10 +27,6 @@ impl Tool for StructuredOutputTool {
         "Return structured output in the requested format"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(StructuredOutputInput)).expect("schema")
     }

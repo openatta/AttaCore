@@ -37,10 +37,6 @@ impl Tool for PushNotificationTool {
         "Send a desktop notification to the user's terminal. If Remote Control is connected, also pushes to their phone."
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(PushNotificationInput))
             .expect("schemars output is valid JSON")
@@ -151,12 +147,6 @@ mod tests {
         assert_eq!(tool.name(), "PushNotification");
         assert!(tool.is_read_only(&Value::Null));
         assert!(tool.is_concurrency_safe(&Value::Null));
-    }
-
-    #[tokio::test]
-    async fn is_deferred() {
-        let tool = PushNotificationTool;
-        assert!(tool.is_deferred());
     }
 
     #[tokio::test]

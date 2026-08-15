@@ -13,6 +13,90 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
+/// Tools whose full JSON schema stays in every request for this scene.
+///
+/// Chosen to match the reference implementation's resident set, which is the
+/// same shape for the same reason: these are the tools a coding turn reaches
+/// for without deliberating — reading, editing, searching, running commands,
+/// delegating — plus the two that exist to reach everything else (`Skill`,
+/// `ToolSearch`). Anything a turn uses occasionally is one `ToolSearch` call
+/// away and does not need to be paid for on every request.
+///
+/// `Glob`/`Grep` are resident despite being cheap to defer: they are the
+/// intended alternative to shelling out to `find`/`grep` (see
+/// `bash.prompt.md`), so making them cost an extra round trip would push the
+/// model toward `Bash` for exactly the searches these exist to serve.
+///
+/// `Write` is resident despite declaring `is_deferred()` on the tool itself —
+/// a tool-level default that predates any scene policy. Deferring the tool
+/// that creates files would put a round trip in front of the first write of
+/// nearly every session.
+const RESIDENT_TOOLS: &[&str] = &[
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Read",
+    "ScheduleWakeup",
+    "Skill",
+    "ToolSearch",
+    "Write",
+];
+
+/// Every tool this scene may see, resident or not.
+///
+/// Spelled out rather than read from the registry because `deferred_tools()`
+/// is a scene-level *policy* — it has no registry to consult, runs before the
+/// session's registry is assembled, and must give the same answer regardless
+/// of which optional tools a given deployment wired up. `apply_deferred_policy`
+/// ignores names it cannot resolve, so an entry for a tool that is not
+/// registered costs nothing.
+///
+/// A tool missing from this list is simply never deferred. When adding a
+/// tool, add it here too — `every_registered_tool_has_a_deferral_policy` in
+/// `crates/runtime` fails otherwise.
+const ALL_DEFERRABLE_TOOLS: &[&str] = &[
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Edit",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "Monitor",
+    "NotebookEdit",
+    "Ping",
+    "PushNotification",
+    "Read",
+    "ScheduleWakeup",
+    "Skill",
+    "Sleep",
+    "StructuredOutput",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TeamCreate",
+    "TeamDelete",
+    "TeamList",
+    "TodoWrite",
+    "ToolSearch",
+    "VerifyPlanExecution",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
+
 pub struct CodingScene;
 
 impl AgentScene for CodingScene {
@@ -37,6 +121,28 @@ impl AgentScene for CodingScene {
     }
     fn disallowed_tools(&self) -> Vec<String> {
         vec![]
+    }
+
+    /// Everything outside [`RESIDENT_TOOLS`] is advertised by name only until
+    /// `ToolSearch` fetches its schema.
+    ///
+    /// Returning `vec![]` (the trait default, which this scene used to take)
+    /// means every registered tool ships its full JSON schema on every API
+    /// call. For this scene that was ~17k tokens of tool definitions per
+    /// request, most of it for tools a given session never touches.
+    ///
+    /// The set is derived rather than listed: a tool opts out of being
+    /// deferred by *not* being in `RESIDENT_TOOLS`, so a newly registered
+    /// tool is deferred by default instead of silently joining the resident
+    /// set. Names absent from the registry are ignored by
+    /// `apply_deferred_policy`, so listing a tool this deployment doesn't
+    /// register is harmless.
+    fn deferred_tools(&self) -> Vec<String> {
+        ALL_DEFERRABLE_TOOLS
+            .iter()
+            .filter(|name| !RESIDENT_TOOLS.contains(*name))
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn token_budget(&self) -> TokenBudget {

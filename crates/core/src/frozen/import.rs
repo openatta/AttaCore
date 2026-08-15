@@ -9,8 +9,10 @@
 //! - This module: pure detection + execution, no UI, no callback awareness.
 //! - `ImportCallback` (crate::interface::import_callback): automatic,
 //!   process-level trigger for hosts that want to prompt a human.
-//! - `ImportTool` (crates/tools): manual `/import` slash command, always
-//!   re-detects, ignores the "already decided" marker.
+//! - the bundled `import` skill: manual `/import`, does the file work with
+//!   the ordinary file tools rather than through this module. It writes the
+//!   same `IMPORTED_FROM_<TAG>_{BEGIN,END}` markers `merge_marked_section`
+//!   does, so the two paths can re-run over each other's output.
 
 use std::path::{Path, PathBuf};
 
@@ -231,9 +233,9 @@ async fn write_marker(cwd: &Path, marker: &ImportedMarker) -> std::io::Result<()
 /// and "defer" decisions leave no marker, so they don't count here — the
 /// automatic path will ask again next process start.
 ///
-/// The **manual** `/import` path (`ImportTool`) intentionally does not call
-/// this — a user explicitly asking to import should always get a fresh
-/// detection, regardless of prior decisions.
+/// The **manual** `/import` path (the bundled `import` skill) intentionally
+/// does not consult this — a user explicitly asking to import should always
+/// get a fresh detection, regardless of prior decisions.
 pub async fn already_decided(cwd: &Path) -> bool {
     if path_exists(&cwd.join(".agents")).await {
         return true;

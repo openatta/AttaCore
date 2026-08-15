@@ -754,32 +754,82 @@ Rename the current conversation session to a descriptive title that makes it eas
 
 const IMPORT: &str = r#"# Import: Migrate Config from Claude Code / Codex / Cursor
 
-Detect and import project configuration left behind by another agent tool (Claude Code, Codex, or Cursor) into this engine's `AGENTS.md` + `.agents/skills/` + `.atta/rules/` layout.
+Bring project configuration left behind by another agent tool into this
+engine's layout: `AGENTS.md` + `.agents/skills/` + `.atta/rules/`.
+
+Do the work with the ordinary file tools. There is no `Import` tool — the
+detection rules and output layout change often enough that they belong here,
+in text you can edit, rather than compiled into the binary.
 
 ## When to use
 
-- The user runs `/import`, or asks to "import"/"migrate" settings from Claude Code, Codex, or Cursor
-- You notice `CLAUDE.md`, `.claude/skills/`, `.cursorrules`, `.cursor/rules/*.mdc`, or an `AGENTS.md` without `.agents/skills/` in the project and the user hasn't already declined an import for it
+- The user runs `/import`, or asks to import/migrate settings from Claude
+  Code, Codex, or Cursor
+- You notice `CLAUDE.md`, `.claude/skills/`, `.cursorrules`,
+  `.cursor/rules/*.mdc`, or an `AGENTS.md` with no `.agents/skills/`, and the
+  user has not already declined
 
 ## Process
 
-1. **List candidates** — call the `Import` tool with no `source`. It scans the project and returns each detected source (`claude_code`/`codex`/`cursor`) with a short description.
-2. **No candidates** — tell the user nothing importable was found; stop here.
-3. **One or more candidates** — present them to the user and ask which one to import from. **Single-select only**: even if multiple tools' configs are present, the user picks exactly one — importing from more than one at a time is not supported (avoids conflicting `AGENTS.md` sections).
-4. **Execute** — once the user picks one, call the `Import` tool again with `source` set to their choice (`claude_code`/`codex`/`cursor`). Report back the actions it took (what was written where).
-5. If the user declines entirely, do not call the tool again — just acknowledge and move on. (There's no "record the decline" step from the model side; the automatic detection path handles that separately for hosts that use it.)
+1. **Detect.** Check for each source in the project root:
+   - `claude_code` — `CLAUDE.md` exists, or `.claude/skills/` is non-empty
+   - `cursor` — `.cursorrules` exists, or `.cursor/rules/*.mdc` matches
+   - `codex` — `AGENTS.md` exists but `.agents/skills/` does not
+2. **Nothing found** — say so and stop.
+3. **Ask which one.** Present what you found and let the user pick exactly
+   one. Never import two sources in one pass: their `AGENTS.md` sections would
+   interleave and neither would be re-runnable.
+4. **Execute** the steps for that source below.
+5. **Report** what you wrote, by path.
+6. **Declined** — acknowledge and stop. Do not record anything; the automatic
+   detection path keeps its own marker.
 
-## What actually happens for each source
+## Merging into AGENTS.md
 
-- **claude_code**: `CLAUDE.md` content is merged into `AGENTS.md` (marker-wrapped, safe to re-run); `.claude/skills/*` are copied into `.agents/skills/*` (existing project skills of the same name are never overwritten).
-- **codex**: no content to migrate — Codex's `AGENTS.md` is already the target format. This just scaffolds an empty `.agents/skills/` if it's missing.
-- **cursor**: `.cursorrules` (plain text) is merged into `AGENTS.md`; each `.cursor/rules/*.mdc` file becomes `.atta/rules/<name>.md`, and any marked `alwaysApply: true` gets referenced from `AGENTS.md` too.
+Imported prose goes inside HTML-comment markers so a re-run replaces its own
+section instead of appending a second copy. Use the tag for the source
+(`CLAUDE_CODE` or `CURSOR_RULES`):
+
+```
+<!-- IMPORTED_FROM_<TAG>_AT: <ISO-8601 UTC> -->
+<!-- IMPORTED_FROM_<TAG>_BEGIN -->
+...imported content...
+<!-- IMPORTED_FROM_<TAG>_END -->
+```
+
+Read `AGENTS.md` first. If the pair of markers is already present, replace
+only what is between them and keep everything after `_END` — that tail is the
+user's own writing. If `AGENTS.md` does not exist, create it with the block
+alone. If it exists without markers, put the block at the top and the existing
+content below it.
+
+Match this format exactly. The automatic import path
+(`base::frozen::import`, used at daemon startup) writes the same markers, and
+the two must be able to re-run over each other's output.
+
+## Per source
+
+**claude_code**
+- Merge `CLAUDE.md` into `AGENTS.md` under tag `CLAUDE_CODE`
+- Copy `.claude/skills/*` to `.agents/skills/*`. **Never overwrite** an
+  existing project skill of the same name — skip it and say which you skipped
+
+**cursor**
+- Merge `.cursorrules` (plain text) into `AGENTS.md` under tag `CURSOR_RULES`
+- Convert each `.cursor/rules/*.mdc` to `.atta/rules/<name>.md`
+- An `.mdc` whose frontmatter has `alwaysApply: true` should also be
+  referenced from `AGENTS.md`, so it is actually loaded
+
+**codex**
+- Nothing to migrate; Codex already uses `AGENTS.md`. Create an empty
+  `.agents/skills/` if missing and say that was all that was needed
 
 ## Don't
 
-- Don't guess a `source` value — only use one that the `Import` tool's list actually returned.
-- Don't call `Import` with a `source` the user didn't explicitly choose.
-- Don't try to import multiple sources in the same request.
+- Don't invent a source the detection step did not find
+- Don't import a source the user did not pick
+- Don't overwrite existing project skills or rules
+- Don't touch `.atta/.imported.json` — that belongs to the automatic path
 "#;
 
 #[cfg(test)]

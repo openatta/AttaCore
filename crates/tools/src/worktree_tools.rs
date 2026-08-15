@@ -87,9 +87,6 @@ impl Tool for EnterWorktreeTool {
         "EnterWorktree"
     }
     /// **P3b **: 标 deferred —— 系统 prompt 仅暴露 name + 短描述。
-    fn is_deferred(&self) -> bool {
-        true
-    }
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(EnterWorktreeInput)).expect("schema")
     }
@@ -193,9 +190,6 @@ impl Tool for ExitWorktreeTool {
         "ExitWorktree"
     }
     /// **P3b **: 标 deferred —— 系统 prompt 仅暴露 name + 短描述。
-    fn is_deferred(&self) -> bool {
-        true
-    }
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(ExitWorktreeInput)).expect("schema")
     }

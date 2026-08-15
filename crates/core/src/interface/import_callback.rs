@@ -7,9 +7,8 @@
 //! would be the wrong lifetime. Hosts call `maybe_detect_and_import` directly
 //! at their own process-startup point, passing `Some(callback)` if they can
 //! synchronously ask a human, or `None` to skip the automatic path entirely
-//! (the manual `/import` command — `ImportTool` in `crates/tools` — remains
-//! available either way). See docs/design/2026-08-03-agents-config-migration.md
-//! §3.7 for the full design.
+//! (the manual `/import` path — the bundled `import` skill — remains
+//! available either way).
 
 use std::path::Path;
 use std::sync::Arc;

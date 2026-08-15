@@ -7,8 +7,11 @@
 //!   Bash + slack-cli/curl/mail covers messaging; AgentTool with `remote=true`
 //!   covers remote-trigger; multi-agent orchestration now lives in
 //!   `agent::TeamCreateTool`.
-//! - `LspTool`: replaced by real `attacode_lsp::tools::LspToolReal` (D1
-//!   moved it from `attacode_tools::lsp` to `attacode_lsp::tools`).
+//! - `LspTool`: removed. The registered instance was always
+//!   `LspTool::ephemeral()`, which spawns a language server per request and
+//!   drops it; the pooling half (`LspManager`) had no caller outside its own
+//!   tests. Code intelligence is better served by the language's own CLI via
+//!   `Bash` than by a tool that only ever ran its fallback path.
 //! - `McpAuthTool`: real OAuth flow implementation. Starts a browser-based
 //!   PKCE flow and returns the authorization URL. Completion exchanges the
 //!   code for a token via `mcp::oauth`.

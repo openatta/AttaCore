@@ -40,10 +40,6 @@ impl Tool for VerifyPlanExecutionTool {
         "VerifyPlanExecution"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(VerifyPlanExecutionInput))
             .expect("schemars output is valid JSON")

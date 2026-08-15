@@ -459,6 +459,21 @@ impl InMemoryToolRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .push(t);
     }
+
+    /// Swap the entry for `t.name()`, or append when there is none.
+    ///
+    /// [`register`](Self::register) appends unconditionally while
+    /// [`get`](Self::get) returns the *first* name match, so re-registering an
+    /// existing name leaves the original in front and the new instance
+    /// unreachable. Use this wherever the intent is to substitute a tool that
+    /// is already present — wrapping one in a decorator, for instance.
+    pub fn replace(&self, t: Arc<dyn Tool>) {
+        let mut w = self.tools.write().unwrap_or_else(|e| e.into_inner());
+        match w.iter().position(|x| x.name() == t.name()) {
+            Some(i) => w[i] = t,
+            None => w.push(t),
+        }
+    }
     pub fn get(&self, n: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .read()

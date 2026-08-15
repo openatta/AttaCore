@@ -55,11 +55,6 @@ impl Tool for TodoWriteTool {
     }
 
     /// **P3f **: deferred -- only Bash/Read/Edit/ToolSearch 4 eager.
-    /// Other tools activated via ToolSearch, saving ~13KB tools schema.
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(TodoWriteInput))
             .expect("schemars output is valid JSON")

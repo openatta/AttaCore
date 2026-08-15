@@ -12,8 +12,6 @@ pub mod file_read;
 pub mod file_write;
 pub mod glob;
 pub mod grep;
-pub mod import_tool;
-pub mod lsp;
 pub mod monitor;
 pub mod notebook_edit;
 pub mod ping;
@@ -126,7 +124,6 @@ pub fn register_builtin_tools(reg: &std::sync::Arc<base::tool::InMemoryToolRegis
         Arc::new(crate::file_edit::FileEditTool),
         Arc::new(crate::grep::GrepTool),
         Arc::new(crate::glob::GlobTool),
-        Arc::new(crate::lsp::LspTool::ephemeral()),
         Arc::new(crate::notebook_edit::NotebookEditTool),
         Arc::new(crate::todo_write::TodoWriteTool),
         Arc::new(crate::tasks::TaskCreateTool),

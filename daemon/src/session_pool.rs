@@ -1099,8 +1099,8 @@ impl SessionPool {
 
     /// Detect importable cross-tool configuration sources (Claude Code/
     /// Codex/Cursor) in this pool's project directory — pure filesystem
-    /// detection, no LLM turn needed. Same underlying primitive the manual
-    /// `/import` slash command (`ImportTool`) uses.
+    /// detection, no LLM turn needed. The manual `/import` path (the bundled
+    /// `import` skill) does its own detection with the file tools.
     pub async fn list_import_sources(&self) -> Vec<serde_json::Value> {
         base::frozen::detect_import_sources(&self.cwd)
             .await

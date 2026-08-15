@@ -36,7 +36,7 @@ impl AutoClassifier for YoloClassifier {
     ) -> ClassifyDecision {
         match tool_name {
             // ── Read-only operations: always allow ──
-            "Read" | "Grep" | "Glob" | "LSP" | "ListFiles" | "Search" => ClassifyDecision::Allow {
+            "Read" | "Grep" | "Glob" | "ListFiles" | "Search" => ClassifyDecision::Allow {
                 reason: "yolo: read-only operation".into(),
             },
 

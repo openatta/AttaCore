@@ -513,8 +513,8 @@ async fn main() -> anyhow::Result<()> {
     // `import.list`/`import.run` RPCs whenever it's ready, no LLM turn
     // required. Respects the same `.imported.json` marker the automatic
     // path always has, so this doesn't nag on every restart. The manual
-    // `/import` slash command (`ImportTool`) remains available regardless
-    // and always re-detects. See docs/design/2026-08-03-agents-config-migration.md §3.3/§3.7.
+    // `/import` slash command (the bundled `import` skill) remains available
+    // regardless and always re-detects.
     {
         let pool = pool.clone();
         let import_cwd = pool.cwd().to_path_buf();

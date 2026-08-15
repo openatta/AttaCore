@@ -1241,7 +1241,7 @@ impl Builder {
         // daemon's shared, immutable-after-startup template of built-in
         // tools — see `SessionPool.tools`). Every per-session-stateful tool
         // this function registers below (`Skill`/`Agent`/`TeamCreate`/
-        // `TeamDelete`/`ImportTool`/`TaskStop`/`TaskOutput`/MCP adapters)
+        // `TeamDelete`/`TaskStop`/`TaskOutput`/MCP adapters)
         // goes into *this* fresh copy, not the caller-supplied one.
         //
         // Before this existed, `Builder::build()` pushed straight into the
@@ -1289,6 +1289,27 @@ impl Builder {
             }
             session_tools
         };
+
+        // Scene-contributed tools (`AgentScene::extra_tools`, default empty).
+        // Registered here rather than alongside the engine-state tools below
+        // so a scene's own tools are subject to the same deferred policy as
+        // everything else.
+        //
+        // A collision is an error, not an override: `InMemoryToolRegistry::get`
+        // returns the first name match, so a scene shadowing `Bash` would be
+        // invisible at every call site that looks the name up.
+        for t in scene.extra_tools() {
+            if tools.get(t.name()).is_some() {
+                return Err(EngineError::Internal(format!(
+                    "scene {:?} contributes a tool named {:?}, which is already \
+                     registered; rename the scene's tool",
+                    scene.id(),
+                    t.name()
+                )));
+            }
+            tools.register(t);
+        }
+
         let settings = self
             .settings
             .ok_or_else(|| EngineError::Internal("settings required".into()))?;
@@ -1561,10 +1582,6 @@ impl Builder {
         tools.register(std::sync::Arc::new(tools::task_stop::TaskStopTool));
         // Register TaskOutputTool — retrieve output from running/completed tasks
         tools.register(std::sync::Arc::new(tools::task_output::TaskOutputTool));
-        // Register ImportTool — backs the /import slash command (cross-tool
-        // config import from Claude Code/Codex/Cursor). See
-        // docs/design/2026-08-03-agents-config-migration.md §3.8.
-        tools.register(std::sync::Arc::new(tools::import_tool::ImportTool));
         // Register AgentTool ("Agent") into the tool registry the model calls
         // (`agent_tool_arc` itself was constructed earlier, before `hooks`,
         // so its `AgentSpawner` wrapper could be handed to the "agent"-type
@@ -1718,6 +1735,35 @@ impl Builder {
             settings.paths.user_data_dir.join("scheduled_tasks.json"),
         )));
         tools::register_cron_tools(&tools, cron_store.clone());
+
+        // Second pass of the scene's deferred policy, now that registration
+        // is complete.
+        //
+        // The first pass (further up) runs on the *seeding* copy, so it only
+        // ever saw `register_builtin_tools`' self-contained set. Everything
+        // registered since — `Agent`, `Skill`, `Cron*`, `EnterWorktree`/
+        // `ExitWorktree`, `WebSearch`, `Team*`, MCP adapters — was therefore
+        // exempt from any scene policy and shipped its full schema no matter
+        // what the scene asked for. That is most of what a scene would want
+        // to defer.
+        //
+        // Re-registering by name over the same `Arc` (rather than rebuilding
+        // the registry) is what keeps `ToolSearchTool` working: it closes over
+        // this exact registry and reads it at call time, so a wrapped tool
+        // swapped in underneath it stays discoverable.
+        {
+            let deferred = scene.deferred_tools();
+            if !deferred.is_empty() {
+                for t in tools::deferred::apply_deferred_policy(tools.list(), &deferred) {
+                    // `ToolSearch` must never be deferred — it is the only way
+                    // back to a deferred tool's schema, so hiding its own
+                    // schema would strand every other deferred tool.
+                    if t.name() != "ToolSearch" {
+                        tools.replace(t);
+                    }
+                }
+            }
+        }
 
         let (input_tx, input_rx) = mpsc::unbounded_channel();
 
@@ -2382,11 +2428,211 @@ mod tests {
         );
     }
 
+    /// The coding scene's deferred policy has to reach the tools registered
+    /// *after* the seeding copy is built, and has to actually collapse their
+    /// schemas.
+    ///
+    /// Two separate defects made the policy a near-no-op before, and this
+    /// asserts the outcome rather than either mechanism:
+    ///
+    /// - `apply_deferred_policy` skipped any tool whose own `is_deferred()`
+    ///   already reported `true`. Two dozen built-ins declare it, and the
+    ///   wrapper is the only thing that collapses a schema — so those tools
+    ///   were announced as deferred while still shipping full schemas.
+    /// - The policy ran once, on the seeding registry, before `Agent`,
+    ///   `Skill`, `Cron*`, `Worktree*`, `WebSearch` and `Team*` were
+    ///   registered, exempting exactly the tools a scene most wants deferred.
+    #[tokio::test]
+    async fn coding_scene_defers_everything_outside_its_resident_set() {
+        let (agent, _rx, _tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .tools({
+                let t = Arc::new(InMemoryToolRegistry::new());
+                tools::register_builtin_tools(&t);
+                t
+            })
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let resident: Vec<String> = agent
+            .tools
+            .list()
+            .iter()
+            .filter(|t| !t.is_deferred())
+            .map(|t| t.name().to_string())
+            .collect();
+
+        let mut sorted = resident.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "Agent",
+                "AskUserQuestion",
+                "Bash",
+                "Edit",
+                "Glob",
+                "Grep",
+                "Read",
+                "ScheduleWakeup",
+                "Skill",
+                "ToolSearch",
+                "Write",
+            ],
+            "resident set drifted from CodingScene::RESIDENT_TOOLS"
+        );
+
+        // Registered after the seeding copy — the set the old single-pass
+        // policy could not reach.
+        for late in ["CronCreate", "EnterWorktree", "WebSearch"] {
+            let t = agent.tools.get(late).expect(late);
+            assert!(t.is_deferred(), "{late} must be deferred");
+            let schema = serde_json::to_string(&t.input_schema()).unwrap();
+            assert!(
+                schema.len() < 400,
+                "{late} still ships a full schema ({} bytes) — reported as \
+                 deferred but never wrapped",
+                schema.len()
+            );
+        }
+
+        // The way back to every deferred schema must never itself be deferred.
+        assert!(!agent.tools.get("ToolSearch").unwrap().is_deferred());
+
+        // Duplicate entries would shadow the wrapped instance, since `get`
+        // returns the first name match.
+        let mut names = agent.tools.names();
+        names.sort();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "registry contains duplicate tool names"
+        );
+    }
+
+    /// A scene can contribute a tool the host's registry never had, and it is
+    /// subject to the scene's own deferred policy like any other.
+    #[tokio::test]
+    async fn scene_extra_tools_are_registered_and_follow_the_deferred_policy() {
+        struct SceneWithExtra;
+        impl AgentScene for SceneWithExtra {
+            fn id(&self) -> &str {
+                "extra"
+            }
+            fn name(&self) -> &str {
+                "Extra"
+            }
+            fn description(&self) -> &str {
+                "scene contributing its own tool"
+            }
+            fn build_system_prompt(
+                &self,
+                _: &base::interface::scene::ScenePromptContext,
+            ) -> Vec<base::interface::prompt::PromptBlock> {
+                vec![]
+            }
+            fn tools(&self) -> Vec<String> {
+                vec![]
+            }
+            fn token_budget(&self) -> base::interface::scene::TokenBudget {
+                base::interface::scene::TokenBudget {
+                    compact_threshold: 150_000,
+                    compact_keep_recent: 20,
+                }
+            }
+            fn extra_tools(&self) -> Vec<Arc<dyn base::tool::Tool>> {
+                vec![Arc::new(ProbeTool), Arc::new(SecondProbeTool)]
+            }
+            fn deferred_tools(&self) -> Vec<String> {
+                vec!["SecondProbe".into()]
+            }
+        }
+
+        let (agent, _rx, _tx) = Builder::new()
+            .scene(Arc::new(SceneWithExtra) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let probe = agent.tools.get("Probe").expect("scene tool registered");
+        assert!(!probe.is_deferred(), "not named in deferred_tools");
+
+        let second = agent.tools.get("SecondProbe").expect("registered");
+        assert!(
+            second.is_deferred(),
+            "a scene's own tool must obey its own deferred policy"
+        );
+    }
+
+    /// Shadowing an existing tool from a scene has to fail loudly: the
+    /// registry returns the first name match, so the scene's version would
+    /// never be reached and every call site would silently keep the original.
+    #[tokio::test]
+    async fn scene_extra_tool_colliding_with_a_registered_name_fails_the_build() {
+        struct Shadower;
+        impl AgentScene for Shadower {
+            fn id(&self) -> &str {
+                "shadow"
+            }
+            fn name(&self) -> &str {
+                "Shadow"
+            }
+            fn description(&self) -> &str {
+                "scene shadowing a built-in"
+            }
+            fn build_system_prompt(
+                &self,
+                _: &base::interface::scene::ScenePromptContext,
+            ) -> Vec<base::interface::prompt::PromptBlock> {
+                vec![]
+            }
+            fn tools(&self) -> Vec<String> {
+                vec![]
+            }
+            fn token_budget(&self) -> base::interface::scene::TokenBudget {
+                base::interface::scene::TokenBudget {
+                    compact_threshold: 150_000,
+                    compact_keep_recent: 20,
+                }
+            }
+            fn extra_tools(&self) -> Vec<Arc<dyn base::tool::Tool>> {
+                vec![Arc::new(ProbeTool)]
+            }
+        }
+
+        let seeded = Arc::new(InMemoryToolRegistry::new());
+        seeded.register(Arc::new(ProbeTool));
+
+        let err = match Builder::new()
+            .scene(Arc::new(Shadower) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .tools(seeded)
+            .skip_warmup(true)
+            .build()
+        {
+            Ok(_) => panic!("a colliding scene tool must fail the build"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("Probe"),
+            "error should name the colliding tool, got: {err}"
+        );
+    }
+
     /// W-1 regression: `WebSearchTool` was never registered anywhere, while
     /// `ChatScene::tools()` and `ResearchScene::tools()` both list
     /// `"WebSearch"`. A scene whitelist is intersected with the registry, so
     /// the failure mode was silent — no error, the model just never saw the
     /// tool and the Research scenario had no way to search the web.
+
     #[tokio::test]
     async fn build_registers_web_search_and_the_other_bridged_tools() {
         let settings = Arc::new(test_settings());
@@ -2803,6 +3049,27 @@ mod tests {
             _progress: base::tool::ProgressSender,
         ) -> Result<base::tool::ToolResult, base::error::ToolError> {
             Ok(base::tool::ToolResult::text("probe-ok"))
+        }
+    }
+
+    /// Second stand-in, so a scene can contribute two tools and have the
+    /// deferred policy apply to one of them but not the other.
+    struct SecondProbeTool;
+    #[async_trait::async_trait]
+    impl base::tool::Tool for SecondProbeTool {
+        fn name(&self) -> &str {
+            "SecondProbe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: base::tool::ToolContext,
+            _progress: base::tool::ProgressSender,
+        ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+            Ok(base::tool::ToolResult::text("second-probe-ok"))
         }
     }
 

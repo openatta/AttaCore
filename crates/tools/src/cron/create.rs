@@ -60,10 +60,6 @@ impl Tool for CronCreateTool {
          recurring schedules and one-shot reminders."
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(CronCreateInput)).expect("schema")
     }

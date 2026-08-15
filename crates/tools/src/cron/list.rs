@@ -31,10 +31,6 @@ impl Tool for CronListTool {
         "List scheduled cron jobs"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",

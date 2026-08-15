@@ -31,10 +31,6 @@ impl Tool for SleepTool {
         "Sleep"
     }
 
-    fn is_deferred(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::to_value(schemars::schema_for!(SleepInput)).expect("schema")
     }

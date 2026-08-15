@@ -148,7 +148,6 @@ impl Permission for PermissionBridge {
             "Glob",
             "WebSearch",
             "WebFetch",
-            "LSP",
             "ListPeers",
             "ReadMail",
             "SendMessage",
