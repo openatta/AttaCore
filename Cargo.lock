@@ -167,7 +167,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base",
  "base64 0.22.1",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "base"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -522,7 +522,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "compaction"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1360,7 +1360,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "history"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "hooks"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -1988,7 +1988,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "mcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-toy-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "rmcp",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2400,7 +2400,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permissions"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -2504,7 +2504,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "plugin"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "hex",
@@ -2523,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-compiler"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "plugin",
@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "daemon",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "scene"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base",
 ]
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -3430,7 +3430,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skills"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base",
  "globset",
@@ -3607,7 +3607,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "task"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -3623,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "team"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3643,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
