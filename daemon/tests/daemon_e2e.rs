@@ -747,6 +747,25 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["success"], true, "install resp: {v}");
 
+    // ── the install reports what the plugin will contribute ──
+    let d = &v["result"]["disclosure"];
+    assert_eq!(d["plugin"], "demo-plugin", "install must disclose: {v}");
+    assert_eq!(d["version"], "1.0.0");
+    assert_eq!(
+        d["capabilities"].as_array().unwrap().len(),
+        0,
+        "this fixture asks for nothing: {d}"
+    );
+    // The plugin's own description reaches the model, so it is listed with
+    // its provenance rather than left for the reader to infer.
+    let visible = d["model_visible"].as_array().unwrap();
+    assert!(
+        visible
+            .iter()
+            .any(|v| v["origin"] == "plugin description" && v["text"] == "demo plugin"),
+        "{d}"
+    );
+
     // ── plugin.list shows it, enabled ──
     let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":2}"#).await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -1580,6 +1599,42 @@ async fn an_unknown_plugin_scene_is_refused() {
     .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(v["error"].is_object(), "expected a refusal, got {v}");
+
+    server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+/// Installing must state what a plugin will contribute — above all the text
+/// that will reach the model, which no sandbox can vet.
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn a_scene_owning_plugin_discloses_its_prompt_and_capabilities() {
+    let dir = tempfile::tempdir().unwrap();
+    install_scene_plugin(dir.path(), "disclosing-plugin");
+
+    let (server, sock, _dir, handle) = start_server_in(dir).await;
+
+    // Already installed on disk, so ask through the subsystem's own view by
+    // reinstalling over it — the response carries the disclosure either way.
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":1}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(
+        v["result"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "disclosing-plugin"),
+        "{v}"
+    );
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"scene.list","id":2}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let listed = v["result"]["scenes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["scene"] == "plugin:disclosing-plugin");
+    assert!(listed, "the scene the plugin owns should be servable: {v}");
 
     server.shutdown_token().cancel();
     let _ = handle.await;

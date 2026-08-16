@@ -90,6 +90,31 @@ impl InstalledPlugins {
 
 
 
+    /// What one installed plugin will contribute, for an installer to put in
+    /// front of the user.
+    ///
+    /// Enriched with the tool text only a loaded component can supply, which
+    /// is why this lives here rather than in the manifest crate: the
+    /// descriptions a plugin's tools carry into the model's context are not
+    /// in the manifest at all.
+    pub fn disclose(&self, name: &str) -> Option<Result<plugin::Disclosure, plugin::PluginError>> {
+        let p = self.plugins.iter().find(|p| p.name() == name)?;
+        let mut d = match plugin::Disclosure::from_plugin(p) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e)),
+        };
+        for tool in self.tools.iter().filter(|t| {
+            t.name()
+                .starts_with(&format!("plugin__{name}__"))
+        }) {
+            let short = tool.short_description().unwrap_or_default();
+            if let Err(e) = d.add_tool(tool.name(), &short, None) {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(d))
+    }
+
     /// Scene ids this host contributes, for the caller that has to register
     /// and later withdraw them.
     pub fn scene_ids(&self) -> Vec<String> {

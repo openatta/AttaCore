@@ -94,6 +94,10 @@ pub struct McpManager {
     server_states: Vec<(String, McpServerState)>,
     /// Registered notification handlers.
     notification_handlers: Vec<Box<dyn McpNotificationHandler>>,
+    /// Notifications servers have sent that nothing has acted on yet — see
+    /// `crate::notify::NotificationQueue`. Shared with every connected
+    /// client, since the reaction (re-asking for tools) is manager-wide.
+    notifications: Arc<crate::notify::NotificationQueue>,
     /// P2-2: MCP notification channel allowlist — only notifications from
     /// servers whose names appear in this set are dispatched to handlers.
     /// Empty = allow all.
@@ -123,6 +127,7 @@ impl McpManager {
             prompts: Vec::new(),
             server_states: Vec::new(),
             notification_handlers: Vec::new(),
+            notifications: crate::notify::NotificationQueue::new(),
             notification_allowlist: None,
             tool_permissions: std::collections::HashMap::new(),
             output_cache: Arc::new(Mutex::new(McpOutputCache::new())),
@@ -236,6 +241,10 @@ impl McpManager {
         // later `set_elicitation_callback` call reaches adapters built here.
         let elicitation_cell = Arc::new(Mutex::new(elicitation_cb));
         let cache = Arc::new(Mutex::new(McpOutputCache::new()));
+        // Shared with every client this builds, and kept as this manager's
+        // own field, so a server that announces a tool change reaches the
+        // same queue the manager later drains.
+        let notifications = crate::notify::NotificationQueue::new();
         let mut clients: Vec<McpClientHandle> = Vec::new();
         let mut adapters: Vec<Arc<dyn Tool>> = Vec::new();
         let mut set = JoinSet::new();
@@ -274,8 +283,17 @@ impl McpManager {
 
             let cache_for_spawn = cache.clone();
             let cell_for_spawn = elicitation_cell.clone();
+            let queue_for_spawn = notifications.clone();
             set.spawn(async move {
-                match Self::connect_with_retry(&name, &cfg, cache_for_spawn, cell_for_spawn).await {
+                match Self::connect_with_retry(
+                    &name,
+                    &cfg,
+                    cache_for_spawn,
+                    cell_for_spawn,
+                    queue_for_spawn,
+                )
+                .await
+                {
                     Ok((client, server_adapters)) => {
                         info!(server = %name, n_tools = server_adapters.len(), "MCP server connected");
                         Ok((name, client, server_adapters))
@@ -293,6 +311,7 @@ impl McpManager {
         let manager = Self {
             clients,
             adapters,
+            notifications,
             prompts: Vec::new(),
             server_states: Vec::new(),
             notification_handlers: Vec::new(),
@@ -354,9 +373,11 @@ impl McpManager {
         cfg: &McpServerConfig,
         cache: Arc<Mutex<McpOutputCache>>,
         elicitation_cell: Arc<Mutex<Option<ElicitationCallback>>>,
+        notifications: Arc<crate::notify::NotificationQueue>,
     ) -> Result<(McpClientHandle, Vec<Arc<dyn Tool>>), McpError> {
         // StdioMcpClient 现在支持 stdio + streamable_http 两种 config（spawn_service 里分派）
-        let client = StdioMcpClient::connect(name, cfg).await?;
+        let client =
+            StdioMcpClient::connect_with_sink(name, cfg, Some(notifications.sink())).await?;
         let tools = client.list_tools().await?;
         let handle: McpClientHandle = client;
         let adapters: Vec<Arc<dyn Tool>> = tools
@@ -377,6 +398,7 @@ impl McpManager {
         cfg: &McpServerConfig,
         cache: Arc<Mutex<McpOutputCache>>,
         elicitation_cell: Arc<Mutex<Option<ElicitationCallback>>>,
+        notifications: Arc<crate::notify::NotificationQueue>,
     ) -> Result<(McpClientHandle, Vec<Arc<dyn Tool>>), McpError> {
         const MAX_RETRIES: u32 = 5;
         const INITIAL_DELAY_MS: u64 = 1_000;
@@ -384,7 +406,14 @@ impl McpManager {
 
         let mut last_err = None;
         for attempt in 0..MAX_RETRIES {
-            match Self::connect_one(name, cfg, cache.clone(), elicitation_cell.clone()).await {
+            match Self::connect_one(
+                name,
+                cfg,
+                cache.clone(),
+                elicitation_cell.clone(),
+                notifications.clone(),
+            )
+            .await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_err = Some(e);
@@ -415,7 +444,8 @@ impl McpManager {
     /// a warning.
     pub async fn add_server(&mut self, name: &str, cfg: &McpServerConfig) {
         let cb = self.elicitation_callback.clone();
-        match Self::connect_one(name, cfg, self.output_cache.clone(), cb).await {
+        match Self::connect_one(name, cfg, self.output_cache.clone(), cb, self.notifications.clone())
+            .await {
             Ok((client, server_adapters)) => {
                 info!(
                     server = %name,
@@ -442,6 +472,7 @@ impl McpManager {
             prompts: Vec::new(),
             server_states: Vec::new(),
             notification_handlers: Vec::new(),
+            notifications: crate::notify::NotificationQueue::new(),
             notification_allowlist: None,
             tool_permissions: std::collections::HashMap::new(),
             output_cache: Arc::new(Mutex::new(McpOutputCache::new())),
@@ -710,6 +741,27 @@ impl McpManager {
     /// Refresh tools from connected MCP servers. Used between turns to pick up
     /// newly connected servers.
     /// Re-fetches tool lists from all connected clients and updates adapters.
+    /// Re-ask every server for its tools when one of them announced a
+    /// change.
+    ///
+    /// Returns whether anything was refreshed, so a caller can log it or
+    /// skip work when nothing happened. This is the consumer that makes the
+    /// notification path mean something — before it, `McpNotification` was a
+    /// type nothing constructed and nothing read.
+    pub async fn refresh_tools_if_announced(&mut self) -> bool {
+        if !self.notifications.take_tools_changed() {
+            return false;
+        }
+        tracing::info!("an MCP server announced new tools; re-reading every server's list");
+        self.refresh_tools().await;
+        true
+    }
+
+    /// Notifications parked since the last drain, for diagnostics.
+    pub fn pending_notifications(&self) -> Vec<McpNotification> {
+        self.notifications.drain()
+    }
+
     pub async fn refresh_tools(&mut self) {
         let mut new_adapters: Vec<Arc<dyn Tool>> = Vec::new();
         // Always alias the shared cell (not gated on it currently holding
@@ -1192,5 +1244,50 @@ mod tests {
             .resolve_resource_refs("@docs:doc://guide/install")
             .await
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod notification_wiring_tests {
+    use super::*;
+
+    /// Regression: `McpNotification` existed, `dispatch_notification`
+    /// existed, and nothing in the process ever constructed one — a server
+    /// announcing new tools was talking to a wall. This pins the queue that
+    /// closes the gap.
+    #[tokio::test]
+    async fn a_manager_starts_with_nothing_announced() {
+        let mut m = McpManager::empty();
+        assert!(m.pending_notifications().is_empty());
+        assert!(
+            !m.refresh_tools_if_announced().await,
+            "nothing announced means no work"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_announced_tool_change_triggers_exactly_one_refresh() {
+        let mut m = McpManager::empty();
+        m.notifications.push(McpNotification::ToolListChanged {
+            server: "github".into(),
+        });
+
+        assert!(m.refresh_tools_if_announced().await);
+        assert!(
+            !m.refresh_tools_if_announced().await,
+            "one announcement is one refresh, not a standing order"
+        );
+    }
+
+    /// A resource or prompt change does not invalidate the tool list, and
+    /// re-reading every server's tools for it would be work nobody asked
+    /// for.
+    #[tokio::test]
+    async fn other_announcements_do_not_trigger_a_tool_refresh() {
+        let mut m = McpManager::empty();
+        m.notifications.push(McpNotification::ResourceListChanged {
+            server: "github".into(),
+        });
+        assert!(!m.refresh_tools_if_announced().await);
     }
 }

@@ -142,6 +142,29 @@ mod imp {
             self.read().names().len()
         }
 
+        /// What `name` will contribute, as JSON. `null` when the plugin is
+        /// not installed; an `error` field when its declarations are
+        /// themselves inadmissible.
+        pub fn disclosure(&self, name: &str) -> serde_json::Value {
+            match self.read().disclose(name) {
+                None => serde_json::Value::Null,
+                Some(Err(e)) => serde_json::json!({"error": e.to_string()}),
+                Some(Ok(d)) => serde_json::json!({
+                    "plugin": d.plugin,
+                    "version": d.version,
+                    "capabilities": d.capabilities,
+                    "events": d.events,
+                    "scene": d.scene,
+                    "mcp_servers": d.mcp_servers,
+                    "model_visible": d.model_visible.iter().map(|v| serde_json::json!({
+                        "origin": v.origin,
+                        "text": v.text,
+                    })).collect::<Vec<_>>(),
+                    "inert": d.is_inert(),
+                }),
+            }
+        }
+
         fn read(&self) -> Arc<InstalledPlugins> {
             self.active.read().unwrap_or_else(|e| e.into_inner()).clone()
         }
@@ -189,6 +212,11 @@ mod imp {
             Ok(serde_json::json!({
                 "success": result.success,
                 "message": result.message,
+                // What the plugin will contribute, for the caller to show
+                // before anyone relies on it. Text reaching the model is the
+                // one thing the sandbox cannot check, so it travels back
+                // with the install rather than waiting to be asked for.
+                "disclosure": self.disclosure(name),
             }))
         }
 
@@ -309,6 +337,9 @@ mod imp {
         }
         pub fn list(&self) -> Vec<serde_json::Value> {
             Vec::new()
+        }
+        pub fn disclosure(&self, _name: &str) -> serde_json::Value {
+            serde_json::Value::Null
         }
         pub async fn install(
             &self,

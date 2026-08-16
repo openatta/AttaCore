@@ -773,7 +773,11 @@ impl SessionPool {
                 return;
             }
             let requested: std::collections::HashSet<String> = parsed.keys().cloned().collect();
-            let manager = McpManager::connect_all(parsed).await;
+            let mut manager = McpManager::connect_all(parsed).await;
+            // A server may have announced a tool change while this project's
+            // manager was being built or reused. Acting on it here is what
+            // keeps the announcement from being one more thing nobody reads.
+            manager.refresh_tools_if_announced().await;
             let statuses = manager.server_statuses();
             let connected: std::collections::HashSet<String> =
                 statuses.iter().map(|s| s.name.clone()).collect();

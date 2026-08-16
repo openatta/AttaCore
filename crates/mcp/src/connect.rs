@@ -53,15 +53,21 @@ fn truncate_mcp_instructions(instructions: String) -> String {
 
 /// stdio 子进程连接的 MCP client。`Arc<Self>` 共享给多个 adapter。
 ///
-/// 内部存 rmcp 的 `RunningService` —— 真正干活的 RPC 引擎。具体类型用 `()` 作
-/// ClientHandler（最简模式，不实现自定义回调；用 default capabilities）。
+/// 内部存 rmcp 的 `RunningService` —— 真正干活的 RPC 引擎。ClientHandler 用
+/// [`crate::notify::NotifyingHandler`]：除了我们会处理的几条 notification，
+/// 其余全部保持 trait 的默认行为（也就是这里原先用 `()` 时的行为）。
 pub struct StdioMcpClient {
     server_name: String,
     config: McpServerConfig,
     instructions: Option<String>,
-    inner: Mutex<Option<rmcp::service::RunningService<rmcp::RoleClient, ()>>>,
+    inner: Mutex<Option<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>>>,
     last_reconnect_at: Mutex<Option<Instant>>,
     consecutive_failures: AtomicU32,
+    /// Kept so a reconnect rebuilds the same notification wiring — a server
+    /// that came back after a crash is exactly one whose tool list may have
+    /// changed, so losing the sink here would silence the case that matters
+    /// most.
+    sink: Option<crate::notify::NotificationSink>,
 }
 
 impl StdioMcpClient {
@@ -70,7 +76,19 @@ impl StdioMcpClient {
         server_name: &str,
         config: &McpServerConfig,
     ) -> Result<Arc<Self>, McpError> {
-        let service = spawn_service(server_name, config).await?;
+        Self::connect_with_sink(server_name, config, None).await
+    }
+
+    /// Connect, forwarding this server's notifications to `sink`.
+    ///
+    /// `None` reproduces the pre-existing behavior exactly: the handler is
+    /// still real, it simply has nowhere to report to.
+    pub async fn connect_with_sink(
+        server_name: &str,
+        config: &McpServerConfig,
+        sink: Option<crate::notify::NotificationSink>,
+    ) -> Result<Arc<Self>, McpError> {
+        let service = spawn_service(server_name, config, sink.clone()).await?;
         let instructions = service
             .peer_info()
             .and_then(|info| info.instructions.clone())
@@ -82,6 +100,7 @@ impl StdioMcpClient {
             inner: Mutex::new(Some(service)),
             last_reconnect_at: Mutex::new(None),
             consecutive_failures: AtomicU32::new(0),
+            sink,
         }))
     }
 
@@ -128,7 +147,7 @@ impl StdioMcpClient {
             let _ = old.cancel().await;
         }
 
-        match spawn_service(&self.server_name, &self.config).await {
+        match spawn_service(&self.server_name, &self.config, self.sink.clone()).await {
             Ok(new_svc) => {
                 *self.inner.lock().await = Some(new_svc);
                 self.consecutive_failures.store(0, Ordering::SeqCst);
@@ -418,7 +437,8 @@ fn render_prompt_result(result: rmcp::model::GetPromptResult) -> String {
 async fn spawn_service(
     server_name: &str,
     config: &McpServerConfig,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpError> {
+    sink: Option<crate::notify::NotificationSink>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
     match config {
         McpServerConfig::Stdio {
             command, args, env, ..
@@ -434,7 +454,7 @@ async fn spawn_service(
                 .iter()
                 .map(|(k, v)| (k.clone(), crate::config::expand_env_vars(v)))
                 .collect();
-            spawn_stdio_service(server_name, &command, &args, &env).await
+            spawn_stdio_service(server_name, &command, &args, &env, sink).await
         }
         McpServerConfig::StreamableHttp {
             url,
@@ -447,7 +467,7 @@ async fn spawn_service(
                 .iter()
                 .map(|(k, v)| (k.clone(), crate::config::expand_env_vars(v)))
                 .collect();
-            spawn_streamable_http_service(server_name, &url, &headers, oauth_provider.as_deref())
+            spawn_streamable_http_service(server_name, &url, &headers, oauth_provider.as_deref(), sink)
                 .await
         }
         McpServerConfig::Sse {
@@ -466,7 +486,7 @@ async fn spawn_service(
                 url = %url,
                 "connecting to MCP server via SSE transport"
             );
-            spawn_sse_service(server_name, &url, &headers, oauth_provider.as_deref()).await
+            spawn_sse_service(server_name, &url, &headers, oauth_provider.as_deref(), sink).await
         }
         McpServerConfig::InProcess { name, .. } => {
             // In-process servers are handled by InProcessMcpClient via
@@ -486,7 +506,7 @@ async fn spawn_service(
                 .iter()
                 .map(|(k, v)| (k.clone(), crate::config::expand_env_vars(v)))
                 .collect();
-            spawn_websocket_service(server_name, &url, &headers).await
+            spawn_websocket_service(server_name, &url, &headers, sink).await
         }
     }
 }
@@ -496,7 +516,8 @@ async fn spawn_stdio_service(
     command: &str,
     args: &[String],
     env: &std::collections::HashMap<String, String>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpError> {
+    sink: Option<crate::notify::NotificationSink>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
     let mut cmd = tokio::process::Command::new(command);
     for a in args {
         cmd.arg(a);
@@ -512,7 +533,8 @@ async fn spawn_stdio_service(
         }
     })?;
 
-    ().serve(transport)
+    crate::notify::NotifyingHandler::new(server_name, sink)
+        .serve(transport)
         .await
         .map_err(|e| McpError::ConnectFailed {
             name: server_name.into(),
@@ -536,7 +558,8 @@ async fn spawn_streamable_http_service(
     url: &str,
     headers: &std::collections::HashMap<String, String>,
     oauth_provider: Option<&str>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpError> {
+    sink: Option<crate::notify::NotificationSink>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
     use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
     use rmcp::transport::StreamableHttpClientTransport;
 
@@ -584,7 +607,8 @@ async fn spawn_streamable_http_service(
 
     let transport = StreamableHttpClientTransport::from_config(config);
 
-    ().serve(transport)
+    crate::notify::NotifyingHandler::new(server_name, sink)
+        .serve(transport)
         .await
         .map_err(|e| McpError::ConnectFailed {
             name: server_name.into(),
@@ -818,7 +842,8 @@ async fn spawn_websocket_service(
     server_name: &str,
     url: &str,
     headers: &std::collections::HashMap<String, String>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpError> {
+    sink: Option<crate::notify::NotificationSink>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
     // 1. Try WebSocket first
     match try_ws_connect(url, headers).await {
         Ok(transport) => {
@@ -827,7 +852,10 @@ async fn spawn_websocket_service(
                 url = %url,
                 "Connected to MCP server via WebSocket transport"
             );
-            return ().serve(transport).await.map_err(|e| McpError::ConnectFailed {
+            return crate::notify::NotifyingHandler::new(server_name, sink)
+                .serve(transport)
+                .await
+                .map_err(|e| McpError::ConnectFailed {
                 name: server_name.into(),
                 source: anyhow::anyhow!("{e}"),
             });
@@ -850,7 +878,7 @@ async fn spawn_websocket_service(
         http_url = %http_url,
         "WebSocket unavailable; falling back to StreamableHTTP transport"
     );
-    spawn_streamable_http_service(server_name, &http_url, headers, None).await
+    spawn_streamable_http_service(server_name, &http_url, headers, None, sink).await
 }
 
 // ── SSE (Server-Sent Events) transport ──
@@ -860,9 +888,10 @@ async fn spawn_sse_service(
     url: &str,
     headers: &std::collections::HashMap<String, String>,
     oauth_provider: Option<&str>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpError> {
+    sink: Option<crate::notify::NotificationSink>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
     tracing::info!(server = %server_name, url = %url, "SSE transport: delegating to streamable HTTP");
-    spawn_streamable_http_service(server_name, url, headers, oauth_provider).await
+    spawn_streamable_http_service(server_name, url, headers, oauth_provider, sink).await
 }
 
 // ── WebSocketMcpClient ──
@@ -1057,6 +1086,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             last_reconnect_at: tokio::sync::Mutex::new(None),
             consecutive_failures: AtomicU32::new(0),
+            sink: None,
         };
         assert_eq!(client.transport_kind(), "stdio");
     }
@@ -1075,6 +1105,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             last_reconnect_at: tokio::sync::Mutex::new(None),
             consecutive_failures: AtomicU32::new(0),
+            sink: None,
         };
         assert_eq!(client.transport_kind(), "streamable_http");
     }
@@ -1098,6 +1129,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             last_reconnect_at: tokio::sync::Mutex::new(None),
             consecutive_failures: AtomicU32::new(0),
+            sink: None,
         };
         let err = client
             .get_prompt("some-prompt", &HashMap::new())
@@ -1170,6 +1202,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             last_reconnect_at: tokio::sync::Mutex::new(None),
             consecutive_failures: AtomicU32::new(0),
+            sink: None,
         };
         // 三次失败后 try_reconnect 应当 short-circuit NotConnected，不再 spawn
         let mut last_err = None;
@@ -1223,6 +1256,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             last_reconnect_at: tokio::sync::Mutex::new(None),
             consecutive_failures: AtomicU32::new(0),
+            sink: None,
         };
         assert_eq!(client.transport_kind(), "web_socket");
     }
@@ -1241,6 +1275,7 @@ mod tests {
                 inner: tokio::sync::Mutex::new(None),
                 last_reconnect_at: tokio::sync::Mutex::new(None),
                 consecutive_failures: AtomicU32::new(0),
+                sink: None,
             }),
         };
         assert_eq!(client.transport_kind(), "web_socket");
@@ -1264,6 +1299,7 @@ mod tests {
                 inner: tokio::sync::Mutex::new(None),
                 last_reconnect_at: tokio::sync::Mutex::new(None),
                 consecutive_failures: AtomicU32::new(0),
+                sink: None,
             }),
         };
         // The inner StdioMcpClient would report "stdio",

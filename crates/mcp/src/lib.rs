@@ -6,6 +6,7 @@ pub mod config;
 pub mod connect;
 pub mod error;
 pub mod manager;
+pub mod notify;
 pub mod oauth;
 pub mod output_cache;
 pub mod prompts;
