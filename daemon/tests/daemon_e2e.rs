@@ -705,8 +705,7 @@ async fn commands_list_returns_builtin_local_commands() {
 #[tokio::test]
 async fn plugin_install_rejects_bad_checksum() {
     let (_server, sock, dir, handle) = start_server().await;
-    let (archive_path, _correct_checksum) =
-        build_demo_plugin_zip(dir.path(), "demo-plugin");
+    let (archive_path, _correct_checksum) = build_demo_plugin_zip(dir.path(), "demo-plugin");
 
     let resp = rpc_call(
         &sock,
@@ -1486,14 +1485,13 @@ async fn plugin_rpcs_report_plugins_disabled_when_compiled_out() {
     ] {
         let resp = rpc_call(
             &sock,
-            &format!(
-                r#"{{"jsonrpc":"2.0","method":"{method}","id":1,"params":{params}}}"#
-            ),
+            &format!(r#"{{"jsonrpc":"2.0","method":"{method}","id":1,"params":{params}}}"#),
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(
-            v["error"]["code"], codes::PLUGINS_DISABLED,
+            v["error"]["code"],
+            codes::PLUGINS_DISABLED,
             "{method} should report the subsystem as unavailable: {v}"
         );
         assert!(
@@ -1513,11 +1511,7 @@ async fn plugin_rpcs_report_plugins_disabled_when_compiled_out() {
 /// versioned cache — the layout `plugin::discovery` reads.
 #[cfg(feature = "plugins")]
 fn install_scene_plugin(root: &std::path::Path, name: &str) {
-    let dir = root
-        .join("plugins")
-        .join("cache")
-        .join(name)
-        .join("1.0.0");
+    let dir = root.join("plugins").join("cache").join(name).join("1.0.0");
     std::fs::create_dir_all(dir.join("scene")).unwrap();
     std::fs::write(
         dir.join("scene/prompt.md"),

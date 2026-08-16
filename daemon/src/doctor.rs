@@ -148,7 +148,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = StaticDaemonPaths::new(dir.path().to_path_buf());
         let settings = base_settings();
-        let report = run_doctor(&paths, "coding", &settings, false, crate::plugins::PluginStatus::Enabled);
+        let report = run_doctor(
+            &paths,
+            "coding",
+            &settings,
+            false,
+            crate::plugins::PluginStatus::Enabled,
+        );
         let tiers = report["settings_tiers"].as_array().unwrap();
         assert_eq!(tiers.len(), 3);
         for t in tiers {
@@ -163,7 +169,13 @@ mod tests {
         std::fs::write(dir.path().join("settings.json"), "{not json").unwrap();
         let paths = StaticDaemonPaths::new(dir.path().to_path_buf());
         let settings = base_settings();
-        let report = run_doctor(&paths, "coding", &settings, false, crate::plugins::PluginStatus::Enabled);
+        let report = run_doctor(
+            &paths,
+            "coding",
+            &settings,
+            false,
+            crate::plugins::PluginStatus::Enabled,
+        );
         let tiers = report["settings_tiers"].as_array().unwrap();
         // config_root == project_root == dir here, so both entries see the
         // malformed file — only assert the ones that actually point at `dir`.
@@ -188,7 +200,13 @@ mod tests {
                 models: vec![],
             },
         );
-        let report = run_doctor(&paths, "coding", &settings, false, crate::plugins::PluginStatus::Enabled);
+        let report = run_doctor(
+            &paths,
+            "coding",
+            &settings,
+            false,
+            crate::plugins::PluginStatus::Enabled,
+        );
         assert_eq!(report["providers"]["ok"], false);
         assert!(report["providers"]["error"].as_str().is_some());
     }
@@ -198,10 +216,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = StaticDaemonPaths::new(dir.path().to_path_buf());
         let settings = base_settings();
-        let report = run_doctor(&paths, "coding", &settings, true, crate::plugins::PluginStatus::Enabled);
+        let report = run_doctor(
+            &paths,
+            "coding",
+            &settings,
+            true,
+            crate::plugins::PluginStatus::Enabled,
+        );
         assert_eq!(report["session_persistence"]["history_store_wired"], true);
     }
-
 
     /// A locked-down deployment has to be able to confirm from the running
     /// process that plugins are not merely switched off but absent.

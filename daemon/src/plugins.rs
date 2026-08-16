@@ -199,7 +199,10 @@ mod imp {
         }
 
         fn read(&self) -> Arc<InstalledPlugins> {
-            self.active.read().unwrap_or_else(|e| e.into_inner()).clone()
+            self.active
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         /// Every plugin on disk with its enable state — including the
@@ -248,7 +251,9 @@ mod imp {
             // right here — beats discovering it in the middle of a session.
             if let Err(e) = self.precompile(name).await {
                 let _ = commands.uninstall(name, Some(version)).await;
-                return Err(format!("installed but could not be compiled, so it was removed: {e:#}"));
+                return Err(format!(
+                    "installed but could not be compiled, so it was removed: {e:#}"
+                ));
             }
 
             self.refresh().await;
@@ -288,7 +293,9 @@ mod imp {
             scope: &str,
         ) -> Result<serde_json::Value, String> {
             let state = plugin::state::EnableState::new(self.tier_root(scope)?);
-            state.set_enabled(name, enabled).map_err(|e| e.to_string())?;
+            state
+                .set_enabled(name, enabled)
+                .map_err(|e| e.to_string())?;
             self.refresh().await;
             Ok(serde_json::json!({"name": name, "enabled": enabled, "scope": scope}))
         }
@@ -452,6 +459,9 @@ mod tests {
     fn status_strings_are_the_ones_doctor_reports() {
         assert_eq!(PluginStatus::CompiledOut.as_str(), "compiled-out");
         assert_eq!(PluginStatus::Enabled.as_str(), "enabled");
-        assert_eq!(PluginStatus::DisabledByPolicy.as_str(), "disabled-by-policy");
+        assert_eq!(
+            PluginStatus::DisabledByPolicy.as_str(),
+            "disabled-by-policy"
+        );
     }
 }
