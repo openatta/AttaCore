@@ -2,12 +2,20 @@
 //!
 //! Compiling a component is the expensive part of loading a plugin;
 //! `Component::serialize` produces a machine-code artifact that skips it.
-//! An artifact is only usable by a compatible wasmtime build, so the key
-//! combines the component's content hash with wasmtime's own compatibility
-//! hash — which accounts for more than the version number (optimization
-//! level and module-version strategy change it too). A key that only tracked
-//! the version would let a rebuild with different codegen settings read back
-//! an artifact it cannot use.
+//!
+//! The key is the component's content hash and nothing else. Compatibility
+//! is not the key's job: `Component::deserialize` validates the artifact's
+//! own header and rejects one built by an incompatible toolchain, so putting
+//! a compatibility fingerprint in the filename would only duplicate a check
+//! that already happens — and it cannot be done anyway, because the function
+//! that computes wasmtime's compatibility hash exists only in a build that
+//! links the compiler. The whole point of the split is that the process
+//! doing the loading may not have one.
+//!
+//! What that buys: the compiler and the runtime agree on where an artifact
+//! goes without having to agree on anything else, and an artifact from the
+//! wrong toolchain produces wasmtime's own rejection — which names the real
+//! problem — instead of a silent cache miss.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -15,19 +23,15 @@ use std::path::{Path, PathBuf};
 /// AOT artifacts for one plugin version, stored beside its extracted files.
 pub struct AotCache {
     dir: PathBuf,
-    /// Identifies the wasmtime build + configuration that produces artifacts
-    /// this cache may hand back — see [`crate::WasmEngine::compat_key`].
-    compat_key: u64,
 }
 
 impl AotCache {
     /// `plugin_version_dir` is the plugin's extracted directory
     /// (`plugins/cache/<name>/<version>/`); artifacts land in `.aot/` inside
     /// it, so uninstalling the version takes its artifacts with it.
-    pub fn new(plugin_version_dir: &Path, compat_key: u64) -> Self {
+    pub fn new(plugin_version_dir: &Path) -> Self {
         Self {
             dir: plugin_version_dir.join(".aot"),
-            compat_key,
         }
     }
 
@@ -35,18 +39,16 @@ impl AotCache {
         &self.dir
     }
 
-    /// Cache file for `component_bytes` under this engine configuration.
+    /// Cache file for `component_bytes`.
     ///
-    /// The engine key is in the *filename* rather than checked after loading:
-    /// an upgraded or reconfigured host then simply misses, instead of
-    /// reading an artifact it would have to reject, and the orphaned files
-    /// are visible rather than silently shadowing.
+    /// Content-addressed, so a rebuilt plugin never reads back the previous
+    /// build's machine code, and the compiler and the runtime land on the
+    /// same filename without sharing anything but this function.
     pub fn artifact_path(&self, component_bytes: &[u8]) -> PathBuf {
         let mut hasher = Sha256::new();
         hasher.update(component_bytes);
         let digest = hex::encode(hasher.finalize());
-        self.dir
-            .join(format!("{:016x}-{}.cwasm", self.compat_key, &digest[..32]))
+        self.dir.join(format!("{}.cwasm", &digest[..32]))
     }
 
     pub fn read(&self, path: &Path) -> Option<Vec<u8>> {
@@ -73,31 +75,29 @@ impl AotCache {
 mod tests {
     use super::*;
 
-    const KEY: u64 = 0xabcd_1234;
-
     #[test]
     fn the_key_changes_with_the_component_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = AotCache::new(dir.path(), KEY);
+        let cache = AotCache::new(dir.path());
         assert_ne!(cache.artifact_path(b"one"), cache.artifact_path(b"two"));
         assert_eq!(cache.artifact_path(b"one"), cache.artifact_path(b"one"));
     }
 
-    /// An artifact produced by a different wasmtime build or codegen
-    /// configuration must not be mistaken for a hit — the two are not
-    /// interchangeable, and the key in the filename is what keeps them apart.
+    /// The compiler and the runtime are separate binaries sharing only this
+    /// function. If they disagreed on the filename, nothing would ever load
+    /// in a build that cannot compile a replacement.
     #[test]
-    fn the_key_changes_with_the_engine_configuration() {
+    fn the_same_bytes_always_land_on_the_same_filename() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AotCache::new(dir.path(), KEY);
-        let b = AotCache::new(dir.path(), KEY + 1);
-        assert_ne!(a.artifact_path(b"same"), b.artifact_path(b"same"));
+        let a = AotCache::new(dir.path());
+        let b = AotCache::new(dir.path());
+        assert_eq!(a.artifact_path(b"same"), b.artifact_path(b"same"));
     }
 
     #[test]
     fn artifacts_live_under_the_plugin_version_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = AotCache::new(dir.path(), KEY);
+        let cache = AotCache::new(dir.path());
         assert_eq!(cache.dir(), dir.path().join(".aot"));
         assert!(cache
             .artifact_path(b"x")
@@ -112,14 +112,14 @@ mod tests {
     #[test]
     fn a_missing_artifact_is_a_miss_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = AotCache::new(dir.path(), KEY);
+        let cache = AotCache::new(dir.path());
         assert!(cache.read(&cache.artifact_path(b"x")).is_none());
     }
 
     #[test]
     fn a_written_artifact_reads_back() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = AotCache::new(dir.path(), KEY);
+        let cache = AotCache::new(dir.path());
         let path = cache.artifact_path(b"x");
         cache.write(&path, b"artifact-bytes");
         assert_eq!(cache.read(&path).as_deref(), Some(&b"artifact-bytes"[..]));
@@ -128,7 +128,7 @@ mod tests {
     /// An unwritable cache slows the next load down; it must not break it.
     #[test]
     fn an_unwritable_cache_is_survivable() {
-        let cache = AotCache::new(Path::new("/dev/null/nope"), KEY);
+        let cache = AotCache::new(Path::new("/dev/null/nope"));
         let path = cache.artifact_path(b"x");
         cache.write(&path, b"bytes");
         assert!(cache.read(&path).is_none());

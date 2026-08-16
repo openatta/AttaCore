@@ -336,6 +336,67 @@ fn dsh_bridge_config(
     }))
 }
 
+/// Compile every component a freshly installed plugin declares.
+///
+/// Runs at install, not at first load, and a failure fails the install:
+/// installing a plugin that cannot be loaded is worse than not installing
+/// it, because the failure surfaces later and somewhere else.
+///
+/// With the compiler linked in this is a direct call. Without it — the
+/// hardened build, where the daemon has no Cranelift at all — the work goes
+/// to `atta-plugin-compile`, located the same way the DSH bridge is.
+pub async fn precompile_plugin(dir: &Path) -> anyhow::Result<()> {
+    #[cfg(feature = "compile")]
+    {
+        let compiled = compile_in_process(dir)?;
+        tracing::info!(
+            dir = %dir.display(),
+            components = compiled,
+            "precompiled plugin components"
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "compile"))]
+    {
+        compile_out_of_process(dir).await
+    }
+}
+
+#[cfg(feature = "compile")]
+fn compile_in_process(dir: &Path) -> anyhow::Result<usize> {
+    let manifest = dir.join("plugin.toml");
+    let p = plugin::manifest::Plugin::load(dir, &manifest)?;
+    let engine = WasmEngine::new()?;
+    let mut n = 0;
+    for payload in &p.manifest.wasm {
+        engine.precompile(&p.path(&payload.component), dir)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+#[cfg(not(feature = "compile"))]
+async fn compile_out_of_process(dir: &Path) -> anyhow::Result<()> {
+    let exe = locate_tool("atta-plugin-compile").ok_or_else(|| {
+        anyhow::anyhow!(
+            "this build cannot compile plugin components and `atta-plugin-compile` was not \
+             found; set ATTA_PLUGIN_COMPILE to its path"
+        )
+    })?;
+    let out = tokio::process::Command::new(&exe)
+        .arg(dir)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("running {}: {e}", exe.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "compiling this plugin's components failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Path of the bridge's entry module inside a checkout or an install.
 const BRIDGE_REL: &str = "bridges/atta-dsh-bridge/src/main.js";
 
@@ -364,25 +425,42 @@ fn locate_bridge(override_path: Option<std::path::PathBuf>) -> Option<std::path:
             "ATTA_DSH_BRIDGE does not point at a file; falling back to the search"
         );
     }
+    search_near_executable(&[BRIDGE_REL, "atta-dsh-bridge/src/main.js"])
+}
 
+/// Look for a sibling file at each of `relatives`, walking up from the
+/// running executable.
+///
+/// Walking rather than counting `..`s because the executable's depth is not
+/// fixed: `target/debug/`, `target/debug/deps/` under test, and an installed
+/// `bin/` are all different distances from the same file. Bounded, because
+/// an unbounded walk eventually inspects `/`.
+fn search_near_executable(relatives: &[&str]) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut dir = exe.parent()?;
-    // Four levels covers target/<profile>/deps/ and an installed bin/ with
-    // room to spare; an unbounded walk would eventually inspect `/`.
     for _ in 0..4 {
-        for candidate in [dir.join(BRIDGE_REL), dir.join("atta-dsh-bridge/src/main.js")] {
+        for rel in relatives {
+            let candidate = dir.join(rel);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
         dir = dir.parent()?;
     }
-
-    tracing::warn!(
-        from = %exe.display(),
-        "atta-dsh-bridge not found; set ATTA_DSH_BRIDGE to its main.js"
-    );
     None
+}
+
+/// Find a companion executable this build needs but does not contain.
+#[cfg_attr(feature = "compile", allow(dead_code))]
+fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
+    let var = format!("ATTA_{}", name.to_uppercase().replace('-', "_"));
+    if let Ok(p) = std::env::var(&var) {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    search_near_executable(&[name])
 }
 
 fn bridge_entry_path() -> Option<std::path::PathBuf> {

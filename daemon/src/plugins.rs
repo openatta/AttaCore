@@ -241,6 +241,16 @@ mod imp {
                 .install_source(name, &source)
                 .await
                 .map_err(|e| e.to_string())?;
+
+            // Ahead of the refresh, and fatal: a plugin whose components
+            // cannot be compiled is one that will fail to load every time,
+            // and discovering that at install — where the user is standing
+            // right here — beats discovering it in the middle of a session.
+            if let Err(e) = self.precompile(name).await {
+                let _ = commands.uninstall(name, Some(version)).await;
+                return Err(format!("installed but could not be compiled, so it was removed: {e:#}"));
+            }
+
             self.refresh().await;
             Ok(serde_json::json!({
                 "success": result.success,
@@ -291,6 +301,26 @@ mod imp {
                 return;
             }
             self.load_components().await;
+        }
+
+        /// Compile the components of every installed version of `name`.
+        ///
+        /// Versions rather than "the current one" because install leaves the
+        /// others in place, and which one resolves can change under a
+        /// downgrade — an uncompiled sibling would then fail to load in a
+        /// build that cannot compile.
+        async fn precompile(&self, name: &str) -> anyhow::Result<()> {
+            let (global, scene) = tier_dirs(self.paths.as_ref());
+            for tier in [global, scene] {
+                let cache = plugin::cache::PluginCache::new(tier.join("cache"));
+                for version in cache.list_versions(name) {
+                    let dir = cache.version_dir(name, &version);
+                    if dir.join("plugin.toml").is_file() {
+                        plugin_host::precompile_plugin(&dir).await?;
+                    }
+                }
+            }
+            Ok(())
         }
 
         fn tier_root(&self, scope: &str) -> Result<std::path::PathBuf, String> {

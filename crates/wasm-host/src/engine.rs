@@ -7,8 +7,7 @@
 
 use crate::cache::AotCache;
 use anyhow::{anyhow, Context, Result};
-use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine};
@@ -23,7 +22,6 @@ fn wasm_err(e: wasmtime::Error) -> anyhow::Error {
 #[derive(Clone)]
 pub struct WasmEngine {
     engine: Engine,
-    compat_key: u64,
     /// Keeps the epoch ticker alive for as long as any clone of this engine
     /// exists. The ticker is what makes a deadline mean anything: without it
     /// the epoch never advances, guests never reach a yield point, and a
@@ -73,7 +71,15 @@ impl Drop for EpochTicker {
 }
 
 impl WasmEngine {
-    pub fn new() -> Result<Self> {
+    /// The engine configuration, and the only place it is written.
+    ///
+    /// Single-sourced because the AOT cache key derives from it. A build that
+    /// compiles artifacts and a build that loads them are separate binaries;
+    /// if their `Config`s differ by so much as one flag their compatibility
+    /// hashes differ, every artifact misses, and in a runtime-only build a
+    /// miss is a refusal to load. Two copies of this function would be two
+    /// chances to get that wrong silently.
+    pub fn config() -> Config {
         let mut config = Config::new();
         config.wasm_component_model(true);
         // Timeouts and cancellation are wall-clock questions — "has the user
@@ -81,25 +87,19 @@ impl WasmEngine {
         // interruption mechanism is epochs, not fuel. Fuel counts
         // instructions, which answers a different question.
         config.epoch_interruption(true);
+        config
+    }
+
+    pub fn new() -> Result<Self> {
+        let config = Self::config();
         let engine = Engine::new(&config)
             .map_err(wasm_err)
             .context("failed to construct the wasmtime engine")?;
-        let compat_key = compat_key(&engine);
         let ticker = Arc::new(EpochTicker::start(&engine)?);
         Ok(Self {
             engine,
-            compat_key,
             _ticker: ticker,
         })
-    }
-
-    /// Identifies this engine's build *and* configuration for AOT caching.
-    ///
-    /// wasmtime exposes the compatibility input as an opaque `Hash` rather
-    /// than a version string, and deliberately: codegen settings change what
-    /// artifacts are usable just as much as a version bump does.
-    pub fn compat_key(&self) -> u64 {
-        self.compat_key
     }
 
     pub fn inner(&self) -> &Engine {
@@ -114,15 +114,16 @@ impl WasmEngine {
         let bytes = std::fs::read(component_path)
             .with_context(|| format!("reading component {}", component_path.display()))?;
 
-        let cache = AotCache::new(plugin_version_dir, self.compat_key);
+        let cache = AotCache::new(plugin_version_dir);
         let artifact_path = cache.artifact_path(&bytes);
 
         if let Some(artifact) = cache.read(&artifact_path) {
-            // SAFETY: the artifact is one this process wrote, in a directory
-            // the daemon owns, keyed by the exact wasmtime build now running.
-            // `deserialize` still validates its own header, so a corrupted or
-            // foreign file is rejected rather than executed — which is why a
-            // failure here is demoted to a recompile instead of an error.
+            // SAFETY: the artifact is one this toolchain wrote, in a
+            // directory the daemon owns, keyed by the exact engine
+            // configuration now running. `deserialize` still validates its
+            // own header, so a corrupted or foreign file is rejected rather
+            // than executed — which is why a failure here is demoted to a
+            // recompile instead of an error.
             match unsafe { Component::deserialize(&self.engine, &artifact) } {
                 Ok(component) => {
                     return Ok(ComponentHandle {
@@ -133,30 +134,84 @@ impl WasmEngine {
                 Err(e) => tracing::warn!(
                     path = %artifact_path.display(),
                     error = %e,
-                    "cached AOT artifact was rejected; recompiling"
+                    "cached AOT artifact was rejected"
                 ),
             }
         }
 
-        let component = Component::new(&self.engine, &bytes)
+        self.compile_and_cache(component_path, &bytes, &cache, &artifact_path)
+    }
+
+    /// Compile `bytes` and record the artifact.
+    ///
+    /// Only exists in a build that links Cranelift. Without it a cache miss
+    /// is where loading stops: the artifact was supposed to be produced by
+    /// `atta-plugin-compile` at install, and quietly compiling here instead
+    /// would defeat the point of removing the compiler.
+    #[cfg(feature = "compile")]
+    fn compile_and_cache(
+        &self,
+        component_path: &Path,
+        bytes: &[u8],
+        cache: &AotCache,
+        artifact_path: &Path,
+    ) -> Result<ComponentHandle> {
+        let component = Component::new(&self.engine, bytes)
             .map_err(wasm_err)
             .with_context(|| format!("compiling component {}", component_path.display()))?;
         match component.serialize() {
-            Ok(artifact) => cache.write(&artifact_path, &artifact),
+            Ok(artifact) => cache.write(artifact_path, &artifact),
             Err(e) => tracing::warn!(error = %e, "component could not be serialized for caching"),
         }
-
         Ok(ComponentHandle {
             component: Arc::new(component),
             from_cache: false,
         })
     }
-}
 
-fn compat_key(engine: &Engine) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    engine.precompile_compatibility_hash().hash(&mut hasher);
-    hasher.finish()
+    #[cfg(not(feature = "compile"))]
+    fn compile_and_cache(
+        &self,
+        component_path: &Path,
+        _bytes: &[u8],
+        _cache: &AotCache,
+        artifact_path: &Path,
+    ) -> Result<ComponentHandle> {
+        anyhow::bail!(
+            "no precompiled artifact for {} (expected {}), and this build cannot compile one. \
+             Reinstall the plugin so `atta-plugin-compile` runs, or check that the compiler and \
+             this binary are the same version.",
+            component_path.display(),
+            artifact_path.display()
+        )
+    }
+
+    /// Compile a component and leave the artifact in its plugin's cache.
+    ///
+    /// What `atta-plugin-compile` calls. Returns where the artifact landed.
+    #[cfg(feature = "compile")]
+    pub fn precompile(&self, component_path: &Path, plugin_version_dir: &Path) -> Result<PathBuf> {
+        let bytes = std::fs::read(component_path)
+            .with_context(|| format!("reading component {}", component_path.display()))?;
+        let cache = AotCache::new(plugin_version_dir);
+        let artifact_path = cache.artifact_path(&bytes);
+
+        let component = Component::new(&self.engine, &bytes)
+            .map_err(wasm_err)
+            .with_context(|| format!("compiling component {}", component_path.display()))?;
+        let artifact = component
+            .serialize()
+            .map_err(wasm_err)
+            .context("serializing the compiled component")?;
+
+        // Not best-effort here, unlike the load path's cache write: this *is*
+        // the job, and a caller that was told the plugin compiled must be
+        // able to rely on the artifact existing.
+        std::fs::create_dir_all(cache.dir())
+            .and_then(|_| std::fs::write(&artifact_path, &artifact))
+            .with_context(|| format!("writing {}", artifact_path.display()))?;
+        Ok(artifact_path)
+    }
 }
 
 /// A loaded component, cheap to clone and share across calls.
@@ -197,12 +252,7 @@ mod tests {
     fn the_engine_is_configured_for_components_and_interruption() {
         // Construction is the assertion: `Engine::new` rejects a `Config`
         // whose options don't agree.
-        let engine = WasmEngine::new().expect("engine config must be self-consistent");
-        assert_eq!(
-            engine.compat_key(),
-            WasmEngine::new().unwrap().compat_key(),
-            "two engines built the same way must share a cache namespace"
-        );
+        WasmEngine::new().expect("engine config must be self-consistent");
     }
 
     #[test]
@@ -251,7 +301,7 @@ mod tests {
         let engine = WasmEngine::new().unwrap();
         engine.load(&path, dir.path()).unwrap();
 
-        let artifact = AotCache::new(dir.path(), engine.compat_key()).artifact_path(&bytes);
+        let artifact = AotCache::new(dir.path()).artifact_path(&bytes);
         std::fs::write(&artifact, b"not a wasmtime artifact").unwrap();
 
         let handle = engine.load(&path, dir.path()).unwrap();

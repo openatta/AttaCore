@@ -22,5 +22,11 @@ tokio-util = { workspace = true }
 serde_json = { workspace = true }
 tracing    = { workspace = true }
 
+[features]
+default = ["compile"]
+# Compile plugin components in-process. Off means the work goes to
+# `atta-plugin-compile`, and this build links no WebAssembly compiler.
+compile = ["wasm-host/compile"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
