@@ -7,5 +7,6 @@ mod agent_type_watcher;
 pub mod commands;
 pub mod context;
 pub mod hook_executors;
+pub mod plugin_host;
 pub mod streaming;
 pub mod turn;

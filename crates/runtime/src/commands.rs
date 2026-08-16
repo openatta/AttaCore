@@ -115,20 +115,20 @@ impl Command {
 /// construction time is stale as soon as a user adds, edits or deletes a
 /// skill file; a session built at 9am would keep resolving the skill set of
 /// 9am for as long as it lived, and the daemon's pool-wide registry — built
-/// once and shared by every session — never updated at all outside a plugin
-/// refresh.
+/// once and shared by every session — never updated at all outside a
+/// plugin refresh.
 ///
 /// Precedence on lookup, highest first: [`registered`](Self::insert_prompt)
-/// (plugin- and MCP-contributed) → live skills → [`builtin`](Default) local
-/// commands. This is the order the old insert-everything-into-one-map build
-/// sequence produced, preserved deliberately: `Builder::build`/
+/// (MCP-contributed) → live skills → [`builtin`](Default) local commands.
+/// This is the order the old insert-everything-into-one-map build sequence
+/// produced, preserved deliberately: `Builder::build`/
 /// `build_shared_commands` inserted skills over the built-ins and then
-/// plugin commands over both.
+/// explicitly registered commands over both.
 pub struct CommandRegistry {
     /// Built-in local commands (`/help`, `/clear`, …). Lowest precedence.
     builtin: HashMap<String, Command>,
-    /// Plugin-contributed prompts and MCP prompts — everything explicitly
-    /// registered that has no backing entry in the skill catalog.
+    /// MCP prompts — everything explicitly registered that has no backing
+    /// entry in the skill catalog.
     registered: HashMap<String, Command>,
     skills: Option<Arc<::skills::manager::SkillManager>>,
 }
@@ -225,7 +225,7 @@ impl CommandRegistry {
     }
 
     /// Insert a prompt command from a SkillEntry — for commands that have no
-    /// entry in the skill catalog (plugin-contributed ones); a skill on disk
+    /// entry in the skill catalog (MCP-contributed ones); a skill on disk
     /// needs no registration, it resolves through the manager.
     pub fn insert_prompt(&mut self, entry: SkillEntry) {
         self.registered.insert(
@@ -376,12 +376,6 @@ pub struct CommandInfo {
     /// Where the command came from: `"builtin"`, `"user"`, `"project"`, or
     /// `"plugin"`.
     pub source: &'static str,
-}
-
-impl plugin::manifest::SlashCommandRegistrar for CommandRegistry {
-    fn register_plugin_command(&mut self, entry: SkillEntry) {
-        self.insert_prompt(entry);
-    }
 }
 
 impl Default for CommandRegistry {

@@ -166,28 +166,10 @@ async fn collect_skills(home: &Path, cwd: &Path, scope: &str) -> Vec<SkillEntry>
     let global_dir = home.join(".atta").join("skills");
     let scene_dir = home.join(".atta").join("scenes").join(scope).join("skills");
     let project_dir = cwd.join(".agents").join("skills");
-    let global_plugins_dir = home.join(".atta").join("plugins");
-    let scene_plugins_dir = home
-        .join(".atta")
-        .join("scenes")
-        .join(scope)
-        .join("plugins");
     let mut all = Vec::new();
     all.extend(scan_skills_dir(&scene_dir, SkillSource::User).await);
     all.extend(scan_skills_dir(&global_dir, SkillSource::User).await);
     all.extend(scan_skills_dir(&project_dir, SkillSource::Project).await);
-
-    // Scan plugin skill directories (scene tier first, same override intent).
-    for plugins_dir in [&scene_plugins_dir, &global_plugins_dir] {
-        if let Ok(mut plugins) = tokio::fs::read_dir(plugins_dir).await {
-            while let Ok(Some(entry)) = plugins.next_entry().await {
-                let plugin_skills = entry.path().join("skills");
-                if plugin_skills.is_dir() {
-                    all.extend(scan_skills_dir(&plugin_skills, SkillSource::Plugin).await);
-                }
-            }
-        }
-    }
     all
 }
 

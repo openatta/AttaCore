@@ -8,7 +8,6 @@ publish      = false
 description  = "AttaCore — plugin manifest loader"
 
 [dependencies]
-base          = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }
@@ -17,8 +16,7 @@ async-trait   = { workspace = true }
 reqwest       = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
-hooks         = { workspace = true }
-mcp           = { workspace = true }
+semver        = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
 zip           = { workspace = true }

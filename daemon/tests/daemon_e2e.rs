@@ -21,11 +21,8 @@ use tokio_util::sync::CancellationToken;
 /// Build a zip archive (in memory) for a minimal demo plugin declaring one
 /// `/name` slash command, write it to `dir`, and return `(archive_path,
 /// sha256_hex)`.
-fn build_demo_plugin_zip(
-    dir: &std::path::Path,
-    plugin_name: &str,
-    command_name: &str,
-) -> (PathBuf, String) {
+#[cfg(feature = "plugins")]
+fn build_demo_plugin_zip(dir: &std::path::Path, plugin_name: &str) -> (PathBuf, String) {
     let mut buf = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
@@ -34,13 +31,9 @@ fn build_demo_plugin_zip(
         use std::io::Write;
         write!(
             writer,
-            "[plugin]\nname = \"{plugin_name}\"\nversion = \"1.0.0\"\ndescription = \"demo plugin\"\n\n[slash_commands]\n\"/{command_name}\" = \"prompts/{command_name}.md\"\n"
+            "[plugin]\nname = \"{plugin_name}\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\ndescription = \"demo plugin\"\n"
         )
         .unwrap();
-        writer
-            .start_file(format!("prompts/{command_name}.md"), opts)
-            .unwrap();
-        write!(writer, "Demo prompt body for /{command_name}: {{args}}").unwrap();
         writer.finish().unwrap();
     }
     let archive_path = dir.join(format!("{plugin_name}.zip"));
@@ -692,102 +685,12 @@ async fn commands_list_returns_builtin_local_commands() {
     let _ = handle.await;
 }
 
-#[tokio::test]
-async fn commands_list_includes_installed_plugin_slash_command() {
-    let dir = tempfile::tempdir().unwrap();
-    // Install a plugin directly into the global tier's versioned cache —
-    // same layout `plugin::discovery::discover_plugins` reads from
-    // (`{global_root}/plugins/cache/{name}/{version}/plugin.toml`).
-    let plugin_dir = dir
-        .path()
-        .join("plugins")
-        .join("cache")
-        .join("code-review-helper")
-        .join("1.0.0");
-    std::fs::create_dir_all(plugin_dir.join("prompts")).unwrap();
-    std::fs::write(
-        plugin_dir.join("plugin.toml"),
-        r#"
-[plugin]
-name = "code-review-helper"
-version = "1.0.0"
-description = "Adds /review"
-
-[slash_commands]
-"/review" = "prompts/review.md"
-"#,
-    )
-    .unwrap();
-    std::fs::write(
-        plugin_dir.join("prompts/review.md"),
-        "Review the diff: {args}",
-    )
-    .unwrap();
-
-    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
-    let client: Arc<dyn AnthropicClient> =
-        Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        client,
-        settings,
-        scene,
-        permission,
-        memory_store,
-        dir.path().to_path_buf(),
-        None,
-        paths,
-        None, // task_router
-    ));
-    let cancel = CancellationToken::new();
-    let server = Arc::new(daemon::DaemonServer::new(pool, cancel));
-    let sock = dir.path().join("test.sock");
-    let server2 = server.clone();
-    let sock2 = sock.clone();
-    let handle = tokio::spawn(async move {
-        let _ = server2.serve_unix(&sock2).await;
-    });
-    for _ in 0..20 {
-        if sock.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(sock.exists(), "socket never bound");
-
-    let resp = rpc_call(
-        &sock,
-        r#"{"jsonrpc":"2.0","method":"commands.list","id":1}"#,
-    )
-    .await;
-    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let commands = v["result"]["commands"].as_array().expect("commands array");
-    let review = commands
-        .iter()
-        .find(|c| c["name"] == "review")
-        .unwrap_or_else(|| panic!("plugin command 'review' not in {commands:?}"));
-    assert_eq!(review["kind"], "prompt");
-    assert_eq!(review["source"], "plugin");
-
-    server.shutdown_token().cancel();
-    let _ = handle.await;
-}
-
+#[cfg(feature = "plugins")]
 #[tokio::test]
 async fn plugin_install_rejects_bad_checksum() {
     let (_server, sock, dir, handle) = start_server().await;
     let (archive_path, _correct_checksum) =
-        build_demo_plugin_zip(dir.path(), "demo-plugin", "demo");
+        build_demo_plugin_zip(dir.path(), "demo-plugin");
 
     let resp = rpc_call(
         &sock,
@@ -809,10 +712,11 @@ async fn plugin_install_rejects_bad_checksum() {
     let _ = handle.await;
 }
 
+#[cfg(feature = "plugins")]
 #[tokio::test]
 async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     let (_server, sock, dir, handle) = start_server().await;
-    let (archive_path, checksum) = build_demo_plugin_zip(dir.path(), "demo-plugin", "demo");
+    let (archive_path, checksum) = build_demo_plugin_zip(dir.path(), "demo-plugin");
 
     // ── install ──
     let resp = rpc_call(
@@ -834,19 +738,6 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     let demo = plugins.iter().find(|p| p["name"] == "demo-plugin").unwrap();
     assert_eq!(demo["enabled"], true);
 
-    // ── commands.list shows the plugin's slash command ──
-    let resp = rpc_call(
-        &sock,
-        r#"{"jsonrpc":"2.0","method":"commands.list","id":3}"#,
-    )
-    .await;
-    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let commands = v["result"]["commands"].as_array().unwrap();
-    assert!(
-        commands.iter().any(|c| c["name"] == "demo"),
-        "commands: {commands:?}"
-    );
-
     // ── disable ──
     let resp = rpc_call(
         &sock,
@@ -855,18 +746,6 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     .await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["enabled"], false, "resp: {v}");
-
-    let resp = rpc_call(
-        &sock,
-        r#"{"jsonrpc":"2.0","method":"commands.list","id":5}"#,
-    )
-    .await;
-    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let commands = v["result"]["commands"].as_array().unwrap();
-    assert!(
-        !commands.iter().any(|c| c["name"] == "demo"),
-        "commands still has it: {commands:?}"
-    );
 
     let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":6}"#).await;
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -886,18 +765,6 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["enabled"], true, "resp: {v}");
 
-    let resp = rpc_call(
-        &sock,
-        r#"{"jsonrpc":"2.0","method":"commands.list","id":8}"#,
-    )
-    .await;
-    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let commands = v["result"]["commands"].as_array().unwrap();
-    assert!(
-        commands.iter().any(|c| c["name"] == "demo"),
-        "commands: {commands:?}"
-    );
-
     // ── uninstall ──
     let resp = rpc_call(
         &sock,
@@ -913,18 +780,6 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     assert!(
         !plugins.iter().any(|p| p["name"] == "demo-plugin"),
         "plugins: {plugins:?}"
-    );
-
-    let resp = rpc_call(
-        &sock,
-        r#"{"jsonrpc":"2.0","method":"commands.list","id":11}"#,
-    )
-    .await;
-    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let commands = v["result"]["commands"].as_array().unwrap();
-    assert!(
-        !commands.iter().any(|c| c["name"] == "demo"),
-        "commands: {commands:?}"
     );
 
     _server.shutdown_token().cancel();
@@ -1571,6 +1426,49 @@ async fn recreating_a_stale_session_at_capacity_does_not_evict_an_unrelated_sess
         final_ids.contains(&id_older),
         "unrelated older session was evicted as a side effect of recreating the newer one: {final_ids:?}"
     );
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+/// A build without the plugin subsystem must say so, not pretend. An empty
+/// `plugin.list` would read as "nothing installed", which is a different fact
+/// from "this binary cannot load plugins at all".
+#[cfg(not(feature = "plugins"))]
+#[tokio::test]
+async fn plugin_rpcs_report_plugins_disabled_when_compiled_out() {
+    let (_server, sock, _dir, handle) = start_server().await;
+
+    for (method, params) in [
+        ("plugin.list", "{}"),
+        (
+            "plugin.install",
+            r#"{"name":"x","version":"1.0.0","download_url":"file:///dev/null"}"#,
+        ),
+        ("plugin.uninstall", r#"{"name":"x"}"#),
+        ("plugin.enable", r#"{"name":"x"}"#),
+        ("plugin.disable", r#"{"name":"x"}"#),
+    ] {
+        let resp = rpc_call(
+            &sock,
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"{method}","id":1,"params":{params}}}"#
+            ),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["error"]["code"], codes::PLUGINS_DISABLED,
+            "{method} should report the subsystem as unavailable: {v}"
+        );
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("compiled-out"),
+            "{method} should say why: {v}"
+        );
+    }
 
     _server.shutdown_token().cancel();
     let _ = handle.await;

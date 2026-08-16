@@ -1,6 +1,10 @@
 # Rust build output
 target/
 
+# Ahead-of-time compiled plugin components (crates/wasm-host writes these
+# beside each installed plugin; they are reproducible from the .wasm)
+.aot/
+
 # Reference source copies
 3rds/
 

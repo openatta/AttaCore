@@ -494,6 +494,59 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rule(source: base::permission::RuleSource, tool: &str) -> PermissionRule {
+        PermissionRule {
+            source,
+            behavior: base::permission::RuleBehavior::Allow,
+            tool_name: tool.into(),
+            rule_content: None,
+        }
+    }
+
+    /// Unloading a plugin must take its rules with it — `RuleSource::Plugin`
+    /// exists so that removal is a single call rather than a diff against
+    /// whatever the plugin happened to add.
+    #[test]
+    fn plugin_rules_are_removable_as_a_batch_without_touching_others() {
+        let gate = PermissionGate::new(RuleSet::new(vec![rule(
+            base::permission::RuleSource::UserSettings,
+            "Read",
+        )]));
+        gate.add_rules(vec![
+            rule(base::permission::RuleSource::Plugin, "Grep"),
+            rule(base::permission::RuleSource::Plugin, "Glob"),
+        ]);
+        assert_eq!(gate.rules().len(), 3);
+
+        gate.remove_rules_by_source(base::permission::RuleSource::Plugin);
+
+        let remaining = gate.rules();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tool_name, "Read");
+    }
+
+    /// A plugin is third-party content pulled off the network; its rules must
+    /// never outrank the user's own settings or the org's managed policy.
+    #[test]
+    fn plugin_source_has_the_lowest_priority() {
+        use base::permission::RuleSource;
+        let plugin = RuleSource::Plugin.priority();
+        for higher in [
+            RuleSource::PolicySettings,
+            RuleSource::UserSettings,
+            RuleSource::ProjectSettings,
+            RuleSource::LocalSettings,
+            RuleSource::Command,
+            RuleSource::Session,
+            RuleSource::CliArg,
+        ] {
+            assert!(
+                plugin < higher.priority(),
+                "plugin must rank below {higher:?}"
+            );
+        }
+    }
+
     /// 一个可配置的 fake tool，用来覆盖 gate 各分支。
     struct FakeTool {
         name: &'static str,

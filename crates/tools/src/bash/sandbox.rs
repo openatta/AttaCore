@@ -15,13 +15,11 @@
 //!
 //! 受 `EngineConfig::dangerously_disable_sandbox` 控制；为 true 直跑无沙盒。
 //!
-//! `SandboxPolicy`（含 `network_mode`/`allowed_domains`）目前只从
-//! `bash.rs::to_sandbox_policy()` 转换 `ToolContext.sandbox` 得到——而
-//! `ToolContext.sandbox` 本身在所有构造点都还是 `Default::default()`（没有
-//! settings.json → EngineConfig → ToolContext 这一段的接线），所以在真实
-//! settings.json 里配置 `sandbox.network_mode` 目前还不会生效。这个模块内的
-//! 逻辑（profile 生成）是完整、经测试的；缺的是更上游的配置读取，不在本次
-//! 改动范围内。
+//! `SandboxPolicy`（含 `network_mode`/`allowed_domains`）由
+//! `bash.rs::to_sandbox_policy()` 从 `ToolContext.sandbox` 转换而来，后者由
+//! `runtime::turn` 从 `EngineConfig::sandbox_policy` 填充，而那一层又来自
+//! `settings.sandbox`。这条链路有回归测试兜底（见
+//! `base::context::config` 与 `runtime::turn` 各自的 sandbox 用例）。
 //!
 //! # 已知沙盒逃逸风险
 //!

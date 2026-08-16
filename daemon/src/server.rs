@@ -334,6 +334,12 @@ impl DaemonServer {
                 id,
                 serde_json::json!({"commands": self.pool.list_commands().await}),
             ),
+            "plugin.list" if !self.plugins_enabled() => self.plugins_disabled(id),
+            "plugin.install" | "plugin.uninstall" | "plugin.enable" | "plugin.disable"
+                if !self.plugins_enabled() =>
+            {
+                self.plugins_disabled(id)
+            }
             "plugin.list" => RpcResponse::ok(
                 id,
                 serde_json::json!({"plugins": self.pool.list_plugins().await}),
@@ -513,6 +519,25 @@ impl DaemonServer {
     /// `plugin::cli::PluginCommands::install_source`). Verifies the
     /// checksum before extracting; a network (`http(s)://`) source without
     /// a `checksum` is rejected outright.
+    /// Is the plugin subsystem present and switched on? When it isn't, the
+    /// `plugin.*` methods answer `PLUGINS_DISABLED` rather than pretending
+    /// (an empty `plugin.list` would read as "nothing installed", which is a
+    /// different fact from "this build has no plugin support").
+    fn plugins_enabled(&self) -> bool {
+        self.pool.plugin_status() == crate::plugins::PluginStatus::Enabled
+    }
+
+    fn plugins_disabled(&self, id: serde_json::Value) -> RpcResponse {
+        RpcResponse::err(
+            id,
+            codes::PLUGINS_DISABLED,
+            format!(
+                "plugin subsystem unavailable ({})",
+                self.pool.plugin_status().as_str()
+            ),
+        )
+    }
+
     async fn method_plugin_install(
         &self,
         id: serde_json::Value,

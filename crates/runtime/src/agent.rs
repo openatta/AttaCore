@@ -883,16 +883,20 @@ pub struct Builder {
     /// `FrozenContext::collect()`. Essential for deterministic VCR replay.
     frozen: Option<base::frozen::FrozenContext>,
     wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
-    /// Plugins available to this session (built-ins + installed, discovered
-    /// once per daemon instance — see `plugin::discover_plugins`). `None`
-    /// (the default) means no plugins are wired in, matching prior
-    /// behavior for non-daemon callers (tests, single-process CLI mode).
-    plugins: Option<Arc<Vec<plugin::manifest::Plugin>>>,
+    /// Everything installed plugins contribute to this session — see
+    /// [`crate::plugin_host::PluginHost`]. `None` (the default) means no
+    /// plugins, which is also what a build with the plugin subsystem
+    /// compiled out always sees.
+    plugin_host: Option<Arc<dyn crate::plugin_host::PluginHost>>,
     /// Pre-built command registry shared across many sessions instead of
     /// re-scanning skill dirs per session — see `Builder::commands_override`.
     commands_override: Option<Arc<crate::commands::CommandRegistry>>,
     /// Multi-provider per-task-type model routing — see `Builder::task_router`.
     task_router: Option<Arc<base::provider::TaskRouter>>,
+    /// Every scene this host registered, so an agent type's `scene:` id can
+    /// name one beyond the built-in four (plugin scenes, in particular) —
+    /// see `crate::agent_tool::AgentTool::set_scene_registry`.
+    scene_registry: Option<Arc<scene::scene::SceneRegistry>>,
     /// Pool-level shared agent-type catalog — see
     /// `crate::agent_tool::SharedAgentTypeCatalog`. When set, the session's
     /// `AgentTool` attaches to it (`AgentTool::with_shared_agent_types`)
@@ -988,7 +992,6 @@ fn build_hook_runner(
     settings: &Settings,
     model: Arc<dyn Model>,
     agent_tool: Arc<crate::agent_tool::AgentTool>,
-    plugins: &[plugin::manifest::Plugin],
 ) -> Arc<HookRunner> {
     let parsed: hooks::HooksSettings = match &settings.hooks_config {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
@@ -1014,19 +1017,10 @@ fn build_hook_runner(
         agent_spawner,
         settings.paths.project_root(),
     ));
-    let mut runner = HookRunner::new(parsed)
+    let runner = HookRunner::new(parsed)
         .with_hooks_search_dirs(hooks_search_dirs)
         .with_prompt_executor(prompt_executor)
         .with_agent_executor(agent_executor);
-    for plugin in plugins {
-        if let Err(e) = plugin.install_hooks(&mut runner, &plugin.root) {
-            tracing::warn!(
-                plugin = %plugin.manifest.plugin.name,
-                error = %e,
-                "failed to install plugin hooks, skipping"
-            );
-        }
-    }
     Arc::new(runner)
 }
 
@@ -1051,9 +1045,10 @@ impl Builder {
             skip_warmup: false,
             frozen: None,
             wake_rx: None,
-            plugins: None,
+            plugin_host: None,
             commands_override: None,
             task_router: None,
+            scene_registry: None,
             shared_agent_types: None,
             skill_catalog: None,
             agent_depth: 0,
@@ -1182,8 +1177,8 @@ impl Builder {
     /// slash commands are *not* installed from this list — see
     /// `commands_override` — since daemon builds one shared command
     /// registry up front instead of per session.
-    pub fn plugins(mut self, p: Arc<Vec<plugin::manifest::Plugin>>) -> Self {
-        self.plugins = Some(p);
+    pub fn plugin_host(mut self, h: Arc<dyn crate::plugin_host::PluginHost>) -> Self {
+        self.plugin_host = Some(h);
         self
     }
 
@@ -1205,6 +1200,15 @@ impl Builder {
     /// behavior exactly — sub-agents always use the parent's model.
     pub fn task_router(mut self, r: Arc<base::provider::TaskRouter>) -> Self {
         self.task_router = Some(r);
+        self
+    }
+
+    /// Let an agent type's `scene:` id resolve against every scene this host
+    /// registered, not just the built-in four. Without it a `plugin:<name>`
+    /// scene is unresolvable and the sub-agent silently inherits its parent's
+    /// scene instead.
+    pub fn scene_registry(mut self, r: Arc<scene::scene::SceneRegistry>) -> Self {
+        self.scene_registry = Some(r);
         self
     }
 
@@ -1373,25 +1377,11 @@ impl Builder {
         let compactor = self
             .compactor
             .unwrap_or_else(|| Arc::new(DefaultCompactor) as Arc<dyn Compactor>);
-        // Plugins wired into this session — see `Builder::plugins` doc
-        // comment. Cheap `Arc` clone; empty by default for non-daemon
-        // callers.
-        let plugins: Arc<Vec<plugin::manifest::Plugin>> = self.plugins.clone().unwrap_or_default();
-        // Plugin-declared agent types, converted to the runtime's
-        // `AgentTypeDefinition` (reads each plugin's `system_prompt_path`
-        // relative to its own root — see `agent_tool::agent_def_to_type`).
-        // A plugin whose prompt file can't be read (e.g. a built-in
-        // plugin's synthetic `(builtin:...)` root) is skipped with a
-        // warning rather than failing the whole build.
-        let plugin_agent_types: Vec<crate::agent_tool::AgentTypeDefinition> = plugins
-            .iter()
-            .flat_map(|p| {
-                p.manifest
-                    .agents
-                    .iter()
-                    .filter_map(move |def| crate::agent_tool::agent_def_to_type(def, &p.root))
-            })
-            .collect();
+        let plugin_agent_types: Vec<crate::agent_tool::AgentTypeDefinition> = self
+            .plugin_host
+            .as_ref()
+            .map(|h| h.agent_types())
+            .unwrap_or_default();
         // AgentTool ("Agent") — lets the model spawn sub-agents. Previously
         // had zero production construction sites despite the CodingScene
         // system prompt instructing the model to use it (see
@@ -1454,7 +1444,7 @@ impl Builder {
             Arc::new(agent_tool)
         };
         let hooks = self.hooks.unwrap_or_else(|| {
-            build_hook_runner(&settings, model.clone(), agent_tool_arc.clone(), &plugins)
+            build_hook_runner(&settings, model.clone(), agent_tool_arc.clone())
         });
         // P2: Wire the wake receiver into hooks for async rewake support.
         if let Some(rx) = self.wake_rx {
@@ -1849,6 +1839,9 @@ impl Builder {
         agent_tool_arc.set_parent_permission(permission.clone());
         agent_tool_arc.set_parent_pending_permissions(pending_permissions.clone());
         agent_tool_arc.set_scene(scene.clone());
+        if let Some(registry) = self.scene_registry.clone() {
+            agent_tool_arc.set_scene_registry(registry);
+        }
         agent_tool_arc.set_instruction_file(instruction_file.clone());
         if let Some(store) = self.history_store.clone() {
             agent_tool_arc.set_history_store(store);
@@ -3894,7 +3887,7 @@ mod tests {
     fn build_hook_runner_defaults_to_empty_without_hooks_config() {
         let settings = test_settings();
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[]);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool());
         assert!(runner.is_empty());
     }
 
@@ -3907,7 +3900,7 @@ mod tests {
             ]
         }));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[]);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool());
         assert!(!runner.is_empty());
         assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
     }
@@ -3918,34 +3911,8 @@ mod tests {
         // Wrong shape: hooks value must be a map of event -> Vec<HookConfig>.
         settings.hooks_config = Some(serde_json::json!("not-a-hooks-map"));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[]);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool());
         assert!(runner.is_empty());
-    }
-
-    #[test]
-    fn build_hook_runner_installs_plugin_hooks() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("plugin.toml"),
-            r#"
-[plugin]
-name = "test-hook-plugin"
-version = "1.0.0"
-
-[hooks]
-pre_tool_use = "hooks/pre.sh"
-"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
-        std::fs::write(dir.path().join("hooks/pre.sh"), "echo plugin-hook").unwrap();
-        let plugin =
-            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
-
-        let settings = test_settings();
-        let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), &[plugin]);
-        assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
     }
 
     /// Regression: `hooks::watcher::FileWatcher` was fully implemented

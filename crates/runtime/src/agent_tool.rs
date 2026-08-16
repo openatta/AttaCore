@@ -44,11 +44,40 @@ use tools::worktree::create_worktree;
 // Agent type registry
 // ═══════════════════════════════════════════════════════════
 
+/// Where an [`AgentTypeDefinition`] came from, which decides whether its
+/// `permission_mode` / `max_turns` are honored as written or clamped.
+///
+/// A definition can loosen the session it spawns into: `permission_mode`
+/// overwrites the parent's mode, and `max_turns` overwrites the API-call cap.
+/// That is the user's prerogative for a file they wrote themselves. It is not
+/// something a package downloaded from a marketplace gets to do — see
+/// [`apply_agent_type_overrides`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentTypeSource {
+    /// Shipped with AttaCore.
+    #[default]
+    Builtin,
+    /// Loaded from an `agents/` directory the user controls.
+    LocalFile,
+    /// Declared by an installed plugin.
+    Plugin,
+}
+
+impl AgentTypeSource {
+    /// May a definition from this source hand its sub-agent *more* than the
+    /// session it was spawned from already had?
+    fn may_loosen(self) -> bool {
+        !matches!(self, Self::Plugin)
+    }
+}
+
 /// A named agent type definition with associated system prompt and tool set.
 #[derive(Debug, Clone, Default)]
 pub struct AgentTypeDefinition {
     /// Unique name (e.g. "explore", "plan", "code-reviewer").
     pub name: String,
+    /// Provenance, for the override clamp — see [`AgentTypeSource`].
+    pub source: AgentTypeSource,
     /// Short description of the agent type's purpose.
     pub description: String,
     /// Tool names the agent type is allowed to use (empty = all tools).
@@ -312,40 +341,6 @@ impl SharedAgentTypeCatalog {
     }
 }
 
-/// Convert a plugin-declared [`plugin::manifest::AgentDef`] into a runtime
-/// [`AgentTypeDefinition`], reading its system prompt file relative to the
-/// plugin's root.
-///
-/// Returns `None` (with a `tracing::warn!`) if the prompt file can't be
-/// read — e.g. a built-in plugin's synthetic `(builtin:...)` root, or a disk
-/// plugin whose declared path doesn't exist — so one bad plugin definition
-/// doesn't break agent type resolution for everyone else.
-pub fn agent_def_to_type(
-    def: &plugin::manifest::AgentDef,
-    plugin_root: &Path,
-) -> Option<AgentTypeDefinition> {
-    let prompt_path = plugin_root.join(&def.system_prompt_path);
-    match std::fs::read_to_string(&prompt_path) {
-        Ok(system_prompt) => Some(AgentTypeDefinition {
-            name: def.name.clone(),
-            description: def.description.clone(),
-            allowed_tools: def.allowed_tools.clone(),
-            model: def.model.clone(),
-            system_prompt,
-            ..Default::default()
-        }),
-        Err(e) => {
-            tracing::warn!(
-                agent = %def.name,
-                path = %prompt_path.display(),
-                error = %e,
-                "plugin agent type: failed to read system prompt, skipping"
-            );
-            None
-        }
-    }
-}
-
 /// Render the one-line-per-type catalog injected into `AgentTool::description()`
 /// so the model can see what `subagent_type` values are actually available
 /// (built-in + any custom types loaded from `.atta/agents/`) without a
@@ -369,7 +364,10 @@ fn describe_agent_types(
 
 /// Parse a single agent type definition from a markdown file with YAML
 /// frontmatter. Returns `None` if the file lacks a valid `description`.
-fn parse_permission_mode(value: &str) -> Option<base::interface::settings::PermissionMode> {
+/// Parse the textual `permission_mode` an agent-type declaration carries —
+/// agent `.md` frontmatter and plugin manifests both spell it as a string.
+/// `auto`/`bubble` are program-only and deliberately unparseable here.
+pub fn parse_permission_mode(value: &str) -> Option<base::interface::settings::PermissionMode> {
     use base::interface::settings::PermissionMode;
     match value {
         "default" => Some(PermissionMode::Default),
@@ -464,6 +462,7 @@ fn parse_agent_type_file(content: &str, path: &Path) -> Option<AgentTypeDefiniti
 
     Some(AgentTypeDefinition {
         name,
+        source: AgentTypeSource::LocalFile,
         description,
         allowed_tools,
         disallowed_tools,
@@ -478,15 +477,15 @@ fn parse_agent_type_file(content: &str, path: &Path) -> Option<AgentTypeDefiniti
     })
 }
 
-/// Resolve a scene id to a built-in scene instance.
+/// Resolve a scene id against the built-in set.
 ///
-/// Deliberately the same closed set as the daemon's `resolve_scene()` (see
-/// `daemon/src/main.rs`) — this is how a sub-agent recovers its parent's
-/// scene when no explicit `Arc<dyn AgentScene>` was wired in (the daemon
-/// sets `Settings.paths.scope` to `scene.id()`, so the scope *is* the scene
-/// id there). Unknown ids return `None` so the caller can fall back rather
-/// than guessing.
-fn scene_by_id(id: &str) -> Option<Arc<dyn AgentScene>> {
+/// The fallback for callers that never wired a `SceneRegistry` — see
+/// `Inner::scene_registry` and `Inner::resolve_scene_id`. This is also how a
+/// sub-agent recovers its parent's scene when no explicit
+/// `Arc<dyn AgentScene>` was wired in (the daemon sets `Settings.paths.scope`
+/// to `scene.id()`, so the scope *is* the scene id there). Unknown ids return
+/// `None` so the caller can fall back rather than guessing.
+fn builtin_scene_by_id(id: &str) -> Option<Arc<dyn AgentScene>> {
     match id {
         "coding" => Some(Arc::new(scene::scene::coding::CodingScene)),
         "chat" => Some(Arc::new(scene::scene::chat::ChatScene)),
@@ -927,15 +926,61 @@ fn effort_to_thinking_mode(effort: &str) -> Option<ThinkingMode> {
     }
 }
 
+/// How much a permission mode restrains the agent. Higher restrains more.
+///
+/// There is no natural ordering on `PermissionMode` — the variants describe
+/// different policies, not points on a scale — so this is a deliberate
+/// ranking, used for exactly one question: is the mode an agent type asks for
+/// at least as restrictive as the one it would otherwise inherit
+/// ([`apply_agent_type_overrides`])? Ties are fine; only a strict decrease is
+/// refused.
+fn permission_restraint(mode: base::interface::settings::PermissionMode) -> u8 {
+    use base::interface::settings::PermissionMode as M;
+    match mode {
+        M::Plan => 100,
+        M::DontAsk => 90,
+        M::Bubble => 60,
+        M::Default => 50,
+        M::Auto => 40,
+        M::AcceptEdits => 30,
+        M::Yolo => 20,
+        M::BypassPermissions => 10,
+    }
+}
+
 /// Apply an `AgentTypeDefinition`'s `permission_mode`/`effort`/`max_turns`
 /// overrides to an already-built subagent `Settings`, in place. Called after
 /// `sub_settings()`/the inline equivalent in `run_sub_inner` — kept as a
 /// separate step (not folded into `settings_from_parent`) so it applies
 /// identically regardless of which of the two settings-construction paths
 /// built the base `Settings`.
+///
+/// Overrides from a plugin-declared type are **clamped**: the mode may only
+/// hold or increase [`permission_restraint`], and the API-call cap may only
+/// hold or decrease. An agent type is a plain data declaration, and once
+/// plugins can ship one it arrives over the network — a package naming
+/// `permission_mode = "bypassPermissions"` would otherwise switch the
+/// permission gate off for everything its sub-agent does, and `max_turns =
+/// 10000` would spend the user's tokens at a rate they never agreed to.
+///
+/// Types the user controls keep the unclamped behavior: overriding your own
+/// session is the point of writing the file. `ExecutionParams`'s
+/// `max_api_calls_per_turn` documents the same "one side must not silently
+/// widen the other" rule for scenes; this brings agent types in line.
 fn apply_agent_type_overrides(settings: &mut Settings, def: &AgentTypeDefinition) {
     if let Some(mode) = def.permission_mode {
-        settings.permission_mode = mode;
+        if def.source.may_loosen()
+            || permission_restraint(mode) >= permission_restraint(settings.permission_mode)
+        {
+            settings.permission_mode = mode;
+        } else {
+            tracing::warn!(
+                agent_type = %def.name,
+                requested = ?mode,
+                inherited = ?settings.permission_mode,
+                "plugin-declared agent type asked for a looser permission mode; keeping the inherited one"
+            );
+        }
     }
     if let Some(effort) = &def.effort {
         if let Some(mode) = effort_to_thinking_mode(effort) {
@@ -945,7 +990,11 @@ fn apply_agent_type_overrides(settings: &mut Settings, def: &AgentTypeDefinition
         }
     }
     if let Some(max_turns) = def.max_turns {
-        settings.execution.max_api_calls_per_turn = max_turns;
+        settings.execution.max_api_calls_per_turn = if def.source.may_loosen() {
+            max_turns
+        } else {
+            max_turns.min(settings.execution.max_api_calls_per_turn)
+        };
     }
 }
 
@@ -1246,9 +1295,16 @@ struct Inner {
     /// The parent agent's scene. Sub-agents inherit it (S-5) rather than
     /// always being built as `CodingScene` — a Research-scene parent used to
     /// hand its sub-agents a programming-shop system prompt. `None` falls
-    /// back to resolving `Settings.paths.scope` via `scene_by_id`, then to
+    /// back to resolving `Settings.paths.scope` via `resolve_scene_id`, then to
     /// `CodingScene`.
     parent_scene: Arc<std::sync::RwLock<Option<Arc<dyn AgentScene>>>>,
+    /// Every scene this process knows about, for resolving an agent type's
+    /// `scene:` id. `None` falls back to [`builtin_scene_by_id`], which is
+    /// what an embedder that never wires a registry (tests, library callers)
+    /// gets — the built-in four, exactly as before. A host that registers
+    /// scenes beyond those (the daemon, which also registers plugin scenes)
+    /// wires its registry here so those ids resolve too.
+    scene_registry: Arc<std::sync::RwLock<Option<Arc<scene::scene::SceneRegistry>>>>,
     /// The parent's resolved instruction file (AGENTS.md / CLAUDE.md), for
     /// the case where it came from `Builder::instruction_file(..)` and so
     /// isn't visible in `Settings` — see `settings_from_parent`.
@@ -1418,7 +1474,7 @@ impl Inner {
     ) -> Arc<dyn AgentScene> {
         let parent = self.parent_scene.read().unwrap().clone();
         if let Some(name) = def.and_then(|d| d.scene.as_deref()) {
-            match scene_by_id(name) {
+            match self.resolve_scene_id(name) {
                 Some(requested) => {
                     // An agent type may *narrow* the scene, never widen it
                     // (N-17).
@@ -1462,8 +1518,20 @@ impl Inner {
         if let Some(parent) = parent {
             return parent;
         }
-        scene_by_id(&settings.paths.scope)
+        self.resolve_scene_id(&settings.paths.scope)
             .unwrap_or_else(|| Arc::new(scene::scene::coding::CodingScene))
+    }
+
+    /// A scene id resolved against the host's registry when one was wired,
+    /// otherwise against the built-in set. Plugin scenes (`plugin:<name>`)
+    /// only exist in the registry, so without this an agent type naming one
+    /// would silently fall through to "unrecognized scene" and inherit the
+    /// parent's instead.
+    fn resolve_scene_id(&self, id: &str) -> Option<Arc<dyn AgentScene>> {
+        if let Some(registry) = self.scene_registry.read().unwrap().as_ref() {
+            return registry.resolve(id);
+        }
+        builtin_scene_by_id(id)
     }
 }
 
@@ -1696,6 +1764,7 @@ impl AgentTool {
                 parent_permission: Arc::new(std::sync::RwLock::new(None)),
                 parent_pending_permissions: Arc::new(std::sync::RwLock::new(None)),
                 parent_scene: Arc::new(std::sync::RwLock::new(None)),
+                scene_registry: Arc::new(std::sync::RwLock::new(None)),
                 instruction_file: Arc::new(std::sync::RwLock::new(None)),
                 parent_session_id: Arc::new(std::sync::RwLock::new(None)),
                 telemetry_handle: Arc::new(std::sync::RwLock::new(None)),
@@ -1756,6 +1825,7 @@ impl AgentTool {
                 parent_permission: Arc::new(std::sync::RwLock::new(None)),
                 parent_pending_permissions: Arc::new(std::sync::RwLock::new(None)),
                 parent_scene: Arc::new(std::sync::RwLock::new(None)),
+                scene_registry: Arc::new(std::sync::RwLock::new(None)),
                 instruction_file: Arc::new(std::sync::RwLock::new(None)),
                 parent_session_id: Arc::new(std::sync::RwLock::new(None)),
                 telemetry_handle: Arc::new(std::sync::RwLock::new(None)),
@@ -1916,6 +1986,12 @@ impl AgentTool {
     /// `Inner::parent_scene`.
     pub fn set_scene(&self, scene: Arc<dyn AgentScene>) {
         *self.inner.parent_scene.write().unwrap() = Some(scene);
+    }
+
+    /// Let an agent type's `scene:` id resolve against every scene the host
+    /// registered, not just the built-in four — see `Inner::scene_registry`.
+    pub fn set_scene_registry(&self, registry: Arc<scene::scene::SceneRegistry>) {
+        *self.inner.scene_registry.write().unwrap() = Some(registry);
     }
 
     /// Let sub-agents inherit an instruction file that the parent got from
@@ -3584,58 +3660,6 @@ mod catalog_tests {
     }
 
     #[test]
-    fn agent_def_to_type_returns_none_when_prompt_file_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-def-missing-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let def = plugin::manifest::AgentDef {
-            name: "ghost".into(),
-            description: "A ghost agent".into(),
-            system_prompt_path: std::path::PathBuf::from("does-not-exist.md"),
-            allowed_tools: vec![],
-            model: None,
-        };
-        let result = agent_def_to_type(&def, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn agent_def_to_type_reads_system_prompt_from_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-def-ok-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("prompt.md"), "You are a specialized plugin agent.").unwrap();
-        let def = plugin::manifest::AgentDef {
-            name: "plugin-agent".into(),
-            description: "A plugin-declared agent".into(),
-            system_prompt_path: std::path::PathBuf::from("prompt.md"),
-            allowed_tools: vec!["Read".into()],
-            model: Some("claude-opus-4-8".into()),
-        };
-        let result = agent_def_to_type(&def, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
-        let def_out = result.expect("prompt file should be read successfully");
-        assert_eq!(def_out.name, "plugin-agent");
-        assert_eq!(def_out.description, "A plugin-declared agent");
-        assert_eq!(def_out.system_prompt, "You are a specialized plugin agent.");
-        assert_eq!(def_out.allowed_tools, vec!["Read"]);
-        assert_eq!(def_out.model.as_deref(), Some("claude-opus-4-8"));
-    }
-
-    #[test]
     fn describe_agent_types_lists_every_type_sorted_by_name() {
         let merged = merge_agent_types(&[], &[]);
         let text = describe_agent_types(&merged);
@@ -4025,6 +4049,95 @@ mod catalog_tests {
             settings.execution.max_api_calls_per_turn,
             original_max_calls
         );
+    }
+
+    /// A plugin ships over the network. Letting its agent type name
+    /// `bypassPermissions` would switch the permission gate off for
+    /// everything that sub-agent does, and a huge `max_turns` would spend the
+    /// user's tokens at a rate they never agreed to.
+    #[test]
+    fn plugin_agent_type_cannot_loosen_permissions_or_raise_the_call_cap() {
+        use base::interface::settings::PermissionMode as M;
+        let def = AgentTypeDefinition {
+            name: "greedy".into(),
+            source: AgentTypeSource::Plugin,
+            description: "d".into(),
+            permission_mode: Some(M::BypassPermissions),
+            max_turns: Some(10_000),
+            ..Default::default()
+        };
+        let mut settings = Settings::defaults_for("test-model");
+        settings.permission_mode = M::Default;
+        settings.execution.max_api_calls_per_turn = 25;
+
+        apply_agent_type_overrides(&mut settings, &def);
+
+        assert_eq!(
+            settings.permission_mode,
+            M::Default,
+            "a plugin must not be able to switch the permission gate off"
+        );
+        assert_eq!(
+            settings.execution.max_api_calls_per_turn, 25,
+            "a plugin must not be able to raise the API-call cap"
+        );
+    }
+
+    /// The clamp is one-directional: a plugin restraining its own sub-agent
+    /// more than the session does is exactly what a well-behaved plugin
+    /// should be able to declare.
+    #[test]
+    fn plugin_agent_type_may_still_tighten() {
+        use base::interface::settings::PermissionMode as M;
+        let def = AgentTypeDefinition {
+            name: "careful".into(),
+            source: AgentTypeSource::Plugin,
+            description: "d".into(),
+            permission_mode: Some(M::Plan),
+            max_turns: Some(5),
+            ..Default::default()
+        };
+        let mut settings = Settings::defaults_for("test-model");
+        settings.permission_mode = M::AcceptEdits;
+        settings.execution.max_api_calls_per_turn = 25;
+
+        apply_agent_type_overrides(&mut settings, &def);
+
+        assert_eq!(settings.permission_mode, M::Plan);
+        assert_eq!(settings.execution.max_api_calls_per_turn, 5);
+    }
+
+    /// Overriding your own session is the point of writing the file, so a
+    /// type loaded from a directory the user controls keeps the unclamped
+    /// behavior.
+    #[test]
+    fn local_agent_type_keeps_unclamped_override_behavior() {
+        use base::interface::settings::PermissionMode as M;
+        let def = AgentTypeDefinition {
+            name: "mine".into(),
+            source: AgentTypeSource::LocalFile,
+            description: "d".into(),
+            permission_mode: Some(M::BypassPermissions),
+            max_turns: Some(200),
+            ..Default::default()
+        };
+        let mut settings = Settings::defaults_for("test-model");
+        settings.permission_mode = M::Default;
+        settings.execution.max_api_calls_per_turn = 25;
+
+        apply_agent_type_overrides(&mut settings, &def);
+
+        assert_eq!(settings.permission_mode, M::BypassPermissions);
+        assert_eq!(settings.execution.max_api_calls_per_turn, 200);
+    }
+
+    #[test]
+    fn permission_restraint_orders_plan_above_default_above_bypass() {
+        use base::interface::settings::PermissionMode as M;
+        assert!(permission_restraint(M::Plan) > permission_restraint(M::Default));
+        assert!(permission_restraint(M::Default) > permission_restraint(M::AcceptEdits));
+        assert!(permission_restraint(M::AcceptEdits) > permission_restraint(M::BypassPermissions));
+        assert!(permission_restraint(M::DontAsk) > permission_restraint(M::Default));
     }
 
     #[test]
@@ -5760,6 +5873,90 @@ mod catalog_tests {
             "research",
             "an unknown scene id is ignored, not fatal — inherited scene is kept"
         );
+    }
+
+    /// A scene id that exists only in the host's registry — which is what
+    /// every `plugin:<name>` scene is — must resolve. Before the registry was
+    /// wired in, `scene_for_subagent` matched against a hardcoded list of the
+    /// four built-ins, so such an id hit the "unrecognized scene" branch and
+    /// the sub-agent silently inherited its parent's scene instead.
+    #[test]
+    fn agent_type_can_name_a_scene_that_only_the_registry_knows() {
+        let agent_tool = test_agent_tool();
+        let settings = Settings::defaults_for("test-model");
+        let named = AgentTypeDefinition {
+            name: "specialist".into(),
+            description: "d".into(),
+            scene: Some("plugin:demo".into()),
+            ..Default::default()
+        };
+
+        // Parent is Chat, so the requested scene must be no wider than Chat's
+        // tool surface for N-17 to admit it. Reusing ChatScene under a
+        // plugin-style id keeps this test about *resolution*, not about the
+        // narrowing rule the test above already covers.
+        let chat: Arc<dyn AgentScene> = Arc::new(scene::scene::chat::ChatScene);
+        agent_tool.set_scene(chat);
+
+        assert_eq!(
+            agent_tool
+                .inner
+                .scene_for_subagent(Some(&named), &settings)
+                .id(),
+            "chat",
+            "without a registry, a non-builtin id is unresolvable and the parent scene is kept"
+        );
+
+        let mut registry = scene::scene::SceneRegistry::new();
+        registry.register_builtin();
+        registry.register(Arc::new(AliasScene {
+            id: "plugin:demo",
+            inner: Arc::new(scene::scene::chat::ChatScene),
+        }));
+        agent_tool.set_scene_registry(Arc::new(registry));
+
+        assert_eq!(
+            agent_tool
+                .inner
+                .scene_for_subagent(Some(&named), &settings)
+                .id(),
+            "plugin:demo",
+            "a registry-only scene id must resolve once the registry is wired in"
+        );
+    }
+
+    /// A scene that borrows another's behavior under a different id — stands
+    /// in for a plugin scene without depending on the plugin crate.
+    struct AliasScene {
+        id: &'static str,
+        inner: Arc<dyn AgentScene>,
+    }
+
+    impl AgentScene for AliasScene {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn name(&self) -> &str {
+            self.id
+        }
+        fn description(&self) -> &str {
+            "alias"
+        }
+        fn build_system_prompt(
+            &self,
+            ctx: &base::interface::scene::ScenePromptContext,
+        ) -> Vec<base::interface::prompt::PromptBlock> {
+            self.inner.build_system_prompt(ctx)
+        }
+        fn tools(&self) -> Vec<String> {
+            self.inner.tools()
+        }
+        fn token_budget(&self) -> base::interface::scene::TokenBudget {
+            self.inner.token_budget()
+        }
+        fn disallowed_tools(&self) -> Vec<String> {
+            self.inner.disallowed_tools()
+        }
     }
 
     /// With no explicit scene wired in, `Settings.paths.scope` (which the

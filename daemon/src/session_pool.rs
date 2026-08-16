@@ -108,42 +108,6 @@ pub enum ProjectSelector {
 /// inventing a new response envelope for it.
 pub type RpcError = (i32, String);
 
-/// The two plugin-tier root directories (plain `plugins/`, not
-/// `plugins/cache/` — see `plugin::cache` module docs) for this daemon
-/// instance's paths: global (shared across scenes) and scene (this
-/// daemon's `--scene`).
-fn plugin_tier_dirs(paths: &dyn crate::config::DaemonPaths) -> (PathBuf, PathBuf) {
-    (
-        paths.global_root().join("plugins"),
-        paths.config_root().join("plugins"),
-    )
-}
-
-/// Every plugin discovered on disk + built-ins, regardless of enable state
-/// — used by `plugin.list` so disabled plugins still show up (with
-/// `enabled: false`), not just the active set sessions actually use.
-fn discover_all_plugins(paths: &dyn crate::config::DaemonPaths) -> Vec<plugin::manifest::Plugin> {
-    let (global, scene) = plugin_tier_dirs(paths);
-    plugin::discover_plugins(&global, &scene)
-}
-
-/// Subset of `all` that's currently enabled (see `plugin::state`) — what
-/// actually gets wired into new sessions' hooks/MCP/commands/agent types.
-fn active_plugins(
-    paths: &dyn crate::config::DaemonPaths,
-    all: &[plugin::manifest::Plugin],
-) -> Vec<plugin::manifest::Plugin> {
-    let (global, scene) = plugin_tier_dirs(paths);
-    let global_state = plugin::state::EnableState::new(global);
-    let scene_state = plugin::state::EnableState::new(scene);
-    all.iter()
-        .filter(|p| {
-            plugin::state::resolve_enabled(&p.manifest.plugin.name, &global_state, &scene_state)
-        })
-        .cloned()
-        .collect()
-}
-
 /// Global → scene → project `agents/*.md` directories — same three tiers,
 /// same order, as `Builder::build()`'s own (now `SessionPool`-shared) copy of
 /// this computation; see `SessionPool::agent_type_catalog`.
@@ -155,77 +119,19 @@ fn agent_type_dirs(settings: &Settings) -> [std::path::PathBuf; 3] {
     ]
 }
 
-/// Plugin-declared agent types, converted to the runtime's
-/// `AgentTypeDefinition` — same conversion `Builder::build()` used to do
-/// per-session (see `runtime::agent_tool::agent_def_to_type`).
-fn plugin_agent_types(
-    plugins: &[plugin::manifest::Plugin],
-) -> Vec<runtime::agent_tool::AgentTypeDefinition> {
-    plugins
-        .iter()
-        .flat_map(|p| {
-            p.manifest
-                .agents
-                .iter()
-                .filter_map(move |def| runtime::agent_tool::agent_def_to_type(def, &p.root))
-        })
-        .collect()
-}
-
 /// Build the command catalog shared by every session: the 5 built-in local
 /// commands plus a live view of `skill_catalog` (via
-/// `CommandRegistry::from_skill_manager`), with each plugin's
-/// `slash_commands` merged on top. The skill half tracks the catalog, so a
-/// skill file added or deleted after daemon startup is reflected here — and
-/// in `commands.list` — without a rebuild; only the plugin half is a
-/// snapshot, refreshed by `refresh_plugins()`.
+/// `CommandRegistry::from_skill_manager`). The skill half tracks the catalog,
+/// so a skill file added or deleted after daemon startup is reflected here —
+/// and in `commands.list` — without a rebuild.
 fn build_shared_commands(
     skill_catalog: Arc<skills::manager::SkillManager>,
-    plugins: &[plugin::manifest::Plugin],
 ) -> Arc<runtime::commands::CommandRegistry> {
-    let mut registry = runtime::commands::CommandRegistry::from_skill_manager(skill_catalog);
-    for plugin in plugins {
-        plugin.install_slash_commands(&mut registry, &plugin.manifest.plugin.name, &plugin.root);
-    }
-    Arc::new(registry)
+    Arc::new(runtime::commands::CommandRegistry::from_skill_manager(
+        skill_catalog,
+    ))
 }
 
-/// MCP server configs declared by installed plugins (`plugin.toml`'s `[mcp]
-/// servers = [...]` entries), keyed the same way
-/// `Plugin::install_mcp_servers` would (`"{plugin_name}-mcp-{idx}"`) so they
-/// merge into `settings.mcp_servers` without colliding across plugins.
-/// Read-only JSON parsing — connecting is still done exactly once by the
-/// existing `connect_mcp_servers_in_background` flow (see
-/// `SessionPool::plugin_mcp_servers`), not duplicated here.
-fn plugin_mcp_server_configs(
-    plugins: &[plugin::manifest::Plugin],
-) -> HashMap<String, serde_json::Value> {
-    let mut out = HashMap::new();
-    for plugin in plugins {
-        for (idx, path) in plugin.mcp_server_paths.iter().enumerate() {
-            match std::fs::read_to_string(path) {
-                Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                    Ok(v) => {
-                        out.insert(format!("{}-mcp-{idx}", plugin.manifest.plugin.name), v);
-                    }
-                    Err(e) => tracing::warn!(
-                        plugin = %plugin.manifest.plugin.name,
-                        path = %path.display(),
-                        error = %e,
-                        "invalid plugin mcp server config json, skipping"
-                    ),
-                },
-                Err(e) => tracing::warn!(
-                    plugin = %plugin.manifest.plugin.name,
-                    path = %path.display(),
-                    error = %e,
-                    "failed to read plugin mcp server config, skipping"
-                ),
-            }
-        }
-    }
-    out
-}
 
 /// The first `LogEntry::Meta` line in `entries`, if any — every session
 /// history has at most one (see `create()`), always first when present, but
@@ -309,7 +215,7 @@ pub struct SessionPool {
     /// `scene.list` enumerates and `scene.activate` resolves new entries
     /// against. Immutable after construction (registering a scene is a
     /// compile-time fact); only *activation* is runtime state.
-    scene_registry: scene::scene::SceneRegistry,
+    scene_registry: Arc<scene::scene::SceneRegistry>,
     /// The **opt-out** permission instance: an allow-everything
     /// `Permission` handed to a session only when its effective permission
     /// mode is `bypassPermissions` (see `resolve_session_permission`).
@@ -354,15 +260,12 @@ pub struct SessionPool {
     /// `send()` returning `Err` just means "no subscribers right now", not
     /// a real error, so callers of `emit_event` ignore it.
     events_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    /// *Active* (enabled) plugins available to this daemon instance — see
-    /// `discover_all_plugins`/`active_plugins`. Hot-swappable like
-    /// `settings`/`mcp`: `refresh_plugins()` (called after
-    /// `plugin.install`/`uninstall`/`enable`/`disable`/`update`) updates
-    /// this for sessions created *after* the call; already-running sessions
-    /// keep whatever plugin set they were built with.
-    plugins: AsyncRwLock<Arc<Vec<plugin::manifest::Plugin>>>,
+    /// The plugin subsystem — see `crate::plugins`. Everything plugins
+    /// contribute arrives through it, and in a build without the `plugins`
+    /// feature it is a stub that contributes nothing.
+    plugins: crate::plugins::PluginSubsystem,
     /// Command catalog shared by every session — skill-derived + built-in
-    /// local commands + plugin-contributed slash commands, rebuilt by
+    /// local commands, rebuilt by
     /// `refresh_plugins()` instead of re-scanning skill dirs per session
     /// (see `build_shared_commands`). Backs the `commands.list` RPC
     /// directly and is injected into each new session via
@@ -563,21 +466,21 @@ impl SessionPool {
         };
         let (events_tx, _) = tokio::sync::broadcast::channel(256);
 
-        let all_plugins = discover_all_plugins(paths.as_ref());
-        let plugins = Arc::new(active_plugins(paths.as_ref(), &all_plugins));
+        let plugins = crate::plugins::PluginSubsystem::new(paths.clone(), true);
+        let plugin_agent_types = plugins.agent_types();
         // Built once for every session this pool ever creates — see the
         // `skill_catalog` field doc comment. `runtime::agent::Builder`'s own
         // fallback (used by tests / library embedding without a daemon)
         // does the equivalent scan per-session; a daemon shares one.
         let skill_catalog = Arc::new(runtime::agent::build_default_skill_manager(&settings));
-        let commands = build_shared_commands(skill_catalog.clone(), &plugins);
+        let commands = build_shared_commands(skill_catalog.clone());
 
         let agent_dirs = agent_type_dirs(&settings);
         let agent_dirs_ref: [&std::path::Path; 3] =
             [&agent_dirs[0], &agent_dirs[1], &agent_dirs[2]];
         let agent_type_catalog = runtime::agent_tool::SharedAgentTypeCatalog::build(
             &agent_dirs_ref,
-            &plugin_agent_types(&plugins),
+            &plugin_agent_types,
         );
 
         let tools = Arc::new(base::tool::InMemoryToolRegistry::new());
@@ -585,6 +488,7 @@ impl SessionPool {
 
         let mut scene_registry = scene::scene::SceneRegistry::new();
         scene_registry.register_builtin();
+        let scene_registry = Arc::new(scene_registry);
         let mut active_scenes = HashMap::new();
         active_scenes.insert(scene.id().to_string(), scene.clone());
 
@@ -609,7 +513,7 @@ impl SessionPool {
             paths,
             mcp_by_project: AsyncMutex::new(HashMap::new()),
             events_tx,
-            plugins: AsyncRwLock::new(plugins),
+            plugins,
             commands: AsyncRwLock::new(commands),
             task_router: AsyncRwLock::new(task_router),
             agent_type_catalog,
@@ -651,8 +555,8 @@ impl SessionPool {
         &self.cwd
     }
 
-    /// Full slash command catalog — built-in locals + skill-derived +
-    /// plugin-contributed (see `build_shared_commands`) — for the
+    /// Full slash command catalog — built-in locals + skill-derived
+    /// (see `build_shared_commands`) — for the
     /// `commands.list` RPC. Executing one is not a separate RPC: send
     /// `/name args` as the `message` of `session.run_turn`, which already
     /// intercepts and runs it (see `runtime::turn::process_turn`).
@@ -660,59 +564,36 @@ impl SessionPool {
         self.commands.read().await.list_detailed()
     }
 
-    /// MCP server configs declared by *active* installed plugins — see the
-    /// `plugin_mcp_server_configs` free function. Callers merge this into
-    /// `settings.mcp_servers` before the single startup
+    /// MCP server configs declared by *active* installed plugins. Callers
+    /// merge this into `settings.mcp_servers` before the single startup
     /// `connect_mcp_servers_in_background` call, so plugin-declared servers
     /// get the exact same centrally-connected/shared-across-sessions
     /// treatment as user-configured ones.
     pub async fn plugin_mcp_servers(&self) -> HashMap<String, serde_json::Value> {
-        plugin_mcp_server_configs(&self.plugins.read().await)
+        self.plugins.mcp_servers()
     }
 
-    /// List every installed plugin (built-in + disk, both tiers) with its
-    /// current enabled state — for the `plugin.list` RPC. Unlike
-    /// `self.plugins` (the active set wired into sessions), this includes
-    /// disabled plugins too, since a management UI needs to show and
-    /// re-enable them.
+    /// Whether this binary has the plugin subsystem, and whether it is on —
+    /// see `crate::plugins::PluginStatus`. `daemon.doctor` reports it, and
+    /// the `plugin.*` RPCs refuse with `PLUGINS_DISABLED` when it is not
+    /// `Enabled`.
+    pub fn plugin_status(&self) -> crate::plugins::PluginStatus {
+        self.plugins.status()
+    }
+
+    /// Every installed plugin with its current enable state — for the
+    /// `plugin.list` RPC. Includes disabled ones, since a management UI needs
+    /// to show and re-enable them.
     pub async fn list_plugins(&self) -> Vec<serde_json::Value> {
-        let all = discover_all_plugins(self.paths.as_ref());
-        let (global, scene) = plugin_tier_dirs(self.paths.as_ref());
-        let global_state = plugin::state::EnableState::new(global);
-        let scene_state = plugin::state::EnableState::new(scene);
-        all.iter()
-            .map(|p| {
-                let name = &p.manifest.plugin.name;
-                serde_json::json!({
-                    "name": name,
-                    "version": p.manifest.plugin.version,
-                    "description": p.manifest.plugin.description,
-                    "enabled": plugin::state::resolve_enabled(name, &global_state, &scene_state),
-                })
-            })
-            .collect()
+        self.plugins.list()
     }
 
-    /// Resolve `scope` ("global" or "scene") to its plugins-tier root
-    /// directory (plain `plugins/`, not `plugins/cache/`).
-    fn plugin_tier_root(&self, scope: &str) -> Result<PathBuf, String> {
-        let (global, scene) = plugin_tier_dirs(self.paths.as_ref());
-        match scope {
-            "global" => Ok(global),
-            "scene" => Ok(scene),
-            other => Err(format!(
-                "invalid scope '{other}' — expected 'global' or 'scene'"
-            )),
-        }
-    }
-
-    /// Install a plugin from an explicit source (no marketplace needed —
-    /// see `plugin::cli::PluginCommands::install_source`). `scope` picks
-    /// which tier's cache the plugin lands in ("global", the default a
-    /// caller should use unless it specifically wants a scene-only
-    /// install, or "scene"). Refreshes the active plugin/command set on
-    /// success so sessions created after this call see it — already-running
-    /// sessions are unaffected, same as `config.setProvider`/`mcp.addServer`.
+    /// Install a plugin from an explicit source. `scope` picks which tier's
+    /// cache it lands in ("global", the default a caller should use unless it
+    /// specifically wants a scene-only install, or "scene"). Refreshes the
+    /// active set on success so sessions created after this call see it —
+    /// already-running sessions are unaffected, same as
+    /// `config.setProvider`/`mcp.addServer`.
     pub async fn install_plugin(
         &self,
         name: &str,
@@ -721,84 +602,53 @@ impl SessionPool {
         checksum: Option<&str>,
         scope: &str,
     ) -> Result<serde_json::Value, String> {
-        let tier_root = self.plugin_tier_root(scope)?;
-        let cache = plugin::cache::PluginCache::new(tier_root.join("cache"));
-        let commands = plugin::cli::PluginCommands::new(cache, None);
-        let source = plugin::marketplace::PluginSource {
-            download_url: download_url.to_string(),
-            checksum: checksum.map(|s| s.to_string()),
-            version: version.to_string(),
-        };
-        let result = commands
-            .install_source(name, &source)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.refresh_plugins().await;
-        Ok(serde_json::json!({
-            "success": result.success,
-            "message": result.message,
-        }))
+        let out = self
+            .plugins
+            .install(name, version, download_url, checksum, scope)
+            .await?;
+        self.refresh_after_plugin_change().await;
+        Ok(out)
     }
 
     /// Uninstall a plugin (all versions, or a specific one) from `scope`'s
-    /// tier. Refreshes the active plugin/command set — see `install_plugin`.
+    /// tier — see `install_plugin` for the refresh semantics.
     pub async fn uninstall_plugin(
         &self,
         name: &str,
         version: Option<&str>,
         scope: &str,
     ) -> Result<serde_json::Value, String> {
-        let tier_root = self.plugin_tier_root(scope)?;
-        let cache = plugin::cache::PluginCache::new(tier_root.join("cache"));
-        let commands = plugin::cli::PluginCommands::new(cache, None);
-        let result = commands
-            .uninstall(name, version)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.refresh_plugins().await;
-        Ok(serde_json::json!({
-            "success": result.success,
-            "message": result.message,
-        }))
+        let out = self.plugins.uninstall(name, version, scope).await?;
+        self.refresh_after_plugin_change().await;
+        Ok(out)
     }
 
-    /// Enable or disable a plugin by name in `scope`'s tier (see
-    /// `plugin::state`). Refreshes the active plugin/command set — see
-    /// `install_plugin`.
+    /// Enable or disable a plugin by name in `scope`'s tier — see
+    /// `install_plugin` for the refresh semantics.
     pub async fn set_plugin_enabled(
         &self,
         name: &str,
         enabled: bool,
         scope: &str,
     ) -> Result<serde_json::Value, String> {
-        let tier_root = self.plugin_tier_root(scope)?;
-        let state = plugin::state::EnableState::new(tier_root);
-        state
-            .set_enabled(name, enabled)
-            .map_err(|e| e.to_string())?;
-        self.refresh_plugins().await;
-        Ok(serde_json::json!({"name": name, "enabled": enabled, "scope": scope}))
+        let out = self.plugins.set_enabled(name, enabled, scope).await?;
+        self.refresh_after_plugin_change().await;
+        Ok(out)
     }
 
-    /// Re-discover plugins from disk and rebuild the shared command
-    /// catalog — see the `plugins`/`commands` field doc comments for the
-    /// hot-swap semantics (new sessions only). Does not re-scan skill
-    /// directories: `self.skill_catalog` is the one persistent,
-    /// live-reloaded manager every session shares (see that field's doc
-    /// comment) — only the plugin-contributed slash commands layered on
-    /// top of it need rebuilding here.
-    async fn refresh_plugins(&self) {
-        let all = discover_all_plugins(self.paths.as_ref());
-        let plugins = Arc::new(active_plugins(self.paths.as_ref(), &all));
+    /// Re-merge whatever the plugin set now contributes into the pool-wide
+    /// catalogs. The subsystem has already re-read itself by this point; what
+    /// is left is the state this pool derives from it. Skill directories are
+    /// deliberately not re-scanned: `self.skill_catalog` is the one
+    /// persistent, live-reloaded manager every session shares.
+    async fn refresh_after_plugin_change(&self) {
         let settings = self.settings.read().await.clone();
-        let commands = build_shared_commands(self.skill_catalog.clone(), &plugins);
         let agent_dirs = agent_type_dirs(&settings);
         let agent_dirs_ref: [&std::path::Path; 3] =
             [&agent_dirs[0], &agent_dirs[1], &agent_dirs[2]];
         self.agent_type_catalog
-            .refresh(&agent_dirs_ref, &plugin_agent_types(&plugins));
-        *self.plugins.write().await = plugins;
-        *self.commands.write().await = commands;
+            .refresh(&agent_dirs_ref, &self.plugins.agent_types());
+        *self.commands.write().await = build_shared_commands(self.skill_catalog.clone());
     }
 
     /// Current MCP connection status for this pool's *default* project —
@@ -1164,6 +1014,7 @@ impl SessionPool {
             self.scene.id(),
             &settings,
             self.history_store.is_some(),
+            self.plugins.status(),
         )
     }
 
@@ -1577,7 +1428,6 @@ impl SessionPool {
             .permission(permission)
             .memory_store(self.memory_store.clone())
             .session_id(session_id.clone())
-            .plugins(self.plugins.read().await.clone())
             .commands_override(self.commands.read().await.clone())
             .shared_agent_types(self.agent_type_catalog.handle())
             .skill_catalog(self.skill_catalog.clone());
@@ -1586,6 +1436,10 @@ impl SessionPool {
         }
         if let Some(router) = self.task_router.read().await.clone() {
             builder = builder.task_router(router);
+        }
+        builder = builder.scene_registry(self.scene_registry.clone());
+        if let Some(host) = self.plugins.host() {
+            builder = builder.plugin_host(host);
         }
 
         // Give this session its own owned `McpManager` built from this
@@ -1706,7 +1560,7 @@ impl SessionPool {
                     resume_from: resume.then(|| session_id.clone()),
                     auth_modes: Vec::new(),
                     mcp_server_count,
-                    plugin_count: self.plugins.read().await.len(),
+                    plugin_count: self.plugins.count(),
                     skill_count: self.skill_catalog.list().len(),
                     output_format: "jsonrpc".to_string(),
                     started_at_ms: (time::OffsetDateTime::now_utc().unix_timestamp_nanos()

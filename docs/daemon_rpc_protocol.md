@@ -972,6 +972,7 @@ all     → 全部失效
 | -32013 | SCENE_CAPABILITY_MISSING | 场景不具备该能力(如对 `chat` 调 `team.*`) |
 | -32014 | SIDECHAIN_TERMINAL | 侧链会话已终态收尾,不可 resume |
 | -32015 | SESSION_BUSY | 该会话已有 turn 在跑(§5.3) |
+| -32016 | PLUGINS_DISABLED | 插件子系统不可用——被编译裁掉或被策略关闭(§9.2) |
 
 ### 9.1 `error.data` 的形状
 

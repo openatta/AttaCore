@@ -159,6 +159,10 @@ pub enum RuleSource {
     PolicySettings,
     /// 由命令展开时临时注入
     Command,
+    /// 由已安装插件贡献。优先级最低——插件是从网络装进来的第三方内容，
+    /// 不该盖过用户设置，更不该盖过组织策略。卸载插件时用
+    /// `PermissionGate::remove_rules_by_source` 整批撤销。
+    Plugin,
 }
 
 impl RuleSource {
@@ -172,6 +176,7 @@ impl RuleSource {
             Self::ProjectSettings => 30,
             Self::UserSettings => 20,
             Self::PolicySettings => 10,
+            Self::Plugin => 5,
         }
     }
 }

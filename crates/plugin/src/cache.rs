@@ -55,7 +55,14 @@ impl PluginCache {
         dir.join("plugin.toml").is_file()
     }
 
-    /// List cached versions of a plugin.
+    /// Cached versions of a plugin, newest first.
+    ///
+    /// Ordered by semver, not by string: lexicographically `0.10.0` sorts
+    /// *before* `0.9.0`, so a plugin with both installed would resolve to the
+    /// older one. Directory names that don't parse as semver sort last (among
+    /// themselves lexicographically) rather than being dropped — an
+    /// unparseable name still names a real installed directory, and silently
+    /// hiding it would make `plugin.list` disagree with the filesystem.
     pub fn list_versions(&self, name: &str) -> Vec<String> {
         let dir = self.root.join(name);
         if !dir.is_dir() {
@@ -74,9 +81,14 @@ impl PluginCache {
                 }
             }
         }
-        versions.sort();
-        // Sort by version string (simple lexicographic)
-        versions.reverse();
+        versions.sort_by(|a, b| {
+            match (semver::Version::parse(a), semver::Version::parse(b)) {
+                (Ok(a), Ok(b)) => b.cmp(&a),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.cmp(b),
+            }
+        });
         versions
     }
 
@@ -156,6 +168,44 @@ impl PluginCache {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn cache_with_versions(tmp: &TempDir, name: &str, versions: &[&str]) -> PluginCache {
+        let cache = PluginCache::new(tmp.path().join("plugins").join("cache"));
+        for v in versions {
+            std::fs::create_dir_all(cache.version_dir(name, v)).unwrap();
+        }
+        cache
+    }
+
+    /// Lexicographic ordering puts `0.10.0` before `0.9.0`, which would make
+    /// `discover_plugins` resolve to the older of two installed versions.
+    #[test]
+    fn versions_are_ordered_by_semver_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_versions(&tmp, "p", &["0.9.0", "0.10.0", "1.0.0"]);
+        assert_eq!(cache.list_versions("p"), ["1.0.0", "0.10.0", "0.9.0"]);
+    }
+
+    #[test]
+    fn prerelease_sorts_below_its_release() {
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_versions(&tmp, "p", &["1.0.0", "1.0.0-rc1"]);
+        assert_eq!(cache.list_versions("p"), ["1.0.0", "1.0.0-rc1"]);
+    }
+
+    #[test]
+    fn unparseable_versions_sort_last_but_are_not_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_versions(&tmp, "p", &["nightly", "1.0.0"]);
+        assert_eq!(cache.list_versions("p"), ["1.0.0", "nightly"]);
+    }
+
+    #[test]
+    fn latest_symlink_name_is_excluded() {
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_versions(&tmp, "p", &["1.0.0", "latest"]);
+        assert_eq!(cache.list_versions("p"), ["1.0.0"]);
+    }
 
     #[test]
     fn empty_cache_has_no_versions() {

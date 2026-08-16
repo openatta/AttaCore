@@ -78,9 +78,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arbitrary"
@@ -498,6 +498,7 @@ dependencies = [
  "opentelemetry_sdk",
  "permissions",
  "plugin",
+ "plugin-host",
  "reqwest 0.12.28",
  "runtime",
  "scene",
@@ -1909,11 +1910,9 @@ name = "plugin"
 version = "0.1.6"
 dependencies = [
  "async-trait",
- "base",
  "hex",
- "hooks",
- "mcp",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -1923,6 +1922,19 @@ dependencies = [
  "toml",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "plugin-host"
+version = "0.1.6"
+dependencies = [
+ "base",
+ "hooks",
+ "plugin",
+ "runtime",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2370,7 +2382,6 @@ dependencies = [
  "mcp",
  "notify",
  "permissions",
- "plugin",
  "reqwest 0.12.28",
  "scene",
  "schemars",

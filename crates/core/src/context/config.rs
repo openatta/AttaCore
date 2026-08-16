@@ -402,3 +402,53 @@ pub fn default_blocking_limit(model: &str, max_tokens: u32) -> usize {
     let effective_window = infer_context_window_tokens(model).saturating_sub(max_tokens as usize);
     effective_window.saturating_sub(3_000)
 }
+
+#[cfg(test)]
+mod sandbox_wiring_tests {
+    use super::*;
+    use crate::interface::settings::Settings;
+
+    fn settings_with_sandbox(f: impl FnOnce(&mut crate::interface::settings::SandboxConfig)) -> Settings {
+        let mut s = Settings::defaults_for("test-model");
+        f(&mut s.sandbox);
+        s
+    }
+
+    /// The whole point of `settings.sandbox` is that a user can configure it.
+    /// Each field below reaches `EngineConfig`, which `runtime::turn` copies
+    /// into `ToolContext.sandbox` and `tools::bash` lifts into a real
+    /// `SandboxPolicy` — a gap anywhere on that chain makes the setting inert
+    /// while still appearing in the schema.
+    #[test]
+    fn every_sandbox_setting_reaches_the_engine_config() {
+        let s = settings_with_sandbox(|sb| {
+            sb.network_mode = NetworkModeConfig::Allowlist;
+            sb.allowed_domains = vec!["api.example.com".into()];
+            sb.allow_read = vec![PathBuf::from("/tmp/ok")];
+            sb.deny_read = vec![PathBuf::from("/tmp/secret")];
+            sb.dangerously_disable_sandbox = true;
+        });
+        let c = EngineConfig::from_settings(&s);
+
+        assert_eq!(c.sandbox_policy.network_mode, NetworkModeConfig::Allowlist);
+        assert_eq!(c.sandbox_policy.allowed_domains, ["api.example.com"]);
+        assert_eq!(c.sandbox_policy.allow_read, [PathBuf::from("/tmp/ok")]);
+        assert_eq!(
+            c.sandbox_policy.deny_read,
+            Some(vec![PathBuf::from("/tmp/secret")])
+        );
+        assert!(c.dangerously_disable_sandbox);
+    }
+
+    /// An unconfigured `deny_read` must arrive as `None` ("use the built-in
+    /// credential deny defaults"), never as `Some(vec![])` — which reads as
+    /// "deny exactly nothing" and would switch those defaults off, making
+    /// `~/.ssh` and `~/.aws` readable by any command the classifier allows.
+    #[test]
+    fn empty_deny_read_means_defaults_not_an_empty_deny_list() {
+        let c = EngineConfig::from_settings(&settings_with_sandbox(|sb| {
+            sb.deny_read = Vec::new();
+        }));
+        assert_eq!(c.sandbox_policy.deny_read, None);
+    }
+}

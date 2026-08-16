@@ -115,6 +115,12 @@ pub mod codes {
     /// new sub-agent instead. See `docs/daemon_rpc_protocol.md` §9.1 for the `data`
     /// shape this carries.
     pub const SIDECHAIN_TERMINAL: i32 = -32014;
+    /// Any `plugin.*` management call on a build where the plugin subsystem
+    /// is unavailable — compiled out (`--no-default-features`) or switched
+    /// off by policy. Distinct from `METHOD_NOT_FOUND`: the method exists and
+    /// the request was well-formed; the capability is absent by deployment
+    /// choice, which is what a client needs to be able to tell apart.
+    pub const PLUGINS_DISABLED: i32 = -32016;
 }
 
 // ── Session options (extensible, passed via session.run_turn params) ──

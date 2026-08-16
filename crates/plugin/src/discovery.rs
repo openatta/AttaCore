@@ -1,12 +1,11 @@
-//! Plugin discovery — merges built-in plugins with installed ones from the
-//! versioned cache (see `crate::cache`), applying the same override
-//! precedence as skills/agents/rules: built-in < global < scene.
+//! Plugin discovery — loads installed plugins from the versioned cache (see
+//! `crate::cache`), applying the same override precedence as
+//! skills/agents/rules: global < scene.
 //!
 //! Callers (e.g. `daemon::SessionPool`) pass the plain `plugins/` directory
 //! for each tier (not `plugins/cache/` — this module joins `cache` itself,
 //! mirroring `crate::cache::PluginCache`'s own layout doc).
 
-use crate::bundled::builtin_plugins;
 use crate::cache::PluginCache;
 use crate::manifest::Plugin;
 use std::collections::HashMap;
@@ -15,16 +14,12 @@ use std::path::Path;
 /// Discover every plugin available to this daemon instance.
 ///
 /// Precedence (same name wins, later tier overrides earlier):
-/// built-in < `global_plugins_dir` < `scene_plugins_dir`.
+/// `global_plugins_dir` < `scene_plugins_dir`.
 ///
 /// Missing/empty tier directories are not an error — they simply contribute
 /// nothing (matches `PluginCache`'s own tolerant-of-absence behavior).
 pub fn discover_plugins(global_plugins_dir: &Path, scene_plugins_dir: &Path) -> Vec<Plugin> {
     let mut by_name: HashMap<String, Plugin> = HashMap::new();
-
-    for plugin in builtin_plugins() {
-        by_name.insert(plugin.manifest.plugin.name.clone(), plugin);
-    }
 
     for tier_dir in [global_plugins_dir, scene_plugins_dir] {
         for plugin in load_installed_tier(tier_dir) {
@@ -38,10 +33,12 @@ pub fn discover_plugins(global_plugins_dir: &Path, scene_plugins_dir: &Path) -> 
 }
 
 /// Load every plugin installed in one tier's versioned cache
-/// (`<tier_dir>/cache/{name}/{version}/plugin.toml`), picking the
-/// highest-sorting version per name (see `PluginCache::list_versions` —
-/// lexicographic, not semver-aware; a pre-existing limitation, not
-/// introduced here).
+/// (`<tier_dir>/cache/{name}/{version}/plugin.toml`), picking the highest
+/// version per name (semver order — see `PluginCache::list_versions`).
+///
+/// A manifest that fails to load — unsupported `api_version`, malformed
+/// TOML, an event outside the subscribable set — is skipped with a warning
+/// rather than failing discovery for everyone else.
 fn load_installed_tier(tier_dir: &Path) -> Vec<Plugin> {
     let cache = PluginCache::new(tier_dir.join("cache"));
     let root = cache.root_path();
@@ -92,17 +89,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("plugin.toml"),
-            format!("[plugin]\nname = \"{name}\"\nversion = \"{version}\"\n{extra_toml}"),
+            format!(
+                "[plugin]\nname = \"{name}\"\nversion = \"{version}\"\napi_version = \"0.1\"\n{extra_toml}"
+            ),
         )
         .unwrap();
     }
 
     #[test]
-    fn empty_tiers_return_only_builtins() {
+    fn empty_tiers_discover_nothing() {
         let global = TempDir::new().unwrap();
         let scene = TempDir::new().unwrap();
-        let plugins = discover_plugins(global.path(), scene.path());
-        assert_eq!(plugins.len(), builtin_plugins().len());
+        assert!(discover_plugins(global.path(), scene.path()).is_empty());
     }
 
     #[test]
@@ -142,24 +140,16 @@ mod tests {
     }
 
     #[test]
-    fn disk_plugin_overrides_builtin_same_name() {
+    fn distinct_names_across_tiers_all_appear() {
         let global = TempDir::new().unwrap();
         let scene = TempDir::new().unwrap();
-        write_plugin(
-            global.path(),
-            "plugin-hello",
-            "1.0.0",
-            "description = \"custom hello\"\n",
-        );
-        let plugins = discover_plugins(global.path(), scene.path());
-        let hello = plugins
-            .iter()
-            .find(|p| p.manifest.plugin.name == "plugin-hello")
-            .unwrap();
-        assert_eq!(hello.manifest.plugin.description, "custom hello");
-        // Still only one entry for the built-in-turned-overridden plugin,
-        // plus the untouched second built-in.
-        assert_eq!(plugins.len(), builtin_plugins().len());
+        write_plugin(global.path(), "from-global", "1.0.0", "");
+        write_plugin(scene.path(), "from-scene", "1.0.0", "");
+        let names: Vec<String> = discover_plugins(global.path(), scene.path())
+            .into_iter()
+            .map(|p| p.manifest.plugin.name)
+            .collect();
+        assert_eq!(names, ["from-global", "from-scene"]);
     }
 
     #[test]

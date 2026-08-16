@@ -2889,6 +2889,24 @@ pub(crate) async fn execute_tool_with_telemetry(
     execute_tool_inner(ctx, name, input).await
 }
 
+/// Lower `EngineConfig`'s sandbox policy into the cross-crate view a tool
+/// receives.
+///
+/// `deny_read`'s `None` means "use the built-in credential deny defaults",
+/// and `SandboxSettings` has no way to say that — it carries a plain `Vec`,
+/// with the same empty-means-defaults convention that
+/// `tools::bash::to_sandbox_policy` reads on the other side. So `None` and
+/// `Some(vec![])` both flatten to an empty vec here, and the distinction is
+/// preserved where it is actually decided (`EngineConfig::from_settings`).
+fn sandbox_settings_from(config: &base::context::EngineConfig) -> base::tool::SandboxSettings {
+    base::tool::SandboxSettings {
+        allow_read: config.sandbox_policy.allow_read.clone(),
+        deny_read: config.sandbox_policy.deny_read.clone().unwrap_or_default(),
+        allowed_domains: config.sandbox_policy.allowed_domains.clone(),
+        network_mode: config.sandbox_policy.network_mode,
+    }
+}
+
 async fn execute_tool_inner(
     ctx: &ToolExecCtx,
     name: &str,
@@ -3129,27 +3147,7 @@ async fn execute_tool_inner(
         cwd: ctx.cwd.clone(),
         session_id: ctx.session_id.clone(),
         turn_no: ctx.turn_no,
-        // The configured sandbox policy, not `Default::default()`.
-        //
-        // `EngineConfig::from_settings` has always resolved
-        // `settings.sandbox.{deny_read,allowed_domains}` into
-        // `config.sandbox_policy`, but this struct literal hardcoded the
-        // type default — so every `settings.json` sandbox knob was inert and
-        // `BashTool` ran with an empty deny-read list. Combined with
-        // `to_sandbox_policy`'s empty-means-empty mapping, that left the
-        // sandbox restricting writes only: `~/.ssh` and `~/.aws` were
-        // readable by any command the classifier waved through.
-        sandbox: base::tool::SandboxSettings {
-            allow_read: ctx.config.sandbox_policy.allow_read.clone(),
-            deny_read: ctx
-                .config
-                .sandbox_policy
-                .deny_read
-                .clone()
-                .unwrap_or_default(),
-            allowed_domains: ctx.config.sandbox_policy.allowed_domains.clone(),
-            network_mode: ctx.config.sandbox_policy.network_mode,
-        },
+        sandbox: sandbox_settings_from(&ctx.config),
         cancel: ctx.cancel.clone(),
         additional_writable_dirs,
         snapshot_file: None,
@@ -3828,6 +3826,45 @@ pub enum TurnError {
     Shutdown,
     #[error("internal: {0}")]
     Internal(String),
+}
+
+#[cfg(test)]
+mod sandbox_settings_tests {
+    use super::*;
+    use base::context::config::NetworkModeConfig;
+    use std::path::PathBuf;
+
+    /// Regression: this used to be a `Default::default()` struct literal, so
+    /// every `settings.json` sandbox knob was inert — `BashTool` ran with an
+    /// empty deny-read list and an unrestricted network no matter what the
+    /// user configured.
+    #[test]
+    fn tool_context_sandbox_is_taken_from_the_engine_config() {
+        let mut config = base::context::EngineConfig::defaults_for("test-model");
+        config.sandbox_policy = base::context::config::SandboxPolicyConfig {
+            allow_read: vec![PathBuf::from("/tmp/ok")],
+            deny_read: Some(vec![PathBuf::from("/tmp/secret")]),
+            network_mode: NetworkModeConfig::DenyAll,
+            allowed_domains: vec!["api.example.com".into()],
+        };
+
+        let s = sandbox_settings_from(&config);
+
+        assert_eq!(s.allow_read, [PathBuf::from("/tmp/ok")]);
+        assert_eq!(s.deny_read, [PathBuf::from("/tmp/secret")]);
+        assert_eq!(s.network_mode, NetworkModeConfig::DenyAll);
+        assert_eq!(s.allowed_domains, ["api.example.com"]);
+    }
+
+    /// `None` ("use built-in deny defaults") flattens to an empty vec, which
+    /// is the same empty-means-defaults convention `tools::bash` reads on the
+    /// other side — not a request to deny nothing.
+    #[test]
+    fn absent_deny_read_flattens_to_empty() {
+        let config = base::context::EngineConfig::defaults_for("test-model");
+        assert!(config.sandbox_policy.deny_read.is_none());
+        assert!(sandbox_settings_from(&config).deny_read.is_empty());
+    }
 }
 
 #[cfg(test)]

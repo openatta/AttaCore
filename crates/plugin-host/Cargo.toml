@@ -1,0 +1,19 @@
+[package]
+name = "plugin-host"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — binds installed plugins to the engine's PluginHost seam"
+
+[dependencies]
+base       = { workspace = true }
+hooks      = { workspace = true }
+plugin     = { workspace = true }
+runtime    = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
