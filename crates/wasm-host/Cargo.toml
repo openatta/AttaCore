@@ -1,0 +1,25 @@
+[package]
+name = "wasm-host"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "AttaCore — wasmtime host for WASM component plugins"
+
+[dependencies]
+plugin   = { workspace = true }
+anyhow   = { workspace = true }
+hex      = { workspace = true }
+sha2     = { workspace = true }
+reqwest  = { workspace = true }
+tokio    = { workspace = true }
+tokio-util = { workspace = true }
+tracing  = { workspace = true }
+wasmtime = { version = "47", features = ["component-model", "cranelift", "async"] }
+wasmtime-wasi = "47"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true }
+wat      = "1"

@@ -7,6 +7,7 @@ members = [
     "crates/hooks",
     "crates/plugin",
     "crates/plugin-host",
+    "crates/wasm-host",
     "crates/telemetry",
     "crates/history",
     "crates/permissions",
@@ -99,6 +100,7 @@ auth     = { path = "crates/auth" }
 hooks    = { path = "crates/hooks" }
 plugin   = { path = "crates/plugin" }
 plugin-host = { path = "crates/plugin-host" }
+wasm-host = { path = "crates/wasm-host" }
 telemetry = { path = "crates/telemetry" }
 history  = { path = "crates/history" }
 permissions = { path = "crates/permissions" }
