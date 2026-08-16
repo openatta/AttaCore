@@ -66,7 +66,19 @@ async fn start_server() -> (
     tempfile::TempDir,
     tokio::task::JoinHandle<()>,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    start_server_in(tempfile::tempdir().unwrap()).await
+}
+
+/// Same server, but rooted at a directory the caller prepared — so a test
+/// can install a plugin before the daemon discovers it.
+async fn start_server_in(
+    dir: tempfile::TempDir,
+) -> (
+    Arc<DaemonServer>,
+    PathBuf,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
     let sock = dir.path().join("test.sock");
 
     let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
@@ -98,6 +110,10 @@ async fn start_server() -> (
         paths,
         None, // task_router
     ));
+
+    // Same startup step `main.rs` performs before serving: without it a
+    // session sees no plugin tools and no plugin scenes.
+    pool.load_plugin_components().await;
 
     let cancel = CancellationToken::new();
     let server = Arc::new(DaemonServer::new(pool, cancel));
@@ -1471,5 +1487,100 @@ async fn plugin_rpcs_report_plugins_disabled_when_compiled_out() {
     }
 
     _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+/// Install a plugin that owns a scene directly into the global tier's
+/// versioned cache — the layout `plugin::discovery` reads.
+#[cfg(feature = "plugins")]
+fn install_scene_plugin(root: &std::path::Path, name: &str) {
+    let dir = root
+        .join("plugins")
+        .join("cache")
+        .join(name)
+        .join("1.0.0");
+    std::fs::create_dir_all(dir.join("scene")).unwrap();
+    std::fs::write(
+        dir.join("scene/prompt.md"),
+        "You are the demo workflow agent.",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "1.0.0"
+api_version = "0.1"
+description = "owns a scene"
+
+[scene.own]
+name = "Demo workflow"
+description = "A plugin-owned scene"
+prompt = "scene/prompt.md"
+tools = ["Read", "Grep"]
+disallowed_tools = ["Bash"]
+"#
+        ),
+    )
+    .unwrap();
+}
+
+/// A plugin that owns a scene needs no `scene.activate`: installing and
+/// enabling it is the consent, and entering the scene is still an explicit
+/// `session.create`.
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn a_plugin_owned_scene_is_listed_and_can_host_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    install_scene_plugin(dir.path(), "demo-scene-plugin");
+
+    let (server, sock, _dir, handle) = start_server_in(dir).await;
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"scene.list","id":1}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let scenes = v["result"]["scenes"].as_array().expect("scenes array");
+    let demo = scenes
+        .iter()
+        .find(|s| s["scene"] == "plugin:demo-scene-plugin")
+        .unwrap_or_else(|| panic!("plugin scene missing from {scenes:?}"));
+    assert_eq!(demo["name"], "Demo workflow");
+    assert_eq!(
+        demo["active"], true,
+        "an installed, enabled plugin's scene is servable without a second step"
+    );
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.create","id":2,"params":{"scene":"plugin:demo-scene-plugin"}}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(
+        v["result"]["session_id"].is_string(),
+        "a session should be creatable in a plugin scene: {v}"
+    );
+
+    server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+/// A scene id no plugin owns must still be refused, so a typo does not
+/// silently land the user in the default scene.
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn an_unknown_plugin_scene_is_refused() {
+    let (server, sock, _dir, handle) = start_server().await;
+
+    let resp = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"session.create","id":1,"params":{"scene":"plugin:not-installed"}}"#,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(v["error"].is_object(), "expected a refusal, got {v}");
+
+    server.shutdown_token().cancel();
     let _ = handle.await;
 }

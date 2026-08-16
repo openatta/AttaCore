@@ -6,6 +6,10 @@
 //! and lets the whole subsystem be an optional dependency of the host — see
 //! `runtime::plugin_host`.
 
+pub mod scene;
+
+pub use scene::PluginScene;
+
 use runtime::agent_tool::{AgentTypeDefinition, AgentTypeSource};
 use runtime::plugin_host::PluginHost;
 use std::path::Path;
@@ -20,6 +24,11 @@ pub struct InstalledPlugins {
     /// [`load_components`](Self::load_components) has run — a manifest says
     /// what a plugin claims, only the component says what it provides.
     tools: Vec<Arc<dyn base::tool::Tool>>,
+    /// Scenes plugins own, built once at load. Constructed alongside the
+    /// tools because a plugin's own scene lists its own tools in
+    /// `extra_tools`, and that list is only known after the components have
+    /// been asked.
+    scenes: Vec<Arc<dyn base::interface::scene::AgentScene>>,
 }
 
 impl InstalledPlugins {
@@ -27,6 +36,7 @@ impl InstalledPlugins {
         Self {
             plugins,
             tools: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 
@@ -39,10 +49,13 @@ impl InstalledPlugins {
     /// marketplace install must not cost the user the rest.
     pub async fn load_components(&mut self, engine: &WasmEngine, workspace: &Path) {
         let mut tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
+        let mut scenes: Vec<Arc<dyn base::interface::scene::AgentScene>> = Vec::new();
+
         for p in &self.plugins {
+            let mut own_tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
             for payload in &p.manifest.wasm {
                 match load_payload(engine, p, payload, workspace).await {
-                    Ok(mut loaded) => tools.append(&mut loaded),
+                    Ok(mut loaded) => own_tools.append(&mut loaded),
                     Err(e) => tracing::warn!(
                         plugin = %p.name(),
                         component = %payload.component.display(),
@@ -51,8 +64,23 @@ impl InstalledPlugins {
                     ),
                 }
             }
+            // A plugin's own scene gets its own tools unconditionally: it is
+            // the plugin's scene, so being able to name a tool it shipped is
+            // not a privilege, it is the point.
+            if let Some(scene) = crate::scene::PluginScene::from_plugin(p, own_tools.clone()) {
+                scenes.push(Arc::new(scene));
+            }
+            tools.append(&mut own_tools);
         }
+
         self.tools = tools;
+        self.scenes = scenes;
+    }
+
+    /// Scene ids this host contributes, for the caller that has to register
+    /// and later withdraw them.
+    pub fn scene_ids(&self) -> Vec<String> {
+        self.scenes.iter().map(|s| s.id().to_string()).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -115,7 +143,7 @@ impl PluginHost for InstalledPlugins {
     }
 
     fn scenes(&self) -> Vec<Arc<dyn base::interface::scene::AgentScene>> {
-        Vec::new()
+        self.scenes.clone()
     }
 
     fn agent_types(&self) -> Vec<AgentTypeDefinition> {

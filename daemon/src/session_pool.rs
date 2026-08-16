@@ -215,7 +215,10 @@ pub struct SessionPool {
     /// `scene.list` enumerates and `scene.activate` resolves new entries
     /// against. Immutable after construction (registering a scene is a
     /// compile-time fact); only *activation* is runtime state.
-    scene_registry: Arc<scene::scene::SceneRegistry>,
+    /// Every scene this binary can serve. Swapped wholesale when the plugin
+    /// set changes, since a plugin may add or withdraw a scene; a session
+    /// already running holds its own `Arc<dyn AgentScene>` and is unaffected.
+    scene_registry: std::sync::RwLock<Arc<scene::scene::SceneRegistry>>,
     /// The **opt-out** permission instance: an allow-everything
     /// `Permission` handed to a session only when its effective permission
     /// mode is `bypassPermissions` (see `resolve_session_permission`).
@@ -488,7 +491,7 @@ impl SessionPool {
 
         let mut scene_registry = scene::scene::SceneRegistry::new();
         scene_registry.register_builtin();
-        let scene_registry = Arc::new(scene_registry);
+        let scene_registry = std::sync::RwLock::new(Arc::new(scene_registry));
         let mut active_scenes = HashMap::new();
         active_scenes.insert(scene.id().to_string(), scene.clone());
 
@@ -573,13 +576,60 @@ impl SessionPool {
         self.plugins.mcp_servers()
     }
 
-    /// Compile and interrogate installed plugin components.
+    fn scene_registry(&self) -> Arc<scene::scene::SceneRegistry> {
+        self.scene_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Compile and interrogate installed plugin components, then take up
+    /// whatever scenes they own.
     ///
-    /// Awaited during startup, before the daemon serves: until it has run,
-    /// plugins contribute their manifests but none of their tools, and a
-    /// session created in that window would silently be missing them.
+    /// **Every embedder that constructs a `SessionPool` must call this
+    /// before serving.** It cannot happen in `new`, which is synchronous
+    /// while compiling a component is not; and until it has run, plugins
+    /// contribute their manifests but none of their tools or scenes, so a
+    /// session created in that window is silently missing them with nothing
+    /// to indicate why.
     pub async fn load_plugin_components(&self) {
         self.plugins.load_components(&self.cwd).await;
+        self.adopt_plugin_scenes().await;
+    }
+
+    /// Rebuild the scene registry from the built-ins plus whatever the
+    /// current plugin set owns, and make those scenes servable.
+    ///
+    /// Plugin scenes are activated rather than merely registered: installing
+    /// and enabling a plugin that owns a scene *is* the user's consent to
+    /// serve it, and requiring a second `scene.activate` would be a step
+    /// with no safety it buys — entering the scene is still an explicit
+    /// `session.create`.
+    ///
+    /// Withdrawing one removes it from both maps, which stops new sessions
+    /// from entering it. Sessions already inside keep the `Arc` they were
+    /// built with and run to completion — the alternative would be pulling a
+    /// session's system prompt out from under it mid-turn.
+    async fn adopt_plugin_scenes(&self) {
+        let plugin_scenes = self.plugins.scenes();
+
+        let mut registry = scene::scene::SceneRegistry::new();
+        registry.register_builtin();
+        for s in &plugin_scenes {
+            registry.register(s.clone());
+        }
+        let plugin_ids: std::collections::HashSet<String> =
+            plugin_scenes.iter().map(|s| s.id().to_string()).collect();
+        *self
+            .scene_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::new(registry);
+
+        let mut active = self.active_scenes.write().await;
+        active.retain(|id, _| !id.starts_with("plugin:") || plugin_ids.contains(id));
+        for s in plugin_scenes {
+            active.insert(s.id().to_string(), s);
+        }
     }
 
     /// Whether this binary has the plugin subsystem, and whether it is on —
@@ -651,6 +701,7 @@ impl SessionPool {
     /// deliberately not re-scanned: `self.skill_catalog` is the one
     /// persistent, live-reloaded manager every session shares.
     async fn refresh_after_plugin_change(&self) {
+        self.adopt_plugin_scenes().await;
         let settings = self.settings.read().await.clone();
         let agent_dirs = agent_type_dirs(&settings);
         let agent_dirs_ref: [&std::path::Path; 3] =
@@ -1446,7 +1497,7 @@ impl SessionPool {
         if let Some(router) = self.task_router.read().await.clone() {
             builder = builder.task_router(router);
         }
-        builder = builder.scene_registry(self.scene_registry.clone());
+        builder = builder.scene_registry(self.scene_registry());
         if let Some(host) = self.plugins.host() {
             builder = builder.plugin_host(host);
         }
@@ -2784,7 +2835,7 @@ impl SessionPool {
                 }
             }
         }
-        self.scene_registry
+        self.scene_registry()
             .list_all()
             .into_iter()
             .map(|info| {
@@ -2805,7 +2856,7 @@ impl SessionPool {
         if self.active_scenes.read().await.contains_key(scene_id) {
             return Ok(());
         }
-        let Some(resolved) = self.scene_registry.resolve(scene_id) else {
+        let Some(resolved) = self.scene_registry().resolve(scene_id) else {
             return Err((codes::SCENE_NOT_FOUND, format!("unknown scene: {scene_id}")));
         };
         self.active_scenes

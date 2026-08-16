@@ -129,6 +129,11 @@ mod imp {
             self.read().agent_types()
         }
 
+        pub fn scenes(&self) -> Vec<Arc<dyn base::interface::scene::AgentScene>> {
+            use runtime::plugin_host::PluginHost;
+            self.read().scenes()
+        }
+
         pub fn mcp_servers(&self) -> HashMap<String, serde_json::Value> {
             self.read().mcp_servers().into_iter().collect()
         }
@@ -291,6 +296,9 @@ mod imp {
             None
         }
         pub fn agent_types(&self) -> Vec<AgentTypeDefinition> {
+            Vec::new()
+        }
+        pub fn scenes(&self) -> Vec<Arc<dyn base::interface::scene::AgentScene>> {
             Vec::new()
         }
         pub fn mcp_servers(&self) -> HashMap<String, serde_json::Value> {
