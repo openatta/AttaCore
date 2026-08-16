@@ -4,7 +4,7 @@ use crate::error::HistoryError;
 use crate::path::{
     project_session_state_file, session_file, session_memory_file, session_metadata_file,
     session_prompt_state_file, session_repl_input_history_file, session_sidecar_dir,
-    session_tui_input_history_file, sessions_root,
+    session_tui_input_history_file,
 };
 use base::session::SessionId;
 use serde::{Deserialize, Serialize};
@@ -131,11 +131,6 @@ pub struct SessionSidecarPaths {
     pub metadata: PathBuf,
 }
 
-pub fn session_sidecar_paths(session: &SessionId) -> Result<SessionSidecarPaths, HistoryError> {
-    let root = sessions_root()?;
-    Ok(session_sidecar_paths_in(&root, session))
-}
-
 pub fn session_sidecar_paths_in(sessions_root: &Path, session: &SessionId) -> SessionSidecarPaths {
     SessionSidecarPaths {
         dir: session_sidecar_dir(sessions_root, session),
@@ -199,9 +194,11 @@ impl SessionPromptState {
         }
     }
 
-    pub async fn load(session: SessionId) -> Result<Option<Self>, HistoryError> {
-        let root = sessions_root()?;
-        let path = session_prompt_state_file(&root, &session);
+    pub async fn load(
+        sessions_root: &Path,
+        session: SessionId,
+    ) -> Result<Option<Self>, HistoryError> {
+        let path = session_prompt_state_file(sessions_root, &session);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -210,24 +207,14 @@ impl SessionPromptState {
         Ok(Some(serde_json::from_str(&content)?))
     }
 
-    pub async fn save(&self, session: SessionId) -> Result<(), HistoryError> {
-        let root = sessions_root()?;
-        let path = session_prompt_state_file(&root, &session);
+    pub async fn save(&self, sessions_root: &Path, session: SessionId) -> Result<(), HistoryError> {
+        let path = session_prompt_state_file(sessions_root, &session);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&path, serde_json::to_vec_pretty(self)?).await?;
         Ok(())
     }
-}
-
-pub async fn ensure_session_sidecar(
-    canonical_cwd: &Path,
-    project_history_dir: &Path,
-    session: SessionId,
-) -> Result<SessionSidecarPaths, HistoryError> {
-    let root = sessions_root()?;
-    ensure_session_sidecar_in(&root, canonical_cwd, project_history_dir, session).await
 }
 
 pub async fn ensure_session_sidecar_in(

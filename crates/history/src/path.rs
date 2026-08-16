@@ -4,7 +4,6 @@
 
 use crate::error::HistoryError;
 use base::session::SessionId;
-use std::env;
 use std::path::{Path, PathBuf};
 
 /// Delegate to shared implementation in `attacode-core`.
@@ -20,33 +19,31 @@ pub fn sanitize_path(name: &str) -> String {
     base::path::sanitize_for_fs(name)
 }
 
-/// `~/.atta` 的路径（CLI 与 daemon 共用）。可被 `ATTA_CONFIG_HOME` env 覆盖。
+/// 会话状态的两个根，都从同一个全局根派生。
 ///
-/// 曾经多一段写死的 `code`（产品名，不是场景名——四个场景 id 是
-/// `coding`/`chat`/`demo`/`research`）。去掉之后这里和
-/// `base::paths::ConfigPaths::global_data_dir` 指同一个目录，两套路径体系不再
-/// 各说各话。
-pub fn config_home() -> Result<PathBuf, HistoryError> {
-    if let Ok(p) = env::var("ATTA_CONFIG_HOME") {
-        return Ok(PathBuf::from(p));
-    }
-    let home = env::var("HOME").map_err(|_| HistoryError::NoHome)?;
-    Ok(PathBuf::from(home).join(".atta"))
-}
-
-/// `~/.atta/projects` —— 按项目分的状态（transcript）。
-pub fn projects_root() -> Result<PathBuf, HistoryError> {
-    Ok(config_home()?.join("projects"))
-}
-
-/// `~/.atta/sessions` —— 按会话分的状态（sidecar：memory / metadata / 输入历史）。
-///
-/// 和 [`projects_root`] 是两个维度，不是两层：sidecar 只按 session id 索引
+/// `projects` 与 `sessions` 是两个维度，不是两层：sidecar 只按 session id 索引
 /// （`session_sidecar_paths` 拿不到项目信息），所以它进不了 `projects/<cwd>/`。
-/// 这两个目录以前都叫 `sessions` 且都在用，导致 `~/.atta/sessions/` 下同时躺着
+/// 这两个目录以前都叫 `sessions` 且都在用，导致 `<global>/sessions/` 下同时躺着
 /// `<sanitized-cwd>/` 和 `<session-id>/` 两种命名的目录。
-pub fn sessions_root() -> Result<PathBuf, HistoryError> {
-    Ok(config_home()?.join("sessions"))
+///
+/// 从同一个 `global_root` 派生这件事本身是重点：这两个根曾经一个走
+/// `ATTA_CONFIG_HOME`、一个走 `ATTA_DATA_DIR`，默认值相同但可以被配成不同的
+/// 目录——session memory 因此写去过没人会读的地方。现在只有一个来源。
+#[derive(Debug, Clone)]
+pub struct HistoryRoots {
+    /// 按项目分的状态（transcript）。
+    pub projects: PathBuf,
+    /// 按会话分的状态（sidecar：memory / metadata / 输入历史）。
+    pub sessions: PathBuf,
+}
+
+impl HistoryRoots {
+    pub fn under(global_root: &Path) -> Self {
+        Self {
+            projects: global_root.join("projects"),
+            sessions: global_root.join("sessions"),
+        }
+    }
 }
 
 /// Project-local state directory (`<cwd>/.atta`) —— 与
@@ -218,16 +215,12 @@ mod tests {
         assert_eq!(c, p);
     }
 
-    // 不写 env 变更测试 —— env::set_var 是 unsafe（Rust 1.86+），
-    // 与本 crate 的 #![forbid(unsafe_code)] 冲突；同时 env 在并发测试下是
-    // 全局共享的，单测里改它本就不可靠。env override 行为靠手动 / e2e 验证。
-
+    /// 两个根同源——它们曾经各读各的 env 变量，默认相同但可以被配散，
+    /// session memory 因此写去过没人会读的地方。
     #[test]
-    fn config_home_returns_some_path_when_home_set() {
-        // 仅在 HOME 已存在时跑（CI / 大多数 dev 机器都满足）
-        if env::var("HOME").is_ok() {
-            let h = config_home().unwrap();
-            assert!(h.ends_with("code") || h.to_string_lossy().contains(".atta"));
-        }
+    fn both_roots_come_from_the_one_global_root() {
+        let roots = HistoryRoots::under(Path::new("/state/.atta"));
+        assert_eq!(roots.projects, Path::new("/state/.atta/projects"));
+        assert_eq!(roots.sessions, Path::new("/state/.atta/sessions"));
     }
 }

@@ -137,11 +137,6 @@ pub fn migrate_layout(data_root: &Path) -> MigrationReport {
     report
 }
 
-/// [`migrate_layout`] against the default data root.
-pub fn migrate_default_layout() -> Result<MigrationReport, crate::error::HistoryError> {
-    Ok(migrate_layout(&crate::path::config_home()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

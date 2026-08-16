@@ -2,7 +2,8 @@
 //!
 //! Caches the last result of each MCP tool call keyed by (server, tool, args_hash).
 //! Cache entries have a TTL of 30 seconds — after that, results are re-fetched.
-//! Cache is persisted to `~/.atta/<scope>/mcp_cache.json` for cross-session reuse.
+//! Cache is persisted to a file the caller names — conventionally
+//! `<scene root>/mcp_cache.json` — for cross-session reuse.
 //! This prevents the model from making identical MCP calls back-to-back.
 
 use crate::client::McpCallResult;
@@ -13,16 +14,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_CACHE_ENTRIES: usize = 100;
-
-/// Default cache file path: `~/.atta/<scope>/mcp_cache.json`. No default
-/// scope — callers must say which product instance this belongs to.
-fn default_cache_path(scope: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".atta")
-        .join(scope)
-        .join("mcp_cache.json")
-}
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -55,17 +46,7 @@ impl McpOutputCache {
         Self::default()
     }
 
-    /// Create a cache that persists to `~/.atta/<scope>/mcp_cache.json`.
-    pub fn with_default_persistence(scope: &str) -> Self {
-        let mut cache = Self {
-            entries: HashMap::new(),
-            persist_path: Some(default_cache_path(scope)),
-        };
-        cache.load_from_disk();
-        cache
-    }
-
-    /// Create a cache that persists to a custom path.
+    /// Create a cache that persists to `path`.
     pub fn with_persistence(path: PathBuf) -> Self {
         let mut cache = Self {
             entries: HashMap::new(),

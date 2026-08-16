@@ -5388,9 +5388,12 @@ mod catalog_tests {
                 .as_nanos()
         ));
         let store: Arc<dyn HistoryStore> = Arc::new(
-            history::store::JsonlHistoryStore::with_root(&dir, history_dir.clone())
-                .await
-                .unwrap(),
+            history::store::JsonlHistoryStore::with_roots(
+                &dir,
+                history::path::HistoryRoots::under(&history_dir),
+            )
+            .await
+            .unwrap(),
         );
         agent_tool.set_history_store(store.clone());
         agent_tool.set_parent_session_id("parent-session-1".to_string());
@@ -5450,9 +5453,12 @@ mod catalog_tests {
                 .as_nanos()
         ));
         let store: Arc<dyn HistoryStore> = Arc::new(
-            history::store::JsonlHistoryStore::with_root(&dir, history_dir.clone())
-                .await
-                .unwrap(),
+            history::store::JsonlHistoryStore::with_roots(
+                &dir,
+                history::path::HistoryRoots::under(&history_dir),
+            )
+            .await
+            .unwrap(),
         );
         agent_tool.set_history_store(store.clone());
         agent_tool.set_parent_session_id("parent-session-1".to_string());
@@ -5502,9 +5508,12 @@ mod catalog_tests {
                 .as_nanos()
         ));
         let store: Arc<dyn HistoryStore> = Arc::new(
-            history::store::JsonlHistoryStore::with_root(&dir, history_dir.clone())
-                .await
-                .unwrap(),
+            history::store::JsonlHistoryStore::with_roots(
+                &dir,
+                history::path::HistoryRoots::under(&history_dir),
+            )
+            .await
+            .unwrap(),
         );
         agent_tool.set_history_store(store.clone());
         agent_tool.set_parent_session_id("parent-session-1".to_string());
@@ -6108,9 +6117,12 @@ mod catalog_tests {
                 .as_nanos()
         ));
         let store: Arc<dyn HistoryStore> = Arc::new(
-            history::store::JsonlHistoryStore::with_root(&dir, history_dir.clone())
-                .await
-                .unwrap(),
+            history::store::JsonlHistoryStore::with_roots(
+                &dir,
+                history::path::HistoryRoots::under(&history_dir),
+            )
+            .await
+            .unwrap(),
         );
         agent_tool.set_history_store(store.clone());
         agent_tool.set_parent_session_id("parent-session-1".to_string());
@@ -6184,9 +6196,12 @@ mod catalog_tests {
                 .as_nanos()
         ));
         let store: Arc<dyn HistoryStore> = Arc::new(
-            history::store::JsonlHistoryStore::with_root(&dir, history_dir.clone())
-                .await
-                .unwrap(),
+            history::store::JsonlHistoryStore::with_roots(
+                &dir,
+                history::path::HistoryRoots::under(&history_dir),
+            )
+            .await
+            .unwrap(),
         );
         agent_tool.set_history_store(store.clone());
         agent_tool.set_parent_session_id("parent-session-1".to_string());

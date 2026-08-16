@@ -209,9 +209,12 @@ async fn start_scripted_server(
         Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
 
     let store: Arc<dyn history::store::HistoryStore> = Arc::new(
-        history::store::JsonlHistoryStore::with_root(&cwd, dir.path().join("sessions"))
-            .await
-            .unwrap(),
+        history::store::JsonlHistoryStore::with_roots(
+            &cwd,
+            history::path::HistoryRoots::under(dir.path()),
+        )
+        .await
+        .unwrap(),
     );
 
     let (client, seen) = ScriptedClient::new(rounds);

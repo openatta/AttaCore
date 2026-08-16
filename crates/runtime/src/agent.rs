@@ -1372,15 +1372,12 @@ impl Builder {
             })?;
             // Every other session sidecar (metadata, input history, prompt
             // state) resolves through `history::path`, so this has to as
-            // well — building the root separately from
-            // `paths.global_data_dir` is how the memory file ended up
-            // somewhere nothing would look for it. The two agree on
-            // `~/.atta` by default now, but they still answer to different
-            // env vars (`ATTA_CONFIG_HOME` vs `ATTA_DATA_DIR`), so the
-            // fallback below is a last resort, not an equivalent path.
-            let sessions_root = history::path::sessions_root()
-                .unwrap_or_else(|_| settings.paths.global_data_dir.join("sessions"));
-            let path = history::path::session_memory_file(&sessions_root, &sid);
+            // well — building the root separately is how the memory file
+            // ended up somewhere nothing would look for it. Both now derive
+            // from the one `global_data_dir` this instance was given, so
+            // there is no second root to disagree with.
+            let roots = history::path::HistoryRoots::under(&settings.paths.global_data_dir);
+            let path = history::path::session_memory_file(&roots.sessions, &sid);
             session = session.with_session_memory(SessionMemory::new(path));
         }
         let compactor = self
@@ -2079,9 +2076,9 @@ mod tests {
         let cwd_tmp = tempfile::tempdir().unwrap();
         let projects_tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(
-            history::store::JsonlHistoryStore::with_root(
+            history::store::JsonlHistoryStore::with_roots(
                 cwd_tmp.path(),
-                projects_tmp.path().to_path_buf(),
+                history::path::HistoryRoots::under(projects_tmp.path()),
             )
             .await
             .expect("store should build"),
@@ -2960,9 +2957,9 @@ mod tests {
     async fn build_wires_session_memory_when_history_store_present() {
         let cwd_tmp = tempfile::tempdir().unwrap();
         let projects_tmp = tempfile::tempdir().unwrap();
-        let store = history::store::JsonlHistoryStore::with_root(
+        let store = history::store::JsonlHistoryStore::with_roots(
             cwd_tmp.path(),
-            projects_tmp.path().to_path_buf(),
+            history::path::HistoryRoots::under(projects_tmp.path()),
         )
         .await
         .expect("store should build");
@@ -2991,12 +2988,11 @@ mod tests {
             .expect("session_memory should be wired when a history_store is set");
         // Must land in the same sidecar directory the rest of the history
         // crate reads and writes (metadata, input history, prompt state).
-        // This used to be built from `paths.global_data_dir`, which is a
-        // level short of `history::path::config_home()` and keyed off a
-        // different env var, so the memory file was written where nothing
-        // would ever look for it.
+        // Both derive from the settings' `global_data_dir` now; when they
+        // came from different roots the memory file was written where
+        // nothing would ever look for it.
         let expected = history::path::session_memory_file(
-            &history::path::sessions_root().expect("sessions_root"),
+            &history::path::HistoryRoots::under(projects_tmp.path()).sessions,
             &base::session::SessionId::parse(&sid).unwrap(),
         );
         assert_eq!(sm.path(), expected);

@@ -657,11 +657,13 @@ mod tests {
     async fn real_store(tmp: &std::path::Path) -> Arc<dyn HistoryStore> {
         let cwd = tmp.join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
-        let projects_root = tmp.join("projects");
         Arc::new(
-            history::store::JsonlHistoryStore::with_root(&cwd, projects_root)
-                .await
-                .unwrap(),
+            history::store::JsonlHistoryStore::with_roots(
+                &cwd,
+                history::path::HistoryRoots::under(&tmp),
+            )
+            .await
+            .unwrap(),
         )
     }
 

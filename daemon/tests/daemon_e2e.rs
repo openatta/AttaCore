@@ -856,9 +856,12 @@ async fn start_server_with_history(
         Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
 
     let history_store: Option<Arc<dyn history::store::HistoryStore>> = Some(Arc::new(
-        history::store::JsonlHistoryStore::with_root(dir.path(), dir.path().join("sessions"))
-            .await
-            .unwrap(),
+        history::store::JsonlHistoryStore::with_roots(
+            dir.path(),
+            history::path::HistoryRoots::under(dir.path()),
+        )
+        .await
+        .unwrap(),
     ));
 
     let pool = Arc::new(SessionPool::new(

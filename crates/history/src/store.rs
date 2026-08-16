@@ -6,8 +6,7 @@
 use crate::entry::{EnvelopedEntry, LogEntry, PasteStore};
 use crate::error::HistoryError;
 use crate::path::{
-    canonicalize_cwd, project_dir, projects_root, session_file, session_metadata_file,
-    sessions_root,
+    canonicalize_cwd, project_dir, session_file, session_metadata_file, HistoryRoots,
 };
 use crate::project::SessionMetadata;
 use crate::transcript::{messages_match_query, preview_messages, project_messages};
@@ -90,6 +89,9 @@ pub trait HistoryStore: Send + Sync {
 /// 把 jsonl 落到 `<projects_root>/<sanitize(cwd)>/<session>.jsonl`。
 pub struct JsonlHistoryStore {
     projects_root: PathBuf,
+    /// Sidecar root — see [`HistoryRoots`]; carried rather than re-derived so
+    /// the two halves of a session's state cannot land in different trees.
+    sessions_root: PathBuf,
     canonical_cwd: PathBuf,
     /// 序列化 append 调用，避免并发 partial-line 写。
     /// 不是 RwLock —— append 是写操作，读不互让有意义。
@@ -100,17 +102,13 @@ pub struct JsonlHistoryStore {
 }
 
 impl JsonlHistoryStore {
-    /// 默认指向 `~/.atta/code/projects`。
-    pub async fn new(cwd: &Path) -> Result<Self, HistoryError> {
-        let root = projects_root()?;
-        Self::with_root(cwd, root).await
-    }
-
-    /// 自定义 projects_root —— 测试与企业部署用。
-    pub async fn with_root(cwd: &Path, projects_root: PathBuf) -> Result<Self, HistoryError> {
+    /// 两个根都由调用方给：transcript 落 `roots.projects`，sidecar 落
+    /// `roots.sessions`。
+    pub async fn with_roots(cwd: &Path, roots: HistoryRoots) -> Result<Self, HistoryError> {
         let canonical = canonicalize_cwd(cwd).await?;
         Ok(Self {
-            projects_root,
+            projects_root: roots.projects,
+            sessions_root: roots.sessions,
             canonical_cwd: canonical,
             append_lock: Arc::new(Mutex::new(())),
             paste_store: None,
@@ -193,7 +191,7 @@ impl JsonlHistoryStore {
             };
             let messages = project_messages(&entries);
             if session_id.to_string().contains(query) || messages_match_query(&messages, query) {
-                let metadata = load_session_metadata(session_id).await;
+                let metadata = load_session_metadata(&self.sessions_root, session_id).await;
                 out.push(self.summary_from_parts(
                     session_id,
                     mtime,
@@ -266,7 +264,7 @@ impl JsonlHistoryStore {
         let mut out = Vec::new();
         for (session_id, path, mtime) in candidates {
             let entries = load_entries_from_path(&path, session_id).await?;
-            let metadata = load_session_metadata(session_id).await;
+            let metadata = load_session_metadata(&self.sessions_root, session_id).await;
             if !filter.matches(metadata.as_ref()) {
                 continue;
             }
@@ -312,7 +310,7 @@ impl JsonlHistoryStore {
             Err(e) => return Err(e),
         };
         let messages = project_messages(&entries);
-        let metadata = load_session_metadata(session_id).await;
+        let metadata = load_session_metadata(&self.sessions_root, session_id).await;
         Ok(Some(self.summary_from_parts(
             session_id,
             mtime,
@@ -481,9 +479,11 @@ async fn load_entries_from_path(
     Ok(entries)
 }
 
-async fn load_session_metadata(session: SessionId) -> Option<SessionMetadata> {
-    let root = sessions_root().ok()?;
-    let path = session_metadata_file(&root, &session);
+async fn load_session_metadata(
+    sessions_root: &Path,
+    session: SessionId,
+) -> Option<SessionMetadata> {
+    let path = session_metadata_file(sessions_root, &session);
     let content = tokio::fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&content).ok()
 }
@@ -560,10 +560,8 @@ impl HistoryStore for JsonlHistoryStore {
             Err(e) => return Err(HistoryError::Io(e)),
         }
         // 删除 metadata 文件（如果存在）
-        if let Ok(root) = sessions_root() {
-            let meta_path = session_metadata_file(&root, &session);
-            let _ = tokio::fs::remove_file(meta_path).await;
-        }
+        let meta_path = session_metadata_file(&self.sessions_root, &session);
+        let _ = tokio::fs::remove_file(meta_path).await;
         Ok(())
     }
 
@@ -665,9 +663,10 @@ mod tests {
     async fn make_store() -> (JsonlHistoryStore, TempDir, TempDir) {
         let cwd_tmp = TempDir::new().unwrap();
         let projects_tmp = TempDir::new().unwrap();
-        let store = JsonlHistoryStore::with_root(cwd_tmp.path(), projects_tmp.path().to_path_buf())
-            .await
-            .unwrap();
+        let store =
+            JsonlHistoryStore::with_roots(cwd_tmp.path(), HistoryRoots::under(projects_tmp.path()))
+                .await
+                .unwrap();
         (store, cwd_tmp, projects_tmp)
     }
 
@@ -869,12 +868,14 @@ mod tests {
         let cwd_a = TempDir::new().unwrap();
         let cwd_b = TempDir::new().unwrap();
         let projects = TempDir::new().unwrap();
-        let store_a = JsonlHistoryStore::with_root(cwd_a.path(), projects.path().to_path_buf())
-            .await
-            .unwrap();
-        let store_b = JsonlHistoryStore::with_root(cwd_b.path(), projects.path().to_path_buf())
-            .await
-            .unwrap();
+        let store_a =
+            JsonlHistoryStore::with_roots(cwd_a.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap();
+        let store_b =
+            JsonlHistoryStore::with_roots(cwd_b.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap();
         let session_b = SessionId::new();
         store_b
             .append(
@@ -1034,12 +1035,14 @@ mod tests {
         let cwd_a = TempDir::new().unwrap();
         let cwd_b = TempDir::new().unwrap();
         let projects = TempDir::new().unwrap();
-        let store_a = JsonlHistoryStore::with_root(cwd_a.path(), projects.path().to_path_buf())
-            .await
-            .unwrap();
-        let store_b = JsonlHistoryStore::with_root(cwd_b.path(), projects.path().to_path_buf())
-            .await
-            .unwrap();
+        let store_a =
+            JsonlHistoryStore::with_roots(cwd_a.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap();
+        let store_b =
+            JsonlHistoryStore::with_roots(cwd_b.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap();
 
         let session_a = SessionId::new();
         store_a
@@ -1124,14 +1127,15 @@ mod tests {
             .unwrap();
         assert!(init_output.status.success());
 
-        let repo_store =
-            JsonlHistoryStore::with_root(repo_dir.path(), shared_projects.path().to_path_buf())
-                .await
-                .unwrap();
-        let outside_store =
-            JsonlHistoryStore::with_root(outside_dir.path(), shared_projects.path().to_path_buf())
-                .await
-                .unwrap();
+        // Both stores share one global root, so a session written by either is
+        // visible to the other — which is the thing this test filters on.
+        let roots = HistoryRoots::under(config_home.path());
+        let repo_store = JsonlHistoryStore::with_roots(repo_dir.path(), roots.clone())
+            .await
+            .unwrap();
+        let outside_store = JsonlHistoryStore::with_roots(outside_dir.path(), roots.clone())
+            .await
+            .unwrap();
 
         // Create session in repo
         let session_in_repo = SessionId::new();
@@ -1163,13 +1167,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Save original ATTA_CONFIG_HOME and set to temp dir
-        let original = std::env::var("ATTA_CONFIG_HOME").ok();
-        std::env::set_var("ATTA_CONFIG_HOME", config_home.path());
-
         // Create metadata for in-repo session with canonicalized cwd
         let canonical_repo = tokio::fs::canonicalize(repo_dir.path()).await.unwrap();
-        let sessions_root_dir = config_home.path().join("sessions");
+        let sessions_root_dir = roots.sessions.clone();
         let in_repo_meta_dir = sessions_root_dir.join(session_in_repo.to_string());
         tokio::fs::create_dir_all(&in_repo_meta_dir).await.unwrap();
         let in_repo_meta = SessionMetadata::new(
@@ -1206,12 +1206,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Restore ATTA_CONFIG_HOME
-        match original {
-            Some(v) => std::env::set_var("ATTA_CONFIG_HOME", v),
-            None => std::env::remove_var("ATTA_CONFIG_HOME"),
-        }
-
         // Only the in-repo session should be found
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, session_in_repo);
@@ -1226,10 +1220,11 @@ mod tests {
         let projects_tmp = TempDir::new().unwrap();
         let paste_base = TempDir::new().unwrap();
         let paste_store = PasteStore::new(paste_base.path());
-        let store = JsonlHistoryStore::with_root(cwd_tmp.path(), projects_tmp.path().to_path_buf())
-            .await
-            .unwrap()
-            .with_paste_store(paste_store);
+        let store =
+            JsonlHistoryStore::with_roots(cwd_tmp.path(), HistoryRoots::under(projects_tmp.path()))
+                .await
+                .unwrap()
+                .with_paste_store(paste_store);
         (store, cwd_tmp, projects_tmp, paste_base)
     }
 
