@@ -29,4 +29,12 @@ fi
 echo "==> running the daemon test suite in the locked configuration"
 cargo test -p daemon --no-default-features
 
+echo "==> the DSH bridge is a separate process and has its own suite"
+if command -v node >/dev/null 2>&1; then
+  (cd bridges/atta-dsh-bridge && node --test 'test/**/*.test.js' >/dev/null)
+  echo "    bridge tests pass"
+else
+  echo "    skipped: node is not installed"
+fi
+
 echo "OK: locked build contains no plugin subsystem"

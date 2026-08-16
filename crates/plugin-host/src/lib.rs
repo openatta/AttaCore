@@ -149,27 +149,18 @@ impl PluginHost for InstalledPlugins {
         let mut out = Vec::new();
         for p in &self.plugins {
             for server in &p.manifest.mcp {
-                let Some(rel) = server.config.as_ref() else {
-                    continue;
-                };
-                let path = p.path(rel);
                 let key = format!("{}-mcp-{}", p.name(), server.name);
-                match std::fs::read_to_string(&path) {
-                    Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                        Ok(v) => out.push((key, v)),
-                        Err(e) => tracing::warn!(
-                            plugin = %p.name(),
-                            path = %path.display(),
-                            error = %e,
-                            "plugin MCP server config is not valid JSON, skipping"
-                        ),
-                    },
-                    Err(e) => tracing::warn!(
-                        plugin = %p.name(),
-                        path = %path.display(),
-                        error = %e,
-                        "failed to read plugin MCP server config, skipping"
-                    ),
+                match server.kind {
+                    plugin::manifest::McpKind::Native => {
+                        if let Some(config) = read_native_config(p, server) {
+                            out.push((key, config));
+                        }
+                    }
+                    plugin::manifest::McpKind::Dsh => {
+                        if let Some(config) = dsh_bridge_config(p, server) {
+                            out.push((key, config));
+                        }
+                    }
                 }
             }
         }
@@ -212,6 +203,89 @@ impl PluginHost for InstalledPlugins {
             })
             .collect()
     }
+}
+
+fn read_native_config(
+    plugin: &plugin::manifest::Plugin,
+    server: &plugin::manifest::McpPayload,
+) -> Option<serde_json::Value> {
+    let path = plugin.path(server.config.as_ref()?);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = %plugin.name(),
+                    path = %path.display(),
+                    error = %e,
+                    "plugin MCP server config is not valid JSON, skipping"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                plugin = %plugin.name(),
+                path = %path.display(),
+                error = %e,
+                "failed to read plugin MCP server config, skipping"
+            );
+            None
+        }
+    }
+}
+
+/// A DSH payload as a stdio MCP server: `atta-dsh-bridge` loading the
+/// plugin's entry module.
+///
+/// The bridge is a separate Node process on purpose. Keeping the JS runtime
+/// outside the host is the whole reason DSH plugins arrive over MCP rather
+/// than as a second in-process plugin format — see the bridge's README.
+///
+/// `command` is `node` rather than a resolved path: which Node runs a
+/// plugin is the user's environment's business, and hardcoding one here
+/// would break every install that manages its own toolchain.
+fn dsh_bridge_config(
+    plugin: &plugin::manifest::Plugin,
+    server: &plugin::manifest::McpPayload,
+) -> Option<serde_json::Value> {
+    let entry = plugin.path(server.entry.as_ref()?);
+    if !entry.exists() {
+        tracing::warn!(
+            plugin = %plugin.name(),
+            entry = %entry.display(),
+            "DSH plugin entry module does not exist, skipping"
+        );
+        return None;
+    }
+    let bridge = bridge_entry_path();
+    // Only the variables the manifest named are passed through, the same
+    // rule the WASM capability list follows.
+    let env: serde_json::Map<String, serde_json::Value> = server
+        .env
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v.into())))
+        .collect();
+
+    Some(serde_json::json!({
+        "type": "stdio",
+        "command": "node",
+        "args": [bridge.to_string_lossy(), entry.to_string_lossy()],
+        "env": env,
+    }))
+}
+
+/// Where the bridge's entry point lives.
+///
+/// `ATTA_DSH_BRIDGE` overrides it, which is what a packaged install sets;
+/// the fallback is the in-repo copy so a developer checkout works with no
+/// configuration.
+fn bridge_entry_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("ATTA_DSH_BRIDGE") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bridges/atta-dsh-bridge/src/main.js")
 }
 
 /// Load one `[[wasm]]` payload and adapt each tool it exports.
@@ -399,6 +473,61 @@ permission_mode = "make-me-root"
         assert_eq!(types[0].permission_mode, None);
     }
 
+    /// A DSH payload becomes a stdio server that runs the bridge, so the JS
+    /// runtime stays outside the host — the reason DSH plugins arrive over
+    /// MCP at all.
+    #[test]
+    fn a_dsh_payload_becomes_a_bridge_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("dist/index.js"), "export function apply() {}").unwrap();
+        std::env::set_var("ATTA_TEST_DSH_TOKEN", "secret");
+        let p = load(
+            dir.path(),
+            r#"
+[[mcp]]
+name = "pr-helper"
+kind = "dsh"
+entry = "dist/index.js"
+env = ["ATTA_TEST_DSH_TOKEN", "ATTA_TEST_UNSET"]
+"#,
+        );
+
+        let servers = InstalledPlugins::new(vec![p]).mcp_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].0, "p-mcp-pr-helper");
+
+        let cfg = &servers[0].1;
+        assert_eq!(cfg["type"], "stdio");
+        assert_eq!(cfg["command"], "node");
+        let args = cfg["args"].as_array().unwrap();
+        assert!(
+            args[0].as_str().unwrap().ends_with("main.js"),
+            "the bridge runs first: {args:?}"
+        );
+        assert!(
+            args[1].as_str().unwrap().ends_with("dist/index.js"),
+            "the plugin entry is its argument: {args:?}"
+        );
+        assert_eq!(cfg["env"]["ATTA_TEST_DSH_TOKEN"], "secret");
+        assert!(
+            cfg["env"].get("ATTA_TEST_UNSET").is_none(),
+            "a variable that isn't set is simply absent, not empty"
+        );
+    }
+
+    /// An entry module that isn't there would produce a server that fails to
+    /// start on every session. Better to notice at load.
+    #[test]
+    fn a_dsh_payload_with_no_entry_module_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = load(
+            dir.path(),
+            "\n[[mcp]]\nname = \"gone\"\nkind = \"dsh\"\nentry = \"dist/missing.js\"\n",
+        );
+        assert!(InstalledPlugins::new(vec![p]).mcp_servers().is_empty());
+    }
+
     #[test]
     fn native_mcp_payloads_are_namespaced_and_dsh_ones_are_not_servers() {
         let dir = tempfile::tempdir().unwrap();
@@ -424,11 +553,9 @@ entry = "dist/index.js"
         );
 
         let servers = InstalledPlugins::new(vec![p]).mcp_servers();
-        assert_eq!(
-            servers.len(),
-            1,
-            "a dsh payload names a JS module, not an MCP server"
-        );
+        // The dsh payload's entry module does not exist here, so only the
+        // native one produces a server.
+        assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].0, "p-mcp-github");
         assert_eq!(servers[0].1["command"], "echo");
     }
