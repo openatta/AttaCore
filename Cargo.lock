@@ -770,6 +770,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wasm-host",
  "zip",
 ]
 
@@ -2405,13 +2406,17 @@ dependencies = [
 name = "plugin-host"
 version = "0.1.6"
 dependencies = [
+ "anyhow",
  "base",
  "hooks",
  "plugin",
  "runtime",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "wasm-host",
 ]
 
 [[package]]
@@ -4361,9 +4366,12 @@ name = "wasm-host"
 version = "0.1.6"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base",
  "hex",
  "plugin",
  "reqwest 0.12.28",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

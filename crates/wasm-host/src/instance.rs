@@ -61,7 +61,6 @@ pub struct PluginInstance {
     name: String,
     caps: Arc<ResolvedCapabilities>,
     kv: Arc<KvNamespace>,
-    progress: Option<Arc<dyn ProgressSink>>,
 }
 
 impl PluginInstance {
@@ -93,7 +92,6 @@ impl PluginInstance {
             name,
             caps,
             kv: Arc::new(KvNamespace::new()),
-            progress: None,
         })
     }
 
@@ -103,11 +101,6 @@ impl PluginInstance {
 
     pub fn kv(&self) -> &Arc<KvNamespace> {
         &self.kv
-    }
-
-    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>) -> Self {
-        self.progress = Some(sink);
-        self
     }
 
     /// The tools this component exports.
@@ -139,9 +132,12 @@ impl PluginInstance {
         name: &str,
         input_json: &str,
         call_id: &str,
+        progress: Option<Arc<dyn ProgressSink>>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::bindings::atta::plugin::types::ToolOutput, CallFailure> {
-        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
+        let mut store = self
+            .store_with(progress)
+            .map_err(|e| CallFailure::Faulted(e.to_string()))?;
         let call = async {
             let world = self.pre.instantiate_async(&mut store).await?;
             let out = world
@@ -170,13 +166,37 @@ impl PluginInstance {
         with_deadline(call, self.caps.timeout, cancel).await
     }
 
-    /// Build the store for a single call.
+    /// Ask the component to validate an input before the host commits to
+    /// running it.
+    pub async fn validate_input(
+        &self,
+        name: &str,
+        input_json: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Result<(), String>, CallFailure> {
+        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
+        let call = async {
+            let world = self.pre.instantiate_async(&mut store).await?;
+            let out = world
+                .atta_plugin_tools()
+                .call_validate_input(&mut store, name, input_json)
+                .await?;
+            Ok(out)
+        };
+        with_deadline(call, self.caps.timeout, cancel).await
+    }
+
     fn store(&self) -> Result<Store<PluginState>> {
+        self.store_with(None)
+    }
+
+    /// Build the store for a single call.
+    fn store_with(&self, progress: Option<Arc<dyn ProgressSink>>) -> Result<Store<PluginState>> {
         let state = PluginState::new(
             self.name.clone(),
             self.caps.clone(),
             self.kv.clone(),
-            self.progress.clone(),
+            progress,
         )?;
         let mut store = Store::new(self.engine.inner(), state);
         store.limiter(|s| s.limiter());

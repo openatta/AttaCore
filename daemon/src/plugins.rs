@@ -51,6 +51,15 @@ mod imp {
 
     pub struct PluginSubsystem {
         paths: Arc<dyn DaemonPaths>,
+        /// One engine for the whole process — it owns the compiler and its
+        /// code cache, so building one per plugin would pay that repeatedly
+        /// for no isolation benefit. Isolation comes from the per-call
+        /// store, not from the engine.
+        ///
+        /// `None` when wasmtime could not be initialised at all, which
+        /// leaves MCP payloads working and WASM ones absent rather than
+        /// taking the daemon down.
+        engine: Option<wasm_host::WasmEngine>,
         /// The enabled set, refreshed by install/uninstall/enable/disable.
         /// Sessions pick this up when they are created; already-running
         /// sessions keep what they were built with, same hot-swap semantics
@@ -70,11 +79,34 @@ mod imp {
             } else {
                 Vec::new()
             }));
+            let engine = match wasm_host::WasmEngine::new() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "wasmtime unavailable; WASM plugins will not load");
+                    None
+                }
+            };
             Self {
                 paths,
+                engine,
                 active: RwLock::new(active),
                 enabled,
             }
+        }
+
+        /// Compile and interrogate every installed component.
+        ///
+        /// Split out of `new` because it is async and slow, and because the
+        /// daemon has an async startup phase to do it in. Until this has
+        /// run, plugins contribute their manifests but no tools — so it is
+        /// awaited before the daemon serves, not after.
+        pub async fn load_components(&self, workspace: &std::path::Path) {
+            let (Some(engine), true) = (&self.engine, self.enabled) else {
+                return;
+            };
+            let mut refreshed = InstalledPlugins::new(active_plugins(self.paths.as_ref()));
+            refreshed.load_components(engine, workspace).await;
+            *self.active.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(refreshed);
         }
 
         pub fn status(&self) -> PluginStatus {
@@ -148,7 +180,7 @@ mod imp {
                 .install_source(name, &source)
                 .await
                 .map_err(|e| e.to_string())?;
-            self.refresh();
+            self.refresh().await;
             Ok(serde_json::json!({
                 "success": result.success,
                 "message": result.message,
@@ -166,7 +198,7 @@ mod imp {
                 .uninstall(name, version)
                 .await
                 .map_err(|e| e.to_string())?;
-            self.refresh();
+            self.refresh().await;
             Ok(serde_json::json!({
                 "success": result.success,
                 "message": result.message,
@@ -181,16 +213,19 @@ mod imp {
         ) -> Result<serde_json::Value, String> {
             let state = plugin::state::EnableState::new(self.tier_root(scope)?);
             state.set_enabled(name, enabled).map_err(|e| e.to_string())?;
-            self.refresh();
+            self.refresh().await;
             Ok(serde_json::json!({"name": name, "enabled": enabled, "scope": scope}))
         }
 
-        pub fn refresh(&self) {
+        /// Re-read the installed set after an install/uninstall/enable/
+        /// disable. Components are reloaded too, since the point of the
+        /// refresh is usually that they changed.
+        pub async fn refresh(&self) {
             if !self.enabled {
                 return;
             }
-            let refreshed = Arc::new(InstalledPlugins::new(active_plugins(self.paths.as_ref())));
-            *self.active.write().unwrap_or_else(|e| e.into_inner()) = refreshed;
+            let workspace = self.paths.project_root().to_path_buf();
+            self.load_components(&workspace).await;
         }
 
         fn tier_root(&self, scope: &str) -> Result<std::path::PathBuf, String> {
@@ -293,7 +328,8 @@ mod imp {
         ) -> Result<serde_json::Value, String> {
             Err(DISABLED_MESSAGE.to_string())
         }
-        pub fn refresh(&self) {}
+        pub async fn refresh(&self) {}
+        pub async fn load_components(&self, _workspace: &std::path::Path) {}
     }
 }
 

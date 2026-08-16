@@ -168,8 +168,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn caps_with(fs_read: Vec<PathBuf>, fs_write: Vec<PathBuf>) -> Arc<ResolvedCapabilities> {
-        let mut c = plugin::manifest::Capabilities::default();
-        c.max_memory_mb = 8;
+        let c = plugin::manifest::Capabilities {
+            max_memory_mb: 8,
+            ..Default::default()
+        };
         let mut resolved =
             ResolvedCapabilities::resolve(&c, Path::new("/ws"), Path::new("/plug")).unwrap();
         resolved.fs_read = fs_read;

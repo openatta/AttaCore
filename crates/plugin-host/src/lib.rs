@@ -10,16 +10,49 @@ use runtime::agent_tool::{AgentTypeDefinition, AgentTypeSource};
 use runtime::plugin_host::PluginHost;
 use std::path::Path;
 use std::sync::Arc;
+use wasm_host::{ResolvedCapabilities, WasmEngine, WasmToolAdapter};
 
 /// Every enabled plugin this daemon discovered, presented to the engine as
 /// one host.
 pub struct InstalledPlugins {
     plugins: Vec<plugin::manifest::Plugin>,
+    /// Adapters for the tools each plugin's components export. Empty until
+    /// [`load_components`](Self::load_components) has run — a manifest says
+    /// what a plugin claims, only the component says what it provides.
+    tools: Vec<Arc<dyn base::tool::Tool>>,
 }
 
 impl InstalledPlugins {
     pub fn new(plugins: Vec<plugin::manifest::Plugin>) -> Self {
-        Self { plugins }
+        Self {
+            plugins,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Compile, link and interrogate every declared WASM component.
+    ///
+    /// Separate from construction because it is async and slow — components
+    /// are compiled here (or read from the AOT cache) and asked for their
+    /// tool list. A plugin that fails any of these steps is dropped with a
+    /// warning and the others still load: one broken package in a
+    /// marketplace install must not cost the user the rest.
+    pub async fn load_components(&mut self, engine: &WasmEngine, workspace: &Path) {
+        let mut tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
+        for p in &self.plugins {
+            for payload in &p.manifest.wasm {
+                match load_payload(engine, p, payload, workspace).await {
+                    Ok(mut loaded) => tools.append(&mut loaded),
+                    Err(e) => tracing::warn!(
+                        plugin = %p.name(),
+                        component = %payload.component.display(),
+                        error = %e,
+                        "plugin component could not be loaded; skipping it"
+                    ),
+                }
+            }
+        }
+        self.tools = tools;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -36,7 +69,7 @@ impl InstalledPlugins {
 
 impl PluginHost for InstalledPlugins {
     fn tools(&self) -> Vec<Arc<dyn base::tool::Tool>> {
-        Vec::new()
+        self.tools.clone()
     }
 
     /// Keyed `{plugin}-mcp-{declared name}` so two plugins declaring a
@@ -96,6 +129,43 @@ impl PluginHost for InstalledPlugins {
             })
             .collect()
     }
+}
+
+/// Load one `[[wasm]]` payload and adapt each tool it exports.
+async fn load_payload(
+    engine: &WasmEngine,
+    plugin: &plugin::manifest::Plugin,
+    payload: &plugin::manifest::WasmPayload,
+    workspace: &Path,
+) -> anyhow::Result<Vec<Arc<dyn base::tool::Tool>>> {
+    let caps = Arc::new(ResolvedCapabilities::resolve(
+        &payload.capabilities,
+        workspace,
+        &plugin.root,
+    )?);
+    let component = engine.load(&plugin.path(&payload.component), &plugin.root)?;
+    let instance = Arc::new(wasm_host::PluginInstance::link(
+        engine,
+        &component,
+        plugin.name().to_string(),
+        caps,
+    )?);
+
+    // Nothing has cancelled anything yet — this runs at load, before any
+    // session exists to withdraw the request.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let defs = instance
+        .list_tools(&cancel)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(defs
+        .iter()
+        .map(|def| {
+            Arc::new(WasmToolAdapter::new(instance.clone(), plugin.name(), def))
+                as Arc<dyn base::tool::Tool>
+        })
+        .collect())
 }
 
 /// Convert a plugin-declared `AgentDef` into a runtime [`AgentTypeDefinition`],
@@ -301,5 +371,98 @@ entry = "dist/index.js"
                 serde_json::from_value(serde_json::Value::String((*name).to_string()));
             assert!(parsed.is_ok(), "`{name}` is not a real HookEvent");
         }
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    fn fixture_component() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/wasm_echo_plugin/target/wasm32-wasip2/release/wasm_echo_plugin.wasm")
+    }
+
+    /// The whole point of the seam: a manifest on disk turns into tools the
+    /// engine can register, named the way permission rules expect.
+    #[tokio::test]
+    async fn a_declared_component_becomes_registered_tools() {
+        let component = fixture_component();
+        if !component.exists() {
+            // The fixture is built by wasm-host's own integration test; this
+            // one does not build it, because a unit test suite should not
+            // shell out to cargo.
+            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+[plugin]
+name = "echo-plugin"
+version = "1.0.0"
+api_version = "0.1"
+
+[[wasm]]
+component = "echo.wasm"
+"#,
+        )
+        .unwrap();
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+
+        let mut host = InstalledPlugins::new(vec![p]);
+        assert!(
+            host.tools().is_empty(),
+            "a manifest alone says nothing about what a component provides"
+        );
+
+        let engine = WasmEngine::new().unwrap();
+        host.load_components(&engine, dir.path()).await;
+
+        let names: Vec<String> = host.tools().iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            names.contains(&"plugin__echo-plugin__echo".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            host.tools().iter().all(|t| t.is_deferred()),
+            "plugin tools default to deferred so their schemas cost nothing per turn"
+        );
+    }
+
+    /// One unloadable component must not cost the user the plugins that work.
+    #[tokio::test]
+    async fn a_broken_component_is_skipped_and_the_rest_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.wasm"), b"not a component").unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+[plugin]
+name = "broken"
+version = "1.0.0"
+api_version = "0.1"
+
+[[wasm]]
+component = "broken.wasm"
+"#,
+        )
+        .unwrap();
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+
+        let mut host = InstalledPlugins::new(vec![p]);
+        let engine = WasmEngine::new().unwrap();
+        host.load_components(&engine, dir.path()).await;
+
+        assert!(host.tools().is_empty());
+        assert_eq!(
+            host.names(),
+            ["broken"],
+            "the plugin is still known; only its tools are missing"
+        );
     }
 }

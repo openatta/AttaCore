@@ -23,6 +23,7 @@ hooks         = { workspace = true }
 session       = { workspace = true }
 plugin        = { workspace = true, optional = true }
 plugin-host   = { workspace = true, optional = true }
+wasm-host     = { workspace = true, optional = true }
 skills        = { workspace = true }
 tools         = { workspace = true }
 tokio         = { workspace = true, features = ["full"] }
@@ -64,7 +65,7 @@ default = ["plugins"]
 # `daemon::plugins`. Build the locked-down artifact with
 # `cargo build -p daemon --no-default-features`, never `--workspace`: cargo
 # unifies features across the graph, so any other member enabling it wins.
-plugins = ["dep:plugin", "dep:plugin-host"]
+plugins = ["dep:plugin", "dep:plugin-host", "dep:wasm-host"]
 # Fan session telemetry out to an OTLP collector in addition to the per-session
 # JSONL file. Off by default: the OTLP SDK is a large dependency tree and the
 # file recorder is what makes a run debuggable out of the box.

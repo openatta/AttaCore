@@ -8,6 +8,9 @@ publish      = false
 description  = "AttaCore — wasmtime host for WASM component plugins"
 
 [dependencies]
+base        = { workspace = true }
+async-trait = { workspace = true }
+serde_json  = { workspace = true }
 plugin   = { workspace = true }
 anyhow   = { workspace = true }
 hex      = { workspace = true }

@@ -530,6 +530,11 @@ async fn main() -> anyhow::Result<()> {
     // merged in here so they go through the exact same centrally-connected/
     // shared-across-sessions path as user-configured ones — see
     // `SessionPool::plugin_mcp_servers`.
+    // Before anything can create a session: a session built while this is
+    // still running would be missing every plugin tool, with nothing to
+    // indicate why.
+    pool.load_plugin_components().await;
+
     let mut mcp_servers = mcp_servers;
     mcp_servers.extend(pool.plugin_mcp_servers().await);
     pool.connect_mcp_servers_in_background(mcp_servers);

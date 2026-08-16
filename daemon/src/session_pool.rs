@@ -573,6 +573,15 @@ impl SessionPool {
         self.plugins.mcp_servers()
     }
 
+    /// Compile and interrogate installed plugin components.
+    ///
+    /// Awaited during startup, before the daemon serves: until it has run,
+    /// plugins contribute their manifests but none of their tools, and a
+    /// session created in that window would silently be missing them.
+    pub async fn load_plugin_components(&self) {
+        self.plugins.load_components(&self.cwd).await;
+    }
+
     /// Whether this binary has the plugin subsystem, and whether it is on —
     /// see `crate::plugins::PluginStatus`. `daemon.doctor` reports it, and
     /// the `plugin.*` RPCs refuse with `PLUGINS_DISABLED` when it is not

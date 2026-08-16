@@ -44,9 +44,11 @@ fn component_path() -> PathBuf {
 }
 
 fn caps(net: Vec<String>, timeout_ms: u64) -> Arc<ResolvedCapabilities> {
-    let mut c = plugin::manifest::Capabilities::default();
-    c.net = net;
-    c.timeout_ms = timeout_ms;
+    let c = plugin::manifest::Capabilities {
+        net,
+        timeout_ms,
+        ..Default::default()
+    };
     Arc::new(
         ResolvedCapabilities::resolve(
             &c,
@@ -86,7 +88,7 @@ async fn a_real_component_reports_the_tools_it_exports() {
 async fn a_tool_call_round_trips_content_and_structured_output() {
     let inst = instance(caps(vec![], 5_000));
     let out = inst
-        .call_tool("echo", r#"{"text":"hello"}"#, "call-1", &CancellationToken::new())
+        .call_tool("echo", r#"{"text":"hello"}"#, "call-1", None, &CancellationToken::new())
         .await
         .unwrap();
 
@@ -107,7 +109,7 @@ async fn a_spinning_plugin_is_stopped_at_its_declared_timeout() {
     let started = std::time::Instant::now();
 
     let err = inst
-        .call_tool("spin", "{}", "call-spin", &CancellationToken::new())
+        .call_tool("spin", "{}", "call-spin", None, &CancellationToken::new())
         .await
         .unwrap_err();
 
@@ -119,7 +121,13 @@ async fn a_spinning_plugin_is_stopped_at_its_declared_timeout() {
 
     // And the engine is still usable afterwards.
     let out = inst
-        .call_tool("echo", r#"{"text":"still here"}"#, "call-after", &CancellationToken::new())
+        .call_tool(
+            "echo",
+            r#"{"text":"still here"}"#,
+            "call-after",
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(out.content, "still here");
@@ -136,7 +144,7 @@ async fn cancelling_a_running_call_returns_promptly() {
     });
 
     let started = std::time::Instant::now();
-    let err = inst.call_tool("spin", "{}", "call-cancel", &cancel).await.unwrap_err();
+    let err = inst.call_tool("spin", "{}", "call-cancel", None, &cancel).await.unwrap_err();
 
     assert_eq!(err, CallFailure::Cancelled);
     assert!(
@@ -151,13 +159,19 @@ async fn cancelling_a_running_call_returns_promptly() {
 async fn a_trapping_tool_is_contained() {
     let inst = instance(caps(vec![], 5_000));
     let err = inst
-        .call_tool("explode", "{}", "call-boom", &CancellationToken::new())
+        .call_tool("explode", "{}", "call-boom", None, &CancellationToken::new())
         .await
         .unwrap_err();
     assert!(matches!(err, CallFailure::Faulted(_)), "{err:?}");
 
     let out = inst
-        .call_tool("echo", r#"{"text":"survived"}"#, "call-next", &CancellationToken::new())
+        .call_tool(
+            "echo",
+            r#"{"text":"survived"}"#,
+            "call-next",
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(out.content, "survived");
@@ -173,6 +187,7 @@ async fn an_undeclared_host_is_unreachable_from_inside_the_component() {
             "fetch",
             r#"{"url":"https://example.com/"}"#,
             "call-fetch",
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -195,13 +210,13 @@ async fn state_survives_only_through_the_host_namespace() {
     let cancel = CancellationToken::new();
 
     let first = inst
-        .call_tool("remember", r#"{"value":"one"}"#, "c1", &cancel)
+        .call_tool("remember", r#"{"value":"one"}"#, "c1", None, &cancel)
         .await
         .unwrap();
     assert_eq!(first.content, "(none)", "the first call has nothing stored yet");
 
     let second = inst
-        .call_tool("remember", r#"{"value":"two"}"#, "c2", &cancel)
+        .call_tool("remember", r#"{"value":"two"}"#, "c2", None, &cancel)
         .await
         .unwrap();
     assert_eq!(
@@ -211,7 +226,7 @@ async fn state_survives_only_through_the_host_namespace() {
 
     inst.kv().clear();
     let third = inst
-        .call_tool("remember", r#"{"value":"three"}"#, "c3", &cancel)
+        .call_tool("remember", r#"{"value":"three"}"#, "c3", None, &cancel)
         .await
         .unwrap();
     assert_eq!(
@@ -231,5 +246,144 @@ async fn init_reports_a_configuration_the_plugin_refuses() {
     match err {
         CallFailure::Faulted(msg) => assert!(msg.contains("configuration"), "{msg}"),
         other => panic!("expected the plugin's own rejection, got {other:?}"),
+    }
+}
+
+// ── The adapter: the same component, seen as an ordinary engine tool ──
+
+mod as_a_tool {
+    use super::*;
+    use base::tool::{Tool, ToolContext, ToolResultContent};
+    use wasm_host::WasmToolAdapter;
+
+    async fn adapter_for(tool: &str, timeout_ms: u64) -> WasmToolAdapter {
+        let inst = Arc::new(instance(caps(vec![], timeout_ms)));
+        let defs = inst.list_tools(&CancellationToken::new()).await.unwrap();
+        let def = defs.iter().find(|d| d.name == tool).expect("fixture tool");
+        WasmToolAdapter::new(inst.clone(), "echo-plugin", def)
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext::for_test(std::env::temp_dir())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_adapter_presents_the_component_as_a_named_deferred_tool() {
+        let t = adapter_for("echo", 5_000).await;
+
+        assert_eq!(t.name(), "plugin__echo-plugin__echo");
+        assert!(t.is_deferred(), "a third-party schema is not worth a per-call token cost");
+        assert!(t.is_dynamic(), "list-tools is the authority and it can change");
+        assert_eq!(t.input_schema()["properties"]["text"]["type"], "string");
+        assert_eq!(
+            t.short_description().as_deref(),
+            Some("Echo the `text` argument back"),
+            "the one-liner is the component's own, and it is what ships every turn"
+        );
+    }
+
+    /// `description` is what ships every turn; the long guide is only
+    /// reachable through the on-demand path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_long_guide_is_what_tool_search_would_fetch() {
+        let t = adapter_for("echo", 5_000).await;
+        let detailed = t
+            .detailed_prompt(&base::tool::PromptContext::default())
+            .await
+            .expect("a documented tool has something to fetch");
+        assert!(detailed.contains("verbatim"), "{detailed}");
+        assert_ne!(detailed, t.description());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_through_the_adapter_returns_both_renderings() {
+        let t = adapter_for("echo", 5_000).await;
+        let r = t
+            .call(
+                serde_json::json!({"text": "through the adapter"}),
+                ctx(),
+                base::tool::ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r.is_error);
+        match &r.content {
+            ToolResultContent::Text(s) => assert_eq!(s, "through the adapter"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(
+            r.structured_content.as_ref().unwrap()["echoed"],
+            "through the adapter",
+            "structured output must survive the trip into the engine's own type"
+        );
+    }
+
+    /// A plugin's own tool failing is not the turn failing. The model sees an
+    /// error result and can choose something else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timeout_becomes_an_error_result_not_a_turn_failure() {
+        let t = adapter_for("spin", 150).await;
+        let r = t
+            .call(
+                serde_json::json!({}),
+                ctx(),
+                base::tool::ProgressSender::noop("t"),
+            )
+            .await
+            .expect("a plugin timing out must not fail the turn");
+        assert!(r.is_error);
+        match &r.content {
+            ToolResultContent::Text(s) => assert!(s.contains("timeout"), "{s}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// Cancellation is the engine's own vocabulary, so it has to arrive as
+    /// the engine's error rather than as a result the model would read as an
+    /// answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_surfaces_as_the_engines_own_error() {
+        let t = adapter_for("spin", 60_000).await;
+        let c = ctx();
+        let token = c.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let err = t
+            .call(
+                serde_json::json!({}),
+                c,
+                base::tool::ProgressSender::noop("t"),
+            )
+            .await
+            .expect_err("a cancelled call is not a result");
+        assert!(matches!(err, base::error::ToolError::Cancelled), "{err:?}");
+    }
+
+    /// The plugin's own validator runs before the host commits to the call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_components_validator_rejects_bad_input() {
+        let t = adapter_for("echo", 5_000).await;
+        let bad = t.validate_input(&serde_json::json!({}), &ctx()).await;
+        assert!(bad.is_err(), "echo declares `text` as required");
+
+        let good = t
+            .validate_input(&serde_json::json!({"text": "x"}), &ctx())
+            .await;
+        assert!(good.is_ok());
+    }
+
+    /// A plugin does not get to vouch for itself; the user's rules decide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_adapter_never_grants_its_own_permission() {
+        let t = adapter_for("echo", 5_000).await;
+        let d = t.check_permissions(&serde_json::json!({}), &ctx()).await;
+        assert!(
+            matches!(d, base::tool::PermissionDecision::Ask { .. }),
+            "{d:?}"
+        );
     }
 }

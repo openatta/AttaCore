@@ -95,9 +95,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn state_with(net: Vec<String>, env: Vec<String>) -> PluginState {
-        let mut c = plugin::manifest::Capabilities::default();
-        c.net = net;
-        c.env = env;
+        let c = plugin::manifest::Capabilities {
+            net,
+            env,
+            ..Default::default()
+        };
         let caps = ResolvedCapabilities::resolve(&c, Path::new("/ws"), Path::new("/plug")).unwrap();
         PluginState::new("p", Arc::new(caps), Arc::new(KvNamespace::new()), None).unwrap()
     }

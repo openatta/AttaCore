@@ -6,6 +6,7 @@
 //! all pull in. Paying for wasmtime everywhere something wants to read a
 //! `plugin.toml` would be the wrong trade.
 
+pub mod adapter;
 pub mod bindings;
 pub mod cache;
 pub mod capabilities;
@@ -14,6 +15,7 @@ mod host_impl;
 pub mod instance;
 pub mod state;
 
+pub use adapter::{qualified_name, WasmToolAdapter};
 pub use bindings::{API_VERSION, WIT_PACKAGE};
 pub use cache::AotCache;
 pub use capabilities::ResolvedCapabilities;
