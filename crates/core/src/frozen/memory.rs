@@ -32,7 +32,7 @@ pub struct MemoryFileEntry {
 /// - MEMORY.md 长度截 8KB -- 它本就该是索引而非详情
 ///
 /// 失败时返回 (默认 Path, None) -- 不阻塞 session 启动。
-pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
+pub(crate) async fn collect_memory(cwd: &Path, global_root: &Path) -> (PathBuf, Option<String>) {
     use sha2::{Digest, Sha256};
     let canonical = tokio::fs::canonicalize(cwd)
         .await
@@ -43,9 +43,7 @@ pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
     // 16 hex chars = 64 bits 命名空间，碰撞率 < 2^-32 即便 50k 项目也安全
     let hash_hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
 
-    let dir = crate::paths::atta_global_dir()
-        .join("memory")
-        .join(&hash_hex);
+    let dir = global_root.join("memory").join(&hash_hex);
 
     let index_path = dir.join("MEMORY.md");
     let index = tokio::fs::read_to_string(&index_path)
@@ -60,11 +58,11 @@ pub(crate) async fn collect_memory(cwd: &Path) -> (PathBuf, Option<String>) {
 /// （如"项目 X 常用命令"、"曾经的设计决策"）。只是文件加载；
 /// auto-extract / save tools 推迟。返回路径列表按文件名排序，让加载顺序稳定。
 /// **2026-08-04 起不再挂 scope**，理由同 [`collect_memory`]。
-pub(crate) async fn collect_memdir_files(home: &Path, cwd: &Path) -> Vec<PathBuf> {
+pub(crate) async fn collect_memdir_files(global_root: &Path, cwd: &Path) -> Vec<PathBuf> {
     // Cap the count of memory files loaded, keeping the newest by mtime.
     const MAX_MEMORY_FILES: usize = 200;
     let sanitized = sanitize_for_dir(&cwd.display().to_string());
-    let dir = home.join(".atta").join("memory").join(&sanitized);
+    let dir = global_root.join("memory").join(&sanitized);
     let mut files: Vec<PathBuf> = Vec::new();
     let mut entries = match tokio::fs::read_dir(&dir).await {
         Ok(e) => e,
@@ -105,6 +103,7 @@ pub(crate) async fn collect_memdir_files(home: &Path, cwd: &Path) -> Vec<PathBuf
 pub(crate) async fn collect_memory_files_with(
     cwd: &Path,
     do_walk_up: bool,
+    global_root: &Path,
 ) -> Vec<MemoryFileEntry> {
     let mut visited = std::collections::HashSet::new();
     let mut walk_up: Vec<PathBuf> = Vec::new();
@@ -134,12 +133,8 @@ pub(crate) async fn collect_memory_files_with(
     walk_up.reverse();
 
     // memdir：在 repo 顶层之前插入
-    // ~/.atta/memory/<sanitized-cwd>/*.md
-    let home = std::env::var("HOME").ok();
-    let memdir_files = match home.as_deref() {
-        Some(h) => collect_memdir_files(&PathBuf::from(h), cwd).await,
-        None => Vec::new(),
-    };
+    // <global_root>/memory/<sanitized-cwd>/*.md
+    let memdir_files = collect_memdir_files(global_root, cwd).await;
     let mut combined: Vec<PathBuf> = Vec::with_capacity(walk_up.len() + memdir_files.len());
     combined.extend(memdir_files);
     combined.extend(walk_up);
@@ -567,14 +562,14 @@ mod tests {
             .unwrap();
 
         // walk_up = true（默认）-- parent 应该出现
-        let with_walk = collect_memory_files_with(&child, true).await;
+        let with_walk = collect_memory_files_with(&child, true, &dir.path().join("state")).await;
         assert!(with_walk
             .iter()
             .any(|e| e.content.contains("PARENT-MONOREPO")));
         assert!(with_walk.iter().any(|e| e.content.contains("CHILD-LOCAL")));
 
         // walk_up = false -- 只 child
-        let no_walk = collect_memory_files_with(&child, false).await;
+        let no_walk = collect_memory_files_with(&child, false, &dir.path().join("state")).await;
         assert!(!no_walk
             .iter()
             .any(|e| e.content.contains("PARENT-MONOREPO")));
@@ -587,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn memdir_loads_md_files_for_project() {
-        // 假装的 home + cwd
+        // 假装的状态根 + cwd
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let sanitized = sanitize_for_dir(&cwd.path().display().to_string());
@@ -604,7 +599,7 @@ mod tests {
             .await
             .unwrap();
 
-        let files = collect_memdir_files(home.path(), cwd.path()).await;
+        let files = collect_memdir_files(&home.path().join(".atta"), cwd.path()).await;
         assert_eq!(files.len(), 2);
         // Order is mtime-newest-first; assert by membership, not position.
         let names: Vec<String> = files
@@ -620,7 +615,7 @@ mod tests {
     async fn memdir_returns_empty_when_dir_missing() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let files = collect_memdir_files(home.path(), cwd.path()).await;
+        let files = collect_memdir_files(&home.path().join(".atta"), cwd.path()).await;
         assert!(files.is_empty());
     }
 
@@ -841,17 +836,17 @@ mod tests {
     #[tokio::test]
     async fn memdir_files_capped_at_200() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let global_root = tmp.path().join(".atta");
         let cwd = std::path::Path::new("/fake/project/abc");
         let sanitized = sanitize_for_dir(&cwd.display().to_string());
-        let dir = home.join(".atta").join("memory").join(&sanitized);
+        let dir = global_root.join("memory").join(&sanitized);
         tokio::fs::create_dir_all(&dir).await.unwrap();
         for i in 0..250u32 {
             tokio::fs::write(dir.join(format!("m{i}.md")), format!("body {i}"))
                 .await
                 .unwrap();
         }
-        let got = collect_memdir_files(home, cwd).await;
+        let got = collect_memdir_files(&global_root, cwd).await;
         assert_eq!(got.len(), 200);
     }
 }

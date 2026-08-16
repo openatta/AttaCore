@@ -50,12 +50,7 @@ fn caps(net: Vec<String>, timeout_ms: u64) -> Arc<ResolvedCapabilities> {
         ..Default::default()
     };
     Arc::new(
-        ResolvedCapabilities::resolve(
-            &c,
-            &std::env::temp_dir(),
-            &std::env::temp_dir(),
-        )
-        .unwrap(),
+        ResolvedCapabilities::resolve(&c, &std::env::temp_dir(), &std::env::temp_dir()).unwrap(),
     )
 }
 
@@ -76,7 +71,10 @@ async fn a_real_component_reports_the_tools_it_exports() {
     assert!(names.contains(&"spin"), "{names:?}");
 
     let echo = tools.iter().find(|t| t.name == "echo").unwrap();
-    assert!(echo.read_only, "the component's own declaration comes through");
+    assert!(
+        echo.read_only,
+        "the component's own declaration comes through"
+    );
     assert!(
         echo.doc.as_ref().is_some_and(|d| d.contains("verbatim")),
         "the long doc is what ToolSearch fetches on demand"
@@ -88,7 +86,13 @@ async fn a_real_component_reports_the_tools_it_exports() {
 async fn a_tool_call_round_trips_content_and_structured_output() {
     let inst = instance(caps(vec![], 5_000));
     let out = inst
-        .call_tool("echo", r#"{"text":"hello"}"#, "call-1", None, &CancellationToken::new())
+        .call_tool(
+            "echo",
+            r#"{"text":"hello"}"#,
+            "call-1",
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -144,7 +148,10 @@ async fn cancelling_a_running_call_returns_promptly() {
     });
 
     let started = std::time::Instant::now();
-    let err = inst.call_tool("spin", "{}", "call-cancel", None, &cancel).await.unwrap_err();
+    let err = inst
+        .call_tool("spin", "{}", "call-cancel", None, &cancel)
+        .await
+        .unwrap_err();
 
     assert_eq!(err, CallFailure::Cancelled);
     assert!(
@@ -159,7 +166,13 @@ async fn cancelling_a_running_call_returns_promptly() {
 async fn a_trapping_tool_is_contained() {
     let inst = instance(caps(vec![], 5_000));
     let err = inst
-        .call_tool("explode", "{}", "call-boom", None, &CancellationToken::new())
+        .call_tool(
+            "explode",
+            "{}",
+            "call-boom",
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, CallFailure::Faulted(_)), "{err:?}");
@@ -213,7 +226,10 @@ async fn state_survives_only_through_the_host_namespace() {
         .call_tool("remember", r#"{"value":"one"}"#, "c1", None, &cancel)
         .await
         .unwrap();
-    assert_eq!(first.content, "(none)", "the first call has nothing stored yet");
+    assert_eq!(
+        first.content, "(none)",
+        "the first call has nothing stored yet"
+    );
 
     let second = inst
         .call_tool("remember", r#"{"value":"two"}"#, "c2", None, &cancel)
@@ -272,8 +288,14 @@ mod as_a_tool {
         let t = adapter_for("echo", 5_000).await;
 
         assert_eq!(t.name(), "plugin__echo-plugin__echo");
-        assert!(t.is_deferred(), "a third-party schema is not worth a per-call token cost");
-        assert!(t.is_dynamic(), "list-tools is the authority and it can change");
+        assert!(
+            t.is_deferred(),
+            "a third-party schema is not worth a per-call token cost"
+        );
+        assert!(
+            t.is_dynamic(),
+            "list-tools is the authority and it can change"
+        );
         assert_eq!(t.input_schema()["properties"]["text"]["type"], "string");
         assert_eq!(
             t.short_description().as_deref(),
@@ -369,8 +391,14 @@ mod as_a_tool {
     #[tokio::test(flavor = "multi_thread")]
     async fn validation_checks_the_shape_without_calling_the_component() {
         let t = adapter_for("echo", 5_000).await;
-        assert!(t.validate_input(&serde_json::json!("a string"), &ctx()).await.is_err());
-        assert!(t.validate_input(&serde_json::json!({}), &ctx()).await.is_ok());
+        assert!(t
+            .validate_input(&serde_json::json!("a string"), &ctx())
+            .await
+            .is_err());
+        assert!(t
+            .validate_input(&serde_json::json!({}), &ctx())
+            .await
+            .is_ok());
     }
 
     /// A plugin does not get to vouch for itself; the user's rules decide.
@@ -395,7 +423,11 @@ mod as_an_event_subscriber {
     async fn a_component_can_refuse_an_event_with_a_reason() {
         let inst = instance(caps(vec![], 5_000));
         let decision = inst
-            .on_event("PreToolUse", r#"{"tool_name":"Bash"}"#, &CancellationToken::new())
+            .on_event(
+                "PreToolUse",
+                r#"{"tool_name":"Bash"}"#,
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         match decision {
@@ -411,7 +443,10 @@ mod as_an_event_subscriber {
             .on_event("SessionStart", "{}", &CancellationToken::new())
             .await
             .unwrap();
-        assert!(matches!(decision, HookDecision::AddContext(_)), "{decision:?}");
+        assert!(
+            matches!(decision, HookDecision::AddContext(_)),
+            "{decision:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -489,7 +524,10 @@ mod health {
         match &r.content {
             ToolResultContent::Text(s) => {
                 assert!(s.contains("disabled"), "{s}");
-                assert!(s.contains("echo-plugin"), "the user needs to know which one: {s}");
+                assert!(
+                    s.contains("echo-plugin"),
+                    "the user needs to know which one: {s}"
+                );
             }
             other => panic!("expected text, got {other:?}"),
         }

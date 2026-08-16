@@ -111,9 +111,7 @@ fn into_response(decision: wasm_host::bindings::atta::plugin::types::HookDecisio
 /// Event names were validated against the subscribable whitelist when the
 /// manifest was parsed; anything that slips through here is dropped rather
 /// than trusted, because this is the last point before the dispatcher.
-pub fn hook_configs_for(
-    plugin: &plugin::manifest::Plugin,
-) -> Vec<(HookEvent, HookConfig)> {
+pub fn hook_configs_for(plugin: &plugin::manifest::Plugin) -> Vec<(HookEvent, HookConfig)> {
     let mut out = Vec::new();
     for payload in &plugin.manifest.wasm {
         for name in &payload.events {

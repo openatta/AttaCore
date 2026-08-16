@@ -141,10 +141,16 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.contains("evil.example"), "the host is what was refused: {err}");
+        assert!(
+            err.contains("evil.example"),
+            "the host is what was refused: {err}"
+        );
         assert!(!err.contains("sup3r-secret"), "credentials leaked: {err}");
         assert!(!err.contains("also-secret"), "query secrets leaked: {err}");
-        assert!(!err.contains("/path"), "the path is not needed to explain this: {err}");
+        assert!(
+            !err.contains("/path"),
+            "the path is not needed to explain this: {err}"
+        );
     }
 
     #[tokio::test]

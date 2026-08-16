@@ -259,9 +259,8 @@ mod tests {
 
     #[test]
     fn an_unparseable_schema_degrades_to_an_open_object() {
-        let schema: Value = serde_json::from_str("not json").unwrap_or_else(|_| {
-            serde_json::json!({"type": "object"})
-        });
+        let schema: Value = serde_json::from_str("not json")
+            .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
         assert_eq!(schema["type"], "object");
     }
 

@@ -162,9 +162,9 @@ pub enum SkillSource {
 /// 同名时后扫到的覆盖先扫到的（`scan_skills_dir` 结果直接 extend 进 `Vec`，
 /// 调用方按"先入者优先"处理 slash 分发，所以顺序是：scene 覆盖需要排在它要
 /// 覆盖的全局条目**之前**，让 scene 版本先命中）。
-async fn collect_skills(home: &Path, cwd: &Path, scope: &str) -> Vec<SkillEntry> {
-    let global_dir = home.join(".atta").join("skills");
-    let scene_dir = home.join(".atta").join("scenes").join(scope).join("skills");
+async fn collect_skills(paths: &crate::paths::ConfigPaths, cwd: &Path) -> Vec<SkillEntry> {
+    let global_dir = paths.global_skills_dir();
+    let scene_dir = paths.user_skills_dir();
     let project_dir = cwd.join(".agents").join("skills");
     let mut all = Vec::new();
     all.extend(scan_skills_dir(&scene_dir, SkillSource::User).await);
@@ -217,24 +217,14 @@ pub async fn load_skill_from_path(path: &Path, source: SkillSource) -> Option<Sk
 }
 
 /// 公开的"只扫 skills"入口 -- 给 CLI/TUI 启动时构造 skill 列表用，避免重跑
-/// FrozenContext::collect 里的 git 子命令。home 自动取 $HOME；找不到时只扫
-/// project 目录。
+/// FrozenContext::collect 里的 git 子命令。
 ///
 /// 把 5 个内置 bundled skills 追加到列表末尾。disk 上同名 skill 优先
 /// （因为先入列表，slash 命中第一个）。
-pub async fn load_session_skills(cwd: &Path, scope: &str) -> Vec<SkillEntry> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let all = match home {
-        Some(h) => collect_skills(&h, cwd, scope).await,
-        None => {
-            // 没有 HOME 时只扫 project
-            let project_dir = cwd.join(".agents").join("skills");
-            scan_skills_dir(&project_dir, SkillSource::Project).await
-        }
-    };
+pub async fn load_session_skills(cwd: &Path, paths: &crate::paths::ConfigPaths) -> Vec<SkillEntry> {
     // Disk skills are loaded first (take priority for slash commands).
     // Callers should use collect_skills_with_bundled() to append bundled skills.
-    all
+    collect_skills(paths, cwd).await
 }
 
 /// Like [`load_session_skills`] but appends bundled skills after disk skills.
@@ -246,9 +236,9 @@ pub async fn load_session_skills(cwd: &Path, scope: &str) -> Vec<SkillEntry> {
 pub async fn load_session_skills_with_bundled(
     cwd: &Path,
     bundled: Vec<SkillEntry>,
-    scope: &str,
+    paths: &crate::paths::ConfigPaths,
 ) -> Vec<SkillEntry> {
-    let mut all = load_session_skills(cwd, scope).await;
+    let mut all = load_session_skills(cwd, paths).await;
     let disk_names: std::collections::HashSet<String> =
         all.iter().map(|s| s.name.clone()).collect();
     for s in bundled {
@@ -505,6 +495,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Roots under a tempdir — the same shape a real instance gets, minus any
+    /// dependence on who is running the test.
+    fn test_paths(home: &Path) -> crate::paths::ConfigPaths {
+        crate::paths::ConfigPaths::new(home.join(".atta"), home.join("project/.atta"), "code")
+    }
+
     #[tokio::test]
     async fn collect_skills_loads_user_and_project() {
         let home = TempDir::new().unwrap();
@@ -527,7 +523,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let skills = collect_skills(home.path(), cwd.path(), "code").await;
+        let skills = collect_skills(&test_paths(home.path()), cwd.path()).await;
         assert_eq!(skills.len(), 2);
         // user (scene) 在前
         assert_eq!(skills[0].name, "u-skill");
@@ -557,7 +553,7 @@ mod tests {
         .await
         .unwrap();
 
-        let skills = collect_skills(home.path(), cwd.path(), "code").await;
+        let skills = collect_skills(&test_paths(home.path()), cwd.path()).await;
         let shared: Vec<_> = skills.iter().filter(|s| s.name == "shared").collect();
         // Both entries are present in the raw list (same-name-both-kept
         // convention, see `SkillSource` docs) but the scene one comes first,
@@ -574,7 +570,7 @@ mod tests {
         // 目录存在但没有 SKILL.md
         let d = home.path().join(".atta/scenes/code/skills/empty");
         tokio::fs::create_dir_all(&d).await.unwrap();
-        let skills = collect_skills(home.path(), cwd.path(), "code").await;
+        let skills = collect_skills(&test_paths(home.path()), cwd.path()).await;
         assert!(skills.is_empty());
     }
 
@@ -593,7 +589,7 @@ mod tests {
         .await
         .unwrap();
 
-        let skills = collect_skills(home.path(), cwd.path(), "code").await;
+        let skills = collect_skills(&test_paths(home.path()), cwd.path()).await;
         assert!(
             skills.is_empty(),
             "`.atta/code/skills/` must not be scanned"

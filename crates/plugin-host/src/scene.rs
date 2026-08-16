@@ -102,10 +102,7 @@ impl PluginScene {
                     .unwrap_or(DEFAULT_COMPACT_KEEP_RECENT),
             },
             execution: ExecutionParams {
-                max_api_calls_per_turn: own
-                    .budget
-                    .max_api_calls_per_turn
-                    .unwrap_or(u32::MAX),
+                max_api_calls_per_turn: own.budget.max_api_calls_per_turn.unwrap_or(u32::MAX),
             },
             extra_tools,
         })
@@ -290,7 +287,10 @@ max_api_calls_per_turn = 12
             "\n[scene.own]\nname = \"D\"\nprompt = \"scene/prompt.md\"\n",
         );
         let s = PluginScene::from_plugin(&p, Vec::new()).unwrap();
-        assert_eq!(s.token_budget().compact_threshold, DEFAULT_COMPACT_THRESHOLD);
+        assert_eq!(
+            s.token_budget().compact_threshold,
+            DEFAULT_COMPACT_THRESHOLD
+        );
         assert_eq!(
             s.token_budget().compact_keep_recent,
             DEFAULT_COMPACT_KEEP_RECENT
@@ -336,7 +336,10 @@ max_api_calls_per_turn = 12
         let s = PluginScene::from_plugin(&p, Vec::new()).unwrap();
 
         std::fs::write(dir.path().join("scene/prompt.md"), "REWRITTEN").unwrap();
-        assert_eq!(s.build_system_prompt(&ctx())[0].content, "You are the demo agent.");
+        assert_eq!(
+            s.build_system_prompt(&ctx())[0].content,
+            "You are the demo agent."
+        );
     }
 
     /// A personality the user asked for and silently did not get is worse
@@ -359,12 +362,13 @@ max_api_calls_per_turn = 12
         std::fs::remove_file(dir.path().join("scene/reminder.md")).unwrap();
         let p = load(dir.path(), full_scene_body());
         let s = PluginScene::from_plugin(&p, Vec::new()).unwrap();
-        assert!(s.build_system_reminder(&ReminderContext {
-            cwd: Cow::Borrowed("/work"),
-            git_status: None,
-            memory_summary: None,
-        })
-        .is_empty());
+        assert!(s
+            .build_system_reminder(&ReminderContext {
+                cwd: Cow::Borrowed("/work"),
+                git_status: None,
+                memory_summary: None,
+            })
+            .is_empty());
     }
 
     #[test]

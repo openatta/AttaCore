@@ -97,12 +97,7 @@ impl PluginState {
         }
         for dir in &caps.fs_write {
             builder
-                .preopened_dir(
-                    dir,
-                    guest_path(dir),
-                    DirPerms::all(),
-                    FilePerms::all(),
-                )
+                .preopened_dir(dir, guest_path(dir), DirPerms::all(), FilePerms::all())
                 .map_err(|e| anyhow::anyhow!("preopening {} writable: {e}", dir.display()))?;
         }
 
@@ -190,7 +185,10 @@ mod tests {
         assert!(kv.get("missing").is_none());
 
         kv.clear();
-        assert!(kv.is_empty(), "unloading a plugin must take its state with it");
+        assert!(
+            kv.is_empty(),
+            "unloading a plugin must take its state with it"
+        );
         assert!(kv.get("a").is_none());
     }
 
@@ -242,7 +240,10 @@ mod tests {
 
     #[test]
     fn guest_paths_hide_the_host_layout() {
-        assert_eq!(guest_path(Path::new("/Users/someone/secret/project")), "/project");
+        assert_eq!(
+            guest_path(Path::new("/Users/someone/secret/project")),
+            "/project"
+        );
         assert_eq!(guest_path(Path::new("/")), "/");
     }
 }

@@ -119,7 +119,10 @@ fn resolve_path(raw: &str, workspace: &Path, plugin_root: &Path) -> Result<PathB
              an unanchored path would grant more than a reviewer can judge"
         );
     };
-    if expanded.components().any(|c| c == std::path::Component::ParentDir) {
+    if expanded
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         bail!("capability path `{raw}` may not contain `..`");
     }
     Ok(expanded)
@@ -181,10 +184,19 @@ mod tests {
         let r = resolve(c).unwrap();
 
         assert!(r.allows_url("https://api.github.com/repos"));
-        assert!(r.allows_url("https://API.GitHub.com/repos"), "host is case-insensitive");
-        assert!(r.allows_url("https://api.github.com:443/repos"), "port is not part of the host");
+        assert!(
+            r.allows_url("https://API.GitHub.com/repos"),
+            "host is case-insensitive"
+        );
+        assert!(
+            r.allows_url("https://api.github.com:443/repos"),
+            "port is not part of the host"
+        );
 
-        assert!(!r.allows_url("https://github.com/x"), "a declaration is not a suffix rule");
+        assert!(
+            !r.allows_url("https://github.com/x"),
+            "a declaration is not a suffix rule"
+        );
         assert!(!r.allows_url("https://evil-api.github.com.attacker.test/x"));
         assert!(!r.allows_url("https://api.github.com.attacker.test/x"));
     }

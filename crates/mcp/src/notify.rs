@@ -144,10 +144,7 @@ mod tests {
     fn recorder() -> (NotificationSink, Arc<Mutex<Vec<McpNotification>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        (
-            Arc::new(move |n| sink.lock().unwrap().push(n)),
-            seen,
-        )
+        (Arc::new(move |n| sink.lock().unwrap().push(n)), seen)
     }
 
     #[test]
@@ -192,12 +189,8 @@ mod tests {
     #[test]
     fn asking_whether_tools_changed_clears_the_queue() {
         let q = NotificationQueue::new();
-        q.push(McpNotification::ResourceListChanged {
-            server: "a".into(),
-        });
-        q.push(McpNotification::ToolListChanged {
-            server: "b".into(),
-        });
+        q.push(McpNotification::ResourceListChanged { server: "a".into() });
+        q.push(McpNotification::ToolListChanged { server: "b".into() });
 
         assert!(q.take_tools_changed());
         assert!(
@@ -210,9 +203,7 @@ mod tests {
     #[test]
     fn other_notifications_do_not_claim_the_tools_changed() {
         let q = NotificationQueue::new();
-        q.push(McpNotification::PromptListChanged {
-            server: "a".into(),
-        });
+        q.push(McpNotification::PromptListChanged { server: "a".into() });
         assert!(!q.take_tools_changed());
     }
 }

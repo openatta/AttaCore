@@ -44,10 +44,18 @@ pub fn load_config(plugin: &plugin::manifest::Plugin) -> Result<serde_json::Valu
 pub fn validate_against(schema_path: &Path, config: &serde_json::Value) -> Result<()> {
     let raw = std::fs::read_to_string(schema_path)
         .map_err(|e| anyhow!("config schema {}: {e}", schema_path.display()))?;
-    let schema: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| anyhow!("config schema {} is not valid JSON: {e}", schema_path.display()))?;
-    let validator = jsonschema::validator_for(&schema)
-        .map_err(|e| anyhow!("config schema {} is not a valid JSON Schema: {e}", schema_path.display()))?;
+    let schema: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow!(
+            "config schema {} is not valid JSON: {e}",
+            schema_path.display()
+        )
+    })?;
+    let validator = jsonschema::validator_for(&schema).map_err(|e| {
+        anyhow!(
+            "config schema {} is not a valid JSON Schema: {e}",
+            schema_path.display()
+        )
+    })?;
 
     let problems: Vec<String> = validator
         .iter_errors(config)
@@ -66,7 +74,10 @@ pub fn validate_against(schema_path: &Path, config: &serde_json::Value) -> Resul
     }
     // Every problem, not just the first: a user fixing one at a time,
     // reinstalling between each, is a worse experience than one list.
-    Err(anyhow!("{CONFIG_FILE} does not match this plugin's schema: {}", problems.join("; ")))
+    Err(anyhow!(
+        "{CONFIG_FILE} does not match this plugin's schema: {}",
+        problems.join("; ")
+    ))
 }
 
 #[cfg(test)]
@@ -96,7 +107,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("plugin.toml"), HEAD).unwrap();
         std::fs::write(dir.path().join(CONFIG_FILE), r#"{"whatever": true}"#).unwrap();
-        let p = plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
         assert_eq!(load_config(&p).unwrap()["whatever"], true);
     }
 
@@ -113,7 +125,11 @@ mod tests {
     fn a_conforming_config_is_returned_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let p = plugin_with_schema(dir.path(), SCHEMA);
-        std::fs::write(dir.path().join(CONFIG_FILE), r#"{"token": "abc", "retries": 3}"#).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"{"token": "abc", "retries": 3}"#,
+        )
+        .unwrap();
         let c = load_config(&p).unwrap();
         assert_eq!(c["token"], "abc");
         assert_eq!(c["retries"], 3);
@@ -138,7 +154,10 @@ mod tests {
         )
         .unwrap();
         let err = load_config(&p).unwrap_err().to_string();
-        assert!(err.contains("/retries"), "the path is what a user needs: {err}");
+        assert!(
+            err.contains("/retries"),
+            "the path is what a user needs: {err}"
+        );
     }
 
     /// One list beats fixing one problem at a time with a reinstall between
@@ -158,7 +177,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = plugin_with_schema(dir.path(), SCHEMA);
         std::fs::write(dir.path().join(CONFIG_FILE), "not json").unwrap();
-        assert!(load_config(&p).unwrap_err().to_string().contains("valid JSON"));
+        assert!(load_config(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("valid JSON"));
     }
 
     /// A schema that never rejects anything is indistinguishable from one

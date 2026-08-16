@@ -413,7 +413,8 @@ impl McpManager {
                 elicitation_cell.clone(),
                 notifications.clone(),
             )
-            .await {
+            .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_err = Some(e);
@@ -444,8 +445,15 @@ impl McpManager {
     /// a warning.
     pub async fn add_server(&mut self, name: &str, cfg: &McpServerConfig) {
         let cb = self.elicitation_callback.clone();
-        match Self::connect_one(name, cfg, self.output_cache.clone(), cb, self.notifications.clone())
-            .await {
+        match Self::connect_one(
+            name,
+            cfg,
+            self.output_cache.clone(),
+            cb,
+            self.notifications.clone(),
+        )
+        .await
+        {
             Ok((client, server_adapters)) => {
                 info!(
                     server = %name,

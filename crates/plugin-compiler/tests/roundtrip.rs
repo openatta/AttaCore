@@ -9,8 +9,9 @@
 use std::path::{Path, PathBuf};
 
 fn fixture_component() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/wasm_echo_plugin/target/wasm32-wasip2/release/wasm_echo_plugin.wasm")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../tests/fixtures/wasm_echo_plugin/target/wasm32-wasip2/release/wasm_echo_plugin.wasm",
+    )
 }
 
 fn install_plugin(dir: &Path, component: &Path) {
@@ -43,7 +44,9 @@ fn what_the_compiler_writes_the_runtime_loads_without_compiling() {
 
     // The runtime finds it without compiling anything of its own.
     let engine = wasm_host::WasmEngine::new().unwrap();
-    let handle = engine.load(&dir.path().join("echo.wasm"), dir.path()).unwrap();
+    let handle = engine
+        .load(&dir.path().join("echo.wasm"), dir.path())
+        .unwrap();
     assert!(
         handle.was_cached(),
         "the runtime must reuse the compiler's artifact, not compile its own"
@@ -77,7 +80,9 @@ fn a_plugin_with_no_components_compiles_nothing_and_says_so() {
         "[plugin]\nname = \"mcp-only\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n",
     )
     .unwrap();
-    assert!(plugin_compiler::compile_plugin(dir.path()).unwrap().is_empty());
+    assert!(plugin_compiler::compile_plugin(dir.path())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -89,6 +94,9 @@ fn a_component_that_is_not_wasm_fails_with_its_path() {
         "[plugin]\nname = \"broken\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n\n[[wasm]]\ncomponent = \"echo.wasm\"\n",
     )
     .unwrap();
-    let err = format!("{:#}", plugin_compiler::compile_plugin(dir.path()).unwrap_err());
+    let err = format!(
+        "{:#}",
+        plugin_compiler::compile_plugin(dir.path()).unwrap_err()
+    );
     assert!(err.contains("echo.wasm"), "{err}");
 }

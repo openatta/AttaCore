@@ -110,7 +110,11 @@ impl WasmEngine {
     ///
     /// `plugin_version_dir` is the plugin's extracted directory, which is
     /// where the artifact is cached (see [`AotCache`]).
-    pub fn load(&self, component_path: &Path, plugin_version_dir: &Path) -> Result<ComponentHandle> {
+    pub fn load(
+        &self,
+        component_path: &Path,
+        plugin_version_dir: &Path,
+    ) -> Result<ComponentHandle> {
         let bytes = std::fs::read(component_path)
             .with_context(|| format!("reading component {}", component_path.display()))?;
 

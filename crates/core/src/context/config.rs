@@ -408,7 +408,9 @@ mod sandbox_wiring_tests {
     use super::*;
     use crate::interface::settings::Settings;
 
-    fn settings_with_sandbox(f: impl FnOnce(&mut crate::interface::settings::SandboxConfig)) -> Settings {
+    fn settings_with_sandbox(
+        f: impl FnOnce(&mut crate::interface::settings::SandboxConfig),
+    ) -> Settings {
         let mut s = Settings::defaults_for("test-model");
         f(&mut s.sandbox);
         s

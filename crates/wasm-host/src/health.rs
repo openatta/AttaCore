@@ -101,9 +101,7 @@ impl HealthRegistry {
         self.lock().get(plugin).is_some_and(|h| h.is_broken())
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Arc<Health>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Arc<Health>>> {
         self.by_plugin.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

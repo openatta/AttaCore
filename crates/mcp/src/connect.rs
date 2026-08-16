@@ -60,7 +60,9 @@ pub struct StdioMcpClient {
     server_name: String,
     config: McpServerConfig,
     instructions: Option<String>,
-    inner: Mutex<Option<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>>>,
+    inner: Mutex<
+        Option<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>>,
+    >,
     last_reconnect_at: Mutex<Option<Instant>>,
     consecutive_failures: AtomicU32,
     /// Kept so a reconnect rebuilds the same notification wiring — a server
@@ -438,7 +440,10 @@ async fn spawn_service(
     server_name: &str,
     config: &McpServerConfig,
     sink: Option<crate::notify::NotificationSink>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
+) -> Result<
+    rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>,
+    McpError,
+> {
     match config {
         McpServerConfig::Stdio {
             command, args, env, ..
@@ -467,8 +472,14 @@ async fn spawn_service(
                 .iter()
                 .map(|(k, v)| (k.clone(), crate::config::expand_env_vars(v)))
                 .collect();
-            spawn_streamable_http_service(server_name, &url, &headers, oauth_provider.as_deref(), sink)
-                .await
+            spawn_streamable_http_service(
+                server_name,
+                &url,
+                &headers,
+                oauth_provider.as_deref(),
+                sink,
+            )
+            .await
         }
         McpServerConfig::Sse {
             url,
@@ -517,7 +528,10 @@ async fn spawn_stdio_service(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     sink: Option<crate::notify::NotificationSink>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
+) -> Result<
+    rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>,
+    McpError,
+> {
     let mut cmd = tokio::process::Command::new(command);
     for a in args {
         cmd.arg(a);
@@ -559,7 +573,10 @@ async fn spawn_streamable_http_service(
     headers: &std::collections::HashMap<String, String>,
     oauth_provider: Option<&str>,
     sink: Option<crate::notify::NotificationSink>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
+) -> Result<
+    rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>,
+    McpError,
+> {
     use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
     use rmcp::transport::StreamableHttpClientTransport;
 
@@ -843,7 +860,10 @@ async fn spawn_websocket_service(
     url: &str,
     headers: &std::collections::HashMap<String, String>,
     sink: Option<crate::notify::NotificationSink>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
+) -> Result<
+    rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>,
+    McpError,
+> {
     // 1. Try WebSocket first
     match try_ws_connect(url, headers).await {
         Ok(transport) => {
@@ -856,9 +876,9 @@ async fn spawn_websocket_service(
                 .serve(transport)
                 .await
                 .map_err(|e| McpError::ConnectFailed {
-                name: server_name.into(),
-                source: anyhow::anyhow!("{e}"),
-            });
+                    name: server_name.into(),
+                    source: anyhow::anyhow!("{e}"),
+                });
         }
         Err(e) => {
             warn!(
@@ -889,7 +909,10 @@ async fn spawn_sse_service(
     headers: &std::collections::HashMap<String, String>,
     oauth_provider: Option<&str>,
     sink: Option<crate::notify::NotificationSink>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>, McpError> {
+) -> Result<
+    rmcp::service::RunningService<rmcp::RoleClient, crate::notify::NotifyingHandler>,
+    McpError,
+> {
     tracing::info!(server = %server_name, url = %url, "SSE transport: delegating to streamable HTTP");
     spawn_streamable_http_service(server_name, url, headers, oauth_provider, sink).await
 }

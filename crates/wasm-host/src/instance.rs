@@ -71,7 +71,13 @@ impl PluginInstance {
         name: String,
         caps: Arc<ResolvedCapabilities>,
     ) -> Result<Self> {
-        Self::link_with_health(engine, component, name, caps, Arc::new(crate::health::Health::new()))
+        Self::link_with_health(
+            engine,
+            component,
+            name,
+            caps,
+            Arc::new(crate::health::Health::new()),
+        )
     }
 
     /// Link, reusing an existing fault record.
@@ -149,7 +155,9 @@ impl PluginInstance {
         &self,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<crate::bindings::atta::plugin::types::ToolDef>, CallFailure> {
-        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
+        let mut store = self
+            .store()
+            .map_err(|e| CallFailure::Faulted(e.to_string()))?;
         let call = async {
             let world = self.pre.instantiate_async(&mut store).await?;
             let tools = world
@@ -191,7 +199,9 @@ impl PluginInstance {
         config_json: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), CallFailure> {
-        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
+        let mut store = self
+            .store()
+            .map_err(|e| CallFailure::Faulted(e.to_string()))?;
         let call = async {
             let world = self.pre.instantiate_async(&mut store).await?;
             match world.call_init(&mut store, config_json).await? {
@@ -212,7 +222,9 @@ impl PluginInstance {
         payload_json: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::bindings::atta::plugin::types::HookDecision, CallFailure> {
-        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
+        let mut store = self
+            .store()
+            .map_err(|e| CallFailure::Faulted(e.to_string()))?;
         let call = async {
             let world = self.pre.instantiate_async(&mut store).await?;
             let decision = world

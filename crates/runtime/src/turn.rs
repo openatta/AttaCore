@@ -465,8 +465,8 @@ impl Agent {
         let collected_this_turn = self.frozen.is_none();
         if collected_this_turn {
             let cwd = self.settings.paths.project_root();
-            let scope = self.settings.paths.scope.clone();
-            self.frozen = Some(base::frozen::FrozenContext::collect(cwd, &scope).await);
+            let paths = base::paths::ConfigPaths::from_settings(&self.settings.paths);
+            self.frozen = Some(base::frozen::FrozenContext::collect(cwd, &paths).await);
         }
 
         // A-2: `FrozenContext` is a session snapshot on purpose — but the
@@ -6566,7 +6566,11 @@ mod prompt_assembly_tests {
         std::fs::write(parent.join("AGENTS.md"), "ROOT-CONVENTION: use tabs").unwrap();
         std::fs::write(child.join("AGENTS.md"), "PACKAGE-CONVENTION: use spaces").unwrap();
 
-        let frozen = base::frozen::FrozenContext::collect(child.clone(), "code").await;
+        let frozen = base::frozen::FrozenContext::collect(
+            child.clone(),
+            &base::paths::ConfigPaths::new(child.join(".state"), child.join(".atta"), "code"),
+        )
+        .await;
         let mut settings = test_settings(dir.path());
         settings.paths.local_data_dir = child.clone();
         let (agent, _rx, _tx) = crate::agent::Builder::new()
@@ -6609,7 +6613,11 @@ mod prompt_assembly_tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("AGENTS.md"), "ONLY-CONVENTION").unwrap();
 
-        let frozen = base::frozen::FrozenContext::collect(root.clone(), "code").await;
+        let frozen = base::frozen::FrozenContext::collect(
+            root.clone(),
+            &base::paths::ConfigPaths::new(root.join(".state"), root.join(".atta"), "code"),
+        )
+        .await;
         let mut settings = test_settings(dir.path());
         settings.paths.local_data_dir = root.clone();
         let (agent, _rx, _tx) = crate::agent::Builder::new()

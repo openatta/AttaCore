@@ -81,14 +81,14 @@ impl PluginCache {
                 }
             }
         }
-        versions.sort_by(|a, b| {
-            match (semver::Version::parse(a), semver::Version::parse(b)) {
+        versions.sort_by(
+            |a, b| match (semver::Version::parse(a), semver::Version::parse(b)) {
                 (Ok(a), Ok(b)) => b.cmp(&a),
                 (Ok(_), Err(_)) => std::cmp::Ordering::Less,
                 (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
                 (Err(_), Err(_)) => a.cmp(b),
-            }
-        });
+            },
+        );
         versions
     }
 

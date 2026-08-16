@@ -19,7 +19,11 @@ fn run(args: Vec<String>) -> Result<()> {
     // Nothing to compile is a fine outcome — a plugin may be MCP-only — but
     // it should be visible, because "compiled 0 components" and "compiled the
     // one you expected" look identical in a log that only reports success.
-    println!("compiled {} component(s) in {}", compiled.len(), dir.display());
+    println!(
+        "compiled {} component(s) in {}",
+        compiled.len(),
+        dir.display()
+    );
     for path in compiled {
         println!("  {}", path.display());
     }

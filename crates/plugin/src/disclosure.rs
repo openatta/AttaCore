@@ -64,7 +64,11 @@ impl Disclosure {
         };
 
         if !m.plugin.description.is_empty() {
-            d.push_text("plugin description", &m.plugin.description, MAX_DESCRIPTION_CHARS)?;
+            d.push_text(
+                "plugin description",
+                &m.plugin.description,
+                MAX_DESCRIPTION_CHARS,
+            )?;
         }
 
         for payload in &m.wasm {
@@ -219,8 +223,14 @@ env = ["GITHUB_TOKEN"]
         );
         let d = Disclosure::from_plugin(&p).unwrap();
 
-        assert!(d.capabilities.iter().any(|c| c.contains("read files under ${workspace}/src")));
-        assert!(d.capabilities.iter().any(|c| c.contains("write files under ${plugin}/scratch")));
+        assert!(d
+            .capabilities
+            .iter()
+            .any(|c| c.contains("read files under ${workspace}/src")));
+        assert!(d
+            .capabilities
+            .iter()
+            .any(|c| c.contains("write files under ${plugin}/scratch")));
         assert!(d.capabilities.iter().any(|c| c.contains("api.github.com")));
         assert!(d.capabilities.iter().any(|c| c.contains("GITHUB_TOKEN")));
         assert_eq!(d.events, ["PreToolUse"]);
@@ -307,7 +317,8 @@ prompt = "agent.md"
         let mut d = Disclosure::from_plugin(&load(dir.path(), "")).unwrap();
         assert!(d.is_inert(), "a manifest alone lists no tools");
 
-        d.add_tool("diff", "Show a diff", Some("The long guide.")).unwrap();
+        d.add_tool("diff", "Show a diff", Some("The long guide."))
+            .unwrap();
         assert!(!d.is_inert());
         let origins: Vec<&str> = d.model_visible.iter().map(|v| v.origin.as_str()).collect();
         assert!(origins.iter().any(|o| o.contains("diff")), "{origins:?}");

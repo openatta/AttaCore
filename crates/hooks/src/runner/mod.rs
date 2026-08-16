@@ -524,9 +524,7 @@ impl HookRunner {
                 self.exec_agent(prompt, model.as_deref(), input, *timeout)
                     .await
             }
-            HookConfig::Wasm { plugin, timeout } => {
-                self.exec_wasm(plugin, input, *timeout).await
-            }
+            HookConfig::Wasm { plugin, timeout } => self.exec_wasm(plugin, input, *timeout).await,
         }
     }
 

@@ -27,6 +27,7 @@ pub use self::skill::{
 
 use self::memory::{collect_memory, collect_memory_files_with, load_all_memory_files};
 use self::utils::truncate_chars;
+use crate::paths::ConfigPaths;
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
@@ -166,15 +167,19 @@ impl FrozenContext {
     /// 收集环境快照。所有 IO 错误都吞掉转 None / 默认值；这个函数不该 panic、
     /// 不该 fail -- 让上层 build_system_prompt 总能拿到一份合理的快照。
     ///
-    /// `scope` 标识"这是哪个产品实例的用户级私有状态"（`~/.atta/<scope>/`）；
-    /// 引擎层不提供默认值，调用方（daemon）负责决定传什么、要不要自己兜底默认。
-    pub async fn collect(cwd: PathBuf, scope: &str) -> Self {
-        Self::collect_with_options(cwd, CollectOptions::defaults(), scope).await
+    /// `paths` 是这个实例的根目录集合——引擎层不去环境里找，调用方（daemon）
+    /// 决定这个实例的状态放在哪。
+    pub async fn collect(cwd: PathBuf, paths: &ConfigPaths) -> Self {
+        Self::collect_with_options(cwd, CollectOptions::defaults(), paths).await
     }
 
     /// 带 options 的收集 -- `` 加 `walk_up_claude_md` 控制 monorepo 父级
     /// 上下文是否进 system prompt。
-    pub async fn collect_with_options(cwd: PathBuf, opts: CollectOptions, scope: &str) -> Self {
+    pub async fn collect_with_options(
+        cwd: PathBuf,
+        opts: CollectOptions,
+        paths: &ConfigPaths,
+    ) -> Self {
         let cwd_clone = cwd.clone();
 
         // git 相关命令并发跑，每条独立超时 — 同一段逻辑也被 `refresh_git` 复用
@@ -211,15 +216,16 @@ impl FrozenContext {
             git.git_log,
         );
 
-        let memory_blocks = collect_memory_files_with(&cwd, opts.walk_up_claude_md).await;
+        let memory_blocks =
+            collect_memory_files_with(&cwd, opts.walk_up_claude_md, &paths.global_data_dir).await;
         // P3c : 用 load_session_skills 而非 collect_skills -- 前者把 bundled
         // skills (simplify/verify/debug/batch/stuck) 也并入。否则
         // disk 没装 SKILL.md 时 system prompt 不暴露 bundled，模型不知道有这些
         // skill，/stuck /simplify 等 case 失败。
-        let skills = load_session_skills(&cwd, scope).await;
+        let skills = load_session_skills(&cwd, paths).await;
 
-        // memory_dir = ~/.atta/memory/<sha256(canonical_cwd)[..16]>/（不分 scene）
-        let (memory_dir, memory_index) = collect_memory(&cwd).await;
+        // memory_dir = <global_root>/memory/<sha256(canonical_cwd)[..16]>/（不分 scene）
+        let (memory_dir, memory_index) = collect_memory(&cwd, &paths.global_data_dir).await;
 
         // P1.5: Pre-load all memory files from the project memory dir so they
         // are available for injection into the system prompt. Files are capped
@@ -232,7 +238,7 @@ impl FrozenContext {
 
         // A-5 : output style -- load by name from project then user dir.
         let output_style = match opts.output_style.as_deref() {
-            Some(name) if !name.trim().is_empty() => collect_output_style(&cwd, name, scope).await,
+            Some(name) if !name.trim().is_empty() => collect_output_style(&cwd, name, paths).await,
             _ => None,
         };
 
@@ -322,20 +328,7 @@ impl FrozenContext {
 /// **A-5 **: load `<cwd>/.atta/output-styles/<name>.md` if present,
 /// else `~/.atta/<scope>/output-styles/<name>.md`. Trims whitespace and caps body
 /// at 8KB. Returns None if neither file is present or readable.
-async fn collect_output_style(cwd: &Path, name: &str, scope: &str) -> Option<OutputStyle> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    collect_output_style_with_home(cwd, name, home.as_deref(), scope).await
-}
-
-/// Test-friendly variant taking the home dir explicitly. The public
-/// `collect_output_style` resolves `HOME` from env; this lets tests pass an
-/// arbitrary path without racing on the process-global env.
-async fn collect_output_style_with_home(
-    cwd: &Path,
-    name: &str,
-    home: Option<&Path>,
-    scope: &str,
-) -> Option<OutputStyle> {
+async fn collect_output_style(cwd: &Path, name: &str, paths: &ConfigPaths) -> Option<OutputStyle> {
     let safe = name.trim();
     if safe.is_empty() || safe.contains('/') || safe.contains('\\') || safe.starts_with('.') {
         return None;
@@ -353,10 +346,9 @@ async fn collect_output_style_with_home(
             });
         }
     }
-    if let Some(home) = home {
-        let user = home
-            .join(".atta")
-            .join(scope)
+    {
+        let user = paths
+            .user_data_dir
             .join("output-styles")
             .join(format!("{safe}.md"));
         if let Ok(content) = tokio::fs::read_to_string(&user).await {
@@ -378,25 +370,14 @@ async fn collect_output_style_with_home(
 
 /// **A-5 **: list all output style names from user + project dirs (no
 /// content read). Used by `/output-style` slash command.
-pub async fn list_output_style_names(cwd: &Path, scope: &str) -> Vec<String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    list_output_style_names_with_home(cwd, home.as_deref(), scope).await
-}
-
-async fn list_output_style_names_with_home(
-    cwd: &Path,
-    home: Option<&Path>,
-    scope: &str,
-) -> Vec<String> {
+pub async fn list_output_style_names(cwd: &Path, paths: &ConfigPaths) -> Vec<String> {
     let mut all: Vec<(String, OutputStyleSource)> = Vec::new();
-    if let Some(home) = home {
-        all.extend(
-            scan_output_style_dir(&home.join(".atta").join(scope).join("output-styles"))
-                .await
-                .into_iter()
-                .map(|n| (n, OutputStyleSource::User)),
-        );
-    }
+    all.extend(
+        scan_output_style_dir(&paths.user_data_dir.join("output-styles"))
+            .await
+            .into_iter()
+            .map(|n| (n, OutputStyleSource::User)),
+    );
     all.extend(
         scan_output_style_dir(&cwd.join(".atta").join("output-styles"))
             .await
@@ -436,12 +417,19 @@ async fn scan_output_style_dir(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Roots under a tempdir. Tests never inherit the running user's home —
+    /// that is the property this whole module was changed to guarantee.
+    fn test_paths(root: &Path) -> ConfigPaths {
+        ConfigPaths::new(root.join(".atta"), root.join(".atta"), "code")
+    }
+
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn collects_basic_fields_for_arbitrary_dir() {
         let dir = TempDir::new().unwrap();
-        let ctx = FrozenContext::collect(dir.path().to_path_buf(), "code").await;
+        let ctx = FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path())).await;
         assert!(!ctx.platform.is_empty());
         assert!(ctx.today.len() == 10); // YYYY-MM-DD
                                         // 不在 git 仓库下，is_git=false 且 git_* 字段都 None
@@ -453,7 +441,7 @@ mod tests {
     async fn detects_git_repo_in_a_real_repo() {
         // 当前 cwd 是 attacode 仓库本身，已经初始化了 git
         let pwd = std::env::current_dir().unwrap();
-        let ctx = FrozenContext::collect(pwd, "code").await;
+        let ctx = FrozenContext::collect(pwd.clone(), &test_paths(&pwd)).await;
         assert!(ctx.is_git, "expected attacode workspace to be inside git");
         assert!(ctx.git_branch.is_some());
     }
@@ -478,7 +466,8 @@ mod tests {
         run(&["commit", "--allow-empty", "-q", "-m", "init"]);
         run(&["checkout", "-q", "-b", "original-branch"]);
 
-        let mut ctx = FrozenContext::collect(dir.path().to_path_buf(), "code").await;
+        let mut ctx =
+            FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path())).await;
         assert_eq!(ctx.git_branch.as_deref(), Some("original-branch"));
 
         run(&["checkout", "-q", "-b", "new-branch"]);
@@ -518,7 +507,8 @@ mod tests {
             .unwrap();
         run(&["add", "dirty.txt"]);
 
-        let mut ctx = FrozenContext::collect(dir.path().to_path_buf(), "code").await;
+        let mut ctx =
+            FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path())).await;
         assert!(
             ctx.git_status
                 .as_deref()
@@ -548,7 +538,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_git_status_is_a_noop_outside_a_repo() {
         let dir = TempDir::new().unwrap();
-        let mut ctx = FrozenContext::collect(dir.path().to_path_buf(), "code").await;
+        let mut ctx =
+            FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path())).await;
         assert!(!ctx.is_git);
         ctx.refresh_git_status().await;
         assert!(ctx.git_status.is_none());
@@ -562,7 +553,7 @@ mod tests {
         tokio::fs::write(&p, "# Test instructions\nbe concise.")
             .await
             .unwrap();
-        let ctx = FrozenContext::collect(dir.path().to_path_buf(), "code").await;
+        let ctx = FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path())).await;
         assert_eq!(ctx.memory_blocks.len(), 1, "expected one AGENTS.md");
         assert!(ctx.memory_blocks[0].content.contains("be concise"));
     }
@@ -580,7 +571,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = FrozenContext::collect(child, "code").await;
+        let ctx = FrozenContext::collect(child, &test_paths(dir.path())).await;
         // 应该顺序：parent 在前，child 在后（远到近）
         assert!(ctx.memory_blocks.len() >= 2);
         let parent_idx = ctx
@@ -604,7 +595,7 @@ mod tests {
     async fn output_style_project_takes_precedence_over_user() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let user_dir = home.path().join(".atta/code/output-styles");
+        let user_dir = test_paths(home.path()).user_data_dir.join("output-styles");
         let proj_dir = cwd.path().join(".atta/output-styles");
         tokio::fs::create_dir_all(&user_dir).await.unwrap();
         tokio::fs::create_dir_all(&proj_dir).await.unwrap();
@@ -615,7 +606,7 @@ mod tests {
             .await
             .unwrap();
 
-        let style = collect_output_style_with_home(cwd.path(), "terse", Some(home.path()), "code")
+        let style = collect_output_style(cwd.path(), "terse", &test_paths(home.path()))
             .await
             .unwrap();
         assert_eq!(style.name, "terse");
@@ -627,16 +618,15 @@ mod tests {
     async fn output_style_falls_back_to_user_when_no_project() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let user_dir = home.path().join(".atta/code/output-styles");
+        let user_dir = test_paths(home.path()).user_data_dir.join("output-styles");
         tokio::fs::create_dir_all(&user_dir).await.unwrap();
         tokio::fs::write(user_dir.join("verbose.md"), "explain everything")
             .await
             .unwrap();
 
-        let style =
-            collect_output_style_with_home(cwd.path(), "verbose", Some(home.path()), "code")
-                .await
-                .unwrap();
+        let style = collect_output_style(cwd.path(), "verbose", &test_paths(home.path()))
+            .await
+            .unwrap();
         assert_eq!(style.source, OutputStyleSource::User);
         assert!(style.content.contains("explain everything"));
     }
@@ -646,25 +636,27 @@ mod tests {
         let cwd = TempDir::new().unwrap();
         // names with slashes / leading dot must not load anything
         assert!(
-            collect_output_style_with_home(cwd.path(), "../etc/passwd", None, "code")
+            collect_output_style(cwd.path(), "../etc/passwd", &test_paths(cwd.path()))
                 .await
                 .is_none()
         );
         assert!(
-            collect_output_style_with_home(cwd.path(), ".hidden", None, "code")
+            collect_output_style(cwd.path(), ".hidden", &test_paths(cwd.path()))
                 .await
                 .is_none()
         );
-        assert!(collect_output_style_with_home(cwd.path(), "", None, "code")
-            .await
-            .is_none());
+        assert!(
+            collect_output_style(cwd.path(), "", &test_paths(cwd.path()))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn list_output_style_names_dedups_user_and_project() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let user_dir = home.path().join(".atta/code/output-styles");
+        let user_dir = test_paths(home.path()).user_data_dir.join("output-styles");
         let proj_dir = cwd.path().join(".atta/output-styles");
         tokio::fs::create_dir_all(&user_dir).await.unwrap();
         tokio::fs::create_dir_all(&proj_dir).await.unwrap();
@@ -681,7 +673,7 @@ mod tests {
             .await
             .unwrap();
 
-        let names = list_output_style_names_with_home(cwd.path(), Some(home.path()), "code").await;
+        let names = list_output_style_names(cwd.path(), &test_paths(home.path())).await;
         // expected: terse (deduped), verbose (user), local (project)
         let mut sorted = names.clone();
         sorted.sort();

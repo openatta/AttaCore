@@ -2,8 +2,16 @@
 //!
 //! `ConfigPaths` provides a single source of truth for all persistent
 //! directories used by the AGENT: a flat cross-scene **global** root
-//! (`~/.atta/`), a **scene**-specific override root nested under it
-//! (`~/.atta/scenes/<scope>/`), and a **local**/project root (`<cwd>/.atta/`).
+//! (conventionally `~/.atta/`), a **scene**-specific override root nested
+//! under it (`<global>/scenes/<scope>/`), and a **local**/project root
+//! (`<cwd>/.atta/`).
+//!
+//! **The roots are given, never discovered.** Nothing in this module reads
+//! the environment: the process entry point decides which directory the
+//! instance owns and passes it down. `~/.atta` is what that entry point
+//! usually picks, not something the library assumes — which is what lets a
+//! test, a service account, or a deployment with its state elsewhere work
+//! without every module having to agree separately.
 //!
 //! `scope` identifies which product built on this engine owns the
 //! scene-specific override state (e.g. a coding-agent product might use
@@ -38,7 +46,7 @@
 //! and other external agent tools scan. `ConfigPaths` only models AttaCore's
 //! own private state and extensions, which no other tool reads.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Unified management of AGENT persistent directory paths.
 ///
@@ -60,26 +68,33 @@ pub struct ConfigPaths {
 }
 
 impl ConfigPaths {
-    /// Build from environment. Respects `ATTA_DATA_DIR` / `ATTA_LOCAL_DATA_DIR`
-    /// overrides.
+    /// Build from explicit roots.
     ///
-    /// `scope` has no default at this layer — it identifies which product
-    /// instance's scene-specific override state this is. Callers (e.g.
-    /// `daemon`) decide what to pass, and may apply their own default before
-    /// calling this.
-    pub fn from_env(cwd: &Path, scope: &str) -> Self {
-        let global_data_dir = std::env::var("ATTA_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".atta"));
-        let user_data_dir = global_data_dir.join("scenes").join(scope);
-        let local_data_dir = std::env::var("ATTA_LOCAL_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| cwd.join(".atta"));
-
+    /// There is no constructor that consults the environment, and that is the
+    /// point: a process serves one instance, and which directory that
+    /// instance owns is the caller's to decide. Reading `$HOME` here would
+    /// make every downstream module silently agree on the invoking user's
+    /// home, which is wrong for a test, wrong for a service account, and
+    /// wrong for any deployment that keeps its state somewhere else.
+    ///
+    /// `scope` identifies the product instance whose scene-specific override
+    /// tree lives under `global_data_dir/scenes/<scope>/`.
+    pub fn new(global_data_dir: PathBuf, local_data_dir: PathBuf, scope: &str) -> Self {
         Self {
-            user_data_dir,
+            user_data_dir: global_data_dir.join("scenes").join(scope),
             global_data_dir,
             local_data_dir,
+        }
+    }
+
+    /// The same roots [`crate::interface::settings::Settings`] already
+    /// carries — for the call sites that hold `Settings` and want these
+    /// accessors without re-deriving anything.
+    pub fn from_settings(paths: &crate::interface::settings::PathSettings) -> Self {
+        Self {
+            user_data_dir: paths.user_data_dir.clone(),
+            global_data_dir: paths.global_data_dir.clone(),
+            local_data_dir: paths.local_data_dir.clone(),
         }
     }
 
@@ -185,98 +200,87 @@ impl ConfigPaths {
     }
 }
 
-/// Returns the user-level, scene-specific override directory:
-/// `$HOME/.atta/scenes/<scope>/`.
-///
-/// `scope` has no default here — see module docs.
-pub fn atta_scope_dir(scope: &str) -> PathBuf {
-    dirs_home().join(".atta").join("scenes").join(scope)
-}
-
-/// Returns the user-level, cross-scene global directory: `$HOME/.atta/`.
-pub fn atta_global_dir() -> PathBuf {
-    dirs_home().join(".atta")
-}
-
-fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn paths() -> ConfigPaths {
+        ConfigPaths::new(
+            PathBuf::from("/state/.atta"),
+            PathBuf::from("/tmp/test-project/.atta"),
+            "code",
+        )
+    }
+
     #[test]
-    fn defaults_use_user_home_and_cwd() {
-        let cwd = Path::new("/tmp/test-project");
-        let paths = ConfigPaths::from_env(cwd, "code");
-        assert!(paths.user_data_dir.to_string_lossy().contains(".atta"));
-        assert!(paths.user_data_dir.to_string_lossy().contains("scenes"));
-        assert!(paths.user_data_dir.to_string_lossy().ends_with("code"));
-        assert!(paths.global_data_dir.ends_with(".atta"));
-        assert!(paths.local_data_dir.to_string_lossy().contains(".atta"));
-        // Local/project root is flat: no scope segment appended.
-        assert!(paths.local_data_dir.ends_with(".atta"));
+    fn roots_are_exactly_what_the_caller_passed() {
+        let p = paths();
+        assert_eq!(p.global_data_dir, PathBuf::from("/state/.atta"));
+        assert_eq!(p.local_data_dir, PathBuf::from("/tmp/test-project/.atta"));
     }
 
     #[test]
     fn scene_dir_nests_under_global_dir() {
-        let cwd = Path::new("/tmp/test-project");
-        let paths = ConfigPaths::from_env(cwd, "code");
+        let p = paths();
         assert_eq!(
-            paths.user_data_dir,
-            paths.global_data_dir.join("scenes").join("code")
+            p.user_data_dir,
+            p.global_data_dir.join("scenes").join("code")
         );
     }
 
     #[test]
     fn different_scopes_get_different_user_roots_but_same_global_root() {
-        let cwd = Path::new("/tmp/test-project");
-        let code_paths = ConfigPaths::from_env(cwd, "code");
-        let ops_paths = ConfigPaths::from_env(cwd, "ops");
-        assert_ne!(code_paths.user_data_dir, ops_paths.user_data_dir);
-        assert_eq!(code_paths.global_data_dir, ops_paths.global_data_dir);
+        let global = PathBuf::from("/state/.atta");
+        let local = PathBuf::from("/tmp/p/.atta");
+        let code = ConfigPaths::new(global.clone(), local.clone(), "code");
+        let ops = ConfigPaths::new(global, local, "ops");
+        assert_ne!(code.user_data_dir, ops.user_data_dir);
+        assert_eq!(code.global_data_dir, ops.global_data_dir);
         // Local root is scope-independent (project-level is flat).
-        assert_eq!(code_paths.local_data_dir, ops_paths.local_data_dir);
+        assert_eq!(code.local_data_dir, ops.local_data_dir);
+    }
+
+    /// The roots must survive the trip through `Settings` unchanged —
+    /// `PathSettings` is how they actually reach most call sites.
+    #[test]
+    fn settings_roots_round_trip() {
+        let p = paths();
+        let carried = crate::interface::settings::PathSettings {
+            user_data_dir: p.user_data_dir.clone(),
+            global_data_dir: p.global_data_dir.clone(),
+            local_data_dir: p.local_data_dir.clone(),
+            scope: "code".into(),
+        };
+        let back = ConfigPaths::from_settings(&carried);
+        assert_eq!(back.user_data_dir, p.user_data_dir);
+        assert_eq!(back.global_data_dir, p.global_data_dir);
+        assert_eq!(back.local_data_dir, p.local_data_dir);
     }
 
     #[test]
     fn convenience_methods_derive_from_roots() {
-        let cwd = Path::new("/tmp/test");
-        let paths = ConfigPaths::from_env(cwd, "code");
-        assert!(paths.user_settings_path().ends_with("settings.json"));
-        assert!(paths.user_skills_dir().ends_with("skills"));
-        assert!(paths.user_plugins_dir().ends_with("plugins"));
-        assert!(paths.user_agents_dir().ends_with("agents"));
-        assert!(paths.user_rules_dir().ends_with("rules"));
-        assert!(paths.user_hooks_dir().ends_with("hooks"));
-        assert!(paths.global_settings_path().ends_with("settings.json"));
-        assert!(paths.global_skills_dir().ends_with("skills"));
-        assert!(paths.global_memory_dir().ends_with("memory"));
-        assert!(paths.global_sessions_dir().ends_with("sessions"));
-        assert!(paths.global_vcr_dir().ends_with("vcr"));
-        assert!(paths.global_mcp_dir().ends_with("mcp"));
-        assert!(paths.local_memory_dir().ends_with("memory"));
-        assert!(paths.local_sessions_dir().ends_with("sessions"));
-        assert!(paths.local_vcr_dir().ends_with("vcr"));
-        assert!(paths.local_mcp_dir().ends_with("mcp"));
-    }
-
-    #[test]
-    fn atta_scope_dir_respects_scope_param_and_nests_under_scenes() {
-        let code_dir = atta_scope_dir("code");
-        let ops_dir = atta_scope_dir("ops");
-        assert!(code_dir.ends_with("code"));
-        assert!(ops_dir.ends_with("ops"));
-        assert_ne!(code_dir, ops_dir);
-        assert!(code_dir.to_string_lossy().contains("scenes"));
-    }
-
-    #[test]
-    fn atta_global_dir_is_flat() {
-        let dir = atta_global_dir();
-        assert!(dir.ends_with(".atta"));
+        let p = paths();
+        assert_eq!(
+            p.user_settings_path(),
+            p.user_data_dir.join("settings.json")
+        );
+        assert_eq!(p.user_skills_dir(), p.user_data_dir.join("skills"));
+        assert_eq!(p.user_plugins_dir(), p.user_data_dir.join("plugins"));
+        assert_eq!(p.user_agents_dir(), p.user_data_dir.join("agents"));
+        assert_eq!(p.user_rules_dir(), p.user_data_dir.join("rules"));
+        assert_eq!(p.user_hooks_dir(), p.user_data_dir.join("hooks"));
+        assert_eq!(
+            p.global_settings_path(),
+            p.global_data_dir.join("settings.json")
+        );
+        assert_eq!(p.global_skills_dir(), p.global_data_dir.join("skills"));
+        assert_eq!(p.global_memory_dir(), p.global_data_dir.join("memory"));
+        assert_eq!(p.global_sessions_dir(), p.global_data_dir.join("sessions"));
+        assert_eq!(p.global_vcr_dir(), p.global_data_dir.join("vcr"));
+        assert_eq!(p.global_mcp_dir(), p.global_data_dir.join("mcp"));
+        assert_eq!(p.local_memory_dir(), p.local_data_dir.join("memory"));
+        assert_eq!(p.local_sessions_dir(), p.local_data_dir.join("sessions"));
+        assert_eq!(p.local_vcr_dir(), p.local_data_dir.join("vcr"));
+        assert_eq!(p.local_mcp_dir(), p.local_data_dir.join("mcp"));
     }
 }

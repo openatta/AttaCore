@@ -153,8 +153,6 @@ impl InstalledPlugins {
         self.tool_text = tool_text;
     }
 
-
-
     /// What one installed plugin will contribute, for an installer to put in
     /// front of the user.
     ///
@@ -739,7 +737,11 @@ permission_mode = "make-me-root"
     fn a_dsh_payload_becomes_a_bridge_invocation() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("dist")).unwrap();
-        std::fs::write(dir.path().join("dist/index.js"), "export function apply() {}").unwrap();
+        std::fs::write(
+            dir.path().join("dist/index.js"),
+            "export function apply() {}",
+        )
+        .unwrap();
         std::env::set_var("ATTA_TEST_DSH_TOKEN", "secret");
         let p = load(
             dir.path(),
@@ -999,7 +1001,11 @@ component = "echo.wasm"
             "[plugin]\nname = \"echo-plugin\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n\n[[wasm]]\ncomponent = \"echo.wasm\"\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), r#"{"fail":true}"#).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"{"fail":true}"#,
+        )
+        .unwrap();
         let p =
             plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
 

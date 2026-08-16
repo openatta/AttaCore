@@ -430,7 +430,10 @@ scene = "plugin:github-tools"
         )
         .unwrap();
 
-        assert_eq!(m.plugin.config.schema.unwrap().to_str().unwrap(), "config.schema.json");
+        assert_eq!(
+            m.plugin.config.schema.unwrap().to_str().unwrap(),
+            "config.schema.json"
+        );
         assert_eq!(m.wasm.len(), 1);
         assert_eq!(m.wasm[0].capabilities.net, ["api.github.com"]);
         assert_eq!(m.wasm[0].capabilities.max_memory_mb, 128);
@@ -522,7 +525,10 @@ events = ["PreCompact"]
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("PreCompact"), "{msg}");
-        assert!(msg.contains("PreToolUse"), "the error should list what is allowed: {msg}");
+        assert!(
+            msg.contains("PreToolUse"),
+            "the error should list what is allowed: {msg}"
+        );
     }
 
     /// The host dispatches an event to a plugin by name, so two subscribing
@@ -530,9 +536,8 @@ events = ["PreCompact"]
     /// two subscriptions would be silently ignored.
     #[test]
     fn only_one_component_may_subscribe_to_events() {
-        let err = load_str(
-            &format!(
-                "{MINIMAL}
+        let err = load_str(&format!(
+            "{MINIMAL}
 [[wasm]]
 component = \"a.wasm\"
 events = [\"PreToolUse\"]
@@ -541,8 +546,7 @@ events = [\"PreToolUse\"]
 component = \"b.wasm\"
 events = [\"PostToolUse\"]
 "
-            ),
-        )
+        ))
         .unwrap_err()
         .to_string();
         assert!(err.contains("2 components"), "{err}");
@@ -599,9 +603,7 @@ kind = "dsh"
 
         std::fs::write(
             dir.path().join("plugin.toml"),
-            format!(
-                "{MINIMAL}\n[scene.own]\nname = \"Own\"\nprompt = \"scene/prompt.md\"\n"
-            ),
+            format!("{MINIMAL}\n[scene.own]\nname = \"Own\"\nprompt = \"scene/prompt.md\"\n"),
         )
         .unwrap();
         let p = Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
