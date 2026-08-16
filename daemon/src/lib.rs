@@ -15,6 +15,7 @@ pub mod session_pool;
 #[cfg(feature = "otel")]
 pub mod telemetry_otel;
 pub mod watch_hub;
+pub mod ws;
 
 pub use discovery::write_lock_file;
 pub use server::DaemonServer;

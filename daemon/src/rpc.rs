@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcRequest {
@@ -81,6 +82,43 @@ pub struct RpcError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// Somewhere to put one outgoing JSON-RPC frame.
+///
+/// The transports disagree about framing — a byte stream needs a delimiter
+/// and an explicit flush, a WebSocket connection is already message-framed —
+/// and nothing above this line should have to know which one it is talking
+/// to.
+///
+/// Having a single implementation of "write one frame" per transport is also
+/// what keeps flushing honest. It used to be written twice: the response
+/// path flushed after every frame, the event-streaming path never flushed at
+/// all, so a streamed token could sit in a buffer until the next one pushed
+/// it out.
+#[async_trait::async_trait]
+pub trait FrameSink: Send + Sync {
+    /// Write one complete frame. `false` means the peer is gone and the
+    /// caller should stop writing to this connection.
+    async fn send_json(&self, json: String) -> bool;
+}
+
+/// A sink shared by the dispatcher and by any streaming task it spawns.
+pub type Sink = Arc<dyn FrameSink>;
+
+/// Serialize `frame` and hand it to `sink`.
+///
+/// A frame that cannot be serialized is dropped with a warning rather than
+/// killing the connection: it is a bug in whatever built it, and taking the
+/// session down would hide that behind a disconnect.
+pub async fn send_frame<T: serde::Serialize>(sink: &Sink, frame: &T) -> bool {
+    match serde_json::to_string(frame) {
+        Ok(json) => sink.send_json(json).await,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not serialize an outgoing frame; dropping it");
+            true
+        }
+    }
 }
 
 /// Standard JSON-RPC error codes + daemon extensions.

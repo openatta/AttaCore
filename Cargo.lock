@@ -803,6 +803,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tonic",
  "tools",

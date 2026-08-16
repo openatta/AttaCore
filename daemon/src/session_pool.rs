@@ -25,14 +25,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use telemetry::file_recorder::FileRecorder;
 use telemetry::vcr::VcrModel;
-use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-
-type Writer = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
 
 /// Outcome of comparing a session's recorded `Meta.scene` (if any) against
 /// every scene this daemon currently serves (`SessionPool::active_scenes`) —
@@ -131,7 +127,6 @@ fn build_shared_commands(
         skill_catalog,
     ))
 }
-
 
 /// The first `LogEntry::Meta` line in `entries`, if any — every session
 /// history has at most one (see `create()`), always first when present, but
@@ -469,8 +464,11 @@ impl SessionPool {
         };
         let (events_tx, _) = tokio::sync::broadcast::channel(256);
 
-        let plugins =
-            crate::plugins::PluginSubsystem::new(paths.clone(), cwd.clone(), settings.plugins.clone());
+        let plugins = crate::plugins::PluginSubsystem::new(
+            paths.clone(),
+            cwd.clone(),
+            settings.plugins.clone(),
+        );
         let plugin_agent_types = plugins.agent_types();
         // Built once for every session this pool ever creates — see the
         // `skill_catalog` field doc comment. `runtime::agent::Builder`'s own
@@ -1778,7 +1776,7 @@ impl SessionPool {
         message: String,
         attachments: Vec<runtime::agent::Attachment>,
         turn_id: String,
-        writer: Writer,
+        sink: crate::rpc::Sink,
         id: serde_json::Value,
         options: Option<SessionOptions>,
     ) -> RpcResponse {
@@ -1897,12 +1895,9 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({"kind":"text_delta","text":text}),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 Some(AgentEvent::ToolUse {
@@ -1916,12 +1911,9 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({"kind":"tool_use","id":tid,"name":name,"input":input}),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 Some(AgentEvent::ToolResult {
@@ -1936,12 +1928,9 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({"kind":"tool_result","id":tid,"name":name,"content":content,"is_error":is_error}),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 Some(AgentEvent::PermissionPrompt {
@@ -1978,12 +1967,9 @@ impl SessionPool {
                             "paths":paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
                         }),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 // Sub-agent activity, mirrored from the sub-agent's own
@@ -2011,12 +1997,9 @@ impl SessionPool {
                             "event":serde_json::to_value(&*event).unwrap_or(serde_json::Value::Null)
                         }),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 // Skill files changed under a live session — forwarded so a
@@ -2032,12 +2015,9 @@ impl SessionPool {
                             "kind":"skills_changed","added":added,"removed":removed
                         }),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 // Team stage lifecycle — same non-terminal treatment.
@@ -2060,12 +2040,9 @@ impl SessionPool {
                             "status":status,"members":members,"failed":failed
                         }),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        if writer.lock().await.write_all(&b).await.is_err() {
-                            writer_broken = true;
-                            break;
-                        }
+                    if !crate::rpc::send_frame(&sink, &f).await {
+                        writer_broken = true;
+                        break;
                     }
                 }
                 Some(AgentEvent::TurnComplete {
@@ -2083,10 +2060,7 @@ impl SessionPool {
                             "usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens}
                         }),
                     );
-                    if let Ok(mut b) = serde_json::to_vec(&f) {
-                        b.push(b'\n');
-                        let _ = writer.lock().await.write_all(&b).await;
-                    }
+                    let _ = crate::rpc::send_frame(&sink, &f).await;
                     break;
                 }
                 Some(AgentEvent::Error { code, message, .. }) => {

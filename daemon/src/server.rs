@@ -3,6 +3,11 @@
 //! Accepts newline-delimited JSON-RPC 2.0 requests, dispatches them
 //! to the agent engine, and streams events back as `StreamFrame` lines.
 //!
+//! The framing is the only part that belongs to a transport. `dispatch` takes
+//! a request and a [`Sink`], so `crate::ws` carries the same protocol over
+//! WebSocket without reimplementing any of it — and, more to the point,
+//! without being able to drift from the auth handshake this module defines.
+//!
 //! **Trust boundary**: every RPC method here — including `config.setProvider`
 //! (writes `providers.<id>.api_key`/`base_url` into settings.json) — trusts
 //! whoever can reach this socket. There is no per-method authorization on
@@ -26,6 +31,7 @@
 //! `docs/daemon_rpc_protocol.md` for the opt-out.
 
 use crate::rpc::{codes, RpcRequest, RpcResponse};
+use crate::rpc::{send_frame, FrameSink, Sink};
 use crate::session_pool::SessionPool;
 use base::id::Id;
 use std::net::SocketAddr;
@@ -38,9 +44,98 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-type Writer = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
 type Reader = Box<dyn AsyncRead + Send + Unpin + 'static>;
-type LineReader = tokio::io::Lines<BufReader<Reader>>;
+type ByteWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
+
+/// Largest request a client may send on one connection.
+///
+/// Generous — a turn's worth of context or a pasted file is legitimately
+/// large — but finite, which is the point: without a cap a peer that never
+/// sends a newline makes the daemon buffer until it dies, and on the
+/// WebSocket transport that peer can be any page the user's browser has open.
+pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Newline-delimited frames, with the cap enforced as the bytes arrive.
+///
+/// `tokio::io::Lines` would be the obvious choice, but it grows its buffer
+/// until it finds a newline, so the limit has to live where the reading
+/// happens rather than in a check after the fact.
+struct FrameReader {
+    inner: BufReader<Reader>,
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    fn new(reader: Reader) -> Self {
+        Self {
+            inner: BufReader::new(reader),
+            buf: Vec::new(),
+        }
+    }
+
+    /// The next frame, or `None` at end of stream, on an I/O error, or when
+    /// the peer runs past [`MAX_FRAME_BYTES`].
+    ///
+    /// Over-long frames end the connection rather than being skipped: the
+    /// daemon has no idea where the frame boundary is anymore, so the honest
+    /// options are close it or keep buffering, and the second one is the
+    /// problem being fixed.
+    async fn next_frame(&mut self) -> Option<String> {
+        self.buf.clear();
+        loop {
+            let (complete, consumed) = {
+                let available = match self.inner.fill_buf().await {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                };
+                if available.is_empty() {
+                    return (!self.buf.is_empty())
+                        .then(|| String::from_utf8_lossy(&self.buf).into_owned());
+                }
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        self.buf.extend_from_slice(&available[..i]);
+                        (true, i + 1)
+                    }
+                    None => {
+                        self.buf.extend_from_slice(available);
+                        (false, available.len())
+                    }
+                }
+            };
+            self.inner.consume(consumed);
+
+            if self.buf.len() > MAX_FRAME_BYTES {
+                warn!(
+                    limit = MAX_FRAME_BYTES,
+                    "closing a connection that sent a frame over the size limit"
+                );
+                return None;
+            }
+            if complete {
+                return Some(String::from_utf8_lossy(&self.buf).into_owned());
+            }
+        }
+    }
+}
+
+/// Newline-delimited JSON over a byte stream — Unix socket and TCP.
+struct LineSink(ByteWriter);
+
+#[async_trait::async_trait]
+impl FrameSink for LineSink {
+    async fn send_json(&self, json: String) -> bool {
+        let mut buf = json.into_bytes();
+        buf.push(b'\n');
+        let mut w = self.0.lock().await;
+        if w.write_all(&buf).await.is_err() {
+            return false;
+        }
+        // Every frame, on every path. A response the caller is blocked on and
+        // a streamed token are equally useless sitting in a buffer.
+        w.flush().await.is_ok()
+    }
+}
 
 /// Fixed-time byte comparison — avoids leaking the TCP token's length-matched
 /// prefix via response-time side channels. `a`/`b` differing in length is not
@@ -117,8 +212,9 @@ impl DaemonServer {
                             let this = self.clone();
                             tokio::spawn(async move {
                                 let (r, w) = stream.into_split();
-                                let writer: Writer = Arc::new(AsyncMutex::new(Box::new(w)));
-                                if let Err(e) = this.handle_connection(Box::new(r), writer, true).await {
+                                let writer: ByteWriter = Arc::new(AsyncMutex::new(Box::new(w)));
+                                let sink: Sink = Arc::new(LineSink(writer));
+                                if let Err(e) = this.handle_connection(Box::new(r), sink, true).await {
                                     warn!(error=%e);
                                 }
                             });
@@ -146,8 +242,9 @@ impl DaemonServer {
                             let this = self.clone();
                             tokio::spawn(async move {
                                 let (r, w) = stream.into_split();
-                                let writer: Writer = Arc::new(AsyncMutex::new(Box::new(w)));
-                                if let Err(e) = this.handle_connection(Box::new(r), writer, false).await {
+                                let writer: ByteWriter = Arc::new(AsyncMutex::new(Box::new(w)));
+                                let sink: Sink = Arc::new(LineSink(writer));
+                                if let Err(e) = this.handle_connection(Box::new(r), sink, false).await {
                                     warn!(error=%e);
                                 }
                             });
@@ -160,29 +257,24 @@ impl DaemonServer {
         Ok(())
     }
 
-    async fn handle_connection(
-        &self,
-        reader: Reader,
-        writer: Writer,
-        tcp: bool,
-    ) -> anyhow::Result<()> {
-        let mut lines = BufReader::new(reader).lines();
+    async fn handle_connection(&self, reader: Reader, sink: Sink, tcp: bool) -> anyhow::Result<()> {
+        let mut lines = FrameReader::new(reader);
 
         // Unix socket connections are trusted for their lifetime by file
         // permissions alone (see the module doc comment's trust-boundary
         // note) — no handshake needed. TCP connections must authenticate
         // once, up front, before any RPC method is dispatched.
-        if tcp && !self.authenticate_tcp(&mut lines, &writer).await {
+        if tcp && !self.authenticate_lines(&mut lines, &sink).await {
             return Ok(());
         }
 
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = lines.next_frame().await {
             let req: RpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let resp = self.dispatch(req, writer.clone()).await;
-            if !self.write_response(&writer, &resp).await {
+            let resp = self.dispatch(req, sink.clone()).await;
+            if !send_frame(&sink, &resp).await {
                 break;
             }
         }
@@ -195,38 +287,37 @@ impl DaemonServer {
     /// response either way. Returns `true` if the connection may proceed to
     /// the normal dispatch loop, `false` if it was rejected (or closed before
     /// sending anything) and the caller should just drop it.
-    async fn authenticate_tcp(&self, lines: &mut LineReader, writer: &Writer) -> bool {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            _ => return false,
+    async fn authenticate_lines(&self, lines: &mut FrameReader, sink: &Sink) -> bool {
+        let Some(line) = lines.next_frame().await else {
+            return false;
         };
-        let req: RpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => {
-                self.write_response(
-                    writer,
-                    &RpcResponse::err(
-                        serde_json::Value::Null,
-                        codes::UNAUTHORIZED,
-                        "first message must be a valid daemon.auth request",
-                    ),
-                )
-                .await;
-                return false;
-            }
+        let response = match serde_json::from_str::<RpcRequest>(&line) {
+            Ok(req) => self.check_auth(&req).await,
+            Err(_) => Err(RpcResponse::err(
+                serde_json::Value::Null,
+                codes::UNAUTHORIZED,
+                "first message must be a valid daemon.auth request",
+            )),
         };
+        let ok = response.is_ok();
+        send_frame(sink, &response.unwrap_or_else(|e| e)).await;
+        ok
+    }
+
+    /// Verify one `daemon.auth` request.
+    ///
+    /// Shared by every transport that needs a handshake, so a new one cannot
+    /// accidentally accept a token the others would reject. `Ok` carries the
+    /// success response to send; `Err` carries the refusal — both go back to
+    /// the client, which is why the caller sends either way.
+    pub(crate) async fn check_auth(&self, req: &RpcRequest) -> Result<RpcResponse, RpcResponse> {
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
         if req.method != "daemon.auth" {
-            self.write_response(
-                writer,
-                &RpcResponse::err(
-                    id,
-                    codes::UNAUTHORIZED,
-                    "must authenticate via daemon.auth first",
-                ),
-            )
-            .await;
-            return false;
+            return Err(RpcResponse::err(
+                id,
+                codes::UNAUTHORIZED,
+                "must authenticate via daemon.auth first",
+            ));
         }
         let provided = req
             .params
@@ -239,20 +330,14 @@ impl DaemonServer {
             .is_some_and(|t| constant_time_eq(t.as_bytes(), provided.as_bytes()));
         drop(expected);
 
-        if !authenticated {
-            self.write_response(
-                writer,
-                &RpcResponse::err(id, codes::UNAUTHORIZED, "invalid token"),
-            )
-            .await;
-            return false;
+        if authenticated {
+            Ok(RpcResponse::ok(
+                id,
+                serde_json::json!({"authenticated": true}),
+            ))
+        } else {
+            Err(RpcResponse::err(id, codes::UNAUTHORIZED, "invalid token"))
         }
-        self.write_response(
-            writer,
-            &RpcResponse::ok(id, serde_json::json!({"authenticated": true})),
-        )
-        .await;
-        true
     }
 
     /// Shared `SCENE_MISMATCH` guard for the session-scoped RPCs that only
@@ -284,21 +369,23 @@ impl DaemonServer {
         None
     }
 
-    /// Serialize + write one response line, flush, and report whether the
-    /// write succeeded (`false` means the peer is gone — caller should stop
-    /// writing to this connection).
-    async fn write_response(&self, writer: &Writer, resp: &RpcResponse) -> bool {
-        let mut buf = serde_json::to_vec(resp).unwrap_or_default();
-        buf.push(b'\n');
-        let mut w = writer.lock().await;
-        if w.write_all(&buf).await.is_err() {
-            return false;
-        }
-        let _ = w.flush().await;
-        true
+    /// Dispatch one request. Public so a transport in another module can
+    /// reuse it — the whole point of a transport is framing, not semantics.
+    pub async fn dispatch_public(&self, req: RpcRequest, sink: Sink) -> RpcResponse {
+        self.dispatch(req, sink).await
     }
 
-    async fn dispatch(&self, req: RpcRequest, writer: Writer) -> RpcResponse {
+    /// [`Self::check_auth`], for the same reason.
+    pub async fn check_auth_public(&self, req: &RpcRequest) -> Result<RpcResponse, RpcResponse> {
+        self.check_auth(req).await
+    }
+
+    /// The configured TCP/WebSocket token, if any.
+    pub async fn token(&self) -> Option<String> {
+        self.tcp_token.read().await.clone()
+    }
+
+    async fn dispatch(&self, req: RpcRequest, sink: Sink) -> RpcResponse {
         let id = req.id.unwrap_or(serde_json::Value::Null);
         match req.method.as_str() {
             "daemon.status" => {
@@ -313,7 +400,7 @@ impl DaemonServer {
                 )
             }
             "daemon.doctor" => RpcResponse::ok(id, self.pool.doctor_report().await),
-            "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, writer).await,
+            "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, sink).await,
             "config.setProvider" => self.method_config_set_provider(id, req.params).await,
             "config.getProvider" => self.method_config_get_provider(id, req.params).await,
             // No params. Re-reads all three settings.json tiers from disk
@@ -412,7 +499,7 @@ impl DaemonServer {
                 }
             }
             "session.create" => self.method_session_create(id, req.params).await,
-            "session.run_turn" => self.method_session_run_turn(id, req.params, writer).await,
+            "session.run_turn" => self.method_session_run_turn(id, req.params, sink).await,
             "session.respondToPrompt" => {
                 self.method_session_respond_to_prompt(id, req.params).await
             }
@@ -463,20 +550,16 @@ impl DaemonServer {
     async fn method_daemon_subscribe_events(
         &self,
         id: serde_json::Value,
-        writer: Writer,
+        sink: Sink,
     ) -> RpcResponse {
         let mut rx = self.pool.subscribe_events();
-        let forward_writer = writer.clone();
+        let forward = sink.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
                         let frame = crate::rpc::StreamFrame::daemon_event(event);
-                        let Ok(mut b) = serde_json::to_vec(&frame) else {
-                            continue;
-                        };
-                        b.push(b'\n');
-                        if forward_writer.lock().await.write_all(&b).await.is_err() {
+                        if !send_frame(&forward, &frame).await {
                             break; // connection closed
                         }
                     }
@@ -719,7 +802,7 @@ impl DaemonServer {
         &self,
         id: serde_json::Value,
         params: serde_json::Value,
-        writer: Writer,
+        sink: Sink,
     ) -> RpcResponse {
         // session_id 可选：不传则自动新建 session
         let session_id = params
@@ -768,7 +851,7 @@ impl DaemonServer {
                 user_msg,
                 attachments,
                 turn_id,
-                writer,
+                sink,
                 id,
                 options,
             )
@@ -1051,5 +1134,56 @@ impl DaemonServer {
             Ok(()) => RpcResponse::ok(id, serde_json::json!({"prompt_id": prompt_id})),
             Err(e) => RpcResponse::err(id, codes::SESSION_NOT_FOUND, e),
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_reader_tests {
+    use super::*;
+
+    fn reader(bytes: &'static [u8]) -> FrameReader {
+        FrameReader::new(Box::new(std::io::Cursor::new(bytes)))
+    }
+
+    #[tokio::test]
+    async fn frames_are_split_on_newlines() {
+        let mut r = reader(b"{\"a\":1}\n{\"b\":2}\n");
+        assert_eq!(r.next_frame().await.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(r.next_frame().await.as_deref(), Some("{\"b\":2}"));
+        assert_eq!(r.next_frame().await, None);
+    }
+
+    /// A client that closes without a trailing newline still said something.
+    #[tokio::test]
+    async fn a_final_frame_without_a_newline_is_still_delivered() {
+        let mut r = reader(b"{\"a\":1}");
+        assert_eq!(r.next_frame().await.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(r.next_frame().await, None);
+    }
+
+    /// The reason this type exists: without a cap, a peer that never sends a
+    /// newline makes the daemon buffer until it dies.
+    #[tokio::test]
+    async fn a_frame_over_the_limit_ends_the_connection() {
+        let oversized: &'static [u8] = Box::leak(
+            std::iter::repeat_n(b'x', MAX_FRAME_BYTES + 1)
+                .collect::<Vec<u8>>()
+                .into_boxed_slice(),
+        );
+        assert_eq!(reader(oversized).next_frame().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_frame_at_the_limit_is_delivered() {
+        let at_limit: &'static [u8] = Box::leak(
+            std::iter::repeat_n(b'x', MAX_FRAME_BYTES)
+                .chain(std::iter::once(b'\n'))
+                .collect::<Vec<u8>>()
+                .into_boxed_slice(),
+        );
+        assert_eq!(
+            reader(at_limit).next_frame().await.map(|s| s.len()),
+            Some(MAX_FRAME_BYTES)
+        );
     }
 }

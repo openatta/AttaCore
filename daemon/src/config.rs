@@ -179,6 +179,10 @@ pub struct DaemonConfig {
     pub lock_path: PathBuf,
     pub session_cap: usize,
     pub tcp_addr: Option<SocketAddr>,
+    /// WebSocket transport address. Shares `tcp_token`, because both are the
+    /// same question — is this connection allowed — asked over different
+    /// framing.
+    pub ws_addr: Option<SocketAddr>,
     pub tcp_token: Option<String>,
     /// Not yet sourced from `settings.permission_rules` — daemon has always
     /// hardcoded `AllowAllPermission` + `BypassPermissions` regardless (see
@@ -205,6 +209,7 @@ impl std::fmt::Debug for DaemonConfig {
                 &self.settings.mcp_servers.keys().collect::<Vec<_>>(),
             )
             .field("tcp_addr", &self.tcp_addr)
+            .field("ws_addr", &self.ws_addr)
             .field("tcp_token", &"...")
             .field("paths", &"...")
             .field(
@@ -234,6 +239,7 @@ impl DaemonConfig {
             paths,
             session_cap: 32,
             tcp_addr: None,
+            ws_addr: None,
             tcp_token: None,
             permission_rules: RuleSet::empty(),
             session_idle_timeout_secs: 3600,
@@ -289,6 +295,7 @@ pub fn load_daemon_config(
         ),
         session_cap: 32,
         tcp_addr: None,
+        ws_addr: None,
         tcp_token: None,
         permission_rules: RuleSet::empty(),
         session_idle_timeout_secs: 3600,

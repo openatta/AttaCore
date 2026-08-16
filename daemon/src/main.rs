@@ -52,7 +52,14 @@ struct Cli {
     #[arg(long)]
     listen: Option<String>,
 
-    /// Shared secret for TCP auth. Falls back to `ATTACORE_DAEMON_TOKEN`.
+    /// Bind a WebSocket listener at this addr (e.g. 127.0.0.1:7879), so a
+    /// browser front end can reach the daemon directly. Loopback only, and
+    /// requires --token or ATTACORE_DAEMON_TOKEN env.
+    #[arg(long)]
+    listen_ws: Option<String>,
+
+    /// Shared secret for TCP and WebSocket auth. Falls back to
+    /// `ATTACORE_DAEMON_TOKEN`.
     #[arg(long)]
     token: Option<String>,
 
@@ -292,6 +299,30 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::anyhow!("--listen requires --token or env ATTACORE_DAEMON_TOKEN")
             })?;
         daemon_config.tcp_addr = Some(addr);
+        daemon_config.tcp_token = Some(token);
+    }
+
+    if let Some(ref addr_str) = cli.listen_ws {
+        let addr: std::net::SocketAddr = addr_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --listen-ws `{addr_str}`: {e}"))?;
+        // Refused rather than warned about: this transport is what a browser
+        // connects to, and a browser reaching it from another machine would
+        // mean the token is the only thing between the daemon and the network.
+        if !addr.ip().is_loopback() {
+            anyhow::bail!(
+                "--listen-ws must bind a loopback address; `{addr}` is reachable from the network"
+            );
+        }
+        let token = cli
+            .token
+            .clone()
+            .or_else(|| std::env::var("ATTACORE_DAEMON_TOKEN").ok())
+            .or_else(|| daemon_config.tcp_token.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("--listen-ws requires --token or env ATTACORE_DAEMON_TOKEN")
+            })?;
+        daemon_config.ws_addr = Some(addr);
         daemon_config.tcp_token = Some(token);
     }
 
@@ -621,12 +652,27 @@ async fn main() -> anyhow::Result<()> {
 
     let server = Arc::new(DaemonServer::new(pool, cancel.clone()));
 
-    // TCP listener (optional)
-    if let (Some(addr), Some(token)) = (daemon_config.tcp_addr, daemon_config.tcp_token.clone()) {
+    // One token covers both network transports; either flag alone sets it.
+    if let Some(token) = daemon_config.tcp_token.clone() {
         server.set_tcp_token(token).await;
+    }
+
+    if let Some(addr) = daemon_config.tcp_addr {
         let s = server.clone();
         info!(%addr, "TCP listener bound (token-auth required)");
         tokio::spawn(async move { s.serve_tcp(addr).await });
+    }
+
+    // Bound here rather than inside the task so a port already in use fails
+    // startup, instead of leaving a daemon running without the transport the
+    // user asked for.
+    if let Some(addr) = daemon_config.ws_addr {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not bind --listen-ws `{addr}`: {e}"))?;
+        info!(%addr, "WebSocket listener bound (token-auth required)");
+        let s = server.clone();
+        tokio::spawn(async move { daemon::ws::serve_ws_listener(s, listener).await });
     }
 
     server.serve_unix(&socket).await?;

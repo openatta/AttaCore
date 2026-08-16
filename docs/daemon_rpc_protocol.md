@@ -14,14 +14,20 @@
 ## 1. 传输与编码
 
 **帧格式**:每行一个 JSON 对象,`\n` 分隔(NDJSON)。不使用 Content-Length 头 ——
-让 `tail -f` 和 `nc` 可以直接调试。
+让 `tail -f` 和 `nc` 可以直接调试。WebSocket 传输例外:WebSocket 本身就是消息分帧的,
+**一条 text 消息 = 一帧**,不再附加 `\n`。
 
 | 传输 | 地址 | 认证 |
 |---|---|---|
 | Unix socket | 见 §2 | 文件权限(`0600`) |
 | TCP | `--listen <addr>` | `daemon.auth` 握手,见 §5.1 |
+| WebSocket | `--listen-ws <addr>`(仅回环) | `daemon.auth` 握手 + Origin 校验,见 §5.1 |
 
-编码 UTF-8。单帧无长度上限,但实现建议对单行 > 16 MiB 的输入拒绝并返回 `PARSE_ERROR`。
+**分帧之上的一切都与传输无关** —— 方法、参数、事件帧、权限提示的语义三条路完全一致,
+客户端换传输不需要改协议层代码。
+
+编码 UTF-8。**单帧上限 16 MiB**,三条传输都强制:超限的连接被关闭而不是跳过该帧 ——
+超限之后服务端已经不知道下一个帧边界在哪。
 
 **请求**:
 
@@ -340,17 +346,38 @@ daemon 按**会话**如实上报,不做跨会话/跨场景聚合 —— 聚合�
 
 ### 5.1 认证
 
-仅 TCP 需要。连接建立后的**第一帧**必须是:
+TCP 与 WebSocket 需要,两者用**同一个 token、同一段校验代码**。连接建立后的**第一帧**
+必须是:
 
 ```jsonc
 { "jsonrpc":"2.0", "method":"daemon.auth", "params":{"token":"…"}, "id":0 }
 ```
 
-失败或缺失 → `UNAUTHORIZED (-32003)`,连接关闭。
+失败或缺失 → `UNAUTHORIZED (-32003)`,连接关闭(WebSocket 会先发 close 帧再断,
+浏览器端拿到的是"被拒绝"而不是"连接出错")。
 
 认证粒度是 **daemon 级**,不按场景或会话签发 —— 一条通过认证的连接可以访问该 daemon
 的全部场景与会话。哪些暴露给哪个客户端由上层应用决定。Unix socket 依赖文件系统权限
 (`0600`),无需握手。
+
+token 来自 `--token` 或 `ATTACORE_DAEMON_TOKEN`。**没有配 token 时 WebSocket 监听直接
+启动失败**,不会先起来再拒绝所有人。
+
+#### WebSocket 的 Origin 校验
+
+`--listen-ws` 只接受回环地址,非回环地址启动即失败。但**绑定回环挡不住网页**:
+WebSocket 不受同源策略约束,用户浏览器打开的任何站点都能向 `ws://127.0.0.1:<port>`
+发起连接。所以升级握手阶段还要看 `Origin`:
+
+| `Origin` | 结果 |
+|---|---|
+| 缺失(CLI、编辑器等非浏览器客户端) | 放行,进入 token 握手 |
+| `http(s)://localhost` / `127.0.0.1` / `[::1]`,任意端口 | 放行,进入 token 握手 |
+| 其它 | 升级失败,`403 Forbidden` |
+
+端口不校验 —— 前端跑在哪个端口是部署细节,写死会变成"改 UI 端口要改 daemon"。
+浏览器不允许页面伪造 `Origin`,这个判断才成立;非浏览器客户端不发这个头,而缺失
+不构成任何证据,所以照常走 token 握手。
 
 ### 5.2 一条连接上的并发
 
@@ -433,7 +460,8 @@ session.get {session_id}
 已进入 transcript,用 `session.history` 取。
 
 **心跳**:daemon 不主动发心跳。长时间空闲的连接由 TCP keepalive 或客户端自己的
-`daemon.ping` 维持。
+`daemon.ping` 维持。WebSocket 传输会自动回应 ping 帧,但浏览器的 WebSocket API 不能
+发 ping —— 网页端要保活就用 `daemon.ping`。
 
 ### 5.7 能力探测
 
