@@ -387,3 +387,162 @@ mod as_a_tool {
         );
     }
 }
+
+// ── The event surface ──
+
+mod as_an_event_subscriber {
+    use super::*;
+    use wasm_host::bindings::atta::plugin::types::HookDecision;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_component_can_refuse_an_event_with_a_reason() {
+        let inst = instance(caps(vec![], 5_000));
+        let decision = inst
+            .on_event("PreToolUse", r#"{"tool_name":"Bash"}"#, &CancellationToken::new())
+            .await
+            .unwrap();
+        match decision {
+            HookDecision::Block(reason) => assert!(reason.contains("blocks"), "{reason}"),
+            other => panic!("the fixture blocks PreToolUse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_component_can_add_context_without_deciding_anything() {
+        let inst = instance(caps(vec![], 5_000));
+        let decision = inst
+            .on_event("SessionStart", "{}", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(decision, HookDecision::AddContext(_)), "{decision:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_the_component_does_not_care_about_proceeds() {
+        let inst = instance(caps(vec![], 5_000));
+        let decision = inst
+            .on_event("PostToolUse", "{}", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(decision, HookDecision::Proceed), "{decision:?}");
+    }
+
+    /// An event handler gets the same store treatment as a tool call, so a
+    /// plugin cannot hold a turn hostage from inside a hook either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_handler_is_bounded_by_the_same_deadline() {
+        let inst = instance(caps(vec![], 60_000));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = inst
+            .on_event("PreToolUse", "{}", &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CallFailure::Cancelled);
+    }
+}
+
+// ── Health: when to stop asking ──
+
+mod health {
+    use super::*;
+    use base::tool::{Tool, ToolContext, ToolResultContent};
+    use wasm_host::{health::FAULT_LIMIT, WasmToolAdapter};
+
+    async fn adapter_for(inst: &Arc<wasm_host::PluginInstance>, tool: &str) -> WasmToolAdapter {
+        let defs = inst.list_tools(&CancellationToken::new()).await.unwrap();
+        let def = defs.iter().find(|d| d.name == tool).expect("fixture tool");
+        WasmToolAdapter::new(inst.clone(), "echo-plugin", def)
+    }
+
+    /// Per-call isolation makes it *safe* to keep calling a broken plugin,
+    /// not useful. After enough consecutive traps the adapter stops asking
+    /// and says why, instead of handing the model the same failure forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_component_that_keeps_trapping_is_set_aside() {
+        let inst = Arc::new(instance(caps(vec![], 5_000)));
+        let boom = adapter_for(&inst, "explode").await;
+        let echo = adapter_for(&inst, "echo").await;
+        let ctx = || ToolContext::for_test(std::env::temp_dir());
+
+        for _ in 0..FAULT_LIMIT {
+            let r = boom
+                .call(
+                    serde_json::json!({}),
+                    ctx(),
+                    base::tool::ProgressSender::noop("t"),
+                )
+                .await
+                .unwrap();
+            assert!(r.is_error);
+        }
+        assert!(inst.health().is_broken());
+
+        // Now even a tool that works is refused, because the plugin is what
+        // was disabled — not the individual tool.
+        let r = echo
+            .call(
+                serde_json::json!({"text": "hello"}),
+                ctx(),
+                base::tool::ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
+        assert!(r.is_error);
+        match &r.content {
+            ToolResultContent::Text(s) => {
+                assert!(s.contains("disabled"), "{s}");
+                assert!(s.contains("echo-plugin"), "the user needs to know which one: {s}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// A plugin that fails once and then works is being used at its edges.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_component_is_not_penalised() {
+        let inst = Arc::new(instance(caps(vec![], 5_000)));
+        let boom = adapter_for(&inst, "explode").await;
+        let echo = adapter_for(&inst, "echo").await;
+        let ctx = || ToolContext::for_test(std::env::temp_dir());
+
+        for _ in 0..FAULT_LIMIT * 2 {
+            let _ = boom
+                .call(
+                    serde_json::json!({}),
+                    ctx(),
+                    base::tool::ProgressSender::noop("t"),
+                )
+                .await;
+            let ok = echo
+                .call(
+                    serde_json::json!({"text": "fine"}),
+                    ctx(),
+                    base::tool::ProgressSender::noop("t"),
+                )
+                .await
+                .unwrap();
+            assert!(!ok.is_error, "the working tool must keep working");
+        }
+        assert!(!inst.health().is_broken());
+    }
+
+    /// A slow plugin is not a broken one; disabling it for being used as
+    /// intended would be the worst possible reading of a timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timing_out_repeatedly_does_not_disable_a_plugin() {
+        let inst = Arc::new(instance(caps(vec![], 100)));
+        let cancel = CancellationToken::new();
+        for _ in 0..FAULT_LIMIT * 2 {
+            let err = inst
+                .call_tool("spin", "{}", "c", None, &cancel)
+                .await
+                .unwrap_err();
+            assert_eq!(err, CallFailure::TimedOut);
+        }
+        assert!(
+            !inst.health().is_broken(),
+            "a plugin doing something slow has not misbehaved"
+        );
+    }
+}

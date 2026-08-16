@@ -190,6 +190,19 @@ impl Tool for WasmToolAdapter {
         ctx: ToolContext,
         progress: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
+        // A plugin that has faulted on every recent call is not going to
+        // answer this one either, and each attempt costs the model a turn to
+        // discover that. Refusing here is cheaper than letting it keep
+        // failing, and says why.
+        if self.instance.health().is_broken() {
+            return Ok(ToolResult::error_text(format!(
+                "plugin `{}` has been disabled after {} consecutive failures; \
+                 reinstall or re-enable it to try again",
+                self.plugin,
+                self.instance.health().consecutive_faults()
+            )));
+        }
+
         let sink: Arc<dyn ProgressSink> = Arc::new(SenderSink(progress));
         let out = self
             .instance

@@ -61,6 +61,7 @@ pub struct PluginInstance {
     name: String,
     caps: Arc<ResolvedCapabilities>,
     kv: Arc<KvNamespace>,
+    health: Arc<crate::health::Health>,
 }
 
 impl PluginInstance {
@@ -92,7 +93,26 @@ impl PluginInstance {
             name,
             caps,
             kv: Arc::new(KvNamespace::new()),
+            health: Arc::new(crate::health::Health::new()),
         })
+    }
+
+    /// This plugin's fault record — see [`crate::health`].
+    pub fn health(&self) -> &Arc<crate::health::Health> {
+        &self.health
+    }
+
+    /// Fold a call's outcome into the fault record. Faults are the plugin
+    /// failing to answer; anything else is not held against it.
+    fn note<T>(&self, outcome: Result<T, CallFailure>) -> Result<T, CallFailure> {
+        match &outcome {
+            Ok(_) => self.health.record_success(),
+            Err(CallFailure::Faulted(_)) => self.health.record_fault(),
+            Err(CallFailure::TimedOut) | Err(CallFailure::Cancelled) => {
+                self.health.record_abandoned()
+            }
+        }
+        outcome
     }
 
     pub fn name(&self) -> &str {
@@ -122,7 +142,7 @@ impl PluginInstance {
                 .await?;
             Ok(tools)
         };
-        with_deadline(call, self.caps.timeout, cancel).await
+        self.note(with_deadline(call, self.caps.timeout, cancel).await)
     }
 
     /// Run one tool. The store this builds is dropped when the call returns,
@@ -146,7 +166,7 @@ impl PluginInstance {
                 .await?;
             Ok(out)
         };
-        with_deadline(call, self.caps.timeout, cancel).await
+        self.note(with_deadline(call, self.caps.timeout, cancel).await)
     }
 
     /// Hand the component its validated configuration.
@@ -164,6 +184,28 @@ impl PluginInstance {
             }
         };
         with_deadline(call, self.caps.timeout, cancel).await
+    }
+
+    /// Offer the component a lifecycle event.
+    ///
+    /// A component that does not export the `events` interface answers
+    /// `Proceed`, which is also what a manifest declaring no events means.
+    pub async fn on_event(
+        &self,
+        event: &str,
+        payload_json: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::bindings::atta::plugin::types::HookDecision, CallFailure> {
+        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
+        let call = async {
+            let world = self.pre.instantiate_async(&mut store).await?;
+            let decision = world
+                .atta_plugin_events()
+                .call_on_event(&mut store, event, payload_json)
+                .await?;
+            Ok(decision)
+        };
+        self.note(with_deadline(call, self.caps.timeout, cancel).await)
     }
 
     /// Ask the component to validate an input before the host commits to

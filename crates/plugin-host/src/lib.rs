@@ -6,8 +6,10 @@
 //! and lets the whole subsystem be an optional dependency of the host — see
 //! `runtime::plugin_host`.
 
+pub mod events;
 pub mod scene;
 
+pub use events::WasmEvents;
 pub use scene::PluginScene;
 
 use runtime::agent_tool::{AgentTypeDefinition, AgentTypeSource};
@@ -29,6 +31,9 @@ pub struct InstalledPlugins {
     /// `extra_tools`, and that list is only known after the components have
     /// been asked.
     scenes: Vec<Arc<dyn base::interface::scene::AgentScene>>,
+    /// Loaded components by plugin name, so the event executor can find the
+    /// one a `HookConfig::Wasm` entry names.
+    instances: std::collections::HashMap<String, Arc<wasm_host::PluginInstance>>,
 }
 
 impl InstalledPlugins {
@@ -37,6 +42,7 @@ impl InstalledPlugins {
             plugins,
             tools: Vec::new(),
             scenes: Vec::new(),
+            instances: std::collections::HashMap::new(),
         }
     }
 
@@ -50,12 +56,16 @@ impl InstalledPlugins {
     pub async fn load_components(&mut self, engine: &WasmEngine, workspace: &Path) {
         let mut tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
         let mut scenes: Vec<Arc<dyn base::interface::scene::AgentScene>> = Vec::new();
+        let mut instances = std::collections::HashMap::new();
 
         for p in &self.plugins {
             let mut own_tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
             for payload in &p.manifest.wasm {
                 match load_payload(engine, p, payload, workspace).await {
-                    Ok(mut loaded) => own_tools.append(&mut loaded),
+                    Ok((instance, mut loaded)) => {
+                        own_tools.append(&mut loaded);
+                        instances.insert(p.name().to_string(), instance);
+                    }
                     Err(e) => tracing::warn!(
                         plugin = %p.name(),
                         component = %payload.component.display(),
@@ -75,7 +85,10 @@ impl InstalledPlugins {
 
         self.tools = tools;
         self.scenes = scenes;
+        self.instances = instances;
     }
+
+
 
     /// Scene ids this host contributes, for the caller that has to register
     /// and later withdraw them.
@@ -138,12 +151,29 @@ impl PluginHost for InstalledPlugins {
         out
     }
 
+    /// Only from plugins whose components actually loaded: a manifest that
+    /// subscribes to an event but whose component failed to compile would
+    /// otherwise register a hook that can never answer, and every event it
+    /// claimed would pay a dispatch for nothing.
     fn hook_configs(&self) -> Vec<(hooks::config::HookEvent, hooks::config::HookConfig)> {
-        Vec::new()
+        self.plugins
+            .iter()
+            .filter(|p| self.instances.contains_key(p.name()))
+            .flat_map(crate::events::hook_configs_for)
+            .collect()
     }
 
     fn scenes(&self) -> Vec<Arc<dyn base::interface::scene::AgentScene>> {
         self.scenes.clone()
+    }
+
+    fn hook_executor(&self) -> Option<Arc<dyn hooks::runner::WasmHookExecutor>> {
+        if self.instances.is_empty() {
+            return None;
+        }
+        Some(Arc::new(crate::events::WasmEvents::new(
+            self.instances.clone(),
+        )))
     }
 
     fn agent_types(&self) -> Vec<AgentTypeDefinition> {
@@ -165,7 +195,7 @@ async fn load_payload(
     plugin: &plugin::manifest::Plugin,
     payload: &plugin::manifest::WasmPayload,
     workspace: &Path,
-) -> anyhow::Result<Vec<Arc<dyn base::tool::Tool>>> {
+) -> anyhow::Result<(Arc<wasm_host::PluginInstance>, Vec<Arc<dyn base::tool::Tool>>)> {
     let caps = Arc::new(ResolvedCapabilities::resolve(
         &payload.capabilities,
         workspace,
@@ -187,13 +217,14 @@ async fn load_payload(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(defs
+    let tools = defs
         .iter()
         .map(|def| {
             Arc::new(WasmToolAdapter::new(instance.clone(), plugin.name(), def))
                 as Arc<dyn base::tool::Tool>
         })
-        .collect())
+        .collect();
+    Ok((instance, tools))
 }
 
 /// Convert a plugin-declared `AgentDef` into a runtime [`AgentTypeDefinition`],
@@ -492,5 +523,129 @@ component = "broken.wasm"
             ["broken"],
             "the plugin is still known; only its tools are missing"
         );
+    }
+}
+
+#[cfg(test)]
+mod unload_tests {
+    use super::*;
+
+    fn fixture_component() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/wasm_echo_plugin/target/wasm32-wasip2/release/wasm_echo_plugin.wasm")
+    }
+
+    fn write_plugin(dir: &Path, component: &std::path::Path) {
+        std::fs::copy(component, dir.join("echo.wasm")).unwrap();
+        std::fs::write(
+            dir.join("plugin.toml"),
+            r#"
+[plugin]
+name = "echo-plugin"
+version = "1.0.0"
+api_version = "0.1"
+
+[[wasm]]
+component = "echo.wasm"
+events = ["PreToolUse"]
+"#,
+        )
+        .unwrap();
+    }
+
+    /// Unloading is dropping the host: the instances go, and with them the
+    /// key-value namespace a plugin accumulated. Nothing has to be
+    /// remembered and cleaned up separately, which is the point of keeping
+    /// that state on the host side in the first place.
+    #[tokio::test]
+    async fn replacing_the_host_takes_a_plugins_state_with_it() {
+        let component = fixture_component();
+        if !component.exists() {
+            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(dir.path(), &component);
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+        let engine = WasmEngine::new().unwrap();
+
+        let mut host = InstalledPlugins::new(vec![p.clone()]);
+        host.load_components(&engine, dir.path()).await;
+
+        // `remember` reports the value the *previous* call stored, which
+        // makes it the tool that can tell whether state survived a reload.
+        let remember = |h: &InstalledPlugins| {
+            h.tools()
+                .into_iter()
+                .find(|t| t.name() == "plugin__echo-plugin__remember")
+                .expect("the fixture exports `remember`")
+        };
+        let call = |tool: Arc<dyn base::tool::Tool>, value: &str, root: &Path| {
+            let input = serde_json::json!({ "value": value });
+            let ctx = base::tool::ToolContext::for_test(root.to_path_buf());
+            async move {
+                let r = tool
+                    .call(input, ctx, base::tool::ProgressSender::noop("t"))
+                    .await
+                    .expect("the fixture answers");
+                match r.content {
+                    base::tool::ToolResultContent::Text(s) => s,
+                    other => panic!("expected text, got {other:?}"),
+                }
+            }
+        };
+
+        assert_eq!(
+            call(remember(&host), "remembered", dir.path()).await,
+            "(none)",
+            "a freshly loaded plugin has nothing stored"
+        );
+        assert_eq!(
+            call(remember(&host), "again", dir.path()).await,
+            "remembered",
+            "within one host, state carries between calls"
+        );
+
+        // A fresh host over the same plugin is what install/uninstall/enable
+        // produces, and it starts with nothing.
+        let mut reloaded = InstalledPlugins::new(vec![p]);
+        reloaded.load_components(&engine, dir.path()).await;
+        assert_eq!(
+            call(remember(&reloaded), "after", dir.path()).await,
+            "(none)",
+            "a reloaded plugin must not inherit the previous one's state"
+        );
+    }
+
+    /// A plugin whose component failed to load subscribes to nothing, so the
+    /// dispatcher does not pay for events that can never be answered.
+    #[tokio::test]
+    async fn a_plugin_with_no_loaded_component_registers_no_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.wasm"), b"not a component").unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+[plugin]
+name = "broken"
+version = "1.0.0"
+api_version = "0.1"
+
+[[wasm]]
+component = "broken.wasm"
+events = ["PreToolUse"]
+"#,
+        )
+        .unwrap();
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+
+        let mut host = InstalledPlugins::new(vec![p]);
+        host.load_components(&WasmEngine::new().unwrap(), dir.path())
+            .await;
+
+        assert!(host.hook_configs().is_empty());
+        assert!(host.hook_executor().is_none());
     }
 }

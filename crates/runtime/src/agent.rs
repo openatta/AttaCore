@@ -992,6 +992,7 @@ fn build_hook_runner(
     settings: &Settings,
     model: Arc<dyn Model>,
     agent_tool: Arc<crate::agent_tool::AgentTool>,
+    plugin_host: Option<&Arc<dyn crate::plugin_host::PluginHost>>,
 ) -> Arc<HookRunner> {
     let parsed: hooks::HooksSettings = match &settings.hooks_config {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
@@ -1017,10 +1018,18 @@ fn build_hook_runner(
         agent_spawner,
         settings.paths.project_root(),
     ));
-    let runner = HookRunner::new(parsed)
+    let mut runner = HookRunner::new(parsed)
         .with_hooks_search_dirs(hooks_search_dirs)
         .with_prompt_executor(prompt_executor)
         .with_agent_executor(agent_executor);
+    if let Some(host) = plugin_host {
+        if let Some(executor) = host.hook_executor() {
+            runner = runner.with_wasm_executor(executor);
+        }
+        for (event, config) in host.hook_configs() {
+            runner.register_hook(event, config);
+        }
+    }
     Arc::new(runner)
 }
 
@@ -1444,7 +1453,12 @@ impl Builder {
             Arc::new(agent_tool)
         };
         let hooks = self.hooks.unwrap_or_else(|| {
-            build_hook_runner(&settings, model.clone(), agent_tool_arc.clone())
+            build_hook_runner(
+                &settings,
+                model.clone(),
+                agent_tool_arc.clone(),
+                self.plugin_host.as_ref(),
+            )
         });
         // P2: Wire the wake receiver into hooks for async rewake support.
         if let Some(rx) = self.wake_rx {
@@ -3887,7 +3901,7 @@ mod tests {
     fn build_hook_runner_defaults_to_empty_without_hooks_config() {
         let settings = test_settings();
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool());
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None);
         assert!(runner.is_empty());
     }
 
@@ -3900,7 +3914,7 @@ mod tests {
             ]
         }));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool());
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None);
         assert!(!runner.is_empty());
         assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
     }
@@ -3911,7 +3925,7 @@ mod tests {
         // Wrong shape: hooks value must be a map of event -> Vec<HookConfig>.
         settings.hooks_config = Some(serde_json::json!("not-a-hooks-map"));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool());
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None);
         assert!(runner.is_empty());
     }
 

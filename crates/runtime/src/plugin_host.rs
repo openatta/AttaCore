@@ -7,9 +7,13 @@
 //! does nothing — no `#[cfg]` scattered through the engine, and no behavior
 //! difference to reason about beyond "there are no plugins".
 //!
-//! The contribution points are deliberately few and deliberately enumerable.
-//! Each one is a seam the engine has to keep working across refactors, so
-//! adding a seventh is a decision to argue for, not a detail to slip in.
+//! There are five contribution points — tools, MCP servers, hook
+//! subscriptions, scenes, agent types — plus two supporting methods that
+//! serve them rather than adding new ones ([`PluginHost::hook_executor`] is
+//! the backend for the hook subscriptions; [`PluginHost::permission_rules`]
+//! is data the host merges). Each contribution point is a seam the engine
+//! has to keep working across refactors, so adding a sixth is a decision to
+//! argue for, not a detail to slip in.
 
 use base::interface::scene::AgentScene;
 use base::tool::Tool;
@@ -54,6 +58,14 @@ pub trait PluginHost: Send + Sync {
     /// which is what clamps their `permission_mode` / `max_turns` overrides —
     /// see `agent_tool::apply_agent_type_overrides`.
     fn agent_types(&self) -> Vec<crate::agent_tool::AgentTypeDefinition>;
+
+    /// The backend that runs `HookConfig::Wasm` entries, when this host has
+    /// components loaded. `None` means the entries from
+    /// [`hook_configs`](Self::hook_configs) would have nothing to answer
+    /// them, and the dispatcher skips them with an explanation.
+    fn hook_executor(&self) -> Option<Arc<dyn hooks::runner::WasmHookExecutor>> {
+        None
+    }
 
     /// Permission rules plugins contribute, tagged
     /// [`RuleSource::Plugin`](base::permission::RuleSource::Plugin) so that
