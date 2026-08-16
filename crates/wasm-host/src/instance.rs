@@ -71,6 +71,22 @@ impl PluginInstance {
         name: String,
         caps: Arc<ResolvedCapabilities>,
     ) -> Result<Self> {
+        Self::link_with_health(engine, component, name, caps, Arc::new(crate::health::Health::new()))
+    }
+
+    /// Link, reusing an existing fault record.
+    ///
+    /// A caller that rebuilds instances — which is every install, uninstall,
+    /// enable and disable — passes the record it already had, so a plugin
+    /// that disabled itself does not come back because the user touched a
+    /// different plugin. See [`crate::health::HealthRegistry`].
+    pub fn link_with_health(
+        engine: &WasmEngine,
+        component: &ComponentHandle,
+        name: String,
+        caps: Arc<ResolvedCapabilities>,
+        health: Arc<crate::health::Health>,
+    ) -> Result<Self> {
         let mut linker: Linker<PluginState> = Linker::new(engine.inner());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| anyhow!("adding WASI to the plugin linker: {e}"))?;
@@ -93,7 +109,7 @@ impl PluginInstance {
             name,
             caps,
             kv: Arc::new(KvNamespace::new()),
-            health: Arc::new(crate::health::Health::new()),
+            health,
         })
     }
 
@@ -206,26 +222,6 @@ impl PluginInstance {
             Ok(decision)
         };
         self.note(with_deadline(call, self.caps.timeout, cancel).await)
-    }
-
-    /// Ask the component to validate an input before the host commits to
-    /// running it.
-    pub async fn validate_input(
-        &self,
-        name: &str,
-        input_json: &str,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Result<(), String>, CallFailure> {
-        let mut store = self.store().map_err(|e| CallFailure::Faulted(e.to_string()))?;
-        let call = async {
-            let world = self.pre.instantiate_async(&mut store).await?;
-            let out = world
-                .atta_plugin_tools()
-                .call_validate_input(&mut store, name, input_json)
-                .await?;
-            Ok(out)
-        };
-        with_deadline(call, self.caps.timeout, cancel).await
     }
 
     fn store(&self) -> Result<Store<PluginState>> {

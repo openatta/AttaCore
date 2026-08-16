@@ -67,6 +67,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Common
 uuid = { version = "1", features = ["v4", "serde"] }
 semver = "1"
+jsonschema = { version = "0.49", default-features = false }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 sha2 = "0.10"
 hex = "0.4"

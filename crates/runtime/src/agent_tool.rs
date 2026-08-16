@@ -1056,6 +1056,7 @@ fn fallback_settings(
         execution: ExecutionSettings::default(),
         compaction: Default::default(),
         sandbox: SandboxConfig::default(),
+        plugins: Default::default(),
         // S-2: no parent `Settings` to inherit from here, but the caller may
         // still know the instruction file (`AgentTool::set_instruction_file`).
         instruction_file: instruction_file.cloned(),

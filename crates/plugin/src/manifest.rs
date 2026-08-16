@@ -301,6 +301,18 @@ fn validate(m: &PluginManifest) -> Result<(), PluginError> {
             supported: SUPPORTED_API_VERSIONS.join(", "),
         });
     }
+    // One component per plugin may subscribe. The host resolves an event to
+    // a plugin *by name*, so two subscribing components would give one name
+    // two possible answers — and whichever the host picked, the other's
+    // subscription would be silently ignored.
+    let subscribers = m.wasm.iter().filter(|w| !w.events.is_empty()).count();
+    if subscribers > 1 {
+        return Err(PluginError::Schema(format!(
+            "{subscribers} components declare `events`; at most one may, because \
+             the host dispatches an event to a plugin by name"
+        )));
+    }
+
     for w in &m.wasm {
         for e in &w.events {
             if !SUBSCRIBABLE_EVENTS.contains(&e.as_str()) {
@@ -511,6 +523,46 @@ events = ["PreCompact"]
         let msg = err.to_string();
         assert!(msg.contains("PreCompact"), "{msg}");
         assert!(msg.contains("PreToolUse"), "the error should list what is allowed: {msg}");
+    }
+
+    /// The host dispatches an event to a plugin by name, so two subscribing
+    /// components would give one name two possible answers and one of the
+    /// two subscriptions would be silently ignored.
+    #[test]
+    fn only_one_component_may_subscribe_to_events() {
+        let err = load_str(
+            &format!(
+                "{MINIMAL}
+[[wasm]]
+component = \"a.wasm\"
+events = [\"PreToolUse\"]
+
+[[wasm]]
+component = \"b.wasm\"
+events = [\"PostToolUse\"]
+"
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("2 components"), "{err}");
+        assert!(err.contains("by name"), "{err}");
+    }
+
+    #[test]
+    fn several_components_are_fine_when_only_one_subscribes() {
+        let m = load_str(&format!(
+            "{MINIMAL}
+[[wasm]]
+component = \"a.wasm\"
+events = [\"PreToolUse\"]
+
+[[wasm]]
+component = \"b.wasm\"
+"
+        ))
+        .unwrap();
+        assert_eq!(m.wasm.len(), 2);
     }
 
     #[test]

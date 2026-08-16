@@ -114,12 +114,6 @@ impl ToolsGuest for Component {
         }
     }
 
-    fn validate_input(name: String, input_json: String) -> Result<(), String> {
-        if name == "echo" && field(&input_json, "text").is_none() {
-            return Err("echo requires `text`".into());
-        }
-        Ok(())
-    }
 }
 
 impl EventsGuest for Component {

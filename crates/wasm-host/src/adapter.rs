@@ -82,6 +82,13 @@ impl WasmToolAdapter {
     pub fn tool_name(&self) -> &str {
         &self.tool_name
     }
+
+    /// The long usage guide, which reaches the model on demand through
+    /// `ToolSearch` — so an installer has to disclose it like any other
+    /// model-visible text.
+    pub fn doc(&self) -> Option<&str> {
+        self.doc.as_deref()
+    }
 }
 
 /// Forward a tool's progress reports to the session's sender.
@@ -147,30 +154,15 @@ impl Tool for WasmToolAdapter {
         None
     }
 
-    async fn validate_input(&self, input: &Value, ctx: &ToolContext) -> ValidationResult {
-        if !input.is_object() {
-            return ValidationResult::err("plugin tool input must be a JSON object", 1);
-        }
-        let json = input.to_string();
-        match self
-            .instance
-            .validate_input(&self.tool_name, &json, &ctx.cancel)
-            .await
-        {
-            Ok(Ok(())) => ValidationResult::Ok,
-            Ok(Err(reason)) => ValidationResult::err(reason, 1),
-            // A component that cannot even be asked is a problem for `call`
-            // to report, with its own error handling and its own message.
-            // Failing validation here would mask it as a bad argument.
-            Err(e) => {
-                tracing::warn!(
-                    plugin = %self.plugin,
-                    tool = %self.tool_name,
-                    error = %e,
-                    "plugin could not validate input; deferring the failure to the call"
-                );
-                ValidationResult::Ok
-            }
+    /// Only the shape the ABI requires. There is no per-tool validation
+    /// hook: `Tool::validate_input` has no production caller anywhere in the
+    /// engine, so a WIT export for it would have been a contract offered to
+    /// plugin authors that nothing would ever invoke.
+    async fn validate_input(&self, input: &Value, _: &ToolContext) -> ValidationResult {
+        if input.is_object() {
+            ValidationResult::Ok
+        } else {
+            ValidationResult::err("plugin tool input must be a JSON object", 1)
         }
     }
 

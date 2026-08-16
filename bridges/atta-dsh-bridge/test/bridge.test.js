@@ -19,6 +19,7 @@ import {
   toolToMcp,
 } from '../src/translate.js';
 import { handleRequest, serveLine, PROTOCOL_VERSION } from '../src/server.js';
+import { Semaphore, DEFAULT_MAX_IN_FLIGHT, maxInFlight } from '../src/limit.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (n) => join(here, 'fixtures', n);
@@ -437,4 +438,202 @@ test('an unsupported plugin makes the process refuse to start', async () => {
 
   assert.equal(code, 1);
   assert.match(err, /llm, sessions/);
+});
+
+// ── Concurrency and deadlines ──
+
+// DSH's contract has no timeout and no abort signal, so without this a tool
+// that never returns is indistinguishable from a hung server.
+test('a tool that never returns is reported rather than waited on forever', async () => {
+  const { registry } = await loadPlugin(fixture('slow-plugin.js'));
+  const started = Date.now();
+  const out = await callTool(registry.get('never'), {}, { timeoutMs: 60 });
+
+  assert.equal(out.isError, true);
+  assert.match(out.content[0].text, /did not return within 60ms/);
+  assert.ok(Date.now() - started < 5000, 'it must actually give up');
+});
+
+test('a tool finishing inside its deadline is unaffected', async () => {
+  const { registry } = await loadPlugin(fixture('slow-plugin.js'));
+  const out = await callTool(registry.get('slow'), { ms: 10 }, { timeoutMs: 5000 });
+  assert.equal(out.isError, false);
+  assert.equal(out.content[0].text, 'waited 10ms');
+});
+
+// JSON-RPC pairs a response to its request by id and says nothing about
+// ordering, so serialising would only mean one slow tool blocks every
+// request behind it — including the tools/list a client sends to find out
+// what is going on.
+test('a slow request does not block the ones behind it', async () => {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(
+    process.execPath,
+    [join(here, '..', 'src', 'main.js'), fixture('slow-plugin.js')],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+
+  const lines = [];
+  let buffered = '';
+  child.stdout.on('data', (chunk) => {
+    buffered += chunk.toString();
+    let i;
+    while ((i = buffered.indexOf('\n')) >= 0) {
+      const line = buffered.slice(0, i);
+      buffered = buffered.slice(i + 1);
+      if (line.trim()) lines.push(JSON.parse(line));
+    }
+  });
+
+  const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+  send({
+    jsonrpc: '2.0',
+    id: 'slow',
+    method: 'tools/call',
+    params: { name: 'slow', arguments: { ms: 300 } },
+  });
+  send({
+    jsonrpc: '2.0',
+    id: 'quick',
+    method: 'tools/call',
+    params: { name: 'quick', arguments: {} },
+  });
+
+  await new Promise((resolve) => {
+    const check = () => (lines.length >= 1 ? resolve() : setTimeout(check, 5));
+    check();
+  });
+
+  assert.equal(
+    lines[0].id,
+    'quick',
+    'the fast tool must answer first even though it was asked second',
+  );
+
+  await new Promise((resolve) => {
+    const check = () => (lines.length >= 2 ? resolve() : setTimeout(check, 10));
+    check();
+  });
+  assert.equal(lines[1].id, 'slow');
+
+  child.stdin.end();
+  await new Promise((resolve) => child.on('close', resolve));
+});
+
+// Concurrent responses must not interleave halfway through a line.
+test('every response is written as one whole line', async () => {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(
+    process.execPath,
+    [join(here, '..', 'src', 'main.js'), fixture('slow-plugin.js')],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+
+  let out = '';
+  child.stdout.on('data', (c) => (out += c.toString()));
+
+  for (let i = 0; i < 20; i += 1) {
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: i,
+        method: 'tools/call',
+        params: { name: 'slow', arguments: { ms: i % 5 } },
+      })}\n`,
+    );
+  }
+  child.stdin.end();
+  await new Promise((resolve) => child.on('close', resolve));
+
+  const lines = out.split('\n').filter((l) => l.trim());
+  assert.equal(lines.length, 20);
+  for (const line of lines) {
+    assert.doesNotThrow(() => JSON.parse(line), `not a whole JSON line: ${line}`);
+  }
+});
+
+// ── The in-flight bound ──
+
+test('a semaphore never runs more than its limit at once', async () => {
+  const gate = new Semaphore(3);
+  let active = 0;
+  let peak = 0;
+
+  await Promise.all(
+    Array.from({ length: 20 }, () =>
+      gate.run(async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((r) => setTimeout(r, 5));
+        active -= 1;
+      }),
+    ),
+  );
+
+  assert.equal(peak, 3, `peak concurrency was ${peak}`);
+  assert.equal(active, 0);
+});
+
+// Excess work waits rather than being refused: a refusal would be the
+// client's error for something it had no way to avoid.
+test('work over the limit is queued, not dropped', async () => {
+  const gate = new Semaphore(1);
+  const order = [];
+  await Promise.all([
+    gate.run(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      order.push('first');
+    }),
+    gate.run(async () => order.push('second')),
+    gate.run(async () => order.push('third')),
+  ]);
+  assert.deepEqual(order, ['first', 'second', 'third']);
+});
+
+test('a task that throws still releases its slot', async () => {
+  const gate = new Semaphore(1);
+  await assert.rejects(() => gate.run(async () => { throw new Error('boom'); }));
+  assert.equal(await gate.run(async () => 'after'), 'after');
+});
+
+test('the limit is configurable and has a sane default', () => {
+  assert.equal(maxInFlight(), DEFAULT_MAX_IN_FLIGHT);
+  process.env.ATTA_DSH_MAX_IN_FLIGHT = '2';
+  assert.equal(maxInFlight(), 2);
+  process.env.ATTA_DSH_MAX_IN_FLIGHT = 'nonsense';
+  assert.equal(maxInFlight(), DEFAULT_MAX_IN_FLIGHT, 'nonsense falls back');
+  delete process.env.ATTA_DSH_MAX_IN_FLIGHT;
+});
+
+// Everything sent must still be answered, however tight the bound.
+test('every request is answered even when the bound is tight', async () => {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(
+    process.execPath,
+    [join(here, '..', 'src', 'main.js'), fixture('slow-plugin.js')],
+    { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ATTA_DSH_MAX_IN_FLIGHT: '2' } },
+  );
+
+  let out = '';
+  child.stdout.on('data', (c) => (out += c.toString()));
+
+  for (let i = 0; i < 12; i += 1) {
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: i,
+        method: 'tools/call',
+        params: { name: 'slow', arguments: { ms: 5 } },
+      })}\n`,
+    );
+  }
+  child.stdin.end();
+  await new Promise((resolve) => child.on('close', resolve));
+
+  const ids = out
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l).id)
+    .sort((a, b) => a - b);
+  assert.deepEqual(ids, [...Array(12).keys()]);
 });

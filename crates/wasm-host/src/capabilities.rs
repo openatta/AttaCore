@@ -84,11 +84,16 @@ impl ResolvedCapabilities {
 
 /// Lowercased host of an absolute http(s) URL.
 ///
+/// Public because an error message must be able to name what was refused
+/// *without* echoing the URL: a plugin may have built it from a secret it
+/// fetched through `host.secret`, and a refusal that quotes the whole thing
+/// puts that secret into the model's context and the session transcript.
+///
 /// Deliberately narrow: anything that isn't plainly `http://host/...` or
 /// `https://host/...` yields `None`, and `None` means denied. A parser that
 /// tries to be clever about malformed input is a parser an attacker gets to
 /// negotiate with.
-fn host_of(url: &str) -> Option<String> {
+pub fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;

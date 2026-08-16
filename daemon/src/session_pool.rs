@@ -469,7 +469,8 @@ impl SessionPool {
         };
         let (events_tx, _) = tokio::sync::broadcast::channel(256);
 
-        let plugins = crate::plugins::PluginSubsystem::new(paths.clone(), true);
+        let plugins =
+            crate::plugins::PluginSubsystem::new(paths.clone(), cwd.clone(), settings.plugins.clone());
         let plugin_agent_types = plugins.agent_types();
         // Built once for every session this pool ever creates — see the
         // `skill_catalog` field doc comment. `runtime::agent::Builder`'s own
@@ -593,7 +594,7 @@ impl SessionPool {
     /// session created in that window is silently missing them with nothing
     /// to indicate why.
     pub async fn load_plugin_components(&self) {
-        self.plugins.load_components(&self.cwd).await;
+        self.plugins.load_components().await;
         self.adopt_plugin_scenes().await;
     }
 

@@ -14,6 +14,7 @@ import { basename } from 'node:path';
 import { loadPlugin } from './load.js';
 import { serveLine } from './server.js';
 import { callTool } from './translate.js';
+import { Semaphore } from './limit.js';
 
 async function main(argv) {
   const entry = argv[2];
@@ -39,15 +40,33 @@ async function main(argv) {
     `atta-dsh-bridge: serving ${registry.list().length} tool(s) from ${serverName}\n`,
   );
 
+  // One `write` call per message, so concurrent responses cannot interleave
+  // halfway through a line.
   const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
   const deps = { registry, serverName, callTool };
 
+  // Requests are not awaited in order. JSON-RPC pairs a response to its
+  // request by id and says nothing about ordering, so serialising here would
+  // only mean that one slow tool blocks every request behind it — including
+  // the `tools/list` a client sends to find out what is going on.
+  //
+  // Bounded, though: MCP has no backpressure, so a client that sends a
+  // hundred calls would otherwise have a hundred `execute` bodies running.
+  // Excess requests wait their turn rather than being refused — a refusal
+  // would be the client's error for something it had no way to avoid.
+  const gate = new Semaphore();
+  const inFlight = new Set();
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
-    await serveLine(line, deps, write);
+    const task = gate
+      .run(() => serveLine(line, deps, write))
+      .finally(() => inFlight.delete(task));
+    inFlight.add(task);
   }
 
-  // stdin closed: the client is gone, so run the plugin's cleanup.
+  // stdin closed: the client is gone. Let whatever is still running finish
+  // answering before the plugin's cleanup runs underneath it.
+  await Promise.allSettled(inFlight);
   ctx.dispose();
 }
 

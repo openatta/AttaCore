@@ -97,15 +97,42 @@ function stringify(value) {
 }
 
 /**
+ * How long a single `execute` may run before the bridge gives up on it.
+ *
+ * DSH's tool contract defines no timeout and no abort signal, so a tool that
+ * never returns would otherwise hold its request open forever. The bridge
+ * cannot stop the work — there is nothing in the contract to cancel with —
+ * but it can stop waiting, which is what keeps one bad tool from being
+ * indistinguishable from a hung server.
+ */
+export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+
+export function toolTimeoutMs() {
+  const raw = Number(process.env.ATTA_DSH_TOOL_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TOOL_TIMEOUT_MS;
+}
+
+/**
  * Run a tool and shape the result the way MCP expects.
  *
  * A throwing tool becomes `isError: true` with its message rather than a
  * transport-level failure: the model is the one that has to decide what to
  * do about a tool that did not work, and it can only do that if it is told.
+ * A tool that never returns is reported the same way, for the same reason.
  */
-export async function callTool(tool, args) {
+export async function callTool(tool, args, { timeoutMs = toolTimeoutMs() } = {}) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`did not return within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    // The timer must not be what keeps the process alive once stdin closes.
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+
   try {
-    const value = await tool.execute(args ?? {});
+    const value = await Promise.race([tool.execute(args ?? {}), deadline]);
     return { content: renderOutput(tool, args ?? {}, value), isError: false };
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
@@ -113,5 +140,7 @@ export async function callTool(tool, args) {
       content: [{ type: 'text', text: `${tool.name} failed: ${message}` }],
       isError: true,
     };
+  } finally {
+    clearTimeout(timer);
   }
 }

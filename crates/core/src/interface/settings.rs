@@ -51,6 +51,8 @@ pub struct Settings {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 
     /// Path to an instruction file (e.g. AGENTS.md, CLAUDE.md).
     /// The AGENT reads the file at its discretion (every turn, on change, etc.).
@@ -474,8 +476,42 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Sandbox/security configuration.
+/// Runtime control over the plugin subsystem, for a build that has it
+/// compiled in.
+///
+/// The compile-time feature decides whether plugins *can* exist; this
+/// decides whether they may. A deployment that wants none should prefer the
+/// feature, since that leaves nothing to switch back on — this is for the
+/// case where the same binary serves several deployments.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PluginsConfig {
+    /// Load installed plugins at all.
+    pub enabled: bool,
+    /// When non-empty, only these plugin names load. An allow-list, so a
+    /// name that is not on it is refused rather than merely unmentioned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow: Vec::new(),
+        }
+    }
+}
+
+impl PluginsConfig {
+    /// May `name` load under this configuration?
+    pub fn permits(&self, name: &str) -> bool {
+        self.enabled && (self.allow.is_empty() || self.allow.iter().any(|a| a == name))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+/// Sandbox/security configuration.
 pub struct SandboxConfig {
     pub deny_read: Vec<PathBuf>,
     /// Paths to re-allow reading, on top of the built-in credential deny
@@ -667,6 +703,7 @@ impl Settings {
             execution: ExecutionSettings::default(),
             compaction: CompactionConfig::default(),
             sandbox: SandboxConfig::default(),
+            plugins: PluginsConfig::default(),
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
@@ -1053,5 +1090,43 @@ mod tests {
         );
         assert_eq!(settings.model.model_name, "fallback-model");
         assert!(settings.providers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plugins_policy_tests {
+    use super::PluginsConfig;
+
+    /// A build with plugins compiled in serves them unless told otherwise —
+    /// the compile-time feature is where "never" belongs.
+    #[test]
+    fn the_default_permits_everything() {
+        let c = PluginsConfig::default();
+        assert!(c.enabled);
+        assert!(c.permits("anything"));
+    }
+
+    #[test]
+    fn disabling_refuses_every_plugin() {
+        let c = PluginsConfig {
+            enabled: false,
+            allow: vec!["github-tools".into()],
+        };
+        assert!(
+            !c.permits("github-tools"),
+            "an allow-list does not override being switched off"
+        );
+    }
+
+    /// An allow-list is an allow-list: a name that is not on it is refused,
+    /// not merely unmentioned.
+    #[test]
+    fn a_non_empty_allow_list_excludes_everything_else() {
+        let c = PluginsConfig {
+            enabled: true,
+            allow: vec!["github-tools".into()],
+        };
+        assert!(c.permits("github-tools"));
+        assert!(!c.permits("something-else"));
     }
 }

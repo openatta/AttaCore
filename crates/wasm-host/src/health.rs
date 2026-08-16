@@ -13,6 +13,7 @@
 //! as intended.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Consecutive faults before a plugin is set aside.
 ///
@@ -62,6 +63,48 @@ impl Health {
     /// Has this plugin failed often enough in a row to stop calling it?
     pub fn is_broken(&self) -> bool {
         self.consecutive_faults() >= FAULT_LIMIT
+    }
+}
+
+/// Fault records kept per plugin name, outliving the instances themselves.
+///
+/// A record on the instance is lost whenever the instance is rebuilt, and
+/// rebuilding happens on every install, uninstall, enable and disable — so a
+/// plugin that had disabled itself came back the moment the user touched any
+/// *other* plugin. The registry is what makes "disabled after three
+/// consecutive faults" survive a refresh.
+#[derive(Default)]
+pub struct HealthRegistry {
+    by_plugin: std::sync::Mutex<std::collections::HashMap<String, Arc<Health>>>,
+}
+
+impl HealthRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The record for `plugin`, creating it the first time it is asked for.
+    pub fn for_plugin(&self, plugin: &str) -> Arc<Health> {
+        self.lock()
+            .entry(plugin.to_string())
+            .or_insert_with(|| Arc::new(Health::new()))
+            .clone()
+    }
+
+    /// Forget a plugin's record — for an uninstall, where the user has said
+    /// something about the plugin that a fault streak should not outlive.
+    pub fn forget(&self, plugin: &str) {
+        self.lock().remove(plugin);
+    }
+
+    pub fn is_broken(&self, plugin: &str) -> bool {
+        self.lock().get(plugin).is_some_and(|h| h.is_broken())
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Arc<Health>>> {
+        self.by_plugin.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -134,5 +177,46 @@ mod tests {
             h.record_success();
         }
         assert!(!h.is_broken());
+    }
+
+    /// The whole point of the registry: a record on the instance is lost on
+    /// every rebuild, and rebuilding happens whenever the user touches any
+    /// plugin at all.
+    #[test]
+    fn a_record_survives_being_looked_up_again() {
+        let reg = HealthRegistry::new();
+        for _ in 0..FAULT_LIMIT {
+            reg.for_plugin("broken").record_fault();
+        }
+        assert!(reg.is_broken("broken"));
+        // What a reload does: ask for the record again for a fresh instance.
+        assert!(reg.for_plugin("broken").is_broken());
+    }
+
+    #[test]
+    fn records_do_not_bleed_between_plugins() {
+        let reg = HealthRegistry::new();
+        for _ in 0..FAULT_LIMIT {
+            reg.for_plugin("broken").record_fault();
+        }
+        assert!(!reg.is_broken("healthy"));
+        assert!(!reg.for_plugin("healthy").is_broken());
+    }
+
+    /// Uninstalling is the user saying something about the plugin; a fault
+    /// streak should not outlive that.
+    #[test]
+    fn forgetting_a_plugin_clears_its_record() {
+        let reg = HealthRegistry::new();
+        for _ in 0..FAULT_LIMIT {
+            reg.for_plugin("broken").record_fault();
+        }
+        reg.forget("broken");
+        assert!(!reg.is_broken("broken"));
+    }
+
+    #[test]
+    fn an_unknown_plugin_is_not_broken() {
+        assert!(!HealthRegistry::new().is_broken("never-seen"));
     }
 }

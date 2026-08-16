@@ -183,6 +183,7 @@ mod tests {
             execution: ExecutionSettings::default(),
             compaction: Default::default(),
             sandbox: Default::default(),
+            plugins: Default::default(),
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,

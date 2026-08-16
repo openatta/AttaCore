@@ -967,12 +967,18 @@ all     → 全部失效
 | -32008 | TEAM_NOT_FOUND | `team_id` 不存在 |
 | -32009 | SCENE_HAS_ACTIVE_SESSIONS | `scene.deactivate` 被活跃会话阻止 |
 | -32010 | PROJECT_NOT_FOUND | `project_root` 不存在或不可读 |
-| -32011 | TEAM_DIR_LOCKED | 团队目录被另一 daemon 实例持有 |
-| -32012 | PROJECT_REQUIRED | 场景 `requires_project` 为真,但未给 `project_root` |
-| -32013 | SCENE_CAPABILITY_MISSING | 场景不具备该能力(如对 `chat` 调 `team.*`) |
+| -32011 | TEAM_DIR_LOCKED | 团队目录被另一 daemon 实例持有 ⚠️ |
+| -32012 | PROJECT_REQUIRED | 场景 `requires_project` 为真,但未给 `project_root` ⚠️ |
+| -32013 | SCENE_CAPABILITY_MISSING | 场景不具备该能力(如对 `chat` 调 `team.*`) ⚠️ |
 | -32014 | SIDECHAIN_TERMINAL | 侧链会话已终态收尾,不可 resume |
-| -32015 | SESSION_BUSY | 该会话已有 turn 在跑(§5.3) |
-| -32016 | PLUGINS_DISABLED | 插件子系统不可用——被编译裁掉或被策略关闭(§9.2) |
+| -32015 | SESSION_BUSY | 该会话已有 turn 在跑(§5.3) ⚠️ |
+| -32016 | PLUGINS_DISABLED | 插件子系统不可用——被编译裁掉或被策略关闭 |
+
+⚠️ **标记的四个码当前没有任何代码发出**——`daemon::rpc::codes` 里没有对应常量。
+客户端不应等待它们；对着它们做分支等于写死代码。
+
+号段保留而不是删除,是因为删掉之后下一个人会重用这些数字,而一旦其中某个
+真的被实现,老客户端就会把新语义读成旧语义。保留 + 标注比两者都安全。
 
 ### 9.1 `error.data` 的形状
 

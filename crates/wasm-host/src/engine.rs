@@ -41,7 +41,7 @@ struct EpochTicker {
 }
 
 impl EpochTicker {
-    fn start(engine: &Engine) -> Self {
+    fn start(engine: &Engine) -> Result<Self> {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let engine = engine.weak();
         let flag = stop.clone();
@@ -56,8 +56,13 @@ impl EpochTicker {
                     }
                 }
             })
-            .expect("spawning the epoch ticker");
-        Self { stop }
+            // Without this thread the epoch never advances, so no deadline
+            // is enforceable and a runaway guest would hang the runtime it
+            // is on. An engine that cannot start it is an engine that must
+            // not be used — the host already degrades to "no WASM plugins"
+            // when one cannot be built.
+            .context("could not start the plugin epoch ticker")?;
+        Ok(Self { stop })
     }
 }
 
@@ -80,7 +85,7 @@ impl WasmEngine {
             .map_err(wasm_err)
             .context("failed to construct the wasmtime engine")?;
         let compat_key = compat_key(&engine);
-        let ticker = Arc::new(EpochTicker::start(&engine));
+        let ticker = Arc::new(EpochTicker::start(&engine)?);
         Ok(Self {
             engine,
             compat_key,

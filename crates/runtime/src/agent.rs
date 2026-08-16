@@ -1963,6 +1963,7 @@ mod tests {
             execution: ExecutionSettings::default(),
             compaction: CompactionConfig::default(),
             sandbox: SandboxConfig::default(),
+            plugins: Default::default(),
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,

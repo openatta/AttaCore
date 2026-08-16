@@ -31,7 +31,7 @@
 | **接入面** | 插件与宿主结合的位置 | 工具面 / 事件面 / 场景面 |
 | **能力声明** | 插件在清单里写明它要访问什么 | `[wasm.capabilities]` |
 | **插件场景** | 由插件声明内容构成的场景 | `PluginScene`，场景 id 为 `plugin:<name>` |
-| **插件宿主** | 主进程侧的插件接缝 | `base::interface::plugin_host::PluginHost` |
+| **插件宿主** | 主进程侧的插件接缝 | `runtime::plugin_host::PluginHost` |
 
 命名约定：
 
@@ -40,7 +40,7 @@
 - DSH 桥接工具：`mcp__dsh-<pkg>__<tool>`
 - 插件贡献的权限规则来源：`RuleSource::Plugin`
 - 编译开关：`daemon` 的 `plugins` feature
-- crate 划分：`crates/plugin`（清单与分发，轻量）、`crates/wasm-host`（执行，重依赖）
+- crate 划分见 §10.1
 
 ---
 
@@ -120,7 +120,7 @@ rule（全局行为指令）与 agent 人格描述的是"这个项目/这个人�
 - `has_hooks_for(event)` 是"没有订阅者就零成本早退"的现成实现；
 - `HookConfig` 已有四种执行后端：`Command`（shell）、`Prompt`（小模型）、`Http`（webhook）、`Agent`（子 agent）。
 
-**做法：加第五个变体 `HookConfig::Wasm { plugin, export }`。** 插件成为一种新的 hook 执行后端，走既有分发，主循环调用点数量变化为 0。
+**做法：第五个变体 `HookConfig::Wasm { plugin, timeout }`。** 插件是一种 hook 执行后端，走既有分发，主循环调用点数量变化为 0。执行体由注入的 `WasmHookExecutor` 提供——`hooks` crate 不能依赖 wasmtime，否则编译裁掉插件的构建里分发器本身就不存在了。
 
 #### 3.2.1 事件白名单
 
@@ -181,8 +181,7 @@ rule（全局行为指令）与 agent 人格描述的是"这个项目/这个人�
 | `extra_tools()` | 该插件自己的 WASM 工具 |
 | `token_budget()` | `[scene.budget]` 的压缩阈值与保留条数 |
 | `execution_params()` | `[scene.budget] max_api_calls_per_turn` |
-| `build_system_reminder()` | `[scene] reminder` |
-| `memory_extraction_prompt()` | `[scene] memory_prompt` |
+| `build_system_reminder()` | `[scene.own] reminder` |
 
 #### 3.3.3 场景配置层——已经存在的一半
 
@@ -615,67 +614,63 @@ DSH 的 `ctx.sandbox`（"process confinement"）与 `ctx.shell` / `ctx.subproces
 
 ---
 
-## 10. 现有代码
+## 10. 实现现状
 
-`crates/plugin` 现有 2504 行。安装分发那一半是可用资产，扩展点那一半在新模型下是死代码或需要改造。
+### 10.1 crate 划分
 
-### 10.1 保留（约 1300 行，基本不动）
-
-| 文件 | 作用 |
+| crate / 目录 | 职责 |
 |---|---|
-| `cache.rs` | 版本化目录 `plugins/cache/<name>/<version>/`，global / scene 两层 |
-| `marketplace.rs` + `resolver.rs` | `PluginResolver` trait、HTTP registry、GitHub release、安装期依赖 DAG |
-| `fetch.rs` | 下载 + sha256 校验 |
-| `homograph.rs` | 同形字名字攻击检查 |
-| `state.rs` | `enabled.json`，scene 覆盖 global |
-| `discovery.rs` | 分层发现与覆盖（需修 §10.3） |
-| `cli.rs` | `plugin.list / install / uninstall / enable / disable` |
+| `crates/plugin` | 清单解析、版本化缓存、市场、启停状态、安装期披露。依赖极轻，daemon 可编译裁掉 |
+| `crates/plugin-host` | 唯一同时认识清单与引擎类型的地方：适配工具、构造场景、翻译 agent 类型、校验配置、分发事件 |
+| `crates/wasm-host` | wasmtime 引擎、WIT 绑定、capability 强制、每次调用一个 Store、AOT 缓存、健康记录 |
+| `bridges/atta-dsh-bridge` | 独立 Node 进程，把 DSH 插件当成 MCP server 提供出去 |
 
-WASM component 与 MCP 配置都只是版本化目录里多出来的文件，走同一条下载—校验—落盘—启停链路。
+`crates/runtime` **不依赖** `crates/plugin`——这是插件子系统能整体编译裁掉的前提。
 
-### 10.2 删除与改造
+### 10.2 接缝
 
-| 位置 | 行数 | 处置 |
+插件对主进程的全部贡献经由 `runtime::plugin_host::PluginHost`：五个贡献点
+（tools / mcp_servers / hook_configs / scenes / agent_types）加两个服务于它们的
+方法（hook_executor / permission_rules）。daemon 持 `Option<Arc<dyn PluginHost>>`，
+feature 关闭时恒为 `None`。
+
+新增第六个贡献点需要论证，因为可裁剪性依赖于接缝数量少到能数得清。
+
+### 10.3 三层开关
+
+| 层 | 机制 | 决定 |
 |---|---|---|
-| `agent_registry.rs` | 112 | **删**——daemon 直接用 `manifest.agents` 绕过了它，无消费者 |
-| `bundled.rs` + `lib.rs::init_builtin_plugins` | ~145 | **删**——两个示例内置插件（`/hello` 斜杠命令、一组 MCP 配置），前者是被取消的载荷，后者用普通清单就能表达 |
-| `manifest.rs::install_hooks` | ~170 | **删**——shell hook 载荷取消，改由 `HookConfig::Wasm`（§3.2） |
-| `manifest.rs::install_slash_commands` / `SlashCommandRegistrar` | ~50 | **删**——斜杠命令载荷取消 |
-| `HooksSection` / `SkillsSection` / `ConditionalSkill` / `output_styles` / `slash_commands` | ~50 | **删**——清单收缩到 §5 |
-| `manifest.rs` 的 `AgentDef` + `agent_def_to_type` | — | **保留并扩展**：现只有 5 个字段，要补齐 `disallowed_tools` / `permission_mode` / `effort` / `max_turns` / `scene` |
-| `crates/runtime/src/commands.rs` 的 `SlashCommandRegistrar` impl | ~10 | **删** |
-| `crates/runtime/src/agent.rs` 的 `install_hooks` 调用 | ~5 | **删** |
-| `daemon/src/session_pool.rs` 的 `build_command_registry` 插件分支 | ~20 | **删**；`plugin_agent_types` **保留** |
-| `crates/core/src/frozen/skill.rs::collect_skills` 扫插件 skill 目录那段 | ~12 | **删**——插件不再贡献 skill |
+| 编译期 | `daemon` 的 `plugins` feature | 能不能有 |
+| 运行期 | `settings.plugins.{enabled,allow}` | 允不允许有 |
+| 每插件 | `[wasm.capabilities]` | 有了能干什么 |
 
-`SkillSource::Plugin` 枚举保留——MCP 侧（`crates/skills/src/mcp_builder.rs`）仍在用。
+锁定产物用 `cargo build -p daemon --no-default-features` 构建，**不能用
+`--workspace`**：cargo 会跨图统一 feature。`tests/scripts/locked_build.sh`
+断言依赖图里没有插件 crate，而不是相信 flag。
 
-### 10.3 必须修的既有缺口
+### 10.4 加载与执行的边界值
 
-1. **版本选择是字典序不是 semver**（`discovery.rs::load_installed_tier` 自己注了这点）：`0.10.0` 排在 `0.9.0` 前面，装了两个版本就会选错。
-2. **发现路径与缓存布局不一致**：`discovery.rs` 走 `plugins/cache/<name>/<version>/`，而 `collect_skills` 按 `plugins/<name>/skills/` 扫——删掉后者即统一，但要确认没有别处沿用旧布局。
-3. **`scene_by_id()` 与 daemon 的 `resolve_scene()` 是硬编码闭集**：`plugin:` 前缀解析不到，§6 的两条激活路径都通不了。两处注释已说明它们刻意保持同一集合，要一起改成查 `SceneRegistry`。
-4. **`apply_agent_type_overrides` 无条件放宽权限**：见 §7.2，插件化前必须修。
-5. ~~`ToolContext.sandbox` 未接线~~：**核查后不成立。** `sandbox.rs` 的模块文档这么写，但那段注释本身已经过期——`EngineConfig::from_settings` 与 `runtime::turn` 两侧都已接好，settings 里配的 `sandbox.network_mode` 是生效的。已改正注释并补上两侧的回归测试，防止它再次退化成沉默失效。
-6. **`McpNotification` 从未从 wire 上构造**：见 §4.2，补 `tools/list_changed` → `refresh_tools()`。
-
----
-
-## 11. 落地顺序
-
-| 阶段 | 内容 | 依赖 |
+| 约束 | 值 | 在哪 |
 |---|---|---|
-| 0 | 按 §10.2 删死代码；修 §10.3 的 1、2、4；清单收缩到 §5 | 无 |
-| 1 | `PluginHost` trait + feature 门（§8）+ `daemon.doctor` 报告 + CI 锁定构建作业 | 阶段 0 |
-| 2 | `crates/wasm-host`：Engine、WIT 0.1、`WasmToolAdapter`、capabilities 强制、epoch 取消、AOT 缓存 —— **工具面通** | 阶段 1 |
-| 3 | `atta-dsh-bridge`：Context 垫片、`defineTool` → MCP 映射、inject 边界拒绝；补 §10.3 的 6 | 阶段 1（与 2 并行） |
-| 4 | `HookConfig::Wasm` + 事件白名单 —— **事件面通** | 阶段 2 |
-| 5 | `PluginScene` + `scene_by_id` 查注册表 + `[[agent]]` 扩展 + 修 §10.3 的 5 —— **场景面通** | 阶段 2 |
-| 6 | 市场侧：包签名、capabilities 升级差异提示、`plugin.audit` | 阶段 2 |
+| 并发加载数 | 4 | `plugin_host::MAX_CONCURRENT_LOADS` |
+| 加载阶段总时长 | 30s | `plugin_host::LOAD_BUDGET` |
+| 连续 fault 后禁用 | 3 | `wasm_host::health::FAULT_LIMIT` |
+| epoch 心跳 | 10ms | `wasm_host::EPOCH_TICK` |
+| 单次调用超时 / 内存 | 清单声明 | `[wasm.capabilities]` |
+| bridge 在途请求 | 8 | `ATTA_DSH_MAX_IN_FLIGHT` |
+| bridge 单工具超时 | 120s | `ATTA_DSH_TOOL_TIMEOUT_MS` |
 
-阶段 1 结束时，"关掉 feature 能构建、能验证"这条硬要求就已满足——早于任何插件真正能跑。这是刻意的顺序：**先把边界立住，再往里填能力。**
+### 10.5 已知边界
 
----
+- **自定义循环形状**（`ctx.agentLoop` 的对应物）不提供，见 §9.2。
+- **`Tool::validate_input` 在引擎里没有生产调用点**，所以 WIT 不导出
+  `validate-input`——否则那是一份给插件作者的、永远不会被调用的契约。
+- **运行期仍链接 Cranelift**。AOT 缓存让加载不再编译（`Component::serialize`
+  的产物按 `(precompile_compatibility_hash, 内容哈希)` 存在插件目录的 `.aot/`
+  下），但编译器仍在二进制里，缓存未命中仍会编译。把编译器整个移出运行期
+  需要拆一个独立的编译步骤——wasmtime 的 `runtime` 与 `cranelift` 是两个
+  feature，只留前者时 `Component::new` 直接不存在，所以"不可能编译"可以是
+  编译期保证而不是政策。
 
 ## 参考
 

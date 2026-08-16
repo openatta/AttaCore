@@ -15,10 +15,12 @@ use wasm_host::PluginInstance;
 
 /// Dispatches events to the components that subscribed to them.
 pub struct WasmEvents {
-    /// Plugin name → the instance to ask. A plugin with several components
-    /// subscribes through the first one that declares events; a manifest
-    /// with two event-subscribing components is refused at parse time
-    /// rather than resolved arbitrarily here.
+    /// Plugin name → the instance to ask.
+    ///
+    /// Keyed by plugin rather than by component because that is the identity
+    /// a `HookConfig::Wasm` entry carries. A manifest in which two components
+    /// declare `events` is refused when it is parsed
+    /// (`plugin::manifest`), so this mapping is unambiguous by construction.
     instances: HashMap<String, Arc<PluginInstance>>,
 }
 
@@ -38,7 +40,7 @@ impl WasmHookExecutor for WasmEvents {
         &self,
         plugin: &str,
         payload: &HookInput,
-        _timeout_ms: Option<u64>,
+        timeout_ms: Option<u64>,
     ) -> Result<HookResponse, String> {
         let instance = self
             .instances
@@ -48,14 +50,31 @@ impl WasmHookExecutor for WasmEvents {
         let payload_json =
             serde_json::to_string(payload).map_err(|e| format!("serialising the event: {e}"))?;
 
-        // The plugin's own declared timeout applies, and cancellation is not
-        // wired here: a hook runs inside a turn the caller may already be
-        // abandoning, and the deadline is what bounds it either way.
+        // The hook entry's own deadline, when it carries one, bounds this
+        // call — a hook runs inside a turn that is waiting on it, so it gets
+        // no more time than it asked for. Cancellation is not wired: the
+        // deadline is what bounds it either way, and a hook is short.
         let cancel = tokio_util::sync::CancellationToken::new();
-        let decision = instance
-            .on_event(&payload.hook_event_name, &payload_json, &cancel)
-            .await
-            .map_err(|e| e.to_string())?;
+        let decision = match timeout_ms {
+            Some(ms) => {
+                let deadline = std::time::Duration::from_millis(ms);
+                match tokio::time::timeout(
+                    deadline,
+                    instance.on_event(&payload.hook_event_name, &payload_json, &cancel),
+                )
+                .await
+                {
+                    Ok(r) => r.map_err(|e| e.to_string())?,
+                    Err(_) => {
+                        return Err(format!("hook did not answer within {ms}ms"));
+                    }
+                }
+            }
+            None => instance
+                .on_event(&payload.hook_event_name, &payload_json, &cancel)
+                .await
+                .map_err(|e| e.to_string())?,
+        };
 
         Ok(into_response(decision))
     }

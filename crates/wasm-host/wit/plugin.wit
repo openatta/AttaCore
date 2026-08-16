@@ -74,7 +74,6 @@ interface tools {
   /// list is install-time visibility; this is what the host registers.
   list-tools: func() -> list<tool-def>;
   call-tool: func(name: string, input-json: string, call-id: string) -> tool-output;
-  validate-input: func(name: string, input-json: string) -> result<_, string>;
 }
 
 /// Optional. A component that does not export this does not participate in

@@ -51,6 +51,15 @@ mod imp {
 
     pub struct PluginSubsystem {
         paths: Arc<dyn DaemonPaths>,
+        /// The directory `${workspace}` in a capability declaration resolves
+        /// against.
+        ///
+        /// Held here, and nowhere else, because it decides how much of the
+        /// filesystem a plugin was granted. Taking it from the caller at each
+        /// load let startup and post-install reloads anchor to different
+        /// directories, so the same declaration meant different things
+        /// depending on which path had run.
+        workspace: std::path::PathBuf,
         /// One engine for the whole process — it owns the compiler and its
         /// code cache, so building one per plugin would pay that repeatedly
         /// for no isolation benefit. Isolation comes from the per-call
@@ -60,6 +69,10 @@ mod imp {
         /// leaves MCP payloads working and WASM ones absent rather than
         /// taking the daemon down.
         engine: Option<wasm_host::WasmEngine>,
+        /// Fault records, kept here so they outlive the component instances
+        /// a refresh rebuilds — otherwise a plugin that disabled itself came
+        /// back the moment the user touched a different one.
+        health: Arc<wasm_host::health::HealthRegistry>,
         /// The enabled set, refreshed by install/uninstall/enable/disable.
         /// Sessions pick this up when they are created; already-running
         /// sessions keep what they were built with, same hot-swap semantics
@@ -70,12 +83,21 @@ mod imp {
         /// not async — build its agent-type catalog from them.
         active: RwLock<Arc<InstalledPlugins>>,
         enabled: bool,
+        /// The `settings.plugins` policy this pool started with. Held rather
+        /// than re-read, so a refresh mid-session cannot quietly widen what
+        /// is allowed to load.
+        policy: base::interface::settings::PluginsConfig,
     }
 
     impl PluginSubsystem {
-        pub fn new(paths: Arc<dyn DaemonPaths>, enabled: bool) -> Self {
+        pub fn new(
+            paths: Arc<dyn DaemonPaths>,
+            workspace: std::path::PathBuf,
+            policy: base::interface::settings::PluginsConfig,
+        ) -> Self {
+            let enabled = policy.enabled;
             let active = Arc::new(InstalledPlugins::new(if enabled {
-                active_plugins(paths.as_ref())
+                active_plugins(paths.as_ref(), &policy)
             } else {
                 Vec::new()
             }));
@@ -88,7 +110,10 @@ mod imp {
             };
             Self {
                 paths,
+                workspace,
                 engine,
+                health: wasm_host::health::HealthRegistry::new(),
+                policy,
                 active: RwLock::new(active),
                 enabled,
             }
@@ -100,12 +125,15 @@ mod imp {
         /// daemon has an async startup phase to do it in. Until this has
         /// run, plugins contribute their manifests but no tools — so it is
         /// awaited before the daemon serves, not after.
-        pub async fn load_components(&self, workspace: &std::path::Path) {
+        pub async fn load_components(&self) {
             let (Some(engine), true) = (&self.engine, self.enabled) else {
                 return;
             };
-            let mut refreshed = InstalledPlugins::new(active_plugins(self.paths.as_ref()));
-            refreshed.load_components(engine, workspace).await;
+            let mut refreshed =
+                InstalledPlugins::new(active_plugins(self.paths.as_ref(), &self.policy));
+            refreshed
+                .load_components_with_health(engine, &self.workspace, &self.health)
+                .await;
             *self.active.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(refreshed);
         }
 
@@ -115,6 +143,11 @@ mod imp {
             } else {
                 PluginStatus::DisabledByPolicy
             }
+        }
+
+        /// The policy in force, for diagnostics.
+        pub fn policy(&self) -> &base::interface::settings::PluginsConfig {
+            &self.policy
         }
 
         pub fn host(&self) -> Option<Arc<dyn PluginHost>> {
@@ -257,8 +290,7 @@ mod imp {
             if !self.enabled {
                 return;
             }
-            let workspace = self.paths.project_root().to_path_buf();
-            self.load_components(&workspace).await;
+            self.load_components().await;
         }
 
         fn tier_root(&self, scope: &str) -> Result<std::path::PathBuf, String> {
@@ -288,18 +320,22 @@ mod imp {
         )
     }
 
-    fn active_plugins(paths: &dyn DaemonPaths) -> Vec<plugin::manifest::Plugin> {
+    fn active_plugins(
+        paths: &dyn DaemonPaths,
+        policy: &base::interface::settings::PluginsConfig,
+    ) -> Vec<plugin::manifest::Plugin> {
         let (global, scene) = tier_dirs(paths);
         let global_state = plugin::state::EnableState::new(global.clone());
         let scene_state = plugin::state::EnableState::new(scene.clone());
         plugin::discover_plugins(&global, &scene)
             .into_iter()
             .filter(|p| {
-                plugin::state::resolve_enabled(
-                    &p.manifest.plugin.name,
-                    &global_state,
-                    &scene_state,
-                )
+                let name = &p.manifest.plugin.name;
+                if !policy.permits(name) {
+                    tracing::info!(plugin = %name, "not permitted by settings.plugins; skipping");
+                    return false;
+                }
+                plugin::state::resolve_enabled(name, &global_state, &scene_state)
             })
             .collect()
     }
@@ -314,7 +350,11 @@ mod imp {
     pub struct PluginSubsystem;
 
     impl PluginSubsystem {
-        pub fn new(_paths: Arc<dyn DaemonPaths>, _enabled: bool) -> Self {
+        pub fn new(
+            _paths: Arc<dyn DaemonPaths>,
+            _workspace: std::path::PathBuf,
+            _policy: base::interface::settings::PluginsConfig,
+        ) -> Self {
             Self
         }
         pub fn status(&self) -> PluginStatus {
@@ -368,7 +408,7 @@ mod imp {
             Err(DISABLED_MESSAGE.to_string())
         }
         pub async fn refresh(&self) {}
-        pub async fn load_components(&self, _workspace: &std::path::Path) {}
+        pub async fn load_components(&self) {}
     }
 }
 

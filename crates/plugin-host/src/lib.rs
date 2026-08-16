@@ -6,6 +6,7 @@
 //! and lets the whole subsystem be an optional dependency of the host — see
 //! `runtime::plugin_host`.
 
+pub mod config;
 pub mod events;
 pub mod scene;
 
@@ -16,7 +17,22 @@ use runtime::agent_tool::{AgentTypeDefinition, AgentTypeSource};
 use runtime::plugin_host::PluginHost;
 use std::path::Path;
 use std::sync::Arc;
+use wasm_host::health::HealthRegistry;
 use wasm_host::{ResolvedCapabilities, WasmEngine, WasmToolAdapter};
+
+/// How many plugins may be loaded at once.
+///
+/// Loading runs a plugin's `init`, so it is not merely I/O: a bounded fan-out
+/// keeps a machine with many plugins from starting all of them at once, while
+/// still not making the tenth plugin wait for the ninth.
+pub const MAX_CONCURRENT_LOADS: usize = 4;
+
+/// How long the whole load phase may take.
+///
+/// The daemon awaits this before it serves, so an unbounded wait is a daemon
+/// that never comes up. A plugin still loading when this expires is dropped
+/// with a warning: starting without it is recoverable, never starting is not.
+pub const LOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Every enabled plugin this daemon discovered, presented to the engine as
 /// one host.
@@ -34,6 +50,22 @@ pub struct InstalledPlugins {
     /// Loaded components by plugin name, so the event executor can find the
     /// one a `HookConfig::Wasm` entry names.
     instances: std::collections::HashMap<String, Arc<wasm_host::PluginInstance>>,
+    /// Model-visible tool text, captured while the `ToolDef` was still in
+    /// hand.
+    ///
+    /// Kept separately rather than read back off the registered tools,
+    /// because `Tool` is a trait object and the long guide is not on the
+    /// trait. Adding a downcast to the engine's core tool trait to serve an
+    /// installer's disclosure would be the wrong trade.
+    tool_text: Vec<ToolText>,
+}
+
+/// One tool's model-visible text, for [`InstalledPlugins::disclose`].
+struct ToolText {
+    plugin: String,
+    tool: String,
+    description: String,
+    doc: Option<String>,
 }
 
 impl InstalledPlugins {
@@ -43,6 +75,7 @@ impl InstalledPlugins {
             tools: Vec::new(),
             scenes: Vec::new(),
             instances: std::collections::HashMap::new(),
+            tool_text: Vec::new(),
         }
     }
 
@@ -54,38 +87,70 @@ impl InstalledPlugins {
     /// warning and the others still load: one broken package in a
     /// marketplace install must not cost the user the rest.
     pub async fn load_components(&mut self, engine: &WasmEngine, workspace: &Path) {
+        self.load_components_with_health(engine, workspace, &HealthRegistry::new())
+            .await;
+    }
+
+    /// As [`load_components`](Self::load_components), reusing fault records
+    /// that outlive this host.
+    ///
+    /// The caller that rebuilds hosts — every install, uninstall, enable and
+    /// disable does — passes the registry it keeps, so a plugin that
+    /// disabled itself does not come back because the user touched another
+    /// one.
+    pub async fn load_components_with_health(
+        &mut self,
+        engine: &WasmEngine,
+        workspace: &Path,
+        health: &Arc<HealthRegistry>,
+    ) {
+        let loaded = match tokio::time::timeout(
+            LOAD_BUDGET,
+            load_all(&self.plugins, engine, workspace, health),
+        )
+        .await
+        {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                tracing::warn!(
+                    budget_secs = LOAD_BUDGET.as_secs(),
+                    "plugin loading exceeded its budget; serving without the plugins that \
+                     had not finished"
+                );
+                Vec::new()
+            }
+        };
+
         let mut tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
         let mut scenes: Vec<Arc<dyn base::interface::scene::AgentScene>> = Vec::new();
         let mut instances = std::collections::HashMap::new();
+        let mut tool_text: Vec<ToolText> = Vec::new();
 
-        for p in &self.plugins {
-            let mut own_tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
-            for payload in &p.manifest.wasm {
-                match load_payload(engine, p, payload, workspace).await {
-                    Ok((instance, mut loaded)) => {
-                        own_tools.append(&mut loaded);
-                        instances.insert(p.name().to_string(), instance);
-                    }
-                    Err(e) => tracing::warn!(
-                        plugin = %p.name(),
-                        component = %payload.component.display(),
-                        error = %e,
-                        "plugin component could not be loaded; skipping it"
-                    ),
-                }
+        for outcome in loaded {
+            let Loaded {
+                plugin,
+                mut own_tools,
+                mut text,
+                instance,
+            } = outcome;
+            if let Some(instance) = instance {
+                instances.insert(plugin.name().to_string(), instance);
             }
             // A plugin's own scene gets its own tools unconditionally: it is
             // the plugin's scene, so being able to name a tool it shipped is
             // not a privilege, it is the point.
-            if let Some(scene) = crate::scene::PluginScene::from_plugin(p, own_tools.clone()) {
+            if let Some(scene) = crate::scene::PluginScene::from_plugin(&plugin, own_tools.clone())
+            {
                 scenes.push(Arc::new(scene));
             }
             tools.append(&mut own_tools);
+            tool_text.append(&mut text);
         }
 
         self.tools = tools;
         self.scenes = scenes;
         self.instances = instances;
+        self.tool_text = tool_text;
     }
 
 
@@ -103,12 +168,8 @@ impl InstalledPlugins {
             Ok(d) => d,
             Err(e) => return Some(Err(e)),
         };
-        for tool in self.tools.iter().filter(|t| {
-            t.name()
-                .starts_with(&format!("plugin__{name}__"))
-        }) {
-            let short = tool.short_description().unwrap_or_default();
-            if let Err(e) = d.add_tool(tool.name(), &short, None) {
+        for text in self.tool_text.iter().filter(|t| t.plugin == name) {
+            if let Err(e) = d.add_tool(&text.tool, &text.description, text.doc.as_deref()) {
                 return Some(Err(e));
             }
         }
@@ -258,7 +319,7 @@ fn dsh_bridge_config(
         );
         return None;
     }
-    let bridge = bridge_entry_path();
+    let bridge = bridge_entry_path()?;
     // Only the variables the manifest named are passed through, the same
     // rule the WASM capability list follows.
     let env: serde_json::Map<String, serde_json::Value> = server
@@ -275,17 +336,110 @@ fn dsh_bridge_config(
     }))
 }
 
-/// Where the bridge's entry point lives.
+/// Path of the bridge's entry module inside a checkout or an install.
+const BRIDGE_REL: &str = "bridges/atta-dsh-bridge/src/main.js";
+
+/// Where the bridge's entry point lives, or `None` when it cannot be found.
 ///
-/// `ATTA_DSH_BRIDGE` overrides it, which is what a packaged install sets;
-/// the fallback is the in-repo copy so a developer checkout works with no
-/// configuration.
-fn bridge_entry_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("ATTA_DSH_BRIDGE") {
-        return std::path::PathBuf::from(p);
+/// Deliberately not `CARGO_MANIFEST_DIR`: that is a compile-time constant,
+/// so a shipped binary would carry the build machine's absolute path and
+/// point at a directory that exists on no user's computer.
+///
+/// Instead, `override_path` (from `ATTA_DSH_BRIDGE`) wins if it exists, and
+/// otherwise the search walks up from the running executable looking for the
+/// bridge. Walking rather than counting `..`s because the executable's depth
+/// is not fixed: `target/debug/`, `target/debug/deps/` for tests, and an
+/// installed `bin/` are all different distances from the same file.
+///
+/// Every candidate is checked for existence. Handing `node` a script that is
+/// not there produces a failure message about node, from a process we did
+/// not start, with nothing connecting it back to the plugin that caused it.
+fn locate_bridge(override_path: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if let Some(p) = override_path {
+        if p.is_file() {
+            return Some(p);
+        }
+        tracing::warn!(
+            path = %p.display(),
+            "ATTA_DSH_BRIDGE does not point at a file; falling back to the search"
+        );
     }
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../bridges/atta-dsh-bridge/src/main.js")
+
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+    // Four levels covers target/<profile>/deps/ and an installed bin/ with
+    // room to spare; an unbounded walk would eventually inspect `/`.
+    for _ in 0..4 {
+        for candidate in [dir.join(BRIDGE_REL), dir.join("atta-dsh-bridge/src/main.js")] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        dir = dir.parent()?;
+    }
+
+    tracing::warn!(
+        from = %exe.display(),
+        "atta-dsh-bridge not found; set ATTA_DSH_BRIDGE to its main.js"
+    );
+    None
+}
+
+fn bridge_entry_path() -> Option<std::path::PathBuf> {
+    locate_bridge(std::env::var("ATTA_DSH_BRIDGE").ok().map(Into::into))
+}
+
+/// What loading one plugin produced.
+struct Loaded {
+    plugin: plugin::manifest::Plugin,
+    own_tools: Vec<Arc<dyn base::tool::Tool>>,
+    text: Vec<ToolText>,
+    instance: Option<Arc<wasm_host::PluginInstance>>,
+}
+
+/// Load every plugin, at most [`MAX_CONCURRENT_LOADS`] at a time.
+///
+/// Results come back in the order the plugins were declared rather than the
+/// order they happened to finish, so what a daemon serves does not depend on
+/// which plugin's `init` was slow today.
+async fn load_all(
+    plugins: &[plugin::manifest::Plugin],
+    engine: &WasmEngine,
+    workspace: &Path,
+    health: &Arc<HealthRegistry>,
+) -> Vec<Loaded> {
+    use futures::stream::StreamExt;
+
+    futures::stream::iter(plugins.iter().cloned())
+        .map(|p| async move {
+            let mut own_tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
+            let mut text: Vec<ToolText> = Vec::new();
+            let mut instance = None;
+            for payload in &p.manifest.wasm {
+                match load_payload(engine, &p, payload, workspace, health).await {
+                    Ok((inst, mut loaded, mut t)) => {
+                        own_tools.append(&mut loaded);
+                        text.append(&mut t);
+                        instance = Some(inst);
+                    }
+                    Err(e) => tracing::warn!(
+                        plugin = %p.name(),
+                        component = %payload.component.display(),
+                        error = %e,
+                        "plugin component could not be loaded; skipping it"
+                    ),
+                }
+            }
+            Loaded {
+                plugin: p,
+                own_tools,
+                text,
+                instance,
+            }
+        })
+        .buffered(MAX_CONCURRENT_LOADS)
+        .collect()
+        .await
 }
 
 /// Load one `[[wasm]]` payload and adapt each tool it exports.
@@ -294,23 +448,41 @@ async fn load_payload(
     plugin: &plugin::manifest::Plugin,
     payload: &plugin::manifest::WasmPayload,
     workspace: &Path,
-) -> anyhow::Result<(Arc<wasm_host::PluginInstance>, Vec<Arc<dyn base::tool::Tool>>)> {
+    health: &Arc<HealthRegistry>,
+) -> anyhow::Result<(
+    Arc<wasm_host::PluginInstance>,
+    Vec<Arc<dyn base::tool::Tool>>,
+    Vec<ToolText>,
+)> {
     let caps = Arc::new(ResolvedCapabilities::resolve(
         &payload.capabilities,
         workspace,
         &plugin.root,
     )?);
+    // Before anything is compiled: a configuration the plugin cannot accept
+    // is a reason not to load it, and finding that out first saves the work.
+    let config = crate::config::load_config(plugin)?;
+
     let component = engine.load(&plugin.path(&payload.component), &plugin.root)?;
-    let instance = Arc::new(wasm_host::PluginInstance::link(
+    let instance = Arc::new(wasm_host::PluginInstance::link_with_health(
         engine,
         &component,
         plugin.name().to_string(),
         caps,
+        health.for_plugin(plugin.name()),
     )?);
 
     // Nothing has cancelled anything yet — this runs at load, before any
     // session exists to withdraw the request.
     let cancel = tokio_util::sync::CancellationToken::new();
+
+    // The plugin gets the last word on its own configuration: the schema
+    // says what is well-formed, only the plugin knows what is workable.
+    instance
+        .init(&config.to_string(), &cancel)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let defs = instance
         .list_tools(&cancel)
         .await
@@ -323,7 +495,16 @@ async fn load_payload(
                 as Arc<dyn base::tool::Tool>
         })
         .collect();
-    Ok((instance, tools))
+    let text = defs
+        .iter()
+        .map(|def| ToolText {
+            plugin: plugin.name().to_string(),
+            tool: def.name.clone(),
+            description: def.description.clone(),
+            doc: def.doc.clone(),
+        })
+        .collect();
+    Ok((instance, tools, text))
 }
 
 /// Convert a plugin-declared `AgentDef` into a runtime [`AgentTypeDefinition`],
@@ -516,6 +697,45 @@ env = ["ATTA_TEST_DSH_TOKEN", "ATTA_TEST_UNSET"]
         );
     }
 
+    /// The bridge is found relative to the running executable, never from a
+    /// compile-time path: a shipped binary carrying the build machine's
+    /// directory would point at somewhere that exists on no user's computer.
+    ///
+    /// Takes the override as an argument rather than setting the process
+    /// environment, because tests share one process and an env var set here
+    /// would leak into whatever runs beside it.
+    #[test]
+    fn an_existing_override_is_used_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = dir.path().join("main.js");
+        std::fs::write(&bridge, "// bridge").unwrap();
+        assert_eq!(
+            locate_bridge(Some(bridge.clone())).as_deref(),
+            Some(bridge.as_path())
+        );
+    }
+
+    #[test]
+    fn an_override_pointing_nowhere_is_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.js");
+        assert_ne!(
+            locate_bridge(Some(absent.clone())).as_deref(),
+            Some(absent.as_path()),
+            "a path that does not exist must never be handed to node"
+        );
+    }
+
+    /// The walk has to reach the repo copy from wherever the test binary
+    /// lives — which is `target/debug/deps/`, a different depth from the
+    /// `target/debug/` a normal build produces.
+    #[test]
+    fn the_search_finds_the_repo_copy_from_a_test_binary() {
+        let found = locate_bridge(None).expect("the in-repo bridge should be reachable");
+        assert!(found.is_file());
+        assert!(found.ends_with("atta-dsh-bridge/src/main.js"), "{found:?}");
+    }
+
     /// An entry module that isn't there would produce a server that fails to
     /// start on every session. Better to notice at load.
     #[test]
@@ -596,6 +816,46 @@ mod component_tests {
 
     /// The whole point of the seam: a manifest on disk turns into tools the
     /// engine can register, named the way permission rules expect.
+    /// The long guide is model-visible too — ToolSearch fetches it — so an
+    /// installer that showed only the one-liner would be reviewing half of
+    /// what reaches the model.
+    #[tokio::test]
+    async fn disclosure_covers_the_long_guide_not_just_the_one_liner() {
+        let component = fixture_component();
+        if !component.exists() {
+            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            "[plugin]\nname = \"echo-plugin\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n\n[[wasm]]\ncomponent = \"echo.wasm\"\n",
+        )
+        .unwrap();
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+
+        let mut host = InstalledPlugins::new(vec![p]);
+        host.load_components(&WasmEngine::new().unwrap(), dir.path())
+            .await;
+
+        let d = host.disclose("echo-plugin").unwrap().unwrap();
+        let origins: Vec<&str> = d.model_visible.iter().map(|v| v.origin.as_str()).collect();
+        assert!(
+            origins.iter().any(|o| o.contains("description")),
+            "{origins:?}"
+        );
+        assert!(
+            origins.iter().any(|o| o.contains("guide")),
+            "the long guide must be disclosed too: {origins:?}"
+        );
+        assert!(
+            d.model_visible.iter().any(|v| v.text.contains("verbatim")),
+            "the guide's actual text is what a reviewer needs to see"
+        );
+    }
+
     #[tokio::test]
     async fn a_declared_component_becomes_registered_tools() {
         let component = fixture_component();
@@ -641,6 +901,86 @@ component = "echo.wasm"
         assert!(
             host.tools().iter().all(|t| t.is_deferred()),
             "plugin tools default to deferred so their schemas cost nothing per turn"
+        );
+    }
+
+    /// The plugin gets the last word on its own configuration: a schema says
+    /// what is well-formed, only the plugin knows what is workable. The
+    /// fixture refuses `{"fail":true}`, and refusing means not loading.
+    #[tokio::test]
+    async fn a_plugin_that_rejects_its_configuration_does_not_load() {
+        let component = fixture_component();
+        if !component.exists() {
+            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            "[plugin]\nname = \"echo-plugin\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n\n[[wasm]]\ncomponent = \"echo.wasm\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), r#"{"fail":true}"#).unwrap();
+        let p =
+            plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml")).unwrap();
+
+        let mut host = InstalledPlugins::new(vec![p]);
+        host.load_components(&WasmEngine::new().unwrap(), dir.path())
+            .await;
+
+        assert!(
+            host.tools().is_empty(),
+            "a plugin that refused its configuration must contribute nothing"
+        );
+    }
+
+    /// Order comes from the manifest list, not from which plugin's `init`
+    /// happened to finish first — otherwise what a daemon serves varies run
+    /// to run.
+    #[tokio::test]
+    async fn loading_is_concurrent_but_results_keep_their_order() {
+        let component = fixture_component();
+        if !component.exists() {
+            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
+            return;
+        }
+        let mut dirs = Vec::new();
+        let mut plugins = Vec::new();
+        for name in ["a-plugin", "b-plugin", "c-plugin"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
+            std::fs::write(
+                dir.path().join("plugin.toml"),
+                format!(
+                    "[plugin]\nname = \"{name}\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n\n[[wasm]]\ncomponent = \"echo.wasm\"\n"
+                ),
+            )
+            .unwrap();
+            plugins.push(
+                plugin::manifest::Plugin::load(dir.path(), &dir.path().join("plugin.toml"))
+                    .unwrap(),
+            );
+            dirs.push(dir);
+        }
+
+        let mut host = InstalledPlugins::new(plugins);
+        host.load_components(&WasmEngine::new().unwrap(), dirs[0].path())
+            .await;
+
+        let names: Vec<String> = host
+            .tools()
+            .iter()
+            .map(|t| t.name().split("__").nth(1).unwrap().to_string())
+            .collect();
+        let first_of_each: Vec<&String> = {
+            let mut seen = std::collections::HashSet::new();
+            names.iter().filter(|n| seen.insert((*n).clone())).collect()
+        };
+        assert_eq!(
+            first_of_each,
+            ["a-plugin", "b-plugin", "c-plugin"],
+            "results must follow the declared order: {names:?}"
         );
     }
 
