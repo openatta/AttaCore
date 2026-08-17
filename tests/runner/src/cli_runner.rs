@@ -134,16 +134,21 @@ pub async fn run_test_case(
     for (k, v) in &env_vars {
         cmd.env(k, v);
     }
-    // Isolate the daemon's *global* config root too — `DefaultDaemonPaths::from_env`
-    // (daemon/src/config.rs) defaults to `$HOME/.atta` when `ATTA_CONFIG_HOME` is
-    // unset, which is the real interactive user's actual AttaCore config
-    // directory on this machine. Without this override, a test run's daemon
-    // writes real `daemon.lock`/memory files there — confirmed happening (a
-    // stray `~/.atta/scenes/coding/daemon.lock` from an earlier run before this
-    // fix, cleaned up manually). `cmd.current_dir(workdir)` above only isolates
-    // the *project*-level root, a separate layer.
+    // Isolate the daemon's *global* config root. `cmd.current_dir(workdir)`
+    // above only isolates the *project*-level root, a separate layer.
+    //
+    // `HOME` goes with it. `ATTA_CONFIG_HOME` alone used to be enough for the
+    // daemon's own root while other modules resolved `$HOME/.atta` on their
+    // own — which is how test runs left files in the real one. Those readers
+    // are gone (`daemon/tests/home_is_never_discovered.rs` keeps them gone),
+    // but the sandbox and the environment snapshot still legitimately read
+    // `HOME`, and a test should not be describing the developer's actual home
+    // to the model or building deny rules from it.
     if let Some(dir) = &workdir {
+        let home = dir.join("home");
+        let _ = std::fs::create_dir_all(&home);
         cmd.env("ATTA_CONFIG_HOME", dir.join("global_config"));
+        cmd.env("HOME", &home);
     }
     let mut child = cmd.spawn()?;
 
@@ -246,42 +251,9 @@ pub async fn run_test_case(
 
     // 6. 清理测试 artifacts（session/memory 落盘文件，RPC 层面的 session.close
     // 只关运行时状态，不删磁盘持久化文件）
-    cleanup_test_artifacts(&format!("test-{scenario_leaf}"));
     if let Some(dir) = &workdir {
         let _ = std::fs::remove_dir_all(dir);
     }
 
     Ok(results)
-}
-
-/// 清理测试过程中生成的 session/memory 等文件。
-fn cleanup_test_artifacts(session_id: &str) {
-    let base = std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let session_dir = base.join(".atta").join("code").join("sessions");
-    if session_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&session_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.contains(session_id) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-    let memory_dir = base.join(".atta").join("code").join("memory");
-    if memory_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&memory_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.contains(session_id) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-    let mem_index = memory_dir.join("MEMORY.md");
-    let _ = std::fs::remove_file(mem_index);
 }

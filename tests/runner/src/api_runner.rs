@@ -38,13 +38,27 @@ pub struct TurnOutput {
     pub tool_uses: Vec<(String, serde_json::Value)>,
 }
 
+/// A working directory unique to this run.
+///
+/// This used to be a fixed `/tmp/atta_test_runner`, wiped on entry — so two
+/// cases running at once deleted each other's fixtures, and the failure
+/// looked like a flaky test rather than a collision.
+fn run_dir() -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("atta-test-runner-{}-{unique}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 pub async fn run_test_case(
     config: AgentRunnerConfig,
     case: &TestCase,
 ) -> anyhow::Result<Vec<TurnOutput>> {
-    let tmp = PathBuf::from("/tmp/atta_test_runner");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _ = std::fs::create_dir_all(&tmp);
+    let tmp = run_dir();
 
     if let Some(fixture) = &config.fixture_dir {
         let workdir = tmp.join("workdir");
@@ -94,9 +108,7 @@ pub async fn run_test_case_same_session(
     case: &TestCase,
     mutations: Option<&crate::mutations::MutationManifest>,
 ) -> anyhow::Result<Vec<TurnOutput>> {
-    let tmp = PathBuf::from("/tmp/atta_test_runner");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _ = std::fs::create_dir_all(&tmp);
+    let tmp = run_dir();
 
     if let Some(fixture) = &config.fixture_dir {
         let workdir = tmp.join("workdir");

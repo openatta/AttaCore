@@ -66,10 +66,6 @@ const ALLOWED: &[(&str, &str)] = &[
          on replay, so a recording is portable between machines. A substitution \
          rule, not a location.",
     ),
-    (
-        "tests/runner/src/cli_runner.rs",
-        "test harness: builds the isolated home it hands to the daemon under test.",
-    ),
 ];
 
 fn repo_root() -> PathBuf {
