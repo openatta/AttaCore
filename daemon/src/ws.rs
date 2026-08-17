@@ -28,7 +28,7 @@
 //! the token handshake unchanged: the header is evidence about browsers, and
 //! its absence is not evidence about anything.
 
-use crate::rpc::{send_frame, FrameSink, RpcRequest, RpcResponse, Sink};
+use crate::rpc::{send_frame, Client, FrameSink, RpcRequest, RpcResponse, Sink};
 use crate::server::DaemonServer;
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
@@ -181,11 +181,12 @@ async fn handle(server: Arc<DaemonServer>, stream: TcpStream) -> anyhow::Result<
     let (write, mut read) = ws.split();
     let ws_sink = Arc::new(WsSink(AsyncMutex::new(write)));
     let sink: Sink = ws_sink.clone();
+    let client = server.accept_connection(sink);
 
     // Same handshake as TCP: the first message must be `daemon.auth`. Reusing
     // the check rather than writing a second one is what keeps a new
     // transport from accidentally accepting a token the others reject.
-    if !authenticate(&server, &mut read, &sink).await {
+    if !authenticate(&server, &mut read, &client).await {
         ws_sink.close().await;
         return Ok(());
     }
@@ -201,11 +202,14 @@ async fn handle(server: Arc<DaemonServer>, stream: TcpStream) -> anyhow::Result<
         let Ok(req) = serde_json::from_str::<RpcRequest>(&text) else {
             continue;
         };
-        let resp = server.dispatch_public(req, sink.clone()).await;
-        if !send_frame(&sink, &resp).await {
+        let resp = server.dispatch_public(req, client.clone()).await;
+        if !send_frame(&client, &resp).await {
             break;
         }
     }
+    // A tab closing takes its subscriptions and nothing else — see
+    // `SessionPool::drop_connection`.
+    server.drop_connection(client.id()).await;
     ws_sink.close().await;
     Ok(())
 }
@@ -213,7 +217,7 @@ async fn handle(server: Arc<DaemonServer>, stream: TcpStream) -> anyhow::Result<
 async fn authenticate(
     server: &Arc<DaemonServer>,
     read: &mut futures::stream::SplitStream<WebSocketStream<TcpStream>>,
-    sink: &Sink,
+    client: &Client,
 ) -> bool {
     let Some(Ok(Message::Text(first))) = read.next().await else {
         return false;
@@ -227,7 +231,7 @@ async fn authenticate(
         )),
     };
     let ok = response.is_ok();
-    send_frame(sink, &response.unwrap_or_else(|e| e)).await;
+    send_frame(client, &response.unwrap_or_else(|e| e)).await;
     ok
 }
 

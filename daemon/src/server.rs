@@ -31,7 +31,7 @@
 //! `docs/daemon_rpc_protocol.md` for the opt-out.
 
 use crate::rpc::{codes, RpcRequest, RpcResponse};
-use crate::rpc::{send_frame, FrameSink, Sink};
+use crate::rpc::{send_frame, Client, FrameSink, Sink};
 use crate::session_pool::SessionPool;
 use base::id::Id;
 use std::net::SocketAddr;
@@ -154,6 +154,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 pub struct DaemonServer {
     pool: Arc<SessionPool>,
+    /// Source of connection ids. Monotonic for the process lifetime — an id
+    /// is never reused, so a subscription left behind by a closed connection
+    /// can never be inherited by a later one.
+    next_connection: std::sync::atomic::AtomicU64,
     started_at: Instant,
     shutdown_token: CancellationToken,
     tcp_token: tokio::sync::RwLock<Option<String>>,
@@ -163,10 +167,21 @@ impl DaemonServer {
     pub fn new(pool: Arc<SessionPool>, shutdown_token: CancellationToken) -> Self {
         Self {
             pool,
+            next_connection: std::sync::atomic::AtomicU64::new(1),
             started_at: Instant::now(),
             shutdown_token,
             tcp_token: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Wrap a freshly accepted connection: a new id, and the queue in front
+    /// of its sink. Public so a transport in another module can mint one.
+    pub fn accept_connection(&self, sink: Sink) -> Arc<Client> {
+        let id = crate::rpc::ConnectionId(
+            self.next_connection
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        Arc::new(Client::new(id, sink))
     }
 
     pub async fn set_tcp_token(&self, token: String) {
@@ -259,12 +274,13 @@ impl DaemonServer {
 
     async fn handle_connection(&self, reader: Reader, sink: Sink, tcp: bool) -> anyhow::Result<()> {
         let mut lines = FrameReader::new(reader);
+        let client = self.accept_connection(sink);
 
         // Unix socket connections are trusted for their lifetime by file
         // permissions alone (see the module doc comment's trust-boundary
         // note) — no handshake needed. TCP connections must authenticate
         // once, up front, before any RPC method is dispatched.
-        if tcp && !self.authenticate_lines(&mut lines, &sink).await {
+        if tcp && !self.authenticate_lines(&mut lines, &client).await {
             return Ok(());
         }
 
@@ -273,11 +289,14 @@ impl DaemonServer {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let resp = self.dispatch(req, sink.clone()).await;
-            if !send_frame(&sink, &resp).await {
+            let resp = self.dispatch(req, client.clone()).await;
+            if !send_frame(&client, &resp).await {
                 break;
             }
         }
+        // The connection is what subscriptions belong to; sessions and their
+        // turns are not. Dropping it takes its subscriptions and nothing else.
+        self.pool.drop_connection(client.id()).await;
         Ok(())
     }
 
@@ -287,7 +306,7 @@ impl DaemonServer {
     /// response either way. Returns `true` if the connection may proceed to
     /// the normal dispatch loop, `false` if it was rejected (or closed before
     /// sending anything) and the caller should just drop it.
-    async fn authenticate_lines(&self, lines: &mut FrameReader, sink: &Sink) -> bool {
+    async fn authenticate_lines(&self, lines: &mut FrameReader, client: &Client) -> bool {
         let Some(line) = lines.next_frame().await else {
             return false;
         };
@@ -300,7 +319,7 @@ impl DaemonServer {
             )),
         };
         let ok = response.is_ok();
-        send_frame(sink, &response.unwrap_or_else(|e| e)).await;
+        send_frame(client, &response.unwrap_or_else(|e| e)).await;
         ok
     }
 
@@ -371,8 +390,8 @@ impl DaemonServer {
 
     /// Dispatch one request. Public so a transport in another module can
     /// reuse it — the whole point of a transport is framing, not semantics.
-    pub async fn dispatch_public(&self, req: RpcRequest, sink: Sink) -> RpcResponse {
-        self.dispatch(req, sink).await
+    pub async fn dispatch_public(&self, req: RpcRequest, client: Arc<Client>) -> RpcResponse {
+        self.dispatch(req, client).await
     }
 
     /// [`Self::check_auth`], for the same reason.
@@ -380,12 +399,18 @@ impl DaemonServer {
         self.check_auth(req).await
     }
 
+    /// Forget a connection's subscriptions. Public for the same reason as
+    /// [`Self::accept_connection`].
+    pub async fn drop_connection(&self, connection: crate::rpc::ConnectionId) {
+        self.pool.drop_connection(connection).await;
+    }
+
     /// The configured TCP/WebSocket token, if any.
     pub async fn token(&self) -> Option<String> {
         self.tcp_token.read().await.clone()
     }
 
-    async fn dispatch(&self, req: RpcRequest, sink: Sink) -> RpcResponse {
+    async fn dispatch(&self, req: RpcRequest, client: Arc<Client>) -> RpcResponse {
         let id = req.id.unwrap_or(serde_json::Value::Null);
         match req.method.as_str() {
             "daemon.status" => {
@@ -407,7 +432,7 @@ impl DaemonServer {
                 }),
             ),
             "daemon.doctor" => RpcResponse::ok(id, self.pool.doctor_report().await),
-            "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, sink).await,
+            "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, client).await,
             "config.setProvider" => self.method_config_set_provider(id, req.params).await,
             "config.getProvider" => self.method_config_get_provider(id, req.params).await,
             // No params. Re-reads all three settings.json tiers from disk
@@ -507,11 +532,16 @@ impl DaemonServer {
                 }
             }
             "session.create" => self.method_session_create(id, req.params).await,
-            "session.run_turn" => self.method_session_run_turn(id, req.params, sink).await,
+            "session.run_turn" => self.method_session_run_turn(id, req.params, client).await,
             "session.respondToPrompt" => {
                 self.method_session_respond_to_prompt(id, req.params).await
             }
             "session.get" => self.method_session_get(id, req.params).await,
+            "session.subscribe" => self.method_session_subscribe(id, req.params, client).await,
+            "session.unsubscribe" => {
+                self.method_session_unsubscribe(id, req.params, client)
+                    .await
+            }
             "session.interrupt" => self.method_session_interrupt(id, req.params).await,
             "session.history" => self.method_session_history(id, req.params).await,
             "session.fork" => self.method_session_fork(id, req.params).await,
@@ -561,10 +591,10 @@ impl DaemonServer {
     async fn method_daemon_subscribe_events(
         &self,
         id: serde_json::Value,
-        sink: Sink,
+        client: Arc<Client>,
     ) -> RpcResponse {
         let mut rx = self.pool.subscribe_events();
-        let forward = sink.clone();
+        let forward = client;
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -885,7 +915,7 @@ impl DaemonServer {
         &self,
         id: serde_json::Value,
         params: serde_json::Value,
-        sink: Sink,
+        client: Arc<Client>,
     ) -> RpcResponse {
         // session_id 可选：不传则自动新建 session
         let session_id = params
@@ -934,7 +964,7 @@ impl DaemonServer {
                 user_msg,
                 attachments,
                 turn_id,
-                sink,
+                client,
                 id,
                 options,
             )
@@ -1048,6 +1078,55 @@ impl DaemonServer {
             Ok(detail) => RpcResponse::ok(id, detail),
             Err((code, message)) => RpcResponse::err(id, code, message),
         }
+    }
+
+    /// `session.subscribe` params: `{"session_id": "..."}`.
+    ///
+    /// Starts sending this session's frames to the calling connection and
+    /// returns what the caller needs to catch up: the transcript watermark
+    /// and any unanswered permission asks.
+    ///
+    /// The order matters and is the reason `last_seq` is here at all:
+    /// subscribe, *then* read `session.history` up to `last_seq`, then apply
+    /// the frames that arrived in between. Reading first and subscribing
+    /// second silently loses whatever the session produced in the gap.
+    async fn method_session_subscribe(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+        client: Arc<Client>,
+    ) -> RpcResponse {
+        let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
+        };
+        if let Some(err) = self.scene_mismatch_response(&id, session_id).await {
+            return err;
+        }
+        match self.pool.subscribe_session(session_id, client).await {
+            Ok(v) => RpcResponse::ok(id, v),
+            Err((code, message)) => RpcResponse::err(id, code, message),
+        }
+    }
+
+    /// `session.unsubscribe` params: `{"session_id": "..."}`.
+    ///
+    /// Unsubscribing from a session this connection was not watching is
+    /// success, not an error: the caller wanted to stop receiving it and it
+    /// is not receiving it.
+    async fn method_session_unsubscribe(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+        client: Arc<Client>,
+    ) -> RpcResponse {
+        let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
+        };
+        self.pool.unsubscribe_session(session_id, client.id()).await;
+        RpcResponse::ok(
+            id,
+            serde_json::json!({"session_id": session_id, "subscribed": false}),
+        )
     }
 
     /// `session.interrupt` params: `{"session_id": "..."}`.

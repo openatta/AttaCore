@@ -155,12 +155,6 @@ struct LiveSession {
     last_active: Instant,
     /// 用于首轮命名判断。
     is_first_turn: bool,
-    /// 这个 session 的权限询问出口：turn 期间指向那条正在流式返回的连接。
-    /// 见 `crate::permission_prompt`——权限提问由 daemon 层自己发帧、自己等
-    /// 回应，不走引擎那条（目前无法闭环的）`AgentEvent::PermissionPrompt`
-    /// 通道。
-    /// 这个 session 上"已经问出去、还没被回应"的权限询问。
-    /// `session.respondToPrompt` 直接在这里兑现决定。
     /// `SessionPool.config_generation` 的值，建这个 Agent 时记录的快照。
     /// `run_turn` 每次分派给一个已存在的 session 前，会拿这个值跟池子当前的
     /// 代数比——落后就说明期间有过 `config.setProvider`/`config.reload`，
@@ -177,6 +171,22 @@ struct LiveSession {
     /// (`SESSION_BUSY.data.current_turn_id`) and `session.get` can report
     /// `turn_state` instead of the caller having to infer it.
     current_turn: Option<String>,
+    /// Connections watching this session.
+    ///
+    /// Every frame the session produces goes to all of them. A turn is not
+    /// owned by the connection that started it — several browser tabs can
+    /// watch one conversation, and closing the one that sent the message is
+    /// not a reason to stop.
+    subscribers: HashMap<crate::rpc::ConnectionId, Arc<crate::rpc::Client>>,
+    /// Permission asks raised and not yet answered, by `prompt_id`.
+    ///
+    /// Kept so a connection that subscribes later — a second tab, or the
+    /// same tab after a refresh — is handed the question instead of finding
+    /// a session that appears stuck. The engine remains the authority on
+    /// whether an answer is still wanted; this is a mirror for redelivery,
+    /// and an answer to a `prompt_id` nobody awaits is already a documented
+    /// no-op.
+    pending_prompts: HashMap<String, serde_json::Value>,
 }
 
 // ── SessionPool ─────────────────────────────────────────────────────────
@@ -1775,6 +1785,8 @@ impl SessionPool {
                 .config_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
             current_turn: None,
+            subscribers: HashMap::new(),
+            pending_prompts: HashMap::new(),
         };
         // `insert` returning `Some` means a live entry already existed under
         // this exact sid — only reachable via the config-generation recreate
@@ -1787,6 +1799,122 @@ impl SessionPool {
         }
         info!(%session_id, "session created");
         Ok(session_id)
+    }
+
+    /// Record a raised permission ask so late subscribers can be handed it.
+    async fn remember_prompt<T: serde::Serialize>(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        frame: &T,
+    ) {
+        let Ok(value) = serde_json::to_value(frame) else {
+            return;
+        };
+        let mut sessions = self.sessions.lock().await;
+        if let Some(live) = sessions.get_mut(session_id) {
+            live.pending_prompts.insert(prompt_id.to_string(), value);
+        }
+    }
+
+    /// Forget an ask: answered, or the turn that raised it ended.
+    async fn forget_prompt(&self, session_id: &str, prompt_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(live) = sessions.get_mut(session_id) {
+            live.pending_prompts.remove(prompt_id);
+        }
+    }
+
+    /// Register `client` as a watcher of `session_id`.
+    ///
+    /// Returns the transcript watermark and any unanswered permission asks,
+    /// which together are what a newly opened tab needs to catch up:
+    /// subscribe first, then read history up to `last_seq`, then apply the
+    /// frames that arrived meanwhile. Reading first and subscribing second
+    /// loses everything produced in between — the reason this returns a
+    /// watermark at all.
+    pub async fn subscribe_session(
+        &self,
+        session_id: &str,
+        client: Arc<crate::rpc::Client>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let pending: Vec<serde_json::Value> = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(live) = sessions.get_mut(session_id) else {
+                return Err((
+                    codes::SESSION_NOT_FOUND,
+                    format!("session not found: {session_id}"),
+                ));
+            };
+            live.subscribers.insert(client.id(), client);
+            live.pending_prompts.values().cloned().collect()
+        };
+
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "last_seq": self.transcript_len(session_id).await,
+            "pending_prompts": pending,
+        }))
+    }
+
+    /// Stop sending this session's frames to `connection`.
+    pub async fn unsubscribe_session(
+        &self,
+        session_id: &str,
+        connection: crate::rpc::ConnectionId,
+    ) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(live) = sessions.get_mut(session_id) {
+            live.subscribers.remove(&connection);
+        }
+    }
+
+    /// A connection went away: forget it everywhere.
+    ///
+    /// This is the whole of what a disconnect means now. It used to cancel
+    /// the turn and tear the session down — right when one CLI owned one
+    /// socket, wrong the moment a second tab can be watching, and
+    /// destructive besides (the teardown cascades into deleting the
+    /// session's sidechain transcripts).
+    pub async fn drop_connection(&self, connection: crate::rpc::ConnectionId) {
+        let mut sessions = self.sessions.lock().await;
+        for live in sessions.values_mut() {
+            live.subscribers.remove(&connection);
+        }
+    }
+
+    /// How many entries this session's transcript holds — its watermark.
+    ///
+    /// The log is append-only, so an entry's position is stable and the
+    /// count is a usable sequence number without a stored `seq` field.
+    async fn transcript_len(&self, session_id: &str) -> usize {
+        self.load_entries(session_id)
+            .await
+            .map(|entries| entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Send one frame to every connection watching `session_id`.
+    ///
+    /// A subscriber that cannot take the frame — gone, or fallen far enough
+    /// behind to fill its queue — is dropped here rather than waited on. One
+    /// tab that stopped reading must not hold up the turn or the other tabs
+    /// watching it; a dropped subscriber can subscribe again and catch up
+    /// through `last_seq`, which is what makes dropping an acceptable answer.
+    async fn broadcast_to_session<T: serde::Serialize>(&self, session_id: &str, frame: &T) {
+        let json = match serde_json::to_string(frame) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not serialize a session frame; dropping it");
+                return;
+            }
+        };
+        let mut sessions = self.sessions.lock().await;
+        let Some(live) = sessions.get_mut(session_id) else {
+            return;
+        };
+        live.subscribers
+            .retain(|_, client| client.try_send_json(json.clone()));
     }
 
     /// The turn currently running on `session_id`, if any. `session.get`
@@ -1827,6 +1955,14 @@ impl SessionPool {
         Ok(true)
     }
 
+    /// Drop every outstanding ask for this session.
+    async fn clear_pending_prompts(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(live) = sessions.get_mut(session_id) {
+            live.pending_prompts.clear();
+        }
+    }
+
     /// Mark the session idle again. Called on every path that gives
     /// `event_rx` back, because "busy" is exactly "someone holds the channel".
     async fn clear_current_turn(&self, sid: &str) {
@@ -1845,7 +1981,7 @@ impl SessionPool {
         message: String,
         attachments: Vec<runtime::agent::Attachment>,
         turn_id: String,
-        sink: crate::rpc::Sink,
+        client: Arc<crate::rpc::Client>,
         id: serde_json::Value,
         options: Option<SessionOptions>,
     ) -> RpcResponse {
@@ -1967,6 +2103,10 @@ impl SessionPool {
             let mut sessions = self.sessions.lock().await;
             if let Some(live) = sessions.get_mut(&sid) {
                 live.current_turn = Some(turn_id.clone());
+                // Whoever starts a turn watches it. Not a special role — it
+                // lands in the same subscriber set as any tab that called
+                // `session.subscribe`, and leaves the same way.
+                live.subscribers.insert(client.id(), client.clone());
             }
         }
 
@@ -1977,8 +2117,7 @@ impl SessionPool {
             turn_id: turn_id.clone(),
         });
 
-        let mut api_calls = 0u32;
-        let mut writer_broken = false;
+        let api_calls;
         loop {
             match event_rx.recv().await {
                 Some(AgentEvent::SystemInit { .. }) => continue,
@@ -1988,10 +2127,7 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({"kind":"text_delta","text":text}),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 Some(AgentEvent::ToolUse {
                     id: tid,
@@ -2004,10 +2140,7 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({"kind":"tool_use","id":tid,"name":name,"input":input}),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 Some(AgentEvent::ToolResult {
                     id: tid,
@@ -2021,10 +2154,7 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({"kind":"tool_result","id":tid,"name":name,"content":content,"is_error":is_error}),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 Some(AgentEvent::PermissionPrompt {
                     prompt_id,
@@ -2040,17 +2170,6 @@ impl SessionPool {
                     // documented in `docs/daemon_rpc_protocol.md`, deliberately
                     // generic so a future non-permission "stop and ask" need
                     // can reuse it without a new RPC method.
-                    //
-                    // **Not the path daemon permission prompts take today.**
-                    // A `Permission` that returns
-                    // `PermissionOutcome::Prompt` makes the engine wait on a
-                    // channel that cannot be delivered to mid-turn (see
-                    // `crate::permission_prompt`'s module docs), so the pool
-                    // hands sessions an `AskingPermission` that emits its
-                    // own — byte-identical — frame and resolves the answer
-                    // itself. This arm stays because the event is part of
-                    // the engine's public surface and relaying it is still
-                    // correct; it just isn't reached from here.
                     let f = StreamFrame::event(
                         &sid,
                         &turn_id,
@@ -2060,10 +2179,10 @@ impl SessionPool {
                             "paths":paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
                         }),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    // Registered before it is sent: a tab that subscribes
+                    // between the two must still be handed the question.
+                    self.remember_prompt(&sid, &prompt_id, &f).await;
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 // Sub-agent activity, mirrored from the sub-agent's own
                 // channel (see `runtime::agent_tool`'s `SubagentTag`). Relayed
@@ -2090,10 +2209,7 @@ impl SessionPool {
                             "event":serde_json::to_value(&*event).unwrap_or(serde_json::Value::Null)
                         }),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 // Skill files changed under a live session — forwarded so a
                 // client caching `commands.list` knows to re-fetch. This
@@ -2108,10 +2224,7 @@ impl SessionPool {
                             "kind":"skills_changed","added":added,"removed":removed
                         }),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 // Team stage lifecycle — same non-terminal treatment.
                 Some(AgentEvent::TeamProgress {
@@ -2133,10 +2246,7 @@ impl SessionPool {
                             "status":status,"members":members,"failed":failed
                         }),
                     );
-                    if !crate::rpc::send_frame(&sink, &f).await {
-                        writer_broken = true;
-                        break;
-                    }
+                    self.broadcast_to_session(&sid, &f).await;
                 }
                 Some(AgentEvent::TurnComplete {
                     stop_reason,
@@ -2153,7 +2263,7 @@ impl SessionPool {
                             "usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens}
                         }),
                     );
-                    let _ = crate::rpc::send_frame(&sink, &f).await;
+                    self.broadcast_to_session(&sid, &f).await;
                     break;
                 }
                 Some(AgentEvent::Error { code, message, .. }) => {
@@ -2166,31 +2276,22 @@ impl SessionPool {
             }
         }
 
-        // The turn is over (completed, or the client vanished mid-stream).
-        // Nothing raised during it can still be answered — detach first so a
-        // late prompt can't be written onto a connection that has already
-        // seen its final response, then fail any straggler closed.
-
-        // Client disconnected during turn — cancel the session immediately so
-        // the Agent stops processing and any child processes (e.g. BashTool)
-        // are killed, rather than waiting up to 5 minutes for the janitor.
-        if writer_broken {
-            drop(event_rx);
-            self.clear_current_turn(&sid).await;
-            self.shutdown_session(&sid).await;
-            return RpcResponse::ok(
-                id,
-                serde_json::json!({
-                    "session_id": sid,
-                    "turn_id": turn_id,
-                    "disconnected": true,
-                }),
-            );
-        }
+        // The turn is over. A client that vanished mid-stream is not part of
+        // this: the turn ran to completion and landed in the transcript, and
+        // whoever comes back reads it there.
+        //
+        // This used to cancel the session on a broken writer — correct when
+        // one CLI owned one socket, wrong once a second tab can be watching,
+        // and destructive besides: the teardown cascades into deleting the
+        // session's sidechain transcripts, so closing one tab would delete
+        // another tab's sub-agent records.
 
         // 归还 event_rx
         *event_rx_mutex.lock().await = Some(event_rx);
         self.clear_current_turn(&sid).await;
+        // Whatever was still being asked died with the turn — replaying it to
+        // the next subscriber would be offering an answer nobody awaits.
+        self.clear_pending_prompts(&sid).await;
 
         // ── 首轮自动命名 ──
         let mut session_name = None;
@@ -2791,9 +2892,10 @@ impl SessionPool {
         // answered, timed out, stale) is a silent no-op — the documented
         // behaviour.
         let _ = input_tx.send(InputMessage::PermissionResponse {
-            prompt_id,
+            prompt_id: prompt_id.clone(),
             decision,
         });
+        self.forget_prompt(session_id, &prompt_id).await;
         Ok(())
     }
 
@@ -3984,10 +4086,10 @@ fn effective_permission_mode(
 /// `options.permission_rules` appended, so a session-scoped rule is
 /// evaluated alongside the configured ones rather than replacing them.
 ///
-/// An `ask` verdict from the rule engine is turned into a real, answerable
-/// prompt by wrapping the result in `AskingPermission` — see
-/// `crate::permission_prompt` for why the daemon does the asking itself
-/// instead of returning `PermissionOutcome::Prompt` to the engine.
+/// An `ask` verdict from the rule engine becomes `PermissionOutcome::Prompt`;
+/// the engine raises `AgentEvent::PermissionPrompt`, `run_turn` broadcasts it
+/// to the session's subscribers, and `session.respondToPrompt` feeds the
+/// answer back in.
 ///
 /// Free function (not inlined into `create()`) specifically so this decision
 /// is unit-testable without spinning up a real session.
@@ -4354,6 +4456,8 @@ mod eviction_tests {
             is_first_turn: true,
             config_generation: 0,
             current_turn: None,
+            subscribers: HashMap::new(),
+            pending_prompts: HashMap::new(),
         }
     }
 

@@ -414,15 +414,29 @@ WebSocket 不受同源策略约束,用户浏览器打开的任何站点都能向
 
 ### 5.4 事件帧推给谁
 
-`session.event` 帧**只推给发起该 `run_turn` 的那条连接**,不广播。
+`session.event` 帧推给**所有订阅了该会话的连接**。
 
-**多窗口场景**(同一会话在两个 UI 窗口打开)由此有一个明确后果:只有发起方能看到
-实时流。另一个窗口要跟进有两条路:
+**连接不是会话的所有者。** 一个会话可以被任意多条连接同时观看——浏览器开三个 tab
+就是三条连接看同一个会话——它们收到同一份帧流。发起 `run_turn` 的那条连接没有特殊
+地位,它只是自动订阅了而已。
 
-1. 共享同一条 daemon 连接(推荐 —— 桌面端应用内单例连接,窗口是同一进程的视图);
-2. 轮询 `session.get` 看 `turn_state`,turn 结束后拉 `session.history`。
+订阅有两种来路:
 
-`daemon.event`(§8)与之不同,它推给**所有**订阅者。
+| 来路 | 说明 |
+|---|---|
+| `session.subscribe` | 显式订阅,见 §6.3 |
+| `session.run_turn` | 发起方自动订阅这个会话 |
+
+退订用 `session.unsubscribe`;连接断开时它的全部订阅一起消失,**别的什么都不动**。
+
+**关于慢客户端**:每条连接前面有一个有界的出站队列。一个不读数据的客户端把队列填满
+之后,它的**订阅**会被丢弃(不是它的连接)——一个卡住的 tab 不能拖住 turn,也不能
+拖住其他正在看的 tab。被丢掉的一方重新 `session.subscribe` 即可,靠 `last_seq` 追平
+(见 §5.6)。
+
+`daemon.event`(§8)是另一条通道:它与会话订阅无关,推给所有 `daemon.subscribeEvents`
+的订阅者,用于低频的实例级通知。**分两层是有意的**:侧边栏靠 `daemon.event` 知道
+"某个会话在跑",对话区靠会话订阅拿 token,不必为了看一个会话而接收全部会话的流量。
 
 ### 5.5 事件顺序保证
 
@@ -452,19 +466,29 @@ WebSocket 不受同源策略约束,用户浏览器打开的任何站点都能向
 
 ### 5.6 断线与重连
 
-**turn 进行中断线** → daemon 立即取消该会话的 turn 并杀掉派生的子进程。这是刻意的:
-没有接收方的 turn 继续烧钱没有意义。
+**turn 进行中断线** → 什么都不会被取消。turn 跑完、落盘,会话按正常的空闲超时回收。
+断开只意味着这条连接的订阅没了。
 
-重连后要判断"我刚才那个 turn 怎么样了":
+这一条曾经是反过来的(断线即取消 turn 并销毁会话)。在"一个 CLI 一条连接"下那是对的;
+一旦一个会话可以被多条连接观看,它就变成了"关掉一个 tab 会掐掉另一个 tab 正在看的
+turn",而且销毁会话是级联的——连该会话的侧链 transcript 一起删。
+
+**重连/新开 tab 的追赶顺序(顺序不能颠倒)**:
 
 ```
-session.get {session_id}
-  ├─ turn_state == "idle"        → 上一个 turn 已结束
-  └─ 读 session.history 尾部     → 看到哪里,以及最后一条是否完整
+1. session.subscribe {session_id}   → 拿到 last_seq,此刻起的实时帧开始进本连接
+2. session.history  {before_seq: last_seq}  → 读到水位为止的内容
+3. 把 1 之后缓冲的实时帧接在后面(丢弃 seq ≤ last_seq 的重复)
 ```
 
-**没有"续接流"的机制** —— 不能重连后接着收上一个 turn 剩下的事件帧。已产生的内容都
-已进入 transcript,用 `session.history` 取。
+**先读历史再订阅会永久丢掉中间那段帧**——`last_seq` 存在的唯一理由就是让这个接缝
+可闭合。
+
+`last_seq` 是 transcript 的条目数。日志是 append-only 的,条目位置稳定,所以位置本身
+就是序号。
+
+**仍然没有"续接流"**:重连不会补发上一个 turn 已经推过的帧。已产生的内容都在
+transcript 里,用 `session.history` 取——追赶靠的是历史,不是重放。
 
 **心跳**:daemon 不主动发心跳。长时间空闲的连接由 TCP keepalive 或客户端自己的
 `daemon.ping` 维持。WebSocket 传输会自动回应 ping 帧,但浏览器的 WebSocket API 不能
@@ -722,6 +746,30 @@ resume。
 拿到子会话 id 后用普通 `session.history` 读内容 —— 侧链与主线共用同一套查询 API。
 **不提供**父子合并视图:子 Agent 执行的是一次性固定任务、不与用户交互,逐个查足够。
 
+#### `session.subscribe`
+`{ "session_id":"…" }`
+
+```jsonc
+{ "session_id":"…",
+  "last_seq": 480,              // transcript 水位,用于追赶(§5.6)
+  "pending_prompts": [ /* 未答的 kind:"prompt" 帧,原样重放 */ ] }
+```
+
+订阅之后,该会话的 `session.event` 帧都会推到这条连接上,直到 `session.unsubscribe`
+或连接断开。重复订阅同一会话是幂等的。
+
+`pending_prompts` 里的帧带**原来的 `prompt_id`**,所以中途打开(或刷新后重开)的 tab
+可以直接答那个还悬着的权限提问,而不是看到一个像是卡住的会话。这些帧在 turn 结束时
+清空——一个没人在等答案的提问不该被重放给下一个订阅者。
+
+会话不存在返回 `SESSION_NOT_FOUND`,而不是给一个永远不会有数据的订阅。
+
+#### `session.unsubscribe`
+`{ "session_id":"…" }` → `{ "session_id":"…", "subscribed":false }`
+
+停止向这条连接推送该会话。**没订阅过也返回成功**:调用方要的是"别再推给我",而现状
+已经如此。
+
 #### `session.history`
 `{ "session_id":"…", "limit":200, "cursor":"…" }`
 
@@ -786,6 +834,13 @@ Meta.session_kind == "sidechain"
 按拒绝处理,turn 带着一条 error `tool_result` 继续,不会挂死。
 
 ---
+
+**谁都能答,先答者生效。** 提问广播给该会话的全部订阅者,任何一条连接都可以回答——
+不必是发起 turn 的那条(它可能已经关了)。第二个回答对着一个已经没人在等的 `prompt_id`,
+是**静默成功**而不是错误:调用方要的是"这个提问被答掉",而它确实被答掉了。
+
+中途打开的 tab 通过 `session.subscribe` 的 `pending_prompts` 拿到还悬着的提问,
+`prompt_id` 不变。
 
 ### 6.4 `config.*`
 

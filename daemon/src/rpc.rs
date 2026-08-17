@@ -106,14 +106,116 @@ pub trait FrameSink: Send + Sync {
 /// A sink shared by the dispatcher and by any streaming task it spawns.
 pub type Sink = Arc<dyn FrameSink>;
 
+/// Identifies one client connection for its lifetime.
+///
+/// A connection is the unit of subscription: a browser tab holds one, and
+/// when it goes away its subscriptions go with it — and nothing else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConnectionId(pub u64);
+
+impl std::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conn-{}", self.0)
+    }
+}
+
+/// How many frames may sit queued for one connection before it is treated as
+/// not reading.
+///
+/// Generous: a turn's worth of token deltas is well under this, so the limit
+/// is only reached by a client that has stopped draining. Past it, the
+/// session broadcast drops that connection's *subscription* rather than
+/// waiting — see [`Client::try_send_json`].
+const OUTBOUND_QUEUE_DEPTH: usize = 1024;
+
+/// One client connection: an id, and a queue in front of its sink.
+///
+/// Everything written to a connection goes through the one queue, responses
+/// and pushed frames alike, so a client sees them in the order the daemon
+/// produced them. Two write paths into one socket would let a response
+/// overtake the events that led to it.
+///
+/// The queue also decouples the agent loop from the client: a session's
+/// broadcast enqueues and moves on, so one tab that has stopped reading
+/// cannot hold up the turn — or the other tabs watching it.
+pub struct Client {
+    id: ConnectionId,
+    tx: tokio::sync::mpsc::Sender<Outgoing>,
+}
+
+/// A queued frame, optionally carrying an acknowledgement the pump fires once
+/// the frame has actually reached the sink.
+struct Outgoing {
+    json: String,
+    written: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Client {
+    /// Wrap `sink` and start the pump that drains the queue into it.
+    ///
+    /// The pump ends when the connection is dropped or the sink reports the
+    /// peer gone; nothing else has to notice.
+    pub fn new(id: ConnectionId, sink: Sink) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outgoing>(OUTBOUND_QUEUE_DEPTH);
+        tokio::spawn(async move {
+            while let Some(item) = rx.recv().await {
+                let ok = sink.send_json(item.json).await;
+                if let Some(ack) = item.written {
+                    let _ = ack.send(());
+                }
+                if !ok {
+                    break;
+                }
+            }
+        });
+        Self { id, tx }
+    }
+
+    pub fn id(&self) -> ConnectionId {
+        self.id
+    }
+
+    /// Enqueue and wait until the frame has reached the sink.
+    ///
+    /// For replies, which must not be dropped — a caller is blocked on this
+    /// one — and which callers may follow by closing the connection. Waiting
+    /// for room alone would not be enough there: the queue would still hold
+    /// the frame when the socket closed under it.
+    pub async fn send_json(&self, json: String) -> bool {
+        let (ack, written) = tokio::sync::oneshot::channel();
+        let queued = self
+            .tx
+            .send(Outgoing {
+                json,
+                written: Some(ack),
+            })
+            .await
+            .is_ok();
+        queued && written.await.is_ok()
+    }
+
+    /// Enqueue without waiting. `false` means the connection is gone or has
+    /// fallen [`OUTBOUND_QUEUE_DEPTH`] frames behind, and the caller should
+    /// stop pushing to it. Used for broadcast, where waiting on one slow
+    /// client would stall every other reader of the same session.
+    pub fn try_send_json(&self, json: String) -> bool {
+        self.tx
+            .try_send(Outgoing {
+                json,
+                written: None,
+            })
+            .is_ok()
+    }
+}
+
 /// Serialize `frame` and hand it to `sink`.
 ///
 /// A frame that cannot be serialized is dropped with a warning rather than
 /// killing the connection: it is a bug in whatever built it, and taking the
 /// session down would hide that behind a disconnect.
-pub async fn send_frame<T: serde::Serialize>(sink: &Sink, frame: &T) -> bool {
+pub async fn send_frame<T: serde::Serialize>(client: &Client, frame: &T) -> bool {
     match serde_json::to_string(frame) {
-        Ok(json) => sink.send_json(json).await,
+        Ok(json) => client.send_json(json).await,
         Err(e) => {
             tracing::warn!(error = %e, "could not serialize an outgoing frame; dropping it");
             true

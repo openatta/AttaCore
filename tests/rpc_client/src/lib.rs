@@ -294,6 +294,34 @@ impl DaemonRpcClient {
         })
     }
 
+    /// 订阅一个会话：之后这个会话的帧都会推到这条连接上。
+    ///
+    /// 返回 `last_seq` 与待答的权限提问——**先订阅、再读 history 到
+    /// `last_seq`**，反过来会丢掉中间产生的帧。
+    pub async fn session_subscribe(&mut self, session_id: &str) -> anyhow::Result<RpcResponse> {
+        self.call(
+            "session.subscribe",
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_unsubscribe(&mut self, session_id: &str) -> anyhow::Result<RpcResponse> {
+        self.call(
+            "session.unsubscribe",
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    /// 读下一帧，不发任何请求——给"只旁观"的连接用。
+    ///
+    /// 订阅之后这条连接上会自己冒出 `session.event`，调用方需要能单独等它们，
+    /// 而不是只能在自己发起的 turn 里顺带收。
+    pub async fn next_frame(&mut self) -> anyhow::Result<Option<Value>> {
+        self.transport.recv().await
+    }
+
     /// 发一轮消息，收集期间所有 `session.event` StreamFrame，直到看到
     /// `turn_complete` 事件 + 匹配 id 的最终响应。
     ///
