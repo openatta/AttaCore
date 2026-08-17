@@ -3060,10 +3060,20 @@ name = "rpc-client"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "async-stream",
+ "async-trait",
+ "base",
  "daemon",
+ "futures",
+ "history",
+ "model",
+ "scene",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
 ]
 
 [[package]]
