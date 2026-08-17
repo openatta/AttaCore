@@ -116,6 +116,14 @@ impl AgentScene for CodingScene {
         render_prompt_blocks(resolved)
     }
 
+    fn requires_project(&self) -> bool {
+        true
+    }
+
+    fn supports_team(&self) -> bool {
+        true
+    }
+
     fn tools(&self) -> Vec<String> {
         vec![]
     }

@@ -19,6 +19,11 @@ pub struct SceneInfo {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// See [`AgentScene::requires_project`] — hosts use it to decide whether
+    /// creating a session needs a project first.
+    pub requires_project: bool,
+    /// See [`AgentScene::supports_team`].
+    pub supports_team: bool,
 }
 
 /// Registry of available scenes. Populated at process startup.
@@ -47,6 +52,8 @@ impl SceneRegistry {
                 id: id.clone(),
                 name: s.name().to_string(),
                 description: s.description().to_string(),
+                requires_project: s.requires_project(),
+                supports_team: s.supports_team(),
             })
             .collect()
     }

@@ -1230,9 +1230,17 @@ async fn session_create_with_null_project_root_is_a_no_project_session() {
     let (srv, _seen) =
         start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
 
+    // `chat`, not the daemon's `coding`: a no-project session is only
+    // meaningful in a scene that doesn't require one, and `coding` now
+    // refuses (see `AgentScene::requires_project`).
+    let _ = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"scene.activate","params":{"scene":"chat"},"id":0}"#,
+    )
+    .await;
     let created = rpc(
         &srv.sock,
-        r#"{"jsonrpc":"2.0","method":"session.create","params":{"project_root":null},"id":1}"#,
+        r#"{"jsonrpc":"2.0","method":"session.create","params":{"scene":"chat","project_root":null},"id":1}"#,
     )
     .await;
     let sid = created["result"]["session_id"]
@@ -1943,6 +1951,170 @@ async fn an_unanswered_prompt_is_denied_instead_of_hanging_forever() {
         rendered.contains("Denied by permission") && rendered.contains("no answer"),
         "the timeout must fail closed, with a reason that names itself: {rendered}"
     );
+
+    srv.stop().await;
+}
+
+// ── §5.3 一个会话同时只跑一个 turn / §3.2 场景能力 ──────────────────────
+
+/// A session runs one turn at a time, and the second caller is told so
+/// rather than being served an internal error.
+///
+/// The ordering matters more than the code: the message used to be pushed
+/// into the agent's input queue *before* the exclusive event channel was
+/// claimed, so a rejected second `run_turn` had already handed the user's
+/// message to the turn that was still running. The caller saw a failure and
+/// the message was answered anyway, by the wrong turn.
+#[tokio::test]
+async fn a_second_turn_on_a_busy_session_is_refused_and_its_message_is_not_swallowed() {
+    let (srv, seen) = start_scripted_server(
+        asking_bash_rounds("busy.txt"),
+        ask_settings(),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Park a turn on an unanswered permission prompt: the session is busy
+    // for as long as nobody answers.
+    let sock = srv.sock.clone();
+    let mut conn = UnixStream::connect(&sock).await.unwrap();
+    conn.write_all(
+        br#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"first"},"id":1}"#,
+    )
+    .await
+    .unwrap();
+    conn.write_all(b"\n").await.unwrap();
+
+    let (sid, prompt_id) = {
+        let (r, _w) = conn.split();
+        let mut br = BufReader::new(r);
+        loop {
+            let mut line = String::new();
+            let n = br.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "connection closed before the prompt arrived");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["params"]["event"]["kind"] == "prompt" {
+                break (
+                    v["params"]["session_id"].as_str().unwrap().to_string(),
+                    v["params"]["event"]["prompt_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+    };
+
+    let requests_before = seen.lock().unwrap().len();
+
+    let busy = rpc(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.run_turn","params":{{"session_id":"{sid}","message":"ZZ-refused-message-ZZ"}},"id":2}}"#
+        ),
+    )
+    .await;
+    assert_eq!(busy["error"]["code"], codes::SESSION_BUSY, "{busy}");
+    assert_eq!(busy["error"]["data"]["session_id"], sid, "{busy}");
+    assert!(
+        busy["error"]["data"]["current_turn_id"].is_string(),
+        "the refusal must name the turn holding the session: {busy}"
+    );
+
+    // Let the parked turn finish.
+    let ack = rpc(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{{"session_id":"{sid}","prompt_id":"{prompt_id}","decision":{{"type":"deny","reason":"test"}}}},"id":99}}"#
+        ),
+    )
+    .await;
+    assert_eq!(ack["result"]["prompt_id"], prompt_id, "{ack}");
+
+    // The refused message must not have reached the model as part of the
+    // turn that was already running.
+    let requests: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(requests_before)
+        .map(|r| format!("{r:?}"))
+        .collect();
+    assert!(
+        !requests.iter().any(|r| r.contains("ZZ-refused-message-ZZ")),
+        "the refused message was fed to the running turn anyway: {requests:?}"
+    );
+
+    srv.stop().await;
+}
+
+/// Once the parked turn is done the session is idle again — "busy" tracks
+/// the turn, it is not a latch.
+#[tokio::test]
+async fn a_session_accepts_a_new_turn_after_the_previous_one_finishes() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("a"), text_round("b")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let sid = run_turn(&srv.sock, None, "first").await;
+    let second = rpc_streaming(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.run_turn","params":{{"session_id":"{sid}","message":"second"}},"id":2}}"#
+        ),
+    )
+    .await
+    .1;
+    assert!(second["result"].is_object(), "{second}");
+
+    srv.stop().await;
+}
+
+/// `coding` requires a project, and says so at creation rather than letting
+/// the session exist and fail on its first tool call.
+#[tokio::test]
+async fn a_scene_that_requires_a_project_refuses_a_session_without_one() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.create","params":{"scene":"coding","project_root":null},"id":1}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], codes::PROJECT_REQUIRED, "{resp}");
+
+    srv.stop().await;
+}
+
+/// The capability bits are what a host reads to decide whether to ask for a
+/// project or show a team entry point, so they have to be on the wire.
+#[tokio::test]
+async fn scene_list_reports_the_capability_bits() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"scene.list","id":1}"#,
+    )
+    .await;
+    let scenes = resp["result"]["scenes"].as_array().unwrap();
+    let by_id = |id: &str| {
+        scenes
+            .iter()
+            .find(|s| s["scene"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from scene.list: {resp}"))
+            .clone()
+    };
+
+    assert_eq!(by_id("coding")["requires_project"], true);
+    assert_eq!(by_id("coding")["supports_team"], true);
+    assert_eq!(by_id("chat")["requires_project"], false);
+    assert_eq!(by_id("chat")["supports_team"], false);
 
     srv.stop().await;
 }

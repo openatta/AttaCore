@@ -124,6 +124,26 @@ pub trait AgentScene: Send + Sync + 'static {
     /// Tool whitelist for this scene (empty = all registered tools).
     fn tools(&self) -> Vec<String>;
 
+    /// Whether a session in this scene must be bound to a project root.
+    ///
+    /// A host reads this to decide whether creating a session needs a
+    /// "choose a project" step; the daemon enforces it, refusing a session
+    /// with no `project_root` for a scene that requires one. Scenes whose
+    /// work *is* a project (writing code, researching a codebase) say yes;
+    /// a chat has nothing to bind to.
+    fn requires_project(&self) -> bool {
+        false
+    }
+
+    /// Whether this scene takes part in multi-agent teams.
+    ///
+    /// `false` means the Team tools are never registered for the session at
+    /// all — the model does not see them and cannot be refused at call time,
+    /// which is a different thing from being allowed to try and failing.
+    fn supports_team(&self) -> bool {
+        false
+    }
+
     /// Tools this scene contributes that no other scene has.
     ///
     /// The three-way split between this, `tools()` and `deferred_tools()` is

@@ -159,6 +159,18 @@ pub mod codes {
     /// the request was well-formed; the capability is absent by deployment
     /// choice, which is what a client needs to be able to tell apart.
     pub const PLUGINS_DISABLED: i32 = -32016;
+
+    /// A second `run_turn` arrived while one was already running on that
+    /// session. Not queued and not preempting: the caller decides whether to
+    /// wait or to `session.interrupt` first. `data.current_turn_id` names the
+    /// turn holding the session.
+    pub const SESSION_BUSY: i32 = -32015;
+
+    /// The scene requires a project (`AgentScene::requires_project`) but the
+    /// caller asked for a session without one. Reported at `session.create`
+    /// rather than at the first tool call, so a host can put the user in front
+    /// of a project picker instead of a failed turn.
+    pub const PROJECT_REQUIRED: i32 = -32012;
 }
 
 // ── Session options (extensible, passed via session.run_turn params) ──

@@ -1619,7 +1619,11 @@ impl Builder {
         // Bound outside the `team_enabled` block so the event-channel wiring
         // below can reach it; `None` when team tools are not registered.
         let mut team_create_tool: Option<Arc<team::tool::TeamCreateTool>> = None;
-        if settings.execution.team_enabled {
+        // Both have to agree: the setting is the operator's switch, the
+        // scene's capability is what the scene is *for*. A scene that does
+        // not do teamwork never registers the tools, so the model does not
+        // see them — as opposed to seeing them and being refused.
+        if settings.execution.team_enabled && scene.supports_team() {
             let team_spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner> = Arc::new(
                 crate::agent_spawner_impl::RuntimeAgentSpawner::new(agent_tool_arc.clone()),
             );

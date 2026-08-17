@@ -40,6 +40,14 @@ impl AgentScene for ResearchScene {
     /// [`long_session_note_taking`]）+ Agent（并行拆解"同时对比多个信息源"这
     /// 类子任务）。没有 Bash/Edit/NotebookEdit——和 ChatScene 一样，这是设计
     /// 层面的边界，不依赖模型"表现良好"。
+    fn requires_project(&self) -> bool {
+        true
+    }
+
+    fn supports_team(&self) -> bool {
+        true
+    }
+
     fn tools(&self) -> Vec<String> {
         vec![
             "Read".into(),

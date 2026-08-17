@@ -169,6 +169,14 @@ struct LiveSession {
     /// reload 时 `fetch_add(1)`，用到时惰性比较一次，不用遍历/标记所有
     /// session。
     config_generation: u64,
+    /// The turn currently running on this session, if any.
+    ///
+    /// A session runs one turn at a time — `event_rx` is taken exclusively
+    /// for the duration, so the second caller could never have been served
+    /// anyway. This records *which* turn holds it, so the refusal can name it
+    /// (`SESSION_BUSY.data.current_turn_id`) and `session.get` can report
+    /// `turn_state` instead of the caller having to infer it.
+    current_turn: Option<String>,
 }
 
 // ── SessionPool ─────────────────────────────────────────────────────────
@@ -1370,6 +1378,19 @@ impl SessionPool {
         // its own tier; `settings_for_project` short-circuits to the
         // hot-swappable `self.settings` for the one pair that is the pool's
         // own.
+        // A scene that requires a project is refused here, not later: with no
+        // project root there is nothing for its tools to read or write, and
+        // the failure is far more legible at creation than at the first turn.
+        if scene.requires_project() && matches!(project_root, ProjectSelector::NoProject) {
+            return Err((
+                codes::PROJECT_REQUIRED,
+                format!(
+                    "scene `{}` requires a project; pass project_root",
+                    scene.id()
+                ),
+            ));
+        }
+
         let session_scene_id = scene.id().to_string();
         let (base_settings, project_root_for_meta) = match project_root {
             ProjectSelector::Default => (
@@ -1753,6 +1774,7 @@ impl SessionPool {
             config_generation: self
                 .config_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
+            current_turn: None,
         };
         // `insert` returning `Some` means a live entry already existed under
         // this exact sid — only reachable via the config-generation recreate
@@ -1765,6 +1787,15 @@ impl SessionPool {
         }
         info!(%session_id, "session created");
         Ok(session_id)
+    }
+
+    /// Mark the session idle again. Called on every path that gives
+    /// `event_rx` back, because "busy" is exactly "someone holds the channel".
+    async fn clear_current_turn(&self, sid: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(live) = sessions.get_mut(sid) {
+            live.current_turn = None;
+        }
     }
 
     /// 执行一个 turn：发送消息 → 流式返回事件 → 返回结果。
@@ -1853,7 +1884,7 @@ impl SessionPool {
         };
 
         // ── 获取 session 的 input_tx 和 event_rx ──
-        let (input_tx, event_rx_mutex) = {
+        let (input_tx, event_rx_mutex, busy_with) = {
             let mut sessions = self.sessions.lock().await;
             let live = match sessions.get_mut(&sid) {
                 Some(s) => s,
@@ -1866,8 +1897,40 @@ impl SessionPool {
                 }
             };
             live.last_active = Instant::now();
-            (live.input_tx.clone(), live.event_rx.clone())
+            (
+                live.input_tx.clone(),
+                live.event_rx.clone(),
+                live.current_turn.clone(),
+            )
         };
+
+        // 取出 event_rx（独占 drain）——**在发消息之前**。
+        //
+        // 顺序是关键：这个 take 就是"一个会话同一时刻只能有一个 turn"的实现，
+        // 而消息一旦 send 进去就归正在跑的那个 Agent 消费了。先发后取的话，
+        // 第二个 run_turn 会把用户这句话塞进第一个 turn 的输入队列，然后自己
+        // 报错返回——调用方看到失败，消息却已经被别的 turn 吃掉了。
+        let mut event_rx = match event_rx_mutex.lock().await.take() {
+            Some(rx) => rx,
+            None => {
+                return RpcResponse::err_with_data(
+                    id,
+                    codes::SESSION_BUSY,
+                    "session is busy",
+                    serde_json::json!({
+                        "session_id": sid,
+                        "current_turn_id": busy_with,
+                    }),
+                );
+            }
+        };
+
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(live) = sessions.get_mut(&sid) {
+                live.current_turn = Some(turn_id.clone());
+            }
+        }
 
         // 发送用户消息
         let _ = input_tx.send(InputMessage::User {
@@ -1875,14 +1938,6 @@ impl SessionPool {
             attachments,
             turn_id: turn_id.clone(),
         });
-
-        // 取出 event_rx（独占 drain）
-        let mut event_rx = match event_rx_mutex.lock().await.take() {
-            Some(rx) => rx,
-            None => {
-                return RpcResponse::err(id, codes::INTERNAL_ERROR, "event channel busy");
-            }
-        };
 
         let mut api_calls = 0u32;
         let mut writer_broken = false;
@@ -2066,6 +2121,7 @@ impl SessionPool {
                 Some(AgentEvent::Error { code, message, .. }) => {
                     // 归还 event_rx
                     *event_rx_mutex.lock().await = Some(event_rx);
+                    self.clear_current_turn(&sid).await;
                     return RpcResponse::err(id, codes::ENGINE_ERROR, format!("{code}: {message}"));
                 }
                 _ => continue,
@@ -2082,6 +2138,7 @@ impl SessionPool {
         // are killed, rather than waiting up to 5 minutes for the janitor.
         if writer_broken {
             drop(event_rx);
+            self.clear_current_turn(&sid).await;
             self.shutdown_session(&sid).await;
             return RpcResponse::ok(
                 id,
@@ -2095,6 +2152,7 @@ impl SessionPool {
 
         // 归还 event_rx
         *event_rx_mutex.lock().await = Some(event_rx);
+        self.clear_current_turn(&sid).await;
 
         // ── 首轮自动命名 ──
         let mut session_name = None;
@@ -2824,6 +2882,8 @@ impl SessionPool {
                     "description": info.description,
                     "active": active.contains_key(&info.id),
                     "sessions": counts.get(&info.id).copied().unwrap_or(0),
+                    "requires_project": info.requires_project,
+                    "supports_team": info.supports_team,
                 })
             })
             .collect()
@@ -4065,6 +4125,7 @@ mod eviction_tests {
             last_active,
             is_first_turn: true,
             config_generation: 0,
+            current_turn: None,
         }
     }
 
