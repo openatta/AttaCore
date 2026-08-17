@@ -32,3 +32,26 @@
 `tests/fixtures/template_project/` 是给行为测试用的模板项目，
 有 `.atta/settings.json`（hooks + MCP）、`.agents/skills/`、`AGENTS.md`。
 用例跑之前会整个拷贝到临时目录，改动不会污染这份原件。
+
+## 磁盘
+
+一次干净构建 **~13 GB**，这不是浪费：每个集成测试文件都是一个独立二进制，静态链接
+整张依赖图（光 wasmtime + cranelift 的 rlib 就 507 MB），所以单个测试二进制约 190 MB，
+而这样的二进制有几十个。strip 只能省 18 MB——macOS 上调试信息本来就不在二进制里，
+那 190 MB 是实打实的机器码。
+
+**变成浪费的是 cargo 从不回收。** 被取代的那一套会原地留着，和活着的那套一样久。
+
+两条规矩：
+
+| 时机 | 做什么 |
+|---|---|
+| **改完 workspace 版本号** | `cargo clean` |
+| 每周 | `cargo sweep --time 7`（`cargo install cargo-sweep`） |
+
+第一条是硬性的：版本号一变，23 个 crate 的指纹全变，整套重编而旧的一份不会被删——
+这就是本仓库反复出现"几十 GB 突然爆掉"的直接原因。全量重建约 1 分 10 秒，比排查磁盘
+满便宜得多。
+
+`tests/scripts/disk_report.sh` 会报告当前占用、**7 天没被碰过的字节数**（即
+`cargo sweep` 能回收的量），以及每一种"多出一套产物"的成因。
