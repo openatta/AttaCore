@@ -302,5 +302,5 @@ daemon 不主动发心跳;长连接空闲期间靠 TCP keepalive 或客户端自
 
 - 字段级精确定义、错误码 `data` 形状、完整请求/响应示例:
   [`docs/daemon_rpc_protocol.md`](daemon_rpc_protocol.md)
-- 场景/项目/会话这套架构为什么这么设计:
-  `docs/design/2026-08-11-multi-scene-architecture.md`
+- 场景/会话的不变量(哪些状态必须一致、由谁保证):
+  [`docs/session_and_scene_invariants.md`](session_and_scene_invariants.md)

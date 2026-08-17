@@ -167,6 +167,17 @@ pub struct InstanceFile {
     pub pid: u32,
     pub pid_start_time: i64,
     pub socket: PathBuf,
+    /// The TCP listener's address, when one is bound (`--listen`).
+    ///
+    /// Published for the same reason as `socket`: a client that finds this
+    /// instance should not also have to be told, out of band, how to reach
+    /// it. Absent when the daemon serves only the Unix socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+    /// The WebSocket listener's address, when one is bound (`--listen-ws`).
+    /// A web front end reads this to know which port to connect to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<String>,
     pub scenes: Vec<String>,
     pub protocol_version: u32,
     pub started_at: String,
@@ -404,6 +415,8 @@ mod tests {
             pid,
             pid_start_time,
             socket: PathBuf::from(format!("/tmp/{instance}.sock")),
+            tcp: None,
+            ws: None,
             scenes: vec!["coding".to_string()],
             protocol_version: INSTANCE_PROTOCOL_VERSION,
             started_at: "2026-08-12T00:00:00Z".to_string(),
@@ -514,5 +527,24 @@ mod tests {
         assert!(!instances_dir.join("desktop.json").exists());
 
         remove_instance_file(&instances_dir, "desktop"); // must not panic
+    }
+
+    /// A reader finds the transports along with the instance. Omitted
+    /// entirely when unbound, so an older reader sees the same document it
+    /// always did rather than `"tcp": null`.
+    #[test]
+    fn network_transports_are_published_when_bound_and_absent_when_not() {
+        let quiet = instance_file("quiet", 1, 2);
+        let json = serde_json::to_string(&quiet).unwrap();
+        assert!(!json.contains("tcp"), "{json}");
+        assert!(!json.contains("\"ws\""), "{json}");
+
+        let mut serving = instance_file("serving", 1, 2);
+        serving.tcp = Some("127.0.0.1:7878".into());
+        serving.ws = Some("127.0.0.1:7879".into());
+        let round: InstanceFile =
+            serde_json::from_str(&serde_json::to_string(&serving).unwrap()).unwrap();
+        assert_eq!(round.tcp.as_deref(), Some("127.0.0.1:7878"));
+        assert_eq!(round.ws.as_deref(), Some("127.0.0.1:7879"));
     }
 }

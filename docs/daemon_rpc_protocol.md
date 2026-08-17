@@ -2,8 +2,9 @@
 
 **协议版本:2**
 
-架构设计与取舍依据见 `docs/design/2026-08-11-multi-scene-architecture.md`。
-本文是规范:字段、类型、语义、错误。
+本文是规范:字段、类型、语义、错误。写客户端从这里开始;
+上手用的叙述性介绍见 [`daemon_rpc_developer_guide.md`](daemon_rpc_developer_guide.md),
+场景与会话的不变量见 [`session_and_scene_invariants.md`](session_and_scene_invariants.md)。
 
 协议 1 已停止支持。v2 与 v1 不兼容,主要差异:场景与项目成为一等定位参数;
 `session.create` 是唯一会话创建入口;子 Agent 以侧链会话形式落盘;
@@ -64,10 +65,16 @@ read-modify-write 同一个索引文件而丢更新。读取方 `read_dir` 汇�
   "pid": 4210,
   "pid_start_time": 1754899200,
   "socket": "/Users/x/.atta/daemon/desktop.sock",
+  "tcp": "127.0.0.1:7878",              // 仅在 --listen 时出现
+  "ws": "127.0.0.1:7879",               // 仅在 --listen-ws 时出现
   "scenes": ["coding", "chat", "research"],
   "protocol_version": 2,
   "started_at": "2026-08-11T10:00:00Z" }
 ```
+
+`tcp` / `ws` 缺省表示该传输没有监听。发布它们的理由和发布 `socket` 一样:找得到这个
+实例的客户端,不应该还要靠别的渠道被告知怎么连它 —— 网页前端尤其需要知道 WebSocket
+在哪个端口。**token 不在这里**,它是凭据,不是地址。
 
 单文件写入仍用原子写(临时文件 + rename),保证读取方不会读到半截 JSON。
 
@@ -566,24 +573,28 @@ resume。
 #### `scene.describe`
 `{ "scene":"coding", "project_root":"…", "include_secrets":false }`
 
-返回该 `(场景, 项目)` 组合下的**完整有效配置**,并标注每个字段来自哪一层:
+返回该 `(场景, 项目)` 组合下这个场景**是什么**、以及在这里建会话会用上什么配置:
 
 ```jsonc
-{ "scene":"coding", "project_root":"/Users/x/repo-a",
+{ "scene":"coding", "name":"AttaCode Coding", "description":"…",
+  "project_root":"/Users/x/repo-a",        // 未给则为 null
+  "active":true,
   "capabilities": { "requires_project":true, "supports_team":true },
-  "generation": { "global":3, "scene":7, "project":1 },
-  "settings": { /* 完整合并结果 */ },
-  "sources": { "model.model_name":"scene",
-               "execution.max_api_calls_per_turn":"project",
-               "permission_mode":"global" },
-  "tools": { "allowed":[…], "disallowed":[…], "deferred":[…] },
-  "skills": [ { "name":"…", "source":"project" } ],
-  "agent_types": [ { "name":"Explore", "source":"builtin" } ],
-  "mcp_servers": [ { "name":"…", "connected":true, "tools":12 } ] }
+  "tools": { "allowed":null,               // null = 不设白名单,即全部已注册工具
+             "disallowed":[…], "deferred":[…] },
+  "settings": { /* 三层合并后的完整结果 */ } }
 ```
 
-`include_secrets` 默认 `false`:`auth_token` / `api_key` 一类字段脱敏为
-`"sk-…abcd"`(保留末 4 位)。设为 `true` 才返回原值 —— 与 `config.getProvider` 同一门控。
+`tools.allowed` 为 `null` 而不是 `[]`,是因为空白名单的含义是"不限制",`[]` 会被读成
+"一个工具都不给"——正好相反。
+
+**不返回 `sources` 溯源表。** 设置是逐层 merge 的,merge 之后不保留每个字段来自哪层;
+要给出这张表得把三层重新读一遍再逐字段比对,那是一个功能而不是一个字段。需要看某一层
+原样内容的用 `config.get` 的 `tier` 参数。
+
+`include_secrets` 默认 `false`:`api_key` / `auth_token` / `token` / `secret` /
+`password` 这些键名的值一律脱敏为末 4 位(任意嵌套深度)。设为 `true` 才返回原值 ——
+与 `config.getProvider` 同一门控。
 
 ---
 
@@ -776,101 +787,24 @@ Meta.session_kind == "sidechain"
 
 ---
 
-### 6.4 `agent.*`
-
-子 Agent 有两个把手:`agent_id`(运行期,进程内有效)与 `session_id`(其侧链会话,
-持久)。进程重启后 `AgentRef` 消失,但侧链会话还在 —— 用 `session.history` 读内容。
-
-#### `agent.list`
-`{ "session_id":"…", "state":"running|all" }`
-
-```jsonc
-{ "agents": [
-    { "agent_id":"ag_7f3c…",
-      "session_id":"…",                    // 侧链会话 id,持久
-      "parent_session_id":"…", "scene":"coding",
-      "kind":"subagent",                   // subagent | background | team_member
-      "label":"Explore#7f3c1a2b", "agent_type":"Explore",
-      "state":"running",                   // spawned|running|blocked|completed|failed|cancelled
-      "started_at":"…", "ended_at":null,
-      "turn_ref": { "turn_id":"t-1", "tool_use_id":"toolu_…" },
-      "summary": null } ] }
-```
-
-#### `agent.get`
-`{ "agent_id":"…" }` → 单条上述结构。不存在或已清除 → `AGENT_NOT_FOUND`
-(此时若知道 `session_id`,内容仍可从 `session.history` 读到)。
-
-#### `agent.output`
-`{ "agent_id":"…" }` → `{ "agent_id":"…", "state":"completed", "output":"…" }`
-
-宿主侧取回输出,与模型侧的 `TaskOutput` 工具等价。读的是 `AgentRef.summary`
-(内存),**不依赖侧链 transcript** —— 所以它的可用期与 `AgentRef` 一致,
-不受侧链清理影响。
-
-#### `agent.stop`
-`{ "agent_id":"…" }` → `{ "stopped":true }`
-
-#### `agent.send`
-`{ "agent_id":"…", "message":"…" }`
-
-向 `background` / `team_member` 形态发消息。对一次性 `subagent` 返回
-`INVALID_PARAMS`(它只接受创建时的那一个 prompt)。
-
----
-
-### 6.5 `team.*`
-
-Team 只在 `supports_team == true` 的场景可用(`coding` / `research`)。这些场景同时
-也是 `requires_project == true` 的,所以团队一定有项目锚点 —— 不需要额外的运行时
-检查。`supports_team == false` 的场景根本不注册 Team 工具,模型看不到它们;
-宿主侧对这些场景调 `team.*` 返回 `SCENE_CAPABILITY_MISSING`。
-
-#### `team.list`
-`{ "project_root":"…", "scene":"coding", "session_id":"…" }` — 三个过滤器都可选。
-
-```jsonc
-{ "teams": [
-    { "team_id":"team-refactor-1754899200", "name":"refactor",
-      "scene":"coding", "project_root":"…",
-      "owner_session_id":"…", "mode":"batch",
-      "status":"completed", "current_stage":2,
-      "created_at":"…", "updated_at":"…",
-      "members": [ { "label":"a", "lifecycle":"completed",
-                     "agent_id":null, "session_id":"…" } ] } ] }
-```
-
-`status` 取 `running | completed | failed | cancelled | interrupted`。
-`interrupted` = daemon 重启时该团队仍标记 running 但已无活跃成员。
-
-#### `team.get`
-`{ "team_id":"…" }` → `team.json` 与 `state.json` 的合并视图,含完整 stage 声明。
-
-#### `team.events`
-`{ "team_id":"…", "since":0, "limit":500 }` → `events.jsonl` 分页读取。
-
-#### `team.scratchpad`
-`{ "team_id":"…", "stage":1 }` — `stage` 省略返回 `SCRATCHPAD.md` 索引,给定则返回
-`stages/NN-<name>.md`。
-
-#### `team.delete`
-`{ "team_id":"…" }`
-
-停止仍存活的持久成员 → 删除 `<project>/.atta/teams/<team_id>/` → 移出索引。
-团队不存在 → `TEAM_NOT_FOUND`(不静默成功)。
-
-成员的侧链会话**不随团队删除** —— 它们归属发起会话,随该会话的 `session.delete`
-级联删除。
-
----
-
-### 6.6 `config.*`
+### 6.4 `config.*`
 
 #### `config.get`
-`{ "scene":"coding", "project_root":"…", "tier":"effective" }`
+`{ "scene":"coding", "project_root":"…", "tier":"effective", "include_secrets":false }`
 
-`tier` 取 `global | scene | project | effective`。`effective` 返回合并结果并附
-`sources` 溯源表;其余返回该层原始内容。
+`tier` 取 `global | scene | project | effective`,默认 `effective`。
+
+```jsonc
+{ "scene":"coding", "project_root":"…", "tier":"scene",
+  "settings": { /* 该层 settings.json 原样内容;effective 则是合并结果 */ } }
+```
+
+**该层没有文件时 `settings` 是 `null`,不是 `{}`** —— "这层没配"和"这层配了个空的"
+是两种状态,配置界面得能区分。`tier: "project"` 而没给 `project_root` 同理返回 `null`。
+
+未知 `tier` 返回 `INVALID_PARAMS`。脱敏规则同 `scene.describe`。
+
+同样**不返回 `sources` 溯源表**,理由见 `scene.describe`。
 
 #### `config.reload`
 
@@ -913,17 +847,58 @@ all     → 全部失效
 
 ---
 
-### 6.7 其余命名空间
+### 6.5 `mcp.*` / `plugin.*` / `import.*` / `commands.*`
 
-以下方法全部接受可选 `scene` / `project_root` 定位参数:
+以下方法全部接受可选 `scene` / `project_root` 定位参数。
 
-| 方法 | 说明 |
-|---|---|
-| `mcp.status` | 该 (场景,项目) 组合下 MCP 服务器的连接状态与工具数 |
-| `mcp.addServer` | 写入指定层 settings 并连接 |
-| `plugin.list` / `install` / `uninstall` / `enable` / `disable` | 插件管理 |
-| `commands.list` | 可用斜杠命令(skill 派生 + 内置 + 插件 + MCP prompt) |
-| `import.list` / `import.run` | 从 Claude Code / Codex / Cursor 导入配置 |
+#### `mcp.status`
+无参 → `{ "servers": [ { "name":"…", "connected":true, "tools":12, … } ] }`
+
+该 (场景, 项目) 组合下 MCP 服务器的连接状态与工具数。
+
+#### `mcp.addServer`
+`{ "name":"…", "config": { "type":"stdio", "command":"…", … } }`
+
+`config` 是一个 `McpServerConfig`,按 `type` 标签联合(`stdio` / `sse` / `http`)。
+写入指定层 settings 并立即连接。
+
+#### `plugin.list`
+无参 → `{ "plugins": [ { "name":"…", "version":"…", "enabled":true, … } ] }`
+
+列出磁盘上的全部插件及其启用状态。
+
+#### `plugin.install`
+`{ "name":"…", "version":"…", "archive":"/abs/path.zip", "sha256":"…", "scope":"user" }`
+
+校验校验和 → 解包 → **安装时就把 WASM 组件编译成 AOT 产物**;编译失败会把这次安装
+回滚掉并报错,而不是留一个每次加载都要重编的插件。
+
+#### `plugin.uninstall`
+`{ "name":"…", "version":"…" }` → 删除该版本(连同它的 `.aot/` 产物)。
+
+#### `plugin.enable` / `plugin.disable`
+`{ "name":"…", "scope":"user|project" }` → `{ "name":"…", "enabled":true, "scope":"user" }`
+
+启用状态按层记录,不改动已安装的文件。
+
+> 插件子系统可以在编译期整个裁掉。裁掉的构建里,上面五个方法一律返回
+> `PLUGINS_DISABLED (-32016)` —— 不是"未知方法",因为方法是存在的,只是这个构建
+> 不提供它。
+
+#### `commands.list`
+无参 → `{ "commands": [ { "name":"…", "source":"skill|builtin|plugin|mcp", … } ] }`
+
+可用斜杠命令:skill 派生 + 内置 + 插件 + MCP prompt。
+
+#### `import.list`
+无参 → `{ "sources": [ { "source":"claude-code", "description":"…" } ] }`
+
+探测这台机器上可导入的外部配置来源。
+
+#### `import.run`
+`{ "source":"claude-code", "dry_run":false }` → 导入结果摘要。
+
+从 Claude Code / Codex / Cursor 导入配置。
 
 ---
 
@@ -975,6 +950,24 @@ all     → 全部失效
 
 ---
 
+## 8.5 尚未实现的设计
+
+以下命名空间在早期设计里定稿过接口形状,但**当前代码没有对应的 dispatch 分支**,
+调用它们会返回 `METHOD_NOT_FOUND`。列在这里是为了记录设计意图,不是承诺:
+
+| 命名空间 | 打算做什么 | 现状 |
+|---|---|---|
+| `agent.*` | 列举/查询/停止/发消息给运行中的子 Agent(`agent.list`/`get`/`output`/`stop`/`send`) | 引擎里有子 Agent,但没有 RPC 出口。子 Agent 的内容可以通过它的侧链会话 `session.history` 读到 |
+| `team.*` | 团队的列举/查询/事件流/scratchpad/删除(`team.list`/`get`/`events`/`scratchpad`/`delete`) | `crates/team` 有引擎能力,模型能通过 `TeamCreate` 等工具用;没有 RPC 出口 |
+
+真要做的时候按当时的设计重写接口,不要照抄这里 —— 这段文字比代码老。
+
+`docs/daemon_rpc_protocol.md` 与 dispatch 表由
+`daemon/tests/protocol_doc_matches_dispatch.rs` 保证不漂移:§6 里出现的方法必须可
+调用,可调用的方法必须在 §6 里。这一节不在 §6 内,所以不参与那个检查。
+
+---
+
 ## 9. 错误码
 
 | 码 | 名称 | 含义 |
@@ -989,24 +982,23 @@ all     → 全部失效
 | -32002 | ENGINE_ERROR | turn 执行期错误,`data` 带引擎错误码 |
 | -32003 | UNAUTHORIZED | TCP 握手缺失/失败 |
 | -32004 | SCENE_NOT_FOUND | 场景未注册,或未激活 |
-| -32005 | SCENE_REQUIRED | 需要 `scene` 但未提供且无法推断 |
 | -32006 | SCENE_MISMATCH | resume/fork 的场景与 transcript 记录不符 |
-| -32007 | AGENT_NOT_FOUND | `agent_id` 不存在或已清除 |
-| -32008 | TEAM_NOT_FOUND | `team_id` 不存在 |
 | -32009 | SCENE_HAS_ACTIVE_SESSIONS | `scene.deactivate` 被活跃会话阻止 |
 | -32010 | PROJECT_NOT_FOUND | `project_root` 不存在或不可读 |
-| -32011 | TEAM_DIR_LOCKED | 团队目录被另一 daemon 实例持有 ⚠️ |
-| -32012 | PROJECT_REQUIRED | 场景 `requires_project` 为真,但未给 `project_root` ⚠️ |
-| -32013 | SCENE_CAPABILITY_MISSING | 场景不具备该能力(如对 `chat` 调 `team.*`) ⚠️ |
+| -32012 | PROJECT_REQUIRED | 场景 `requires_project` 为真,但未给 `project_root` |
 | -32014 | SIDECHAIN_TERMINAL | 侧链会话已终态收尾,不可 resume |
-| -32015 | SESSION_BUSY | 该会话已有 turn 在跑(§5.3) ⚠️ |
+| -32015 | SESSION_BUSY | 该会话已有 turn 在跑(§5.3) |
 | -32016 | PLUGINS_DISABLED | 插件子系统不可用——被编译裁掉或被策略关闭 |
 
-⚠️ **标记的四个码当前没有任何代码发出**——`daemon::rpc::codes` 里没有对应常量。
-客户端不应等待它们；对着它们做分支等于写死代码。
+上表里的每一个码在 `daemon/src/rpc.rs` 里都有对应常量,由
+`daemon/tests/protocol_doc_matches_dispatch.rs` 保证 —— 一个没人发出的错误码，客户端
+对着它做分支等于写死代码。
 
-号段保留而不是删除,是因为删掉之后下一个人会重用这些数字,而一旦其中某个
-真的被实现,老客户端就会把新语义读成旧语义。保留 + 标注比两者都安全。
+**保留号段**:`-32005`(SCENE_REQUIRED)、`-32007`(AGENT_NOT_FOUND)、
+`-32008`(TEAM_NOT_FOUND)、`-32011`(TEAM_DIR_LOCKED)、
+`-32013`(SCENE_CAPABILITY_MISSING)曾经出现在这张表里,对应 §8.5 那些没有实现的
+命名空间,现已移出。这五个数字不要重用 —— 一旦其中某个真被实现,重用会让老客户端把
+新语义读成旧语义。
 
 ### 9.1 `error.data` 的形状
 

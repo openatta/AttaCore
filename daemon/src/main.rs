@@ -360,6 +360,8 @@ async fn main() -> anyhow::Result<()> {
         pid: identity.pid,
         pid_start_time: identity.started_at,
         socket: socket.clone(),
+        tcp: daemon_config.tcp_addr.map(|a| a.to_string()),
+        ws: daemon_config.ws_addr.map(|a| a.to_string()),
         scenes: instance_scenes,
         protocol_version: daemon::discovery::INSTANCE_PROTOCOL_VERSION,
         started_at: rfc3339_now(),
