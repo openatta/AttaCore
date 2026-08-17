@@ -528,3 +528,89 @@ async fn a_prompt_is_answered_on_the_same_connection_on_every_transport() {
 
     h.stop().await;
 }
+
+/// Dropping the connection mid-turn cancels the turn.
+///
+/// A turn with nobody listening is burning tokens for no one, so the daemon
+/// cancels the session rather than letting it run to completion — the
+/// behavior is in `session_pool.rs` and had no end-to-end coverage.
+#[tokio::test]
+async fn dropping_the_connection_mid_turn_cancels_the_turn() {
+    let h = Harness::dripping(
+        &["one ", "two ", "three ", "four ", "five"],
+        Duration::from_millis(150),
+    )
+    .await;
+
+    let session_id = {
+        let mut client = DaemonRpcClient::connect(&h.sock).await.unwrap();
+        let mut stream = client.begin_turn(None, "go", "t1", None).await.unwrap();
+
+        // Read one frame so the turn is definitely running, then drop.
+        let item = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("a frame within 500ms")
+            .unwrap()
+            .expect("a frame, not end of stream");
+        assert!(matches!(item, TurnItem::Event(_)));
+        stream
+            .session_id()
+            .expect("the frame names its session")
+            .to_string()
+    };
+
+    // Promptly, not eventually. The turn runs for ~750ms (5 chunks 150ms
+    // apart), so a daemon that ignored the disconnect and simply let the
+    // turn finish would also end up idle — just later. Checking inside
+    // 300ms is what distinguishes "cancelled because nobody is listening"
+    // from "ran to completion anyway".
+    let mut observer = DaemonRpcClient::connect(&h.sock).await.unwrap();
+    let mut still_running = true;
+    for _ in 0..6 {
+        let resp = observer
+            .call(
+                "session.get",
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await
+            .unwrap();
+        let running = resp
+            .result
+            .as_ref()
+            .map(|r| r["turn_state"] == "running")
+            .unwrap_or(false);
+        if !running {
+            still_running = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !still_running,
+        "the turn was still running 300ms after its client disconnected — it is being \
+         left to finish for nobody rather than cancelled"
+    );
+
+    h.stop().await;
+}
+
+/// `daemon.shutdown` stops the daemon, and says so before it goes.
+#[tokio::test]
+async fn shutdown_answers_before_it_stops_serving() {
+    let h = Harness::dripping(&["x"], Duration::ZERO).await;
+
+    let mut client = DaemonRpcClient::connect(&h.sock).await.unwrap();
+    let resp = client.daemon_shutdown().await.unwrap();
+    assert_eq!(
+        resp.result.as_ref().map(|r| r["shutting_down"].clone()),
+        Some(serde_json::json!(true)),
+        "shutdown must answer the caller before it tears the listeners down: {resp:?}"
+    );
+
+    // And it really did shut down: the accept loops end on their own.
+    for t in h.tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(5), t)
+            .await
+            .expect("listeners should stop after daemon.shutdown");
+    }
+}
