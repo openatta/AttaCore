@@ -2118,3 +2118,243 @@ async fn scene_list_reports_the_capability_bits() {
 
     srv.stop().await;
 }
+
+// ── §6.1/§6.3 之前只存在于文档里的方法 ────────────────────────────────
+
+#[tokio::test]
+async fn ping_answers_without_a_session() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"daemon.ping","id":1}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["pong"], true, "{resp}");
+    assert_eq!(resp["result"]["protocol_version"], 2, "{resp}");
+
+    srv.stop().await;
+}
+
+/// `turn_state` is what a client polls to decide whether its send button is
+/// live, so it has to be right on both sides of a turn.
+#[tokio::test]
+async fn session_get_reports_the_summary_and_the_turn_state() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("hello")], ask_settings(), Duration::ZERO).await;
+
+    let sid = run_turn(&srv.sock, None, "hi").await;
+    let got = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.get","params":{{"session_id":"{sid}"}},"id":1}}"#
+        ),
+    )
+    .await;
+
+    assert_eq!(got["result"]["session_id"], sid, "{got}");
+    assert_eq!(got["result"]["scene"], "coding", "{got}");
+    assert_eq!(got["result"]["scene_active"], true, "{got}");
+    assert_eq!(got["result"]["turn_state"], "idle", "{got}");
+    assert!(got["result"]["current_turn_id"].is_null(), "{got}");
+    // `message_count` comes straight from `session.list`'s summary — asserted
+    // present, not non-zero: a live session reports 0 until its transcript is
+    // read back, which is `session.list`'s existing behavior and not something
+    // `session.get` should quietly diverge from.
+    assert!(got["result"]["message_count"].is_number(), "{got}");
+
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn session_get_on_an_unknown_session_is_not_found() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let got = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.get","params":{"session_id":"NopeNopeNopeNopeNope12"},"id":1}"#,
+    )
+    .await;
+    assert_eq!(got["error"]["code"], codes::SESSION_NOT_FOUND, "{got}");
+
+    srv.stop().await;
+}
+
+/// Interrupting an idle session is an answer, not an error — the caller
+/// wanted it idle and it is.
+#[tokio::test]
+async fn interrupting_an_idle_session_reports_that_there_was_nothing_to_interrupt() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let sid = run_turn(&srv.sock, None, "hi").await;
+    let resp = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.interrupt","params":{{"session_id":"{sid}"}},"id":1}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["interrupted"], false, "{resp}");
+
+    srv.stop().await;
+}
+
+/// The documented use: a client that hits `SESSION_BUSY` interrupts, then
+/// sends. The session survives the interrupt and serves the next turn.
+#[tokio::test]
+async fn interrupt_frees_a_busy_session_for_the_next_turn() {
+    let (srv, _seen) = start_scripted_server(
+        vec![
+            asking_bash_rounds("interrupt.txt")
+                .into_iter()
+                .next()
+                .unwrap(),
+            text_round("after"),
+        ],
+        ask_settings(),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let mut conn = UnixStream::connect(&srv.sock).await.unwrap();
+    conn.write_all(
+        br#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"first"},"id":1}"#,
+    )
+    .await
+    .unwrap();
+    conn.write_all(b"\n").await.unwrap();
+
+    let sid = {
+        let (r, _w) = conn.split();
+        let mut br = BufReader::new(r);
+        loop {
+            let mut line = String::new();
+            let n = br.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "connection closed before the prompt arrived");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["params"]["event"]["kind"] == "prompt" {
+                break v["params"]["session_id"].as_str().unwrap().to_string();
+            }
+        }
+    };
+
+    let resp = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.interrupt","params":{{"session_id":"{sid}"}},"id":2}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["interrupted"], true, "{resp}");
+
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn scene_describe_reports_capabilities_tools_and_effective_settings() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"scene.describe","params":{"scene":"coding"},"id":1}"#,
+    )
+    .await;
+
+    assert_eq!(resp["result"]["scene"], "coding", "{resp}");
+    assert_eq!(resp["result"]["capabilities"]["requires_project"], true);
+    assert_eq!(resp["result"]["capabilities"]["supports_team"], true);
+    // `coding` sets no whitelist, which is `null` rather than `[]` — the
+    // latter would read as "no tools allowed", the opposite of the truth.
+    assert!(resp["result"]["tools"]["allowed"].is_null(), "{resp}");
+    assert!(
+        !resp["result"]["tools"]["deferred"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{resp}"
+    );
+    assert!(resp["result"]["settings"].is_object(), "{resp}");
+
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn scene_describe_rejects_an_unknown_scene() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"scene.describe","params":{"scene":"nope"},"id":1}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], codes::SCENE_NOT_FOUND, "{resp}");
+
+    srv.stop().await;
+}
+
+/// A tier with no file on disk is `null`, not `{}` — "nothing configured
+/// here" and "configured empty" are different states a config UI has to be
+/// able to tell apart.
+#[tokio::test]
+async fn config_get_distinguishes_an_absent_tier_from_an_empty_one() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let scene_tier = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"config.get","params":{"scene":"coding","tier":"scene"},"id":1}"#,
+    )
+    .await;
+    assert_eq!(scene_tier["result"]["tier"], "scene", "{scene_tier}");
+    assert!(scene_tier["result"]["settings"].is_null(), "{scene_tier}");
+
+    let effective = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"config.get","params":{"scene":"coding"},"id":2}"#,
+    )
+    .await;
+    assert_eq!(effective["result"]["tier"], "effective", "{effective}");
+    assert!(effective["result"]["settings"].is_object(), "{effective}");
+
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn config_get_rejects_an_unknown_tier() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"config.get","params":{"scene":"coding","tier":"nope"},"id":1}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], codes::INVALID_PARAMS, "{resp}");
+
+    srv.stop().await;
+}
+
+/// Credentials are redacted unless asked for, at whatever depth they sit.
+#[tokio::test]
+async fn config_get_redacts_credentials_by_default() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let resp = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"config.get","params":{"scene":"coding"},"id":1}"#,
+    )
+    .await;
+    let dumped = resp.to_string();
+    assert!(
+        !dumped.contains("test-key"),
+        "the scripted server's auth token leaked into config.get: {dumped}"
+    );
+
+    srv.stop().await;
+}

@@ -1789,6 +1789,44 @@ impl SessionPool {
         Ok(session_id)
     }
 
+    /// The turn currently running on `session_id`, if any. `session.get`
+    /// reports it as `turn_state`; a missing or unknown session reads as idle,
+    /// same as one sitting between turns.
+    pub async fn current_turn_of(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|live| live.current_turn.clone())
+    }
+
+    /// Cancel the in-flight turn, keeping the session.
+    ///
+    /// `EngineCommand::CancelTurn` cancels the turn's own child token, not
+    /// the session's — the agent loop keeps running and the next `run_turn`
+    /// is served normally. Returns whether there was a turn to interrupt;
+    /// there being none is an answer, not an error.
+    pub async fn interrupt_session(&self, session_id: &str) -> Result<bool, RpcError> {
+        let (input_tx, running) = {
+            let sessions = self.sessions.lock().await;
+            let Some(live) = sessions.get(session_id) else {
+                return Err((
+                    codes::SESSION_NOT_FOUND,
+                    format!("session not found: {session_id}"),
+                ));
+            };
+            (live.input_tx.clone(), live.current_turn.is_some())
+        };
+        if !running {
+            return Ok(false);
+        }
+        let _ = input_tx.send(InputMessage::System {
+            kind: runtime::agent::EngineCommand::CancelTurn,
+            content: String::new(),
+        });
+        Ok(true)
+    }
+
     /// Mark the session idle again. Called on every path that gives
     /// `event_rx` back, because "busy" is exactly "someone holds the channel".
     async fn clear_current_turn(&self, sid: &str) {
@@ -2223,6 +2261,166 @@ impl SessionPool {
                 .iter()
                 .any(|env| matches!(env.entry, history::entry::LogEntry::SessionEnd { .. }));
         (session_kind, parent_session_id, !has_terminal_marker)
+    }
+
+    /// `scene.describe {scene, project_root, include_secrets}` — what this
+    /// scene is and what a session in it would run with.
+    ///
+    /// Reports what the daemon can actually answer: the scene's capability
+    /// bits, its tool surface, and the settings a session created here would
+    /// resolve to. It deliberately does **not** report which tier each field
+    /// came from — settings are merged tier by tier and the provenance is not
+    /// retained, so a `sources` map would have to be reconstructed by
+    /// re-reading and re-merging every tier. That is a feature, not a field.
+    pub async fn describe_scene(
+        &self,
+        scene_id: &str,
+        project_root: Option<&Path>,
+        include_secrets: bool,
+    ) -> Result<serde_json::Value, RpcError> {
+        let Some(scene) = self.scene_registry().resolve(scene_id) else {
+            return Err((codes::SCENE_NOT_FOUND, format!("unknown scene: {scene_id}")));
+        };
+        let settings = self.settings_for_project(project_root, scene_id).await;
+        let mut settings_json =
+            serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({}));
+        if !include_secrets {
+            redact_settings_secrets(&mut settings_json);
+        }
+
+        Ok(serde_json::json!({
+            "scene": scene.id(),
+            "name": scene.name(),
+            "description": scene.description(),
+            "project_root": project_root.map(|p| p.display().to_string()),
+            "active": self.active_scenes.read().await.contains_key(scene_id),
+            "capabilities": {
+                "requires_project": scene.requires_project(),
+                "supports_team": scene.supports_team(),
+            },
+            "tools": {
+                // `AgentScene::tools()` is a whitelist, and empty means "no
+                // whitelist — every registered tool". Reporting that as `[]`
+                // would read to a client as "no tools at all", the opposite;
+                // `null` says there is no restriction.
+                "allowed": if scene.tools().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(scene.tools())
+                },
+                "disallowed": scene.disallowed_tools(),
+                "deferred": scene.deferred_tools(),
+            },
+            "settings": settings_json,
+        }))
+    }
+
+    /// `config.get {scene, project_root, tier}` — one settings tier as it
+    /// sits on disk, or `effective` for the merged result.
+    ///
+    /// A tier that has no file reads as `null`, which is the honest answer:
+    /// "nothing at this layer" and "an empty object here" are different
+    /// states and a client showing the config should be able to tell them
+    /// apart.
+    pub async fn config_tier(
+        &self,
+        scene_id: &str,
+        project_root: Option<&Path>,
+        tier: &str,
+        include_secrets: bool,
+    ) -> Result<serde_json::Value, RpcError> {
+        if self.scene_registry().resolve(scene_id).is_none() {
+            return Err((codes::SCENE_NOT_FOUND, format!("unknown scene: {scene_id}")));
+        }
+
+        let paths = self.paths.as_ref();
+        let path = match tier {
+            "global" => Some(paths.global_root().join("settings.json")),
+            "scene" => Some(
+                paths
+                    .global_root()
+                    .join("scenes")
+                    .join(scene_id)
+                    .join("settings.json"),
+            ),
+            "project" => project_root.map(|p| p.join(".atta").join("settings.json")),
+            "effective" => None,
+            other => {
+                return Err((
+                    codes::INVALID_PARAMS,
+                    format!("tier must be global|scene|project|effective, got `{other}`"),
+                ))
+            }
+        };
+
+        let mut value = match tier {
+            "effective" => {
+                let settings = self.settings_for_project(project_root, scene_id).await;
+                serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({}))
+            }
+            _ => match path {
+                Some(p) => std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or(serde_json::Value::Null),
+                // `project` with no project: there is no such tier to read.
+                None => serde_json::Value::Null,
+            },
+        };
+        if !include_secrets {
+            redact_settings_secrets(&mut value);
+        }
+
+        Ok(serde_json::json!({
+            "scene": scene_id,
+            "project_root": project_root.map(|p| p.display().to_string()),
+            "tier": tier,
+            "settings": value,
+        }))
+    }
+
+    /// One session's summary plus what only the live pool knows.
+    ///
+    /// Built from `list_all` rather than a second, parallel assembly: a
+    /// `session.get` that disagreed with the `session.list` entry for the
+    /// same session would be worse than not having it.
+    pub async fn session_detail(&self, session_id: &str) -> Result<serde_json::Value, RpcError> {
+        let info = self
+            .list_all(true, None)
+            .await
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+            .ok_or_else(|| {
+                (
+                    codes::SESSION_NOT_FOUND,
+                    format!("session not found: {session_id}"),
+                )
+            })?;
+
+        let (_, scene) = self.session_kind_and_scene(session_id).await;
+        let scene_active = match &scene {
+            Some(id) => self.active_scenes.read().await.contains_key(id),
+            None => false,
+        };
+        let current_turn = self.current_turn_of(session_id).await;
+
+        let mut detail = serde_json::to_value(&info).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = detail.as_object_mut() {
+            obj.insert("scene".into(), serde_json::json!(scene));
+            obj.insert("scene_active".into(), serde_json::json!(scene_active));
+            // `turn_state` is the pair a client actually acts on: whether to
+            // enable its send button, and which turn to interrupt if not.
+            obj.insert(
+                "turn_state".into(),
+                serde_json::json!(if current_turn.is_some() {
+                    "running"
+                } else {
+                    "idle"
+                }),
+            );
+            obj.insert("current_turn_id".into(), serde_json::json!(current_turn));
+        }
+        Ok(detail)
     }
 
     /// 列出所有 session（活跃的 + 磁盘上历史的），合并去重。
@@ -3828,6 +4026,36 @@ fn resolve_session_permission(
 /// `char`, not byte, so this never panics on non-ASCII input); too-short
 /// secrets (≤4 chars) redact to a bare `***` rather than revealing the
 /// whole thing.
+/// Redact every credential-shaped field in a settings blob.
+///
+/// Walks by key name rather than by type, because the same secrets appear at
+/// several depths (`providers.<id>.api_key`, `model.auth_token`) and a
+/// settings shape that grows a new provider field should not silently start
+/// returning it in the clear.
+fn redact_settings_secrets(value: &mut serde_json::Value) {
+    const SECRET_KEYS: &[&str] = &["api_key", "auth_token", "token", "secret", "password"];
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                match v {
+                    serde_json::Value::String(s) if SECRET_KEYS.contains(&k.as_str()) => {
+                        if !s.is_empty() {
+                            *v = serde_json::Value::String(redact_secret(s));
+                        }
+                    }
+                    other => redact_settings_secrets(other),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_settings_secrets(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn redact_secret(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= 4 {

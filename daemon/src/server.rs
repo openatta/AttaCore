@@ -399,6 +399,13 @@ impl DaemonServer {
                     }),
                 )
             }
+            "daemon.ping" => RpcResponse::ok(
+                id,
+                serde_json::json!({
+                    "pong": true,
+                    "protocol_version": crate::discovery::INSTANCE_PROTOCOL_VERSION,
+                }),
+            ),
             "daemon.doctor" => RpcResponse::ok(id, self.pool.doctor_report().await),
             "daemon.subscribeEvents" => self.method_daemon_subscribe_events(id, sink).await,
             "config.setProvider" => self.method_config_set_provider(id, req.params).await,
@@ -412,6 +419,7 @@ impl DaemonServer {
             // already-running sessions recreate themselves lazily on their
             // next turn — see `SessionPool::run_turn`).
             "config.reload" => RpcResponse::ok(id, self.pool.reload_settings().await),
+            "config.get" => self.method_config_get(id, req.params).await,
             "mcp.status" => RpcResponse::ok(
                 id,
                 serde_json::json!({"servers": self.pool.mcp_status().await}),
@@ -503,6 +511,8 @@ impl DaemonServer {
             "session.respondToPrompt" => {
                 self.method_session_respond_to_prompt(id, req.params).await
             }
+            "session.get" => self.method_session_get(id, req.params).await,
+            "session.interrupt" => self.method_session_interrupt(id, req.params).await,
             "session.history" => self.method_session_history(id, req.params).await,
             "session.fork" => self.method_session_fork(id, req.params).await,
             "session.resume" => self.method_session_resume(id, req.params).await,
@@ -510,6 +520,7 @@ impl DaemonServer {
                 id,
                 serde_json::json!({"scenes": self.pool.list_scenes().await}),
             ),
+            "scene.describe" => self.method_scene_describe(id, req.params).await,
             "scene.activate" => {
                 let scene_id = match req.params.get("scene").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
@@ -584,6 +595,78 @@ impl DaemonServer {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         RpcResponse::ok(id, self.pool.get_providers(include_secrets).await)
+    }
+
+    /// Shared by `scene.describe` and `config.get`: the `(scene,
+    /// project_root, include_secrets)` triple they both key on.
+    ///
+    /// `project_root` absent and `project_root: null` mean the same thing
+    /// here — describe the scene with no project — because unlike
+    /// `session.create` there is no session to bind and so no difference
+    /// between "unspecified" and "explicitly none".
+    fn describe_target(
+        &self,
+        params: &serde_json::Value,
+    ) -> (Option<String>, Option<std::path::PathBuf>, bool) {
+        let scene = params
+            .get("scene")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let project_root = params
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from);
+        let include_secrets = params
+            .get("include_secrets")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        (scene, project_root, include_secrets)
+    }
+
+    /// `scene.describe` params:
+    /// `{"scene": "coding", "project_root": "...", "include_secrets": false}`
+    async fn method_scene_describe(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let (scene, project_root, include_secrets) = self.describe_target(&params);
+        let Some(scene) = scene else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing scene");
+        };
+        match self
+            .pool
+            .describe_scene(&scene, project_root.as_deref(), include_secrets)
+            .await
+        {
+            Ok(v) => RpcResponse::ok(id, v),
+            Err((code, message)) => RpcResponse::err(id, code, message),
+        }
+    }
+
+    /// `config.get` params:
+    /// `{"scene": "coding", "project_root": "...", "tier": "effective"}`
+    async fn method_config_get(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let (scene, project_root, include_secrets) = self.describe_target(&params);
+        let Some(scene) = scene else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing scene");
+        };
+        let tier = params
+            .get("tier")
+            .and_then(|v| v.as_str())
+            .unwrap_or("effective");
+        match self
+            .pool
+            .config_tier(&scene, project_root.as_deref(), tier, include_secrets)
+            .await
+        {
+            Ok(v) => RpcResponse::ok(id, v),
+            Err((code, message)) => RpcResponse::err(id, code, message),
+        }
     }
 
     /// `mcp.addServer` params: `{"name": "...", "config": {"type": "stdio", ...}}`
@@ -944,6 +1027,50 @@ impl DaemonServer {
             .await
         {
             Ok(result) => RpcResponse::ok(id, result),
+            Err((code, message)) => RpcResponse::err(id, code, message),
+        }
+    }
+
+    /// `session.get` params: `{"session_id": "..."}`.
+    ///
+    /// The same summary `session.list` reports for this one session, plus
+    /// `turn_state` — which only the live pool knows, and which a client
+    /// needs to decide whether its send button should be enabled.
+    async fn method_session_get(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
+        };
+        match self.pool.session_detail(session_id).await {
+            Ok(detail) => RpcResponse::ok(id, detail),
+            Err((code, message)) => RpcResponse::err(id, code, message),
+        }
+    }
+
+    /// `session.interrupt` params: `{"session_id": "..."}`.
+    ///
+    /// Cancels the in-flight turn and keeps the session. No turn running is
+    /// `{"interrupted": false}`, not an error: the caller wanted the session
+    /// idle and it is.
+    async fn method_session_interrupt(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
+        };
+        if let Some(err) = self.scene_mismatch_response(&id, session_id).await {
+            return err;
+        }
+        match self.pool.interrupt_session(session_id).await {
+            Ok(interrupted) => RpcResponse::ok(
+                id,
+                serde_json::json!({"session_id": session_id, "interrupted": interrupted}),
+            ),
             Err((code, message)) => RpcResponse::err(id, code, message),
         }
     }
