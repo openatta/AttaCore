@@ -2358,3 +2358,128 @@ async fn config_get_redacts_credentials_by_default() {
 
     srv.stop().await;
 }
+
+// ── §5.2 一条连接上的并发 ────────────────────────────────────────────────
+
+/// A prompt raised by a turn can be answered **on the connection running
+/// that turn**.
+///
+/// This is the case a browser has: one tab, one socket, everything on it.
+/// While requests were served inline the connection read nothing during a
+/// turn, so the answer never arrived — the turn waited for an answer that
+/// waited for the turn, until the prompt timeout denied it. Every other test
+/// in this file answers from a second connection and so never saw it.
+///
+/// The whole test is under a deadline: a regression here does not fail, it
+/// hangs until `permission_prompt_timeout`.
+#[tokio::test]
+async fn a_prompt_is_answerable_on_the_same_connection_that_started_the_turn() {
+    let (srv, _seen) = start_scripted_server(
+        asking_bash_rounds("same-conn.txt"),
+        ask_settings(),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut conn = UnixStream::connect(&srv.sock).await.unwrap();
+        conn.write_all(
+            br#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"make a file"},"id":1}"#,
+        )
+        .await
+        .unwrap();
+        conn.write_all(b"\n").await.unwrap();
+
+        let (r, mut w) = conn.split();
+        let mut br = BufReader::new(r);
+        let mut answered = false;
+        loop {
+            let mut line = String::new();
+            let n = br.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "connection closed before the turn finished");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+            if v["params"]["event"]["kind"] == "prompt" && !answered {
+                let sid = v["params"]["session_id"].as_str().unwrap();
+                let prompt_id = v["params"]["event"]["prompt_id"].as_str().unwrap();
+                // Same socket the turn is streaming on.
+                w.write_all(format!(
+                    r#"{{"jsonrpc":"2.0","method":"session.respondToPrompt","params":{{"session_id":"{sid}","prompt_id":"{prompt_id}","decision":{{"type":"deny","reason":"same-connection test"}}}},"id":2}}"#
+                ).as_bytes()).await.unwrap();
+                w.write_all(b"\n").await.unwrap();
+                answered = true;
+            }
+
+            // The turn's own response, id 1, means the turn ran to an end
+            // rather than stalling on an unanswerable question.
+            if v["id"] == 1 {
+                assert!(answered, "the turn ended without ever asking: {v}");
+                return v;
+            }
+        }
+    })
+    .await;
+
+    let response = outcome.expect(
+        "the turn never finished — the connection is not reading while it runs, so its own \
+         prompt cannot be answered",
+    );
+    assert!(response["result"].is_object(), "turn failed: {response}");
+
+    srv.stop().await;
+}
+
+/// `session.interrupt` works from the connection running the turn.
+///
+/// The tab that started a turn is the one with a stop button on it, so this
+/// is the case that matters most; it was unreachable for the same reason.
+#[tokio::test]
+async fn a_turn_can_be_interrupted_from_the_connection_running_it() {
+    let (srv, _seen) = start_scripted_server(
+        asking_bash_rounds("interrupt-same-conn.txt"),
+        ask_settings(),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let interrupted = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut conn = UnixStream::connect(&srv.sock).await.unwrap();
+        conn.write_all(
+            br#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"go"},"id":1}"#,
+        )
+        .await
+        .unwrap();
+        conn.write_all(b"\n").await.unwrap();
+
+        let (r, mut w) = conn.split();
+        let mut br = BufReader::new(r);
+        let mut asked = false;
+        loop {
+            let mut line = String::new();
+            let n = br.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "connection closed");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+            // Wait until the turn is definitely in flight, then interrupt it
+            // on this same socket.
+            if v["params"]["event"]["kind"] == "prompt" && !asked {
+                let sid = v["params"]["session_id"].as_str().unwrap();
+                w.write_all(format!(
+                    r#"{{"jsonrpc":"2.0","method":"session.interrupt","params":{{"session_id":"{sid}"}},"id":2}}"#
+                ).as_bytes()).await.unwrap();
+                w.write_all(b"\n").await.unwrap();
+                asked = true;
+            }
+
+            if v["id"] == 2 {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("session.interrupt was never answered on the connection running the turn");
+
+    assert_eq!(interrupted["result"]["interrupted"], true, "{interrupted}");
+
+    srv.stop().await;
+}

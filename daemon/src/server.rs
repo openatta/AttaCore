@@ -45,6 +45,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 type Reader = Box<dyn AsyncRead + Send + Unpin + 'static>;
+
+/// How many requests one connection may have in flight at once.
+///
+/// A bound, not a queue: at the limit further requests are refused with
+/// [`codes::TOO_MANY_IN_FLIGHT`] rather than made to wait, because waiting
+/// would have to happen in the read loop and a read loop that stops reading
+/// is precisely what this whole arrangement exists to avoid.
+///
+/// Generous next to any real client — a browser tab has a handful of calls
+/// outstanding, and sessions are capped well below this.
+pub(crate) const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
 type ByteWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin + 'static>>>;
 
 /// Largest request a client may send on one connection.
@@ -272,14 +283,34 @@ impl DaemonServer {
         Ok(())
     }
 
-    async fn handle_connection(&self, reader: Reader, sink: Sink, tcp: bool) -> anyhow::Result<()> {
+    /// Read requests and serve them.
+    ///
+    /// **Each request is served in its own task, and the read loop never
+    /// waits for one.** `session.run_turn` runs for as long as the turn does;
+    /// serving it inline meant the connection read nothing else meanwhile, so
+    /// a client could not answer a permission prompt or interrupt the turn on
+    /// the connection that was running it — the prompt deadlocked until its
+    /// timeout denied it, and `session.interrupt` was unreachable from the
+    /// one place that most needs it. §5.2 of the protocol has always
+    /// promised concurrent in-flight requests; this is what delivers it.
+    ///
+    /// Responses may therefore come back out of order, which is what §5.2
+    /// says and why clients match on `id`.
+    async fn handle_connection(
+        self: Arc<Self>,
+        reader: Reader,
+        sink: Sink,
+        tcp: bool,
+    ) -> anyhow::Result<()> {
         let mut lines = FrameReader::new(reader);
         let client = self.accept_connection(sink);
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
 
         // Unix socket connections are trusted for their lifetime by file
         // permissions alone (see the module doc comment's trust-boundary
         // note) — no handshake needed. TCP connections must authenticate
-        // once, up front, before any RPC method is dispatched.
+        // once, up front, before any RPC method is dispatched. This one stays
+        // serial on purpose: nothing may be dispatched before it passes.
         if tcp && !self.authenticate_lines(&mut lines, &client).await {
             return Ok(());
         }
@@ -289,15 +320,45 @@ impl DaemonServer {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let resp = self.dispatch(req, client.clone()).await;
-            if !send_frame(&client, &resp).await {
-                break;
-            }
+            self.clone().serve_request(req, &client, &in_flight);
         }
         // The connection is what subscriptions belong to; sessions and their
         // turns are not. Dropping it takes its subscriptions and nothing else.
         self.pool.drop_connection(client.id()).await;
         Ok(())
+    }
+
+    /// Dispatch one request on its own task, or refuse it if this connection
+    /// is already at its in-flight bound.
+    ///
+    /// Shared by every transport, so none of them can accidentally go back to
+    /// serving requests inline.
+    pub(crate) fn serve_request(
+        self: Arc<Self>,
+        req: RpcRequest,
+        client: &Arc<Client>,
+        in_flight: &Arc<tokio::sync::Semaphore>,
+    ) {
+        let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+        let client = client.clone();
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            let refusal = RpcResponse::err(
+                id,
+                codes::TOO_MANY_IN_FLIGHT,
+                format!(
+                    "this connection already has {MAX_IN_FLIGHT_PER_CONNECTION} requests in flight"
+                ),
+            );
+            tokio::spawn(async move {
+                send_frame(&client, &refusal).await;
+            });
+            return;
+        };
+        tokio::spawn(async move {
+            let resp = self.dispatch(req, client.clone()).await;
+            send_frame(&client, &resp).await;
+            drop(permit);
+        });
     }
 
     /// TCP-only handshake: the first line on the connection must be a

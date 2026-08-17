@@ -182,6 +182,9 @@ async fn handle(server: Arc<DaemonServer>, stream: TcpStream) -> anyhow::Result<
     let ws_sink = Arc::new(WsSink(AsyncMutex::new(write)));
     let sink: Sink = ws_sink.clone();
     let client = server.accept_connection(sink);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(
+        crate::server::MAX_IN_FLIGHT_PER_CONNECTION,
+    ));
 
     // Same handshake as TCP: the first message must be `daemon.auth`. Reusing
     // the check rather than writing a second one is what keeps a new
@@ -202,10 +205,10 @@ async fn handle(server: Arc<DaemonServer>, stream: TcpStream) -> anyhow::Result<
         let Ok(req) = serde_json::from_str::<RpcRequest>(&text) else {
             continue;
         };
-        let resp = server.dispatch_public(req, client.clone()).await;
-        if !send_frame(&client, &resp).await {
-            break;
-        }
+        // Served on its own task — a browser tab holds one socket for
+        // everything, so a turn that occupied the read loop would make its
+        // own permission prompt unanswerable. See `serve_request`.
+        server.clone().serve_request(req, &client, &in_flight);
     }
     // A tab closing takes its subscriptions and nothing else — see
     // `SessionPool::drop_connection`.

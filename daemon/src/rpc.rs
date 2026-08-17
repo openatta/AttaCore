@@ -262,6 +262,15 @@ pub mod codes {
     /// choice, which is what a client needs to be able to tell apart.
     pub const PLUGINS_DISABLED: i32 = -32016;
 
+    /// This connection already has [`MAX_IN_FLIGHT_PER_CONNECTION`] requests
+    /// being served and will not start another.
+    ///
+    /// Refused rather than queued, because queuing would mean the connection
+    /// stops reading — the exact failure this bound exists to prevent. A client
+    /// that sees this has more outstanding calls than it needs and should wait
+    /// for some to answer.
+    pub const TOO_MANY_IN_FLIGHT: i32 = -32017;
+
     /// A second `run_turn` arrived while one was already running on that
     /// session. Not queued and not preempting: the caller decides whether to
     /// wait or to `session.interrupt` first. `data.current_turn_id` names the
