@@ -83,9 +83,20 @@ pub struct TurnStream<'a> {
     client: &'a mut DaemonRpcClient,
     id: i64,
     finished: bool,
+    session_id: Option<String>,
 }
 
 impl TurnStream<'_> {
+    /// The session this turn is running on, once a frame has said so.
+    ///
+    /// A turn started without a `session_id` gets one assigned, and the
+    /// stream frames carry it on the envelope. Answering a permission prompt
+    /// needs it, and the alternative — listing sessions and guessing which
+    /// is yours — is wrong the moment there are two.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     /// The next item, or `None` once the response has been delivered.
     ///
     /// Each call is a single await point, so a caller can put a timeout
@@ -100,7 +111,14 @@ impl TurnStream<'_> {
                 anyhow::bail!("connection closed mid-turn");
             };
             if msg.get("method").and_then(|m| m.as_str()) == Some("session.event") {
-                if let Some(event) = msg.get("params").and_then(|p| p.get("event")) {
+                let params = msg.get("params");
+                if self.session_id.is_none() {
+                    self.session_id = params
+                        .and_then(|p| p.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                if let Some(event) = params.and_then(|p| p.get("event")) {
                     return Ok(Some(TurnItem::Event(event.clone())));
                 }
                 continue;
@@ -272,6 +290,7 @@ impl DaemonRpcClient {
             client: self,
             id,
             finished: false,
+            session_id: session_id.map(str::to_string),
         })
     }
 

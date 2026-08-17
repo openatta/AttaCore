@@ -23,3 +23,5 @@ history     = { workspace = true }
 tokio-util  = { workspace = true }
 tempfile    = { workspace = true }
 async-stream = { workspace = true }
+uuid        = { workspace = true }
+futures     = { workspace = true }

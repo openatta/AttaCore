@@ -3074,6 +3074,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

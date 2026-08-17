@@ -8,10 +8,10 @@
 //!
 //! What differs per transport, and therefore what these cover: streaming a
 //! turn frame by frame, the aggregate read agreeing with the streamed one,
-//! and refusing an oversized frame. The mid-turn permission prompt — the
-//! bidirectional case WebSocket was chosen for — is covered over the Unix
-//! socket in `daemon/tests/session_lifecycle.rs` and not yet over the other
-//! two.
+//! refusing an oversized frame, and answering a permission prompt mid-turn
+//! — the bidirectional case WebSocket was chosen for, since over
+//! server-sent events that answer needs a second channel and a correlation
+//! scheme.
 //!
 //! There is one property here that no aggregate assertion can express: that
 //! a token reaches the client *while the turn is still running*. A client
@@ -81,6 +81,78 @@ impl AnthropicClient for DrippingClient {
     }
 }
 
+/// Calls `Bash` until it sees its own tool result, then answers with text —
+/// the shape that makes the daemon stop and ask, so the prompt round trip
+/// can be exercised.
+///
+/// Keyed on the conversation rather than on a call counter: the same daemon
+/// serves one turn per transport here, and a counter would have the second
+/// and third turns skipping straight to the text round.
+struct AskingClient;
+
+impl AnthropicClient for AskingClient {
+    fn stream_messages(&self, req: MessagesRequest) -> EventStream {
+        let already_ran = serde_json::to_string(&req.messages)
+            .map(|s| s.contains("tool_result"))
+            .unwrap_or(false);
+        let events: Vec<StreamEvent> = if !already_ran {
+            vec![
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlockStart::ToolUse {
+                        id: "tool-1".into(),
+                        name: "Bash".into(),
+                        input: serde_json::Value::Null,
+                    },
+                },
+                StreamEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: BlockDelta::InputJsonDelta {
+                        partial_json: serde_json::json!({"command": "touch parity.txt"})
+                            .to_string(),
+                    },
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some(base::message::StopReason::ToolUse),
+                        stop_sequence: None,
+                    },
+                    usage: Some(WireUsage::default()),
+                },
+            ]
+        } else {
+            vec![
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlockStart::Text {
+                        text: String::new(),
+                    },
+                },
+                StreamEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: BlockDelta::TextDelta {
+                        text: "done".into(),
+                    },
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some(base::message::StopReason::EndTurn),
+                        stop_sequence: None,
+                    },
+                    usage: Some(WireUsage::default()),
+                },
+            ]
+        };
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+
+    fn count_tokens<'a>(&'a self, _req: &'a MessagesRequest) -> CountFuture<'a> {
+        Box::pin(async { Ok(0usize) })
+    }
+}
+
 struct AllowAllPermission;
 
 #[async_trait::async_trait]
@@ -96,6 +168,26 @@ impl base::interface::permission::Permission for AllowAllPermission {
     }
 }
 
+/// Asks about everything, so a turn with a tool call stops for an answer.
+struct AskEverythingPermission;
+
+#[async_trait::async_trait]
+impl base::interface::permission::Permission for AskEverythingPermission {
+    async fn check(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+        _: &std::path::Path,
+        _: &str,
+    ) -> base::interface::permission::PermissionOutcome {
+        base::interface::permission::PermissionOutcome::Prompt {
+            prompt_id: uuid::Uuid::new_v4().to_string(),
+            message: "may I?".into(),
+            paths: Vec::new(),
+        }
+    }
+}
+
 struct Harness {
     server: Arc<DaemonServer>,
     sock: std::path::PathBuf,
@@ -106,16 +198,28 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start(chunks: &[&str], gap: Duration) -> Self {
+    async fn dripping(chunks: &[&str], gap: Duration) -> Self {
+        Self::start(
+            Arc::new(DrippingClient {
+                chunks: chunks.iter().map(|c| c.to_string()).collect(),
+                gap,
+                seen: Arc::new(StdMutex::new(0)),
+            }),
+            true,
+        )
+        .await
+    }
+
+    /// A daemon that will stop and ask before running the tool.
+    async fn asking() -> Self {
+        Self::start(Arc::new(AskingClient), false).await
+    }
+
+    async fn start(client: Arc<dyn AnthropicClient>, allow_all: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let client: Arc<dyn AnthropicClient> = Arc::new(DrippingClient {
-            chunks: chunks.iter().map(|c| c.to_string()).collect(),
-            gap,
-            seen: Arc::new(StdMutex::new(0)),
-        });
         let store: Arc<dyn history::store::HistoryStore> = Arc::new(
             history::store::JsonlHistoryStore::with_roots(
                 &cwd,
@@ -130,7 +234,14 @@ impl Harness {
             client,
             Arc::new(Settings::defaults_for("claude-sonnet-4-6")),
             Arc::new(scene::scene::coding::CodingScene),
-            Arc::new(AllowAllPermission),
+            // `allow_all` decides whether the daemon ever raises a prompt:
+            // the streaming tests want turns that just run, the prompt test
+            // wants one that stops and asks.
+            if allow_all {
+                Arc::new(AllowAllPermission) as Arc<dyn base::interface::permission::Permission>
+            } else {
+                Arc::new(AskEverythingPermission)
+            },
             Arc::new(MemoryStore::new(
                 dir.path().join("user/memory"),
                 dir.path().join("local/memory"),
@@ -210,7 +321,7 @@ impl Harness {
 
 #[tokio::test]
 async fn every_transport_answers_the_same_request() {
-    let h = Harness::start(&["hello"], Duration::ZERO).await;
+    let h = Harness::dripping(&["hello"], Duration::ZERO).await;
 
     for mut client in h.clients().await {
         let name = client.transport_name();
@@ -242,7 +353,7 @@ async fn a_token_reaches_the_client_before_the_turn_ends_on_every_transport() {
     /// Between one streamed chunk (~0ms) and a whole buffered turn (~750ms).
     const DEADLINE: Duration = Duration::from_millis(300);
 
-    let h = Harness::start(&["one ", "two ", "three ", "four ", "five"], CHUNK_GAP).await;
+    let h = Harness::dripping(&["one ", "two ", "three ", "four ", "five"], CHUNK_GAP).await;
 
     for mut client in h.clients().await {
         let name = client.transport_name();
@@ -292,7 +403,7 @@ async fn a_token_reaches_the_client_before_the_turn_ends_on_every_transport() {
 /// The aggregate path must agree with the streaming one it is built on.
 #[tokio::test]
 async fn the_collected_turn_matches_what_the_stream_delivered() {
-    let h = Harness::start(&["a", "b", "c"], Duration::from_millis(5)).await;
+    let h = Harness::dripping(&["a", "b", "c"], Duration::from_millis(5)).await;
 
     for mut client in h.clients().await {
         let name = client.transport_name();
@@ -325,7 +436,7 @@ async fn the_collected_turn_matches_what_the_stream_delivered() {
 /// not know where the next one starts.
 #[tokio::test]
 async fn an_oversized_frame_closes_the_connection_on_the_line_transports() {
-    let h = Harness::start(&["x"], Duration::ZERO).await;
+    let h = Harness::dripping(&["x"], Duration::ZERO).await;
 
     let mut client = DaemonRpcClient::connect(&h.sock).await.unwrap();
     let huge = "z".repeat(17 * 1024 * 1024);
@@ -336,6 +447,84 @@ async fn an_oversized_frame_closes_the_connection_on_the_line_transports() {
         result.is_err(),
         "an over-limit frame must end the connection, not be answered"
     );
+
+    h.stop().await;
+}
+
+/// The bidirectional case, on every transport.
+///
+/// The daemon asks mid-turn and waits; the client answers on the same
+/// connection and the turn continues. This is the exchange WebSocket was
+/// chosen for — over server-sent events the answer needs a second channel
+/// and a correlation scheme — so "it works over WS too" is the claim that
+/// justified the transport, and it was previously only tested over the Unix
+/// socket.
+#[tokio::test]
+async fn a_prompt_is_answered_on_the_same_connection_on_every_transport() {
+    let h = Harness::asking().await;
+
+    for mut client in h.clients().await {
+        let name = client.transport_name();
+
+        // A second connection answers the prompt, because the first one is
+        // parked inside its own turn — same as a real client, which cannot
+        // reply on a socket it is blocked reading.
+        let answerer_sock = h.sock.clone();
+
+        let mut stream = client
+            .begin_turn(None, "make a file", "t1", None)
+            .await
+            .unwrap();
+        let mut answered = false;
+        let mut saw_tool_result = false;
+
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the turn stalled"))
+            .unwrap()
+        {
+            match item {
+                TurnItem::Event(event) => match event["kind"].as_str() {
+                    Some("prompt") if !answered => {
+                        let prompt_id = event["prompt_id"].as_str().unwrap().to_string();
+                        let sid = stream
+                            .session_id()
+                            .expect("a stream frame names its session")
+                            .to_string();
+                        let mut answerer = DaemonRpcClient::connect(&answerer_sock).await.unwrap();
+                        let ack = answerer
+                            .call(
+                                "session.respondToPrompt",
+                                serde_json::json!({
+                                    "session_id": sid,
+                                    "prompt_id": prompt_id,
+                                    "decision": {"type": "deny", "reason": "parity test"},
+                                }),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(
+                            ack.error.is_none(),
+                            "{name}: respondToPrompt failed: {ack:?}"
+                        );
+                        answered = true;
+                    }
+                    Some("tool_result") => saw_tool_result = true,
+                    _ => {}
+                },
+                TurnItem::Response(resp) => {
+                    assert!(resp.error.is_none(), "{name}: turn failed: {resp:?}");
+                    break;
+                }
+            }
+        }
+
+        assert!(answered, "{name}: the daemon never asked");
+        assert!(
+            saw_tool_result,
+            "{name}: the turn did not continue after the answer"
+        );
+    }
 
     h.stop().await;
 }
