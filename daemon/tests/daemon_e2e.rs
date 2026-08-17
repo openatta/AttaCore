@@ -1485,6 +1485,7 @@ async fn plugin_rpcs_report_plugins_disabled_when_compiled_out() {
         ("plugin.uninstall", r#"{"name":"x"}"#),
         ("plugin.enable", r#"{"name":"x"}"#),
         ("plugin.disable", r#"{"name":"x"}"#),
+        ("plugin.reload", "{}"),
     ] {
         let resp = rpc_call(
             &sock,
@@ -1634,5 +1635,64 @@ async fn a_scene_owning_plugin_discloses_its_prompt_and_capabilities() {
     assert!(listed, "the scene the plugin owns should be servable: {v}");
 
     server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+/// A plugin that appeared on disk without going through `plugin.install` —
+/// dropped in by hand, or rebuilt in place during development — is picked up
+/// by `plugin.reload`.
+///
+/// Asserted through the plugin's *scene*, not through `plugin.list`:
+/// `plugin.list` rescans the directories on every call, so it would report a
+/// hand-placed plugin with or without a reload and prove nothing. What needs
+/// the reload is everything derived from the installed set — scenes, agent
+/// types, commands, and the loaded components themselves.
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn plugin_reload_picks_up_a_plugin_that_appeared_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_server, sock, _dir, handle) = start_server_in(dir).await;
+
+    let scene_named = |v: &serde_json::Value| -> bool {
+        v["result"]["scenes"].as_array().is_some_and(|scenes| {
+            scenes
+                .iter()
+                .any(|s| s["scene"] == "plugin:hand-placed-plugin")
+        })
+    };
+
+    // Straight onto disk, behind the daemon's back.
+    install_scene_plugin(&root, "hand-placed-plugin");
+
+    let before = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"scene.list","id":1}"#).await;
+    let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+    assert!(
+        !scene_named(&before),
+        "the daemon adopted a plugin nobody told it about — this test cannot show the reload \
+         does anything: {before}"
+    );
+
+    let reloaded = rpc_call(
+        &sock,
+        r#"{"jsonrpc":"2.0","method":"plugin.reload","id":2}"#,
+    )
+    .await;
+    let reloaded: serde_json::Value = serde_json::from_str(&reloaded).unwrap();
+    assert!(
+        reloaded["result"]["plugins"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x["name"] == "hand-placed-plugin")),
+        "reload should report the installed set it found: {reloaded}"
+    );
+
+    let after = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"scene.list","id":3}"#).await;
+    let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert!(
+        scene_named(&after),
+        "the rescan did not take effect — the plugin's scene is still missing: {after}"
+    );
+
+    _server.shutdown_token().cancel();
     let _ = handle.await;
 }

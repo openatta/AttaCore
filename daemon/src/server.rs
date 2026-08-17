@@ -517,6 +517,7 @@ impl DaemonServer {
             ),
             "plugin.list" if !self.plugins_enabled() => self.plugins_disabled(id),
             "plugin.install" | "plugin.uninstall" | "plugin.enable" | "plugin.disable"
+            | "plugin.reload"
                 if !self.plugins_enabled() =>
             {
                 self.plugins_disabled(id)
@@ -525,6 +526,7 @@ impl DaemonServer {
                 id,
                 serde_json::json!({"plugins": self.pool.list_plugins().await}),
             ),
+            "plugin.reload" => RpcResponse::ok(id, self.pool.reload_plugins().await),
             "plugin.install" => self.method_plugin_install(id, req.params).await,
             "plugin.uninstall" => self.method_plugin_uninstall(id, req.params).await,
             "plugin.enable" => self.method_plugin_set_enabled(id, req.params, true).await,

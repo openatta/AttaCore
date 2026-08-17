@@ -670,6 +670,22 @@ impl SessionPool {
     /// active set on success so sessions created after this call see it —
     /// already-running sessions are unaffected, same as
     /// `config.setProvider`/`mcp.addServer`.
+    /// Re-read the plugin directories and reload what is there.
+    ///
+    /// Install/uninstall/enable/disable each refresh on their own, so this is
+    /// for the case none of them covers: the files changed without going
+    /// through an RPC — a plugin dropped into the directory by hand, or a
+    /// rebuilt component swapped in during development. Without it the only
+    /// way to pick that up is restarting the daemon.
+    ///
+    /// Returns the installed set afterwards, so a caller learns what the
+    /// rescan actually found without a second call.
+    pub async fn reload_plugins(&self) -> serde_json::Value {
+        self.plugins.refresh().await;
+        self.refresh_after_plugin_change().await;
+        serde_json::json!({"plugins": self.list_plugins().await})
+    }
+
     pub async fn install_plugin(
         &self,
         name: &str,

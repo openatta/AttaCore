@@ -935,18 +935,60 @@ all     → 全部失效
 列出磁盘上的全部插件及其启用状态。
 
 #### `plugin.install`
-`{ "name":"…", "version":"…", "archive":"/abs/path.zip", "sha256":"…", "scope":"user" }`
+`{ "name":"…", "version":"…", "download_url":"…", "checksum":"…", "scope":"global" }`
 
-校验校验和 → 解包 → **安装时就把 WASM 组件编译成 AOT 产物**;编译失败会把这次安装
-回滚掉并报错,而不是留一个每次加载都要重编的插件。
+**daemon 自己去取,没有上传通道。** `download_url` 两种形式:
+
+| 形式 | 行为 |
+|---|---|
+| `file:///abs/path/plugin.zip` | daemon 直接读盘(**`file://` 前缀不能省**) |
+| `https://…/plugin.zip` | daemon 发 HTTP GET |
+
+**`checksum` 对网络源是必填的**,缺了会在发起请求**之前**就拒绝——不为一份注定要拒的
+字节去等一次可能挂很久的连接。`file://` 源可以省略:本地文件已经在调用方的信任域内。
+
+流程:取包 → 校验 → 解包到 `<scope 根>/plugins/cache/<name>/<version>/` →
+**安装时就把 WASM 组件编译成 AOT 产物**。编译失败会把这次安装**回滚掉**并报错,而不是
+留一个每次加载都要重编的插件。
+
+同 `name` + `version` 已经装过则直接返回成功,不重装。
+
+响应带 `disclosure`——这个插件会往模型上下文里塞的文本,让调用方在依赖它之前先看见。
 
 #### `plugin.uninstall`
 `{ "name":"…", "version":"…" }` → 删除该版本(连同它的 `.aot/` 产物)。
 
 #### `plugin.enable` / `plugin.disable`
-`{ "name":"…", "scope":"user|project" }` → `{ "name":"…", "enabled":true, "scope":"user" }`
+`{ "name":"…", "scope":"global" }` → `{ "name":"…", "enabled":true, "scope":"global" }`
 
 启用状态按层记录,不改动已安装的文件。
+
+#### `plugin.reload`
+无参 → `{ "plugins": [ … ] }`(与 `plugin.list` 同形)
+
+重扫插件目录并重新加载。上面四个方法各自会自动刷新,**这个是给它们盖不到的情况用的**:
+有人手工把插件放进目录、或者开发时原地替换了组件。没有它,这类改动只能靠重启 daemon
+才能生效。
+
+#### 关于 `scope`
+
+只有两个合法值,**默认 `global`**:
+
+| scope | 目录 |
+|---|---|
+| `global` | `<全局根>/plugins/` — 跨场景共享 |
+| `scene` | `<场景根>/plugins/` — 只对这个 daemon 的场景生效 |
+
+别的值返回 `INVALID_PARAMS`。AOT 产物放在版本目录下的 `.aot/`,所以卸载一个版本会连
+产物一起带走。
+
+#### 什么时候生效
+
+**装/卸/启用/停用/重扫都只影响之后新建的会话。** 插件贡献的工具是在会话创建时注入它
+的工具表的,已经在跑的会话保持原样——一个 turn 跑到一半工具集变了,比晚一点生效更糟。
+
+受影响的面(场景、agent 类型、斜杠命令)会立即刷新,所以 `scene.list` / `commands.list`
+在调用返回之后就是新的;只有**已存在会话的工具表**要等新会话。
 
 > 插件子系统可以在编译期整个裁掉。裁掉的构建里,上面五个方法一律返回
 > `PLUGINS_DISABLED (-32016)` —— 不是"未知方法",因为方法是存在的,只是这个构建
