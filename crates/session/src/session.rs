@@ -660,7 +660,7 @@ mod tests {
         Arc::new(
             history::store::JsonlHistoryStore::with_roots(
                 &cwd,
-                history::path::HistoryRoots::under(&tmp),
+                history::path::HistoryRoots::under(tmp),
             )
             .await
             .unwrap(),

@@ -82,6 +82,7 @@ fn to_sandbox_policy(settings: &base::tool::SandboxSettings) -> sandbox::Sandbox
         // upstream of here populates `ToolContext.sandbox` from real
         // settings today). Empty falls back to `sandbox::KNOWN_SCENES`.
         known_scenes: Vec::new(),
+        state_root: settings.state_root.clone(),
     }
 }
 
@@ -1086,6 +1087,7 @@ mod tests {
             deny_read: vec![PathBuf::from("/tmp/secret")],
             allowed_domains: vec!["api.example.com".to_string()],
             network_mode: base::context::config::NetworkModeConfig::Allowlist,
+            state_root: None,
         };
         let policy = to_sandbox_policy(&settings);
         assert_eq!(policy.deny_read, vec![PathBuf::from("/tmp/secret")]);
@@ -1442,6 +1444,7 @@ mod allow_read_tests {
             deny_read: Vec::new(),
             allowed_domains: Vec::new(),
             network_mode: base::context::config::NetworkModeConfig::Unrestricted,
+            state_root: None,
         };
         let policy = to_sandbox_policy(&settings);
         assert_eq!(policy.allow_read, vec![PathBuf::from("/home/u/.npmrc")]);

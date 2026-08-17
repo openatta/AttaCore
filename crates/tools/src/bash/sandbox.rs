@@ -122,6 +122,21 @@ pub struct SandboxPolicy {
     /// don't know about a daemon's actual `--scenes` set keep today's
     /// behavior exactly.
     pub known_scenes: Vec<String>,
+    /// This instance's global state root. `None` falls back to `$HOME/.atta`,
+    /// which is where an instance usually lives but not where it must: a
+    /// redirected instance whose sandbox protected `$HOME/.atta` would be
+    /// guarding a file it does not use while leaving its real settings.json
+    /// writable.
+    pub state_root: Option<PathBuf>,
+}
+
+/// The state root to protect: the one the caller named, else the
+/// conventional `$HOME/.atta`.
+fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
+    policy
+        .state_root
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atta")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -264,23 +279,23 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
         "(deny file-write* (literal \"{}/.atta/settings.local.json\"))\n",
         sandbox_escape(&cwd_str)
     ));
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_str = std::path::Path::new(&home).display().to_string();
+    if let Some(state_root) = state_root_of(policy) {
+        let root_str = state_root.display().to_string();
         // Cross-scene global settings.json — flat, single file.
         s.push_str(&format!(
-            "(deny file-write* (literal \"{}/.atta/settings.json\"))\n",
-            sandbox_escape(&home_str)
+            "(deny file-write* (literal \"{}/settings.json\"))\n",
+            sandbox_escape(&root_str)
         ));
         // Scene-specific settings.json lives at
-        // `~/.atta/scenes/<scene>/settings.json`, where `<scene>` is one of
+        // `<state root>/scenes/<scene>/settings.json`, where `<scene>` is one of
         // the small, closed set of scenes this engine registers (see
         // `daemon::resolve_scene` / `KNOWN_SCENES` below) — not an arbitrary
         // string, so we can just enumerate all of them rather than needing
         // to know which one the current session actually uses.
         for scene in effective_known_scenes(policy) {
             s.push_str(&format!(
-                "(deny file-write* (literal \"{}/.atta/scenes/{}/settings.json\"))\n",
-                sandbox_escape(&home_str),
+                "(deny file-write* (literal \"{}/scenes/{}/settings.json\"))\n",
+                sandbox_escape(&root_str),
                 scene
             ));
         }
@@ -387,14 +402,14 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
     // or an `additional_writable` entry happens to overlap it) — these are
     // defense-in-depth for that overlap case, mirroring the macOS profile's
     // unconditional deny rules for the same paths.
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_str = std::path::Path::new(&home).display().to_string();
-        let global_settings = format!("{home_str}/.atta/settings.json");
+    if let Some(state_root) = state_root_of(&opts.policy) {
+        let root_str = state_root.display().to_string();
+        let global_settings = format!("{root_str}/settings.json");
         args.push("--ro-bind-try".into());
         args.push(global_settings.clone());
         args.push(global_settings);
         for scene in effective_known_scenes(&opts.policy) {
-            let p = format!("{home_str}/.atta/scenes/{scene}/settings.json");
+            let p = format!("{root_str}/scenes/{scene}/settings.json");
             args.push("--ro-bind-try".into());
             args.push(p.clone());
             args.push(p);
@@ -687,6 +702,7 @@ mod tests {
             network_mode: NetworkMode::Unrestricted,
             allowed_domains: Vec::new(),
             known_scenes: Vec::new(),
+            state_root: None,
         };
         let cmd = wrap(o);
         let profile = &cmd.args[1];
@@ -705,6 +721,7 @@ mod tests {
             network_mode: NetworkMode::Unrestricted,
             allowed_domains: vec![],
             known_scenes: Vec::new(),
+            state_root: None,
         };
         let cmd = wrap(o);
         let profile = &cmd.args[1];
@@ -931,6 +948,7 @@ mod tests {
                 network_mode: NetworkMode::Unrestricted,
                 allowed_domains: Vec::new(),
                 known_scenes: Vec::new(),
+                state_root: None,
             },
         };
         let cmd = wrap(o);
@@ -964,6 +982,7 @@ mod tests {
                 network_mode: NetworkMode::Unrestricted,
                 allowed_domains: vec![],
                 known_scenes: Vec::new(),
+                state_root: None,
             },
         };
         let cmd = wrap(o);
@@ -1042,6 +1061,7 @@ mod tests {
                 network_mode: NetworkMode::Unrestricted,
                 allowed_domains: vec![],
                 known_scenes: Vec::new(),
+                state_root: None,
             },
         };
         let cmd = wrap(o);
@@ -1050,5 +1070,53 @@ mod tests {
             !profile.contains("(deny file-read*"),
             "no deny-read rules when deny_read is empty"
         );
+    }
+
+    /// The profile has to protect the settings.json this instance actually
+    /// reads. When the state root is redirected, denying writes under the
+    /// invoking user's home guards a file nobody uses and leaves the real one
+    /// writable — which is a sandbox escape, since settings.json is where the
+    /// permission rules live.
+    #[test]
+    fn the_profile_protects_the_instance_root_it_was_given() {
+        let policy = SandboxPolicy {
+            state_root: Some(PathBuf::from("/srv/atta-state")),
+            known_scenes: vec!["coding".into()],
+            ..Default::default()
+        };
+        let profile = build_macos_profile(Path::new("/work/project"), &[], &policy);
+
+        assert!(profile.contains("(deny file-write* (literal \"/srv/atta-state/settings.json\"))"));
+        assert!(profile.contains(
+            "(deny file-write* (literal \"/srv/atta-state/scenes/coding/settings.json\"))"
+        ));
+        // The project-level rules under cwd stay; what must be absent is any
+        // rule derived from the invoking user's home.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home_rule = format!(
+                "(deny file-write* (literal \"{}/.atta/settings.json\"))",
+                PathBuf::from(home).display()
+            );
+            assert!(
+                !profile.contains(&home_rule),
+                "a redirected instance is still protecting the home-relative path"
+            );
+        }
+    }
+
+    /// No root given: fall back to the conventional location rather than
+    /// protecting nothing.
+    #[test]
+    fn without_a_root_it_falls_back_to_the_conventional_home_path() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let profile =
+            build_macos_profile(Path::new("/work/project"), &[], &SandboxPolicy::default());
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{}/.atta/settings.json\"))",
+            home.display()
+        )));
     }
 }

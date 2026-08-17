@@ -9,8 +9,6 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Error)]
 pub enum TokenStoreError {
-    #[error("HOME env not set; cannot resolve token store path")]
-    NoHome,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -53,16 +51,12 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// Open the default store under `$HOME/.atta/<scope>/tokens`. No default
-    /// scope — callers must say which product instance this belongs to.
-    pub fn from_home(scope: &str) -> Result<Self, TokenStoreError> {
-        let home = std::env::var_os("HOME").ok_or(TokenStoreError::NoHome)?;
-        Ok(Self {
-            root: PathBuf::from(home).join(".atta").join(scope).join("tokens"),
-        })
-    }
-
-    /// Test-friendly variant taking an explicit root.
+    /// Open a store rooted at `root` — conventionally `<scene root>/tokens`,
+    /// but the caller says where.
+    ///
+    /// These are credentials, so there is no constructor that finds the
+    /// directory on its own: whose home the tokens belong to is not a
+    /// question this type gets to answer.
     pub fn at_root(root: PathBuf) -> Self {
         Self { root }
     }

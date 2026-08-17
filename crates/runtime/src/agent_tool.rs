@@ -1026,6 +1026,13 @@ fn settings_from_parent(
 /// constructed without `.with_settings(...)` — tests, or the generic
 /// `AgentSpawner` bridge which doesn't carry one). Scope is a fixed
 /// `"code"` stand-in since there's no real one to thread through.
+///
+/// The user-level roots hang off `local_data_dir`, which means a
+/// parentless sub-agent keeps its state beside the project. They used to be
+/// derived from `$HOME`: with no instance configuration in hand, the
+/// fallback would pick the invoking user's home and write there — the one
+/// directory it has no grounds to assume it owns. Project-local is the
+/// honest answer to "nobody told me where this instance's state lives".
 fn fallback_settings(
     model_name: String,
     max_tokens: u32,
@@ -1044,12 +1051,8 @@ fn fallback_settings(
             fallback_model,
         },
         paths: PathSettings {
-            user_data_dir: std::env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".atta/scenes/code"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta/scenes/code")),
-            global_data_dir: std::env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".atta"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/atta")),
+            user_data_dir: local_data_dir.join("scenes").join("code"),
+            global_data_dir: local_data_dir.clone(),
             local_data_dir,
             scope: "code".to_string(),
         },
@@ -4329,6 +4332,11 @@ mod catalog_tests {
         let cwd = std::path::PathBuf::from("/tmp/some-real-project");
         let settings = agent_tool.sub_settings(None, cwd.clone());
         assert_eq!(settings.paths.local_data_dir, cwd);
+        // And the user-level roots stay inside it: with no parent settings
+        // there is no instance root to inherit, and the invoking user's home
+        // is not a substitute for one.
+        assert!(settings.paths.global_data_dir.starts_with(&cwd));
+        assert!(settings.paths.user_data_dir.starts_with(&cwd));
     }
 
     // NOTE: a true end-to-end regression test for the worktree-cleanup fix

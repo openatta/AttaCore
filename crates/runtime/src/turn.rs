@@ -2904,6 +2904,7 @@ fn sandbox_settings_from(config: &base::context::EngineConfig) -> base::tool::Sa
         deny_read: config.sandbox_policy.deny_read.clone().unwrap_or_default(),
         allowed_domains: config.sandbox_policy.allowed_domains.clone(),
         network_mode: config.sandbox_policy.network_mode,
+        state_root: config.sandbox_policy.state_root.clone(),
     }
 }
 
@@ -3352,7 +3353,7 @@ fn build_prompt_context<'a>(
     effective_model: &str,
     tool_results_ever_cleared: bool,
 ) -> ScenePromptContext<'a> {
-    let (is_git, git_branch, is_worktree, git_status, memory_index, output_style, shell) =
+    let (is_git, git_branch, is_worktree, git_status, memory_index, output_style, shell, home_dir) =
         if let Some(f) = frozen {
             (
                 f.is_git,
@@ -3362,9 +3363,10 @@ fn build_prompt_context<'a>(
                 f.memory_index.clone(),
                 f.output_style.as_ref().map(|os| os.content.clone()),
                 f.shell.clone(),
+                f.home_dir.clone(),
             )
         } else {
-            (false, None, false, None, None, None, None)
+            (false, None, false, None, None, None, None, None)
         };
     ScenePromptContext {
         cwd: Cow::Owned(settings.paths.project_root().display().to_string()),
@@ -3373,7 +3375,9 @@ fn build_prompt_context<'a>(
         // `/bin/bash` itself when `$SHELL` is unset), so this fallback only
         // matters before the first turn's collection has happened.
         shell: Cow::Owned(shell.unwrap_or_else(|| "/bin/bash".to_string())),
-        home_dir: Cow::Owned(std::env::var("HOME").unwrap_or_else(|_| "/home/user".into())),
+        // From the environment snapshot, same as `shell` — a fact about the
+        // machine, collected once where a test can replace it.
+        home_dir: Cow::Owned(home_dir.unwrap_or_else(|| "/home/user".to_string())),
         date: Cow::Owned(chrono_now()),
         // The model actually being called this turn, not the configured
         // default — after an overloaded-fallback switch these diverge, and
@@ -3846,6 +3850,7 @@ mod sandbox_settings_tests {
             deny_read: Some(vec![PathBuf::from("/tmp/secret")]),
             network_mode: NetworkModeConfig::DenyAll,
             allowed_domains: vec!["api.example.com".into()],
+            state_root: None,
         };
 
         let s = sandbox_settings_from(&config);

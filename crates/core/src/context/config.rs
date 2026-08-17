@@ -229,6 +229,11 @@ pub struct SandboxPolicyConfig {
     pub deny_read: Option<Vec<PathBuf>>,
     pub network_mode: NetworkModeConfig,
     pub allowed_domains: Vec<String>,
+    /// This instance's global state root, so the profile can protect the
+    /// settings.json files that actually govern it. `None` means the caller
+    /// didn't say, and the sandbox falls back to `$HOME/.atta` — which is
+    /// only right when the instance happens to live there.
+    pub state_root: Option<PathBuf>,
 }
 
 #[derive(
@@ -354,6 +359,10 @@ impl EngineConfig {
             // other field.
             network_mode: settings.sandbox.network_mode,
             allowed_domains: settings.sandbox.allowed_domains.clone(),
+            // The instance's own root, so the profile denies writes to the
+            // settings.json this session actually reads — not to whatever
+            // sits under the invoking user's home.
+            state_root: Some(settings.paths.global_data_dir.clone()),
         };
         c.disable_skill_shell_execution = settings.disable_skill_shell_execution;
 

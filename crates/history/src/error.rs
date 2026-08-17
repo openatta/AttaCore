@@ -21,7 +21,4 @@ pub enum HistoryError {
 
     #[error("session {0} not found")]
     SessionNotFound(String),
-
-    #[error("HOME not set; set $HOME or pass an explicit projects_root")]
-    NoHome,
 }

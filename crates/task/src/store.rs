@@ -1,6 +1,7 @@
 //! File-persisted task list.
 //!
-//! Stores individual task files at `~/.atta/<scope>/tasks/{list_id}/{id}.json`.
+//! Stores individual task files at `<scene root>/tasks/{list_id}/{id}.json`,
+//! where the scene root is given by the caller.
 //! Single-process tokio Mutex guards concurrent access within the same
 //! process; the file layout is compatible with future cross-process locking
 //! (flock / proper-lockfile).
@@ -9,15 +10,12 @@
 //! (the typed TaskEntry/TaskStatus live in attacode-tools). Callers serialize
 //! at the boundary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Base directory for all task lists (~/.atta/<scope>/tasks). No default
-/// scope — callers must say which product instance this belongs to.
-fn base_dir(scope: &str) -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".atta").join(scope).join("tasks")
+/// Base directory for all task lists, under the scene root this instance was
+/// given. Nothing here decides where that root is.
+fn base_dir(scene_root: &Path) -> PathBuf {
+    scene_root.join("tasks")
 }
 
 /// Sanitise a string for safe filesystem use.
@@ -62,8 +60,8 @@ pub struct TaskStore {
 
 impl TaskStore {
     /// Create or open a task list. Creates the directory if needed.
-    pub async fn new(list_id: &str, scope: &str) -> std::io::Result<Self> {
-        let dir = base_dir(scope).join(sanitise_path(list_id));
+    pub async fn new(list_id: &str, scene_root: &Path) -> std::io::Result<Self> {
+        let dir = base_dir(scene_root).join(sanitise_path(list_id));
         tokio::fs::create_dir_all(&dir).await?;
         Ok(Self {
             dir,

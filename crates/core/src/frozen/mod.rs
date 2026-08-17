@@ -48,6 +48,11 @@ pub struct FrozenContext {
     pub git_log: Option<String>,
     pub platform: String,
     pub shell: Option<String>,
+    /// 这台机器上用户的 home 目录——和 `platform`/`shell` 一样是**环境事实**，
+    /// 进 system prompt 给模型交代环境，不是 AttaCore 存东西的地方（那些根一律
+    /// 由调用方注入，见 [`crate::paths::ConfigPaths`]）。收进快照而不是在拼
+    /// prompt 时现读，是因为快照可以被测试替换，而 env 不能。
+    pub home_dir: Option<String>,
     pub today: String,
     pub memory_blocks: Vec<MemoryFileEntry>,
     pub user_email: Option<String>,
@@ -190,6 +195,7 @@ impl FrozenContext {
 
         // 平台信息走 std + 环境变量，不阻塞
         let platform = std::env::consts::OS.to_string();
+        let home_dir = std::env::var("HOME").ok();
         let shell = std::env::var("SHELL").ok().map(|p| {
             Path::new(&p)
                 .file_name()
@@ -253,6 +259,7 @@ impl FrozenContext {
             git_log,
             platform,
             shell,
+            home_dir,
             today,
             memory_blocks,
             user_email,
