@@ -802,11 +802,7 @@ impl Agent {
             // 1. Compact if token budget exceeded
             self.compact_if_needed().await;
 
-            // 2. Build prompt, tool defs, and clone messages for the model call
-            let (prompt_blocks, tool_defs, messages) =
-                self.build_prompt_for_turn(&effective_model).await;
-
-            // 3. Call model
+            // 2. Assemble the request
             let step = api_calls;
             api_calls += 1;
             let origin = Some(base::interface::model::CallOrigin {
@@ -814,23 +810,16 @@ impl Agent {
                 turn: self.session.turn_count,
                 step,
             });
-            let stream_result = self
-                .model
-                .stream(
-                    prompt_blocks.clone(),
-                    tool_defs.clone(),
-                    messages.clone(),
-                    base::interface::model::StreamParams {
-                        model: effective_model.clone(),
-                        max_tokens: effective_max_tokens,
-                        thinking_mode: self.settings.model.thinking_mode.clone(),
-                        fallback_model: self.settings.model.fallback_model.clone(),
-                        cache_edits: self.cached_mc.consume_pending_edits(),
-                        origin: origin.clone(),
-                    },
-                    cancel.clone(),
-                )
+            let request = self
+                .prepare_request(&effective_model, effective_max_tokens, origin.clone())
                 .await;
+            // Kept back for the recovery paths, which retry the same tools and
+            // (for an overload) the same conversation.
+            let tool_defs = request.tool_defs.clone();
+            let messages = request.messages.clone();
+
+            // 3. Call model
+            let stream_result = self.send(request, cancel.clone()).await;
 
             // 4. Handle fallback — Overloaded → switch to fallback model
             let stream = match stream_result {
@@ -882,25 +871,15 @@ impl Agent {
                             // KB, which is not what blew the context budget
                             // (the message history is), and the compaction
                             // that just ran freed far more than they take.
-                            let fb_prompt = self.build_prompt_blocks(&effective_model);
-                            match self
-                                .model
-                                .stream(
-                                    fb_prompt,
-                                    tool_defs.clone(),
-                                    self.session.messages().to_vec(),
-                                    base::interface::model::StreamParams {
-                                        model: effective_model.clone(),
-                                        max_tokens: effective_max_tokens,
-                                        thinking_mode: self.settings.model.thinking_mode.clone(),
-                                        fallback_model: self.settings.model.fallback_model.clone(),
-                                        cache_edits: vec![], // already consumed above
-                                        origin: origin.clone(),
-                                    },
-                                    cancel.clone(),
-                                )
-                                .await
-                            {
+                            let retry = self.prepare_retry(
+                                &effective_model,
+                                effective_max_tokens,
+                                tool_defs.clone(),
+                                self.session.messages().to_vec(),
+                                self.settings.model.fallback_model.clone(),
+                                origin.clone(),
+                            );
+                            match self.send(retry, cancel.clone()).await {
                                 Ok(s) => s,
                                 Err(e2) => {
                                     return Err(TurnError::Model(format!(
@@ -2495,6 +2474,91 @@ or project context that should survive across sessions.
         (prompt_blocks, tool_defs, messages)
     }
 
+    /// Assemble a step's request and account for what it costs before any
+    /// conversation content (see `request_overhead_tokens`).
+    ///
+    /// This is also where the pending cache edits are consumed, which is why a
+    /// retry after a failed call must go through [`Agent::prepare_retry`]
+    /// instead: the edits belong to the call that already spent them.
+    async fn prepare_request(
+        &mut self,
+        model: &str,
+        max_tokens: u32,
+        origin: Option<base::interface::model::CallOrigin>,
+    ) -> ModelRequest {
+        let (prompt_blocks, tool_defs, messages) = self.build_prompt_for_turn(model).await;
+        ModelRequest {
+            prompt_blocks,
+            tool_defs,
+            messages,
+            params: base::interface::model::StreamParams {
+                model: model.to_string(),
+                max_tokens,
+                thinking_mode: self.settings.model.thinking_mode.clone(),
+                fallback_model: self.settings.model.fallback_model.clone(),
+                cache_edits: self.cached_mc.consume_pending_edits(),
+                origin,
+            },
+        }
+    }
+
+    /// Reassemble after a recovery changed the model or the message list.
+    ///
+    /// The tool table and the messages come from the caller rather than being
+    /// rebuilt: the overloaded path retries the *same* conversation against a
+    /// different model, while the prompt-too-long path retries a conversation
+    /// that compaction just shortened. Only the prompt blocks are rebuilt, so
+    /// a fallback model still gets the skills inventory and MCP guidance the
+    /// primary one got.
+    ///
+    /// Neither the overhead estimate nor the cache edits are redone — both
+    /// belong to the call that failed.
+    fn prepare_retry(
+        &self,
+        model: &str,
+        max_tokens: u32,
+        tool_defs: Vec<ToolDef>,
+        messages: Vec<ModelMessage>,
+        fallback_model: Option<String>,
+        origin: Option<base::interface::model::CallOrigin>,
+    ) -> ModelRequest {
+        ModelRequest {
+            prompt_blocks: self.build_prompt_blocks(model),
+            tool_defs,
+            messages,
+            params: base::interface::model::StreamParams {
+                model: model.to_string(),
+                max_tokens,
+                thinking_mode: self.settings.model.thinking_mode.clone(),
+                fallback_model,
+                cache_edits: Vec::new(),
+                origin,
+            },
+        }
+    }
+
+    /// The turn's only call into the model.
+    ///
+    /// Routing all three paths — the normal one and the two recoveries —
+    /// through here is what keeps them from diverging: a new field on
+    /// `StreamParams` is filled once rather than in three places that have to
+    /// be found first.
+    async fn send(
+        &self,
+        request: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<ModelStream, base::interface::model::ModelError> {
+        self.model
+            .stream(
+                request.prompt_blocks,
+                request.tool_defs,
+                request.messages,
+                request.params,
+                cancel,
+            )
+            .await
+    }
+
     /// Total tokens this session is currently sending per API call: the
     /// conversation plus the fixed per-request overhead.
     ///
@@ -2531,27 +2595,17 @@ or project context that should survive across sessions.
                 "model overloaded, switching to fallback"
             );
             *effective_model = fallback.clone();
-            // A-4: rebuild the *full* prompt for the fallback model — skills
-            // inventory and MCP instructions included. This path used to pass
-            // `None, None`, so a fallback call reached a different (and
-            // weaker) model with strictly less guidance than the primary one
-            // got. See `build_prompt_blocks`.
-            let fb_prompt = self.build_prompt_blocks(effective_model.as_str());
-            self.model
-                .stream(
-                    fb_prompt,
-                    tool_defs,
-                    messages,
-                    base::interface::model::StreamParams {
-                        model: fallback.clone(),
-                        max_tokens: effective_max_tokens,
-                        thinking_mode: self.settings.model.thinking_mode.clone(),
-                        fallback_model: None,
-                        cache_edits: vec![],
-                        origin,
-                    },
-                    cancel,
-                )
+            // `fallback_model: None` — this retry *is* the fallback, so there
+            // is nothing further to fall back to.
+            let retry = self.prepare_retry(
+                effective_model.as_str(),
+                effective_max_tokens,
+                tool_defs,
+                messages,
+                None,
+                origin,
+            );
+            self.send(retry, cancel)
                 .await
                 .map_err(|e| TurnError::Model(format!("failed to stream model response: {}", e)))
         } else {
@@ -3823,6 +3877,18 @@ fn strip_token_budget_directive(input: &str) -> String {
 
     // No directive found — return original
     input.to_string()
+}
+
+/// One assembled call to the model.
+///
+/// The normal path and the two recovery paths differ only in how these four
+/// fields are produced, so they build one of these and hand it to
+/// [`Agent::send`] rather than each spelling out a `StreamParams` of its own.
+struct ModelRequest {
+    prompt_blocks: Vec<PromptBlock>,
+    tool_defs: Vec<ToolDef>,
+    messages: Vec<ModelMessage>,
+    params: base::interface::model::StreamParams,
 }
 
 #[derive(Debug, Clone, Default)]
