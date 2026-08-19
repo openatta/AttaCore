@@ -60,12 +60,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "same deny-list, reused by the command classifier so `cat ~/.ssh/id_rsa` \
          is not waved through as a read-only command.",
     ),
-    (
-        "crates/telemetry/src/vcr.rs",
-        "scrubs this machine's home out of recorded cassettes and puts it back \
-         on replay, so a recording is portable between machines. A substitution \
-         rule, not a location.",
-    ),
 ];
 
 fn repo_root() -> PathBuf {

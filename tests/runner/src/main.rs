@@ -3,11 +3,11 @@
 //! 用法:
 //! ```sh
 //! # Agent API 模式（录制）
-//! ATTA_VCR_RECORD=c_project cargo run -p test-runner -- \
+//! ATTA_RECORD=c_project cargo run -p test-runner -- \
 //!   --mode agent --case tests/cases/c_project.test
 //!
 //! # Agent API 模式（回放）
-//! ATTA_VCR_REPLAY=c_project cargo run -p test-runner -- \
+//! ATTA_REPLAY=c_project cargo run -p test-runner -- \
 //!   --mode agent --case tests/cases/c_project.test
 //!
 //! # Daemon 模式
@@ -17,7 +17,7 @@
 
 use test_runner::{api_runner, cli_runner, comparator, config, mutations, reporter, script};
 
-use base::interface::settings::VcrMode;
+use base::interface::settings::RecorderMode;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, clap::Parser)]
@@ -47,7 +47,7 @@ struct Args {
     #[clap(long, default_value = "tests/output")]
     out_dir: PathBuf,
 
-    /// VCR scenario name (defaults to case file stem)
+    /// Recording name (defaults to case file stem)
     #[clap(long)]
     scenario: Option<String>,
 
@@ -62,9 +62,9 @@ struct Args {
     #[clap(long)]
     fixture: Option<PathBuf>,
 
-    /// VCR round identifier — cassette data is stored under a per-round
+    /// Round identifier — recorded data is stored under a per-round
     /// subdirectory so re-recording never overwrites/mixes with an earlier
-    /// round. Defaults to $ATTA_VCR_ROUND, or
+    /// round. Defaults to $ATTA_RECORD_ROUND, or
     /// today's UTC date (YYYY-MM-DD) if that's unset either.
     #[clap(long)]
     round: Option<String>,
@@ -120,13 +120,13 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("Loaded: {} ({} turns)", case.source_path, case.turns.len());
     eprintln!("Meta: {}", case.meta.lines().next().unwrap_or("(none)"));
 
-    // Determine VCR mode from env. `ATTA_VCR_REPLAY` (if set) and the
-    // no-env-var default both mean the same thing: try replay, fall back if
-    // no fixture exists — only `ATTA_VCR_RECORD` picks a different mode.
-    let vcr_mode = if std::env::var("ATTA_VCR_RECORD").is_ok() {
-        VcrMode::Record
+    // Determine recorder mode from env. `ATTA_REPLAY` (if set) and the
+    // no-env-var default both mean the same thing: replay what was recorded —
+    // only `ATTA_RECORD` picks a different mode.
+    let recorder_mode = if std::env::var("ATTA_RECORD").is_ok() {
+        RecorderMode::Record
     } else {
-        VcrMode::Replay
+        RecorderMode::Replay
     };
 
     let scenario = args.scenario.clone().unwrap_or_else(|| {
@@ -158,10 +158,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let round = config::resolve_vcr_round(args.round.clone());
-    eprintln!("VCR round: {round}");
+    let round = config::resolve_record_round(args.round.clone());
+    eprintln!("Recording round: {round}");
 
-    // cassette_dir: 本地/CI 缓存的 VCR 录制数据（tests/fixtures/cassettes/，已 gitignore），
+    // cassette_dir: 本地/CI 缓存的录制数据（tests/fixtures/cassettes/，已 gitignore），
     // 按 round 分目录存放——重新录制开新一轮，旧轮次原样留在磁盘上，互不覆盖。
     // output_dir: 纯生成物（人读日志/报告/遥测），继续留在 tests/output/，被 .gitignore 排除。
     let cassette_dir = PathBuf::from("tests/fixtures/cassettes")
@@ -179,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
             run_api_mode(
                 &args,
                 &case,
-                vcr_mode,
+                recorder_mode,
                 &scenario,
                 &cassette_dir,
                 &output_dir,
@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_api_mode(
     args: &Args,
     case: &script::TestCase,
-    vcr_mode: VcrMode,
+    recorder_mode: RecorderMode,
     scenario: &str,
     cassette_dir: &Path,
     output_dir: &Path,
@@ -218,28 +218,24 @@ async fn run_api_mode(
 ) -> anyhow::Result<()> {
     let model_config = config::load_env_config(Path::new(config_path))?;
     eprintln!(
-        "Config: model={} (record + VCR fallback-on-miss — must match to keep cassette hashes valid) / fast_model={} (LLM comparator only)",
+        "Config: model={} (recording and replay must agree on it, or replay reports a params divergence) / fast_model={} (LLM comparator only)",
         model_config.model, model_config.fast_model
     );
     let model = build_model(&model_config)?;
 
     // `cassette_dir`/`output_dir` (built by `main()`) are already scoped by the
     // full scenario path (e.g. `.../skills/001_startup/agent/<round>/`), so the
-    // *filename* written inside them only needs the leaf component — using the
-    // full `scenario` (with a `/` in it) here would make `VcrModel` try to
-    // `.join("skills/001_startup.jsonl")` onto an already-`skills/001_startup`-
-    // scoped directory, i.e. write to a nonexistent nested subdirectory that
-    // nothing ever creates, silently losing every recorded entry (`save_entry`
-    // swallows the open() error) while `--mode agent` itself reports success —
-    // caught by a real recording that "passed" but replayed as 100% miss.
+    // recording *name* inside them only needs the leaf component — a name with
+    // a `/` in it would nest a second copy of the scenario path under an
+    // already-scoped directory.
     let scenario_leaf = scenario.rsplit('/').next().unwrap_or(scenario);
     let telemetry_path = output_dir.join(format!("{scenario_leaf}.telemetry.md"));
 
     let runner_config = api_runner::AgentRunnerConfig {
         model: model.clone(),
-        vcr_mode,
-        vcr_scenario: scenario_leaf.to_string(),
-        vcr_dir: cassette_dir.to_path_buf(),
+        recorder_mode,
+        recorder_name: scenario_leaf.to_string(),
+        recordings_dir: cassette_dir.to_path_buf(),
         telemetry_path: Some(telemetry_path),
         fixture_dir: args.fixture.clone(),
         scene: resolve_scene(&args.scene)?,
@@ -276,20 +272,16 @@ async fn run_cli_mode(
     report_dir: &Path,
 ) -> anyhow::Result<()> {
     let config_path = shellexpand::tilde(&args.config).to_string();
-    let vcr_mode: Option<String> = std::env::var("ATTA_VCR_RECORD")
+    let recorder_mode: Option<String> = std::env::var("ATTA_RECORD")
         .ok()
         .map(|_| "record".into())
-        .or_else(|| {
-            std::env::var("ATTA_VCR_REPLAY")
-                .ok()
-                .map(|_| "replay".into())
-        });
+        .or_else(|| std::env::var("ATTA_REPLAY").ok().map(|_| "replay".into()));
     let config = cli_runner::CliRunnerConfig {
         socket_path: args.socket.clone(),
         daemon_binary: args.daemon_binary.clone(),
         config_path: config_path.clone().into(),
         scenario: scenario.to_string(),
-        vcr_mode,
+        recorder_mode,
         cassette_dir: cassette_dir.to_path_buf(),
         output_dir: output_dir.to_path_buf(),
         fixture_dir: args.fixture.clone(),

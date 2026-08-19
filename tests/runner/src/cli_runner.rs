@@ -2,7 +2,7 @@
 
 use crate::api_runner::TurnOutput;
 use crate::script::TestCase;
-use rpc_client::{DaemonRpcClient, RunTurnOptions, TelemetryRunOptions, VcrRunOptions};
+use rpc_client::{DaemonRpcClient, RecorderRunOptions, RunTurnOptions, TelemetryRunOptions};
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -11,8 +11,8 @@ pub struct CliRunnerConfig {
     pub daemon_binary: PathBuf,
     pub config_path: PathBuf,
     pub scenario: String,
-    pub vcr_mode: Option<String>, // "record" | "replay"
-    /// 本地/CI 缓存的 VCR 录制数据目录（tests/fixtures/cassettes/{scenario}/cli/{round}/，已 gitignore）。
+    pub recorder_mode: Option<String>, // "record" | "replay"
+    /// 本地/CI 缓存的录制数据目录（tests/fixtures/cassettes/{scenario}/cli/{round}/，已 gitignore）。
     pub cassette_dir: PathBuf,
     /// 纯生成物目录（遥测日志），继续被 .gitignore 排除。
     pub output_dir: PathBuf,
@@ -59,8 +59,7 @@ pub async fn run_test_case(
     // 时会继承 `cargo run` 的 cwd（本仓库根，一个有大量未提交改动的真实 git
     // repo），系统提示词里的 env 块会带上完整的 gitStatus，跟 `api_runner.rs`
     // 用的 `/tmp/atta_test_runner`（非 git 目录）在结构上就不一样 —— 不是
-    // dehydrate 能抹平的路径差异，是内容本身不同，VCR 哈希永远对不上。见
-    // 2026-08-06 定位这个问题时的第一次 replay miss。
+    // 路径归一化能抹平的差异，是提示词内容本身不同，回放时必然报分歧。
     let dir = std::env::temp_dir().join(format!("atta_test_runner_cli_{scenario_leaf}"));
     let _ = std::fs::remove_dir_all(&dir);
     if let Some(fixture) = &config.fixture_dir {
@@ -111,18 +110,13 @@ pub async fn run_test_case(
         .arg(&config.scene);
     // daemon has its own `--model` flag (default "claude-sonnet-4-6"), separate
     // from the `ANTHROPIC_MODEL` env-var convention `api_runner.rs`/`.env` use —
-    // it does NOT read `ANTHROPIC_MODEL` at all. Without this, the daemon path
-    // always used the CLI default regardless of what `.env` said, silently
-    // recording/replaying under the wrong model name — which the VCR hash
-    // includes, so cross-path (api vs cli) replay always missed. Found while
-    // trying to replay an already-recorded agent-mode cassette through `--mode
-    // cli`: `ATTA_DEBUG_VCR_MISS=1` showed the daemon's actual request used
-    // `claude-sonnet-4-6` while the cassette was recorded under
-    // `deepseek-v4-pro[1m]`.
+    // it does NOT read `ANTHROPIC_MODEL` at all. Without this the daemon path
+    // runs under a different model than the one the recording was made with,
+    // which a replay reports as a `params` divergence.
     if let Some((_, model)) = env_vars.iter().find(|(k, _)| k == "ANTHROPIC_MODEL") {
         cmd.arg("--model").arg(model);
     }
-    if std::env::var("ATTA_DEBUG_VCR_MISS").is_ok() {
+    if std::env::var("ATTA_DEBUG_RECORDER").is_ok() {
         cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -189,7 +183,7 @@ pub async fn run_test_case(
             session_ids.push(session_id.clone());
         }
 
-        let options = config.vcr_mode.as_ref().map(|mode| {
+        let options = config.recorder_mode.as_ref().map(|mode| {
             let cassette_dir = std::fs::canonicalize(&config.cassette_dir)
                 .unwrap_or_else(|_| config.cassette_dir.clone());
             let _ = std::fs::create_dir_all(&cassette_dir);
@@ -199,17 +193,16 @@ pub async fn run_test_case(
                     .unwrap_or_else(|_| config.output_dir.clone())
                     .join(format!("{scenario_leaf}.telemetry.md"))
             };
-            // Same fallback policy as the direct-API path (`api_runner.rs`),
-            // resolved by the one function that owns it
-            // (`VcrModel::replay_fallback_on_miss` — strict by default under a
-            // test runner / CI, `ATTA_VCR_STRICT=1` to force,
-            // `ATTA_VCR_FALLBACK=1` to opt back in). Record mode ignores it.
-            let strict =
-                mode.as_str() != "record" && !telemetry::vcr::VcrModel::replay_fallback_on_miss();
+            // Same divergence policy as the direct-API path
+            // (`api_runner.rs`), resolved by the one function that owns it
+            // rather than re-derived here. Record mode ignores it.
+            let strict = mode.as_str() != "record"
+                && telemetry::recorder::RecorderModel::default_divergence()
+                    == base::interface::settings::Divergence::Strict;
             RunTurnOptions {
-                vcr: Some(VcrRunOptions {
+                recorder: Some(RecorderRunOptions {
                     mode: mode.clone(),
-                    scenario: scenario_leaf.clone(),
+                    name: scenario_leaf.clone(),
                     dir: cassette_dir.to_string_lossy().to_string(),
                     strict,
                 }),

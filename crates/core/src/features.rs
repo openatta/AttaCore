@@ -29,9 +29,9 @@ pub struct FeatureFlags {
     #[serde(default)]
     pub experimental_agent: bool,
 
-    /// Enable VCR auto-detection in test environments.
+    /// Enable recorder auto-detection in test environments.
     #[serde(default)]
-    pub vcr_auto_detect: bool,
+    pub recorder_auto_detect: bool,
 
     /// Enable microcompact caching (time-based tool result clearing).
     #[serde(default)]
@@ -58,7 +58,7 @@ impl FeatureFlags {
             "plugin_marketplace" => cfg!(feature = "plugin-marketplace") && self.plugin_marketplace,
             "extended_memory" => self.extended_memory,
             "experimental_agent" => cfg!(feature = "experimental-agent") && self.experimental_agent,
-            "vcr_auto_detect" => self.vcr_auto_detect,
+            "recorder_auto_detect" => self.recorder_auto_detect,
             "cached_microcompact" => self.cached_microcompact,
             "reactive_compact" => self.reactive_compact,
             "dream_task" => self.dream_task,
@@ -95,7 +95,7 @@ impl FeatureFlags {
             "plugin_marketplace",
             "extended_memory",
             "experimental_agent",
-            "vcr_auto_detect",
+            "recorder_auto_detect",
             "cached_microcompact",
             "reactive_compact",
             "dream_task",
@@ -140,7 +140,7 @@ mod tests {
         let flags = FeatureFlags {
             team_mode: true,
             extended_memory: true,
-            vcr_auto_detect: true,
+            recorder_auto_detect: true,
             ..Default::default()
         };
         let list = flags.enabled_flags();
@@ -149,7 +149,7 @@ mod tests {
             assert!(list.contains(&"team_mode"));
         }
         assert!(list.contains(&"extended_memory"));
-        assert!(list.contains(&"vcr_auto_detect"));
+        assert!(list.contains(&"recorder_auto_detect"));
         assert!(!list.contains(&"plugin_marketplace"));
     }
 }

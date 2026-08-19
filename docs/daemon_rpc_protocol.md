@@ -646,7 +646,7 @@ resume。
   "options": {
     "permission_mode": "default",        // default|acceptEdits|plan|bypassPermissions
     "permission_rules": [ … ],
-    "vcr": { "mode":"replay", "scenario":"…", "dir":"…", "strict":false },
+    "recorder": { "mode":"replay", "name":"…", "dir":"…", "strict":true },
     "telemetry": { "output":"/abs/path.jsonl" } } }
 // ←
 { "session_id":"…", "scene":"coding", "session_kind":"primary",

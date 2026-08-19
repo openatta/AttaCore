@@ -1,10 +1,9 @@
 //! 测试系统的唯一配置源：仓库根 `.env`（`export KEY=VALUE` 格式）。
 //!
-//! - `ANTHROPIC_MODEL`：Agent 主流程用的正式模型，录制和回放（含 cassette miss 时的
-//!   兜底穿透）都必须用同一个值——VCR 的请求哈希把 model 名字编进去了
-//!   （`crates/telemetry/src/vcr.rs::hash_request`），换了模型名回放必定全 miss。
+//! - `ANTHROPIC_MODEL`：Agent 主流程用的正式模型，录制和回放必须用同一个值——
+//!   model 名字是请求的一部分，回放时对不上会被报成 `params` 分歧。
 //! - `ANTHROPIC_SMALL_FAST_MODEL`：只用于 LLM 比对裁判（`comparator.rs`），跟主
-//!   Agent 流程的 VCR 录制/回放无关，不受哈希约束，可以随便用便宜档模型。
+//!   Agent 流程的录制/回放无关，不受此约束，可以随便用便宜档模型。
 
 use std::path::Path;
 
@@ -50,19 +49,19 @@ pub fn load_env_config(path: &Path) -> anyhow::Result<TestModelConfig> {
     })
 }
 
-/// 解析 VCR 录制轮次标识：`--round` CLI 参数 > `ATTA_VCR_ROUND` 环境变量 >
+/// 解析录制轮次标识：`--round` CLI 参数 > `ATTA_RECORD_ROUND` 环境变量 >
 /// 今天的日期（`YYYY-MM-DD`，UTC）。
 ///
-/// 轮次是 cassette 目录的一层（`tests/fixtures/cassettes/{scenario}/{mode}/{round}/`），
+/// 轮次是录制目录的一层（`tests/fixtures/cassettes/{scenario}/{mode}/{round}/`），
 /// 不同轮次物理上是不同目录，互不覆盖：
 /// 换模型/改 prompt 后开新一轮，旧轮次的录制数据原样留在磁盘上，不会被静默覆盖或
 /// 和新数据混在同一个文件里追加。默认按日期分轮，同一天内的多次录制自然归到同一轮
 /// （不用每次手动想一个轮次名），过了这天再录就是新的一轮。
-pub fn resolve_vcr_round(explicit: Option<String>) -> String {
+pub fn resolve_record_round(explicit: Option<String>) -> String {
     if let Some(r) = explicit {
         return r;
     }
-    if let Ok(r) = std::env::var("ATTA_VCR_ROUND") {
+    if let Ok(r) = std::env::var("ATTA_RECORD_ROUND") {
         if !r.is_empty() {
             return r;
         }
@@ -100,19 +99,19 @@ mod tests {
     use super::*;
 
     /// 一个测试函数里把三级优先级全部断言完，避免和其他测试并发读写同一个
-    /// 进程级环境变量 `ATTA_VCR_ROUND` 产生竞争（cargo test 默认多线程并发跑）。
+    /// 进程级环境变量 `ATTA_RECORD_ROUND` 产生竞争（cargo test 默认多线程并发跑）。
     #[test]
     fn round_resolution_priority() {
         // 1) 显式参数优先于一切，哪怕环境变量也设了。
-        unsafe { std::env::set_var("ATTA_VCR_ROUND", "should-be-ignored") };
-        assert_eq!(resolve_vcr_round(Some("explicit".into())), "explicit");
+        unsafe { std::env::set_var("ATTA_RECORD_ROUND", "should-be-ignored") };
+        assert_eq!(resolve_record_round(Some("explicit".into())), "explicit");
 
         // 2) 没有显式参数时用环境变量。
-        assert_eq!(resolve_vcr_round(None), "should-be-ignored");
+        assert_eq!(resolve_record_round(None), "should-be-ignored");
 
         // 3) 都没有时落到今天的 UTC 日期，格式 YYYY-MM-DD。
-        unsafe { std::env::remove_var("ATTA_VCR_ROUND") };
-        let round = resolve_vcr_round(None);
+        unsafe { std::env::remove_var("ATTA_RECORD_ROUND") };
+        let round = resolve_record_round(None);
         assert_eq!(round.len(), 10, "expected YYYY-MM-DD, got: {round}");
         assert_eq!(round.as_bytes()[4], b'-');
         assert_eq!(round.as_bytes()[7], b'-');

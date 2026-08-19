@@ -292,7 +292,7 @@ pub fn apply_policy(servers: &mut HashMap<String, McpServerConfig>, policy: &Mcp
 /// Scopes (low to high priority):
 /// 1. Enterprise: `{global_data_dir}/policy/mcp.json`
 /// 2. Global: `{global_data_dir}/mcp/servers.json` — **not** scene-scoped
-///    (same reasoning as `memory`/`sessions`/`vcr`, see `base::paths` module
+///    (same reasoning as `memory`/`sessions`/`recordings`, see `base::paths` module
 ///    docs: which scene a session runs under has no bearing on which MCP
 ///    servers a project wants connected).
 /// 3. Project: `{local_data_dir}/mcp/servers.json`

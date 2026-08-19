@@ -17,10 +17,10 @@ pub mod events;
 pub mod file_recorder;
 pub mod handle;
 pub mod perf;
+pub mod recorder;
 pub mod redact;
 pub mod spawn;
 pub mod stats;
-pub mod vcr;
 
 pub use config::{TelemetryConfig, TelemetryMode};
 pub use events::{
@@ -43,4 +43,3 @@ pub use handle::{
 };
 pub use redact::RedactionPolicy;
 pub use spawn::{spawn, SpawnError, TelemetryConsumer};
-pub use vcr::VcrModel;

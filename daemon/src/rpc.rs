@@ -291,7 +291,7 @@ pub mod codes {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct SessionOptions {
-    pub vcr: Option<VcrOptions>,
+    pub recorder: Option<RecorderOptions>,
     pub telemetry: Option<TelemetryOptions>,
     /// Opt-in real permission checking for this session — `None` (the
     /// default) keeps today's behavior (`AllowAllPermission`, every tool
@@ -308,18 +308,18 @@ pub struct SessionOptions {
     pub permission_rules: Vec<base::permission::PermissionRule>,
 }
 
+/// Record or replay this session's LLM calls.
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct VcrOptions {
+pub struct RecorderOptions {
     pub mode: String, // "record" | "replay"
-    pub scenario: String,
-    pub dir: String, // absolute path to VCR fixture directory
-    /// Disable the network fallback on a replay miss — fail immediately
-    /// instead of silently making a real (billed) API call. Was previously
-    /// hardcoded `fallback_on_miss: true` server-side with no way for a
-    /// caller to opt out (`api_runner.rs`'s equivalent direct-API path has
-    /// supported this via `ATTA_VCR_STRICT` since earlier this session; the
-    /// daemon RPC path never got the same knob). Defaults to `false` (the
-    /// prior, only-available behavior) so existing callers are unaffected.
+    /// Directory name for the recording under `dir`. Omitted, the session id
+    /// is used — which is what production recording wants, and what a replay
+    /// must therefore override with the name of the recording it wants back.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub dir: String, // absolute path to the recordings root
+    /// On replay, whether a live request that differs from the recorded one
+    /// fails the call (`true`) or only warns (`false`).
     #[serde(default)]
     pub strict: bool,
 }

@@ -15,7 +15,7 @@ use base::interface::model::{
     Model, ModelError, ModelEvent, ModelMessage, ModelStream, StreamParams, ToolDef, Usage,
 };
 use base::interface::prompt::PromptBlock;
-use base::interface::settings::VcrMode;
+use base::interface::settings::RecorderMode;
 use base::provider::ApiType;
 use std::sync::Arc;
 use test_runner::api_runner::{self, AgentRunnerConfig};
@@ -84,15 +84,15 @@ fn two_turn_case() -> script::TestCase {
     script::parse_test_script(&src, "session_continuity.test").unwrap()
 }
 
-fn runner_config(vcr_dir: &std::path::Path, scenario: &str) -> AgentRunnerConfig {
+fn runner_config(recordings_dir: &std::path::Path, scenario: &str) -> AgentRunnerConfig {
     AgentRunnerConfig {
         model: Arc::new(MarkerProbeModel),
-        // Record（而不是 Replay）：这条路径下 VcrModel 总是调用内层模型，
+        // Record（而不是 Replay）：这条路径下 recorder 总是调用内层模型，
         // 不查 cassette，也就跟"回放命中/未命中"完全无关——这个测试要验的是
-        // 会话语义，不是 VCR。
-        vcr_mode: VcrMode::Record,
-        vcr_scenario: scenario.to_string(),
-        vcr_dir: vcr_dir.to_path_buf(),
+        // 会话语义，不是录制回放。
+        recorder_mode: RecorderMode::Record,
+        recorder_name: scenario.to_string(),
+        recordings_dir: recordings_dir.to_path_buf(),
         telemetry_path: None,
         fixture_dir: None,
         scene: Arc::new(scene::scene::coding::CodingScene),
@@ -184,8 +184,8 @@ fn the_multi_turn_case_file_declares_a_shared_session() {
     );
 }
 
-/// 现存用例一律保持逐轮隔离（它们录好的 cassette 依赖这个默认值：共享会话会
-/// 改变消息历史，也就改变 VCR 请求哈希）。
+/// 现存用例一律保持逐轮隔离（它们录好的数据依赖这个默认值：共享会话会改变
+/// 消息历史，回放时会被判为分歧）。
 #[test]
 fn existing_cases_keep_the_per_turn_default() {
     let cases_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cases");

@@ -200,7 +200,7 @@ struct PendingToolUse {
 /// response. Net effect: every tool call whose arguments streamed via deltas
 /// (the normal case for any call with non-trivial input) reached the tool
 /// dispatcher with an empty `input` object, and the real JSON leaked into the
-/// assistant's visible text instead. Confirmed via real VCR recordings
+/// assistant's visible text instead. Confirmed via real recordings
 /// against `deepseek-v4-pro[1m]` (Anthropic-compatible relay) while testing
 /// the chat/research scenes: 100% of recorded tool calls in both new
 /// cassettes, and (re-checked after the fact) 282/282 tool executions in the
@@ -327,16 +327,25 @@ fn map_stream_event(
             BlockDelta::SignatureDelta { signature } => {
                 vec![Ok(ModelEvent::ThinkingSignature { signature })]
             }
-            BlockDelta::InputJsonDelta { partial_json } => {
-                if let Some(pending) = acc.0.get_mut(&index) {
+            BlockDelta::InputJsonDelta { partial_json } => match acc.0.get_mut(&index) {
+                // The fragment is forwarded *as well as* accumulated: the
+                // engine still acts on the assembled `ToolUse` emitted at
+                // `ContentBlockStop`, but concatenation is lossy in the one
+                // case worth investigating afterwards — arguments that never
+                // parsed. Observers see the bytes; nothing else changes.
+                Some(pending) => {
                     pending.json.push_str(&partial_json);
+                    vec![Ok(ModelEvent::ToolArgsDelta {
+                        id: pending.id.clone(),
+                        partial_json,
+                    })]
                 }
                 // No corresponding tool_use block open (shouldn't happen for
                 // a spec-conformant provider) — nothing sensible to do with
                 // an orphan JSON fragment, so it's dropped rather than
                 // leaked into the visible text like before.
-                vec![]
-            }
+                None => vec![],
+            },
             _ => vec![],
         },
         StreamEvent::ContentBlockStop { index } => {
@@ -422,6 +431,36 @@ mod map_stream_event_tests {
             .flat_map(|e| map_stream_event(e, &mut acc))
             .map(|r| r.expect("no errors in these fixtures"))
             .collect()
+    }
+
+    /// The assembled tool calls in `out` — what the engine dispatches on.
+    /// Argument fragments are forwarded alongside them for observers, so a
+    /// test about assembly has to say which of the two it means.
+    fn tool_uses(out: &[ModelEvent]) -> Vec<&ModelEvent> {
+        out.iter()
+            .filter(|e| matches!(e, ModelEvent::ToolUse { .. }))
+            .collect()
+    }
+
+    /// The raw argument fragments, in arrival order.
+    fn arg_fragments(out: &[ModelEvent]) -> Vec<&str> {
+        out.iter()
+            .filter_map(|e| match e {
+                ModelEvent::ToolArgsDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Argument fragments must never surface as assistant text. They did once:
+    /// raw tool JSON appeared in the user's output while every streamed tool
+    /// call reached the dispatcher with an empty input.
+    fn assert_no_text_leaked(out: &[ModelEvent]) {
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, ModelEvent::TextDelta { .. })),
+            "tool argument fragments leaked into visible text: {out:?}"
+        );
     }
 
     /// `stream.rs` has always parsed thinking blocks, and `parser.rs` has
@@ -590,12 +629,19 @@ mod map_stream_event_tests {
         ];
 
         let out = run(events);
+        assert_no_text_leaked(&out);
         assert_eq!(
-            out.len(),
-            1,
-            "fragments must collapse into exactly one event"
+            arg_fragments(&out),
+            vec![r#"{"file_path": "notes.md", "#, r#""content": "hello"}"#],
+            "fragments must be forwarded verbatim, unjoined"
         );
-        match &out[0] {
+        let uses = tool_uses(&out);
+        assert_eq!(
+            uses.len(),
+            1,
+            "fragments must assemble into exactly one call"
+        );
+        match uses[0] {
             ModelEvent::ToolUse { id, name, input } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "Write");
@@ -637,7 +683,8 @@ mod map_stream_event_tests {
         ];
 
         let out = run(events);
-        match &out[0] {
+        assert_no_text_leaked(&out);
+        match tool_uses(&out)[0] {
             ModelEvent::ToolUse { input, .. } => assert_eq!(input["pattern"], "*.txt"),
             other => panic!("expected ToolUse with pattern, got {other:?}"),
         }
@@ -706,8 +753,10 @@ mod map_stream_event_tests {
         ];
 
         let out = run(events);
-        assert_eq!(out.len(), 2);
-        match &out[0] {
+        assert_no_text_leaked(&out);
+        let uses = tool_uses(&out);
+        assert_eq!(uses.len(), 2);
+        match uses[0] {
             ModelEvent::ToolUse { id, name, input } => {
                 assert_eq!(id, "call_b");
                 assert_eq!(name, "Grep");
@@ -715,7 +764,7 @@ mod map_stream_event_tests {
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
-        match &out[1] {
+        match uses[1] {
             ModelEvent::ToolUse { id, name, input } => {
                 assert_eq!(id, "call_a");
                 assert_eq!(name, "Glob");
@@ -815,7 +864,11 @@ mod map_stream_event_tests {
         ];
 
         let out = run(events);
-        match &out[0] {
+        assert_no_text_leaked(&out);
+        // The unparseable bytes still reach an observer verbatim — that is the
+        // case a recording exists for.
+        assert_eq!(arg_fragments(&out), vec!["{not valid json"]);
+        match tool_uses(&out)[0] {
             ModelEvent::ToolUse { input, .. } => {
                 assert_eq!(input, &serde_json::Value::Object(Default::default()))
             }

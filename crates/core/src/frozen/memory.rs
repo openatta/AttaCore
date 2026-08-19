@@ -23,7 +23,7 @@ pub struct MemoryFileEntry {
 /// 跨会话 memory 目录 ＋ MEMORY.md 加载。
 ///
 /// 路径：`~/.atta/memory/<sha256(canonical_cwd)[..16]>/`——**2026-08-04 起不再
-/// 挂 scope**：memory 跟 sessions/vcr 一样，只分"项目级"与"全局级"，不分
+/// 挂 scope**：memory 跟 sessions/recordings 一样，只分"项目级"与"全局级"，不分
 /// scene（不同 scene 的工具配置跟这份 memory 属于哪个项目无关）。
 ///
 /// 行为：

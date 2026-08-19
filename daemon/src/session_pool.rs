@@ -14,7 +14,7 @@ use base::interface::memory::MemoryStore;
 use base::interface::permission::Permission;
 use base::interface::scene::AgentScene;
 use base::interface::settings::Settings;
-use base::interface::settings::{VcrConfig, VcrMode};
+use base::interface::settings::{Divergence, RecorderConfig, RecorderMode};
 use mcp::manager::McpManager;
 use model::adapter::AnthropicModel;
 use model::client::AnthropicClient;
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use telemetry::file_recorder::FileRecorder;
-use telemetry::vcr::VcrModel;
+use telemetry::recorder::RecorderModel;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
@@ -1495,25 +1495,26 @@ impl SessionPool {
         resume: bool,
     ) -> Result<String, String> {
         let scene_id = scene.id().to_string();
-        // Apply VCR wrapping if configured
+        // Wrap the model in a recorder if this session asked for one.
         let model: Arc<dyn base::interface::model::Model> =
-            match options.and_then(|o| o.vcr.as_ref()) {
-                Some(vcr) => {
-                    let mode = match vcr.mode.as_str() {
-                        "record" => VcrMode::Record,
-                        _ => VcrMode::Replay,
-                    };
-                    Arc::new(VcrModel::new(
-                        self.model.clone(),
-                        Some(VcrConfig {
-                            mode,
-                            scenario: vcr.scenario.clone(),
-                            fallback_on_miss: !vcr.strict,
-                        }),
-                        std::path::PathBuf::from("/tmp/atta_vcr_nonexistent"),
-                        std::path::PathBuf::from(&vcr.dir),
-                    ))
-                }
+            match options.and_then(|o| o.recorder.as_ref()) {
+                Some(recorder) => Arc::new(RecorderModel::new(
+                    self.model.clone(),
+                    Some(RecorderConfig {
+                        mode: match recorder.mode.as_str() {
+                            "record" => RecorderMode::Record,
+                            _ => RecorderMode::Replay,
+                        },
+                        name: recorder.name.clone(),
+                        root: std::path::PathBuf::from(&recorder.dir),
+                        on_divergence: if recorder.strict {
+                            Divergence::Strict
+                        } else {
+                            Divergence::Warn
+                        },
+                    }),
+                    env!("CARGO_PKG_VERSION"),
+                )),
                 None => self.model.clone(),
             };
 
@@ -3871,6 +3872,7 @@ impl SessionPool {
                     thinking_mode: base::interface::settings::ThinkingMode::Off,
                     fallback_model: None,
                     cache_edits: vec![],
+                    origin: None,
                 },
                 CancellationToken::new(),
             )

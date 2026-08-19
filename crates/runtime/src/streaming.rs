@@ -112,11 +112,11 @@ where
     // so the index is carried alongside each block and used to restore
     // submission order at flush time (see `flush_tool_batch`). The API
     // itself doesn't care about tool_result order within the message (only
-    // that the *set* of ids matches the preceding ToolUse blocks), but VCR
-    // replay does: the exact message content feeds `hash_request`, so two
-    // runs of the same turn with the same tools completing in a different
-    // real-world order used to hash differently and desync every replay
-    // after that point — found via a real multi-Glob turn missing on strict
+    // that the *set* of ids matches the preceding ToolUse blocks), but replay
+    // does: the message content is part of the request, so two runs of the
+    // same turn with the same tools completing in a different real-world
+    // order used to produce different requests and desync every replay after
+    // that point — found via a real multi-Glob turn diverging on strict
     // replay for no code-level reason. Fixed the same way an unused sibling
     // implementation (since removed) had already solved it: carry the
     // original submission index alongside each result and restore order by
@@ -415,7 +415,7 @@ fn buffer_result(
 /// `ToolUse` block, immediately followed by one user message with every
 /// buffered `ToolResult` block — sorted back into original submission order
 /// first (see `pending_result_blocks`'s doc comment: the API tolerates any
-/// order since it only checks the *set* of ids, but VCR hash determinism
+/// order since it only checks the *set* of ids, but replay determinism
 /// doesn't, so this restores a canonical order even though it's not
 /// API-required), then any deferred `new_messages` in resolution order.
 /// No-op if nothing is pending.
@@ -794,16 +794,16 @@ mod tests {
         assert_eq!(session.messages().len(), 2);
     }
 
-    /// Regression for a real VCR-replay-determinism bug: three
+    /// Regression for a real replay-determinism bug: three
     /// concurrency-safe tools submitted in order A, B, C but made to
     /// *finish* in the reverse order C, B, A (artificial per-call delays,
     /// simulating real-world scheduling where a fast `Glob` beats a slower
     /// one). Before the fix, `pending_result_blocks` was pushed to in
     /// `FuturesUnordered` completion order, so the flushed `ToolResult`
     /// message came out C, B, A — same *set* of ids (the API doesn't care),
-    /// but a different exact message, which changes `VcrModel::hash_request`
-    /// for every request after this point. Found via a real recorded turn
-    /// (3 parallel `Glob` calls) that missed on strict replay for no
+    /// but a different exact message, so every request after this point
+    /// differed between two runs of the same conversation. Found via a real
+    /// recorded turn (3 parallel `Glob` calls) that diverged on replay for no
     /// code-level reason — the model's own request was identical, only the
     /// tool completion timing differed between record and replay. The fix
     /// (`idx`-sorting at flush time, mirroring `dispatch.rs`) must produce

@@ -67,9 +67,9 @@ pub struct Settings {
     pub prompt_override: Option<String>,
 
     // ── Internal component configuration ──
-    /// VCR record/replay configuration. None = pass-through.
+    /// LLM interaction recording. None = pass-through.
     #[serde(default)]
-    pub vcr: Option<VcrConfig>,
+    pub recorder: Option<RecorderConfig>,
     /// Telemetry endpoint URL. None = noop.
     #[serde(default)]
     pub telemetry_url: Option<String>,
@@ -300,7 +300,7 @@ pub struct PathSettings {
     pub user_data_dir: PathBuf,
     /// User-level, cross-scene global root — flat, shared by every scene
     /// (e.g. `~/.atta/`). Used by resources that don't have a scene tier
-    /// (`memory`/`sessions`/`vcr`/`mcp`) and as the base layer for resources
+    /// (`memory`/`sessions`/`recordings`/`mcp`) and as the base layer for resources
     /// that do (`settings.json`/`skills`/`plugins`/`agents`/`rules`/`hooks`).
     /// See `base::paths::ConfigPaths` module docs for the full breakdown.
     #[serde(default)]
@@ -534,23 +534,43 @@ pub struct SandboxConfig {
     pub dangerously_disable_sandbox: bool,
 }
 
-/// VCR (record/replay) configuration.
+/// Recorder (record/replay) configuration. `None` on [`Settings`] leaves the
+/// model wrapper a pass-through.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct VcrConfig {
-    /// "record" or "replay"
-    pub mode: VcrMode,
-    /// Scenario name (JSONL filename without extension)
-    pub scenario: String,
-    /// On replay, fall back to real API when no match? (default true)
-    #[serde(default = "default_true")]
-    pub fallback_on_miss: bool,
+pub struct RecorderConfig {
+    pub mode: RecorderMode,
+    /// Directory name for this recording under `root`. `None` uses the session
+    /// id, which is what production recording wants; tests name theirs so a
+    /// replay can find it again.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Where recordings live. Each one is a self-contained directory beneath
+    /// it, so a host retires a recording by deleting that directory.
+    pub root: PathBuf,
+    #[serde(default)]
+    pub on_divergence: Divergence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum VcrMode {
+pub enum RecorderMode {
     Record,
     Replay,
+}
+
+/// What replay does when a live request differs from the one recorded at the
+/// same position.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Divergence {
+    /// Fail the call, naming the fields that differ. The default wherever a
+    /// divergence means a broken test.
+    #[default]
+    Strict,
+    /// Report the difference and play the recorded response anyway.
+    Warn,
 }
 
 fn default_true() -> bool {
@@ -707,7 +727,7 @@ impl Settings {
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
-            vcr: None,
+            recorder: None,
             telemetry_url: None,
             telemetry_enabled: true,
             allow_client_permission_override: false,

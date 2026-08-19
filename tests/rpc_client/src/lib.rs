@@ -35,21 +35,21 @@ pub use transport::Transport;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RunTurnOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vcr: Option<VcrRunOptions>,
+    pub recorder: Option<RecorderRunOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryRunOptions>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct VcrRunOptions {
+pub struct RecorderRunOptions {
     /// "record" | "replay"
     pub mode: String,
-    pub scenario: String,
-    /// Absolute path to the VCR cassette directory.
+    /// Directory name of the recording under `dir`.
+    pub name: String,
+    /// Absolute path to the recordings root.
     pub dir: String,
-    /// See `daemon::rpc::VcrOptions::strict`'s doc comment — disables the
-    /// network fallback on a replay miss so a hash mismatch fails loudly
-    /// instead of silently making a real, billed API call.
+    /// See `daemon::rpc::RecorderOptions::strict` — on replay, whether a live
+    /// request that differs from the recorded one fails the call.
     pub strict: bool,
 }
 

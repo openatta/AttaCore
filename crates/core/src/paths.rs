@@ -21,7 +21,7 @@
 //! there's no collision to avoid the way there is under a shared `$HOME`.
 //!
 //! **2026-08-04 restructuring**: the user-level tree used to be entirely
-//! scene-scoped (`~/.atta/<scope>/{memory,sessions,vcr,skills,...}`). It is
+//! scene-scoped (`~/.atta/<scope>/{memory,sessions,recordings,skills,...}`). It is
 //! now split by resource type:
 //!
 //! - **Global + scene override** (config-shaped, keyed by name): `settings.json`,
@@ -29,14 +29,14 @@
 //!   `~/.atta/<resource>/` (base) and `~/.atta/scenes/<scope>/<resource>/`
 //!   (override) — a scene-specific entry with the same name wins.
 //! - **Global + project only, no scene tier** (history/state-shaped):
-//!   `memory/`, `sessions/`, `vcr/`, `mcp/`. Present at `~/.atta/<resource>/`
+//!   `memory/`, `sessions/`, `recordings/`, `mcp/`. Present at `~/.atta/<resource>/`
 //!   (used when there's no specific project — reserved for a future
 //!   no-project/desktop mode, not yet exercised by `daemon`) and
 //!   `<cwd>/.atta/<resource>/` (project, used today). Deliberately **not**
 //!   scene-scoped: a scene's tool/system-prompt config has no bearing on
 //!   which project a session or memory file belongs to, so borrowing across
 //!   scenes would be a correctness hazard (e.g. resuming a session recorded
-//!   under a different scene's tool set, or VCR tapes replaying against the
+//!   under a different scene's tool set, or a recording replaying against the
 //!   wrong tool config).
 //! - **Removed**: `workflows/` — the named-workflow feature was dropped
 //!   before it had a loader; there is no replacement path.
@@ -173,8 +173,8 @@ impl ConfigPaths {
         self.global_data_dir.join("mcp")
     }
 
-    pub fn global_vcr_dir(&self) -> PathBuf {
-        self.global_data_dir.join("vcr")
+    pub fn global_recordings_dir(&self) -> PathBuf {
+        self.global_data_dir.join("recordings")
     }
 
     // ── Local/project-tier convenience methods ──
@@ -195,8 +195,8 @@ impl ConfigPaths {
         self.local_data_dir.join("mcp")
     }
 
-    pub fn local_vcr_dir(&self) -> PathBuf {
-        self.local_data_dir.join("vcr")
+    pub fn local_recordings_dir(&self) -> PathBuf {
+        self.local_data_dir.join("recordings")
     }
 }
 
@@ -276,11 +276,17 @@ mod tests {
         assert_eq!(p.global_skills_dir(), p.global_data_dir.join("skills"));
         assert_eq!(p.global_memory_dir(), p.global_data_dir.join("memory"));
         assert_eq!(p.global_sessions_dir(), p.global_data_dir.join("sessions"));
-        assert_eq!(p.global_vcr_dir(), p.global_data_dir.join("vcr"));
+        assert_eq!(
+            p.global_recordings_dir(),
+            p.global_data_dir.join("recordings")
+        );
         assert_eq!(p.global_mcp_dir(), p.global_data_dir.join("mcp"));
         assert_eq!(p.local_memory_dir(), p.local_data_dir.join("memory"));
         assert_eq!(p.local_sessions_dir(), p.local_data_dir.join("sessions"));
-        assert_eq!(p.local_vcr_dir(), p.local_data_dir.join("vcr"));
+        assert_eq!(
+            p.local_recordings_dir(),
+            p.local_data_dir.join("recordings")
+        );
         assert_eq!(p.local_mcp_dir(), p.local_data_dir.join("mcp"));
     }
 }

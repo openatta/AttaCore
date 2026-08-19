@@ -555,8 +555,8 @@ impl Agent {
         // injection in `prompt.rs` checked the flag, this per-turn recall didn't). That gap
         // meant `memory_enabled: false` was silently a partial opt-out: this background task
         // still read `self.memory_store` and injected a `<system-reminder>` mid-conversation
-        // regardless. Surfaced by VCR test replay for a fixture-based multi-turn case: the
-        // prefetch (fires a real, VCR-covered LLM call) and the extraction spawn below race
+        // regardless. Surfaced by 录制回放测试 for a fixture-based multi-turn case: the
+        // prefetch (fires 一次真实的、被录制覆盖的 LLM 调用) and the extraction spawn below race
         // against the harness's turn boundary in a way that isn't deterministic between
         // record and replay, producing a different injected memory set each run even with
         // identical cassette content.
@@ -807,7 +807,13 @@ impl Agent {
                 self.build_prompt_for_turn(&effective_model).await;
 
             // 3. Call model
+            let step = api_calls;
             api_calls += 1;
+            let origin = Some(base::interface::model::CallOrigin {
+                session_id: self.session.session_id.clone(),
+                turn: self.session.turn_count,
+                step,
+            });
             let stream_result = self
                 .model
                 .stream(
@@ -820,6 +826,7 @@ impl Agent {
                         thinking_mode: self.settings.model.thinking_mode.clone(),
                         fallback_model: self.settings.model.fallback_model.clone(),
                         cache_edits: self.cached_mc.consume_pending_edits(),
+                        origin: origin.clone(),
                     },
                     cancel.clone(),
                 )
@@ -835,6 +842,7 @@ impl Agent {
                         effective_max_tokens,
                         &mut effective_model,
                         cancel.clone(),
+                        origin.clone(),
                     )
                     .await?
                 }
@@ -887,6 +895,7 @@ impl Agent {
                                         thinking_mode: self.settings.model.thinking_mode.clone(),
                                         fallback_model: self.settings.model.fallback_model.clone(),
                                         cache_edits: vec![], // already consumed above
+                                        origin: origin.clone(),
                                     },
                                     cancel.clone(),
                                 )
@@ -2513,6 +2522,7 @@ or project context that should survive across sessions.
         effective_max_tokens: u32,
         effective_model: &mut String,
         cancel: CancellationToken,
+        origin: Option<base::interface::model::CallOrigin>,
     ) -> Result<ModelStream, TurnError> {
         if let Some(ref fallback) = self.settings.model.fallback_model {
             tracing::warn!(
@@ -2538,6 +2548,7 @@ or project context that should survive across sessions.
                         thinking_mode: self.settings.model.thinking_mode.clone(),
                         fallback_model: None,
                         cache_edits: vec![],
+                        origin,
                     },
                     cancel,
                 )
@@ -5065,7 +5076,7 @@ mod tests {
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
-            vcr: None,
+            recorder: None,
             telemetry_url: None,
             memory_enabled: true,
             disable_skill_shell_execution: false,
@@ -5342,7 +5353,7 @@ mod tests {
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
-            vcr: None,
+            recorder: None,
             telemetry_url: None,
             memory_enabled: true,
             disable_skill_shell_execution: false,
@@ -5660,6 +5671,7 @@ Return only a JSON array of memories. If nothing is worth saving, return []."
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
         cache_edits: vec![],
+        origin: None,
     };
     let mut full_text = String::new();
     let stream_result = model
@@ -6424,7 +6436,7 @@ mod prompt_assembly_tests {
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
-            vcr: None,
+            recorder: None,
             telemetry_url: None,
             session_dir: None,
             memory_enabled: false,

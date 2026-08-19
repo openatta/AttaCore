@@ -109,7 +109,7 @@ impl From<FrozenSkillSource> for SkillSource {
 /// cross-session preference). `last_seq` is a monotonic
 /// counter rather than a wall-clock timestamp deliberately: recency only
 /// needs a total order among invocations, and a counter is exact + free of
-/// the timestamp-based VCR non-determinism this session already hit once.
+/// the timestamp-based replay non-determinism this session already hit once.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InvocationStats {
     pub count: u32,
@@ -316,9 +316,9 @@ impl SkillManager {
     /// injects it verbatim into the system prompt, `agent.rs`'s `/skills`
     /// command, the `SkillTool` lookup). An unsorted list meant the system
     /// prompt's "## Available Skills" section came out in a different order
-    /// every single process start — which, since VCR's request hash covers
-    /// the full (dehydrated) prompt text, silently desynced the very first
-    /// turn's hash between any two runs of the exact same test case.
+    /// every single process start — which, since the request carries
+    /// the full prompt text, silently changed the very first
+    /// turn between any two runs of the exact same test case.
     /// Provider-side
     /// prompt caching (most APIs cache by exact prefix match) would have the
     /// same problem in production, independent of testing.
@@ -644,7 +644,7 @@ mod tests {
     /// invisible at startup: such a skill only
     /// became invocable after a live-reload watcher event fired for it once
     /// (see `reload_skill`'s doc comment, which already handled both
-    /// formats). Found via VCR replay of a real test case: the fixture
+    /// formats). Found via replay of a real test case: the fixture
     /// project's `code-review/SKILL.md` skill never appeared in any recorded
     /// system prompt. `load_dir_subdirs` is the fix — it handles both
     /// formats in one pass — and is now what every production call site uses.
@@ -864,7 +864,7 @@ mod tests {
     /// Regression: `list()` used to be `HashMap::values().collect()` — same
     /// skill set, different (randomized, per-process) text order every run.
     /// Since `turn.rs::build_skills_text` renders this straight into the
-    /// system prompt, that silently desynced VCR's request hash for the very
+    /// system prompt, that silently changed the request for the very
     /// first turn of every replay. Register in
     /// deliberately unsorted order and assert the output is alphabetical
     /// regardless — a HashMap-order bug wouldn't reliably fail a single

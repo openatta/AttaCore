@@ -37,7 +37,7 @@
 
 - WASM 工具：`plugin__<pkg>__<tool>`
 - 原生 MCP 工具：`mcp__<server>__<tool>`（既有）
-- DSH 桥接工具：`mcp__dsh-<pkg>__<tool>`
+- JS 插件桥接工具：`mcp__dsh-<pkg>__<tool>`
 - 插件贡献的权限规则来源：`RuleSource::Plugin`
 - 编译开关：`daemon` 的 `plugins` feature
 - crate 划分见 §10.1
@@ -52,7 +52,7 @@
 |---|---|---|---|
 | WASM component | 主进程内 wasmtime Store | 线性内存 + capabilities 白名单 + epoch 中断 | `plugin__<pkg>` 权限规则 + capabilities |
 | MCP server（原生） | 独立进程 / 远程 | OS 进程边界 | `mcp__<server>` 权限规则 |
-| MCP server（DSH 桥接） | 独立 Node 进程 | OS 进程边界 | `mcp__dsh-<pkg>` 权限规则 |
+| MCP server（JS 插件桥接） | 独立 Node 进程 | OS 进程边界 | `mcp__dsh-<pkg>` 权限规则 |
 
 ### 2.1 为什么没有第三种
 
@@ -60,13 +60,13 @@
 
 **hook 本身不取消，取消的是它作为"可分发载荷"的资格。** 用户自己写在 `~/.atta/hooks/` 的脚本继续有效——自己写的脚本和从网上装的包，信任级别不是一回事。插件要参与事件，走 §3.2 的沙箱后端。
 
-**不内嵌 JS/TS 运行时。** 养第二套语言运行时的长期成本，远大于让 JS 生态从进程外接进来的那点不便。DSH 生态走 §4.3 的桥接。
+**不内嵌 JS/TS 运行时。** 养第二套语言运行时的长期成本，远大于让 JS 生态从进程外接进来的那点不便。JS 生态走 §4.3 的桥接。
 
 ### 2.2 故障隔离
 
 这是 WASM 相对同进程插件体系的结构性优势，不是额外做的容错，而是执行模型（§4.1.3 每次调用新建 Store）的自然结果：
 
-| 故障 | 同进程插件体系（如 DSH） | 我们 |
+| 故障 | 同进程插件体系 | 我们 |
 |---|---|---|
 | 插件抛异常 | 沿调用链上抛，该步失败 | Store 丢弃，返回一条工具错误结果，主循环继续 |
 | 同步死循环 | **卡死整个事件循环**，全部会话一起挂 | epoch 中断打断，同上 |
@@ -327,9 +327,9 @@ world plugin {
 
 决定：**补 `tools/list_changed` → `refresh_tools()` 这一条**，其余（sampling / roots）暂不做。理由是这一条直接支撑插件热更新——server 改了工具列表不用重启 daemon；而 sampling 是让 MCP server 反向消费我们的模型额度，需要独立的预算与权限设计，不在本轮范围。
 
-### 4.3 MCP（DSH 桥接）
+### 4.3 MCP（JS 插件桥接）
 
-DSH（DeepSeek Harness）插件是导出 `apply(ctx)` 的 TS 模块，工具用 `defineTool` 定义：
+外部 JS 生态里有一类插件契约：模块导出 `apply(ctx)`，工具用 `defineTool` 定义。bridge 适配的就是这个形状——
 
 ```typescript
 export const inject = ['tools']
@@ -349,7 +349,7 @@ export function apply(ctx: Context) {
 
 这个契约与 MCP 的距离比看上去近：`parameters` 是 JSON Schema 的扁平写法，`render` 的产物 `[{type:'text', text}]` 与 MCP content block 形状几乎一致，`execute` 就是 `tools/call`。
 
-**`atta-dsh-bridge`：一个独立的 Node 进程，对内加载 DSH 插件，对外讲 MCP stdio。**
+**`atta-dsh-bridge`：一个独立的 Node 进程，对内加载这类插件，对外讲 MCP stdio。**
 
 1. 构造最小 `Context`：`ctx.tools`（`register()` 返回 disposer）、`ctx.effect()`、`ctx.on()`、`ctx.logger`；解析 `inject`。
 2. `import()` 插件模块，认三种形态：`export function apply`、`export default { apply }`、`export default class extends Service`。
@@ -357,13 +357,13 @@ export function apply(ctx: Context) {
 4. `tools/call` → `execute(args)` → `output.render(args, value)` → MCP content block。
 5. AttaCore 侧**零改动**：它看到的就是一个普通 MCP server，`McpToolAdapter` 原样复用。
 
-**支持边界：我们适配的是 DSH 的 tool 契约，不是 Cordis 内核。**
+**支持边界：我们适配的是 tool 契约，不是那套插件框架的内核。**
 
-`inject` 里出现 `tools` 以外的服务（`llm`、`sessions`、`sandbox`、`agentLoop` 等），bridge **在加载阶段就拒绝并报出缺哪个服务**，不是加载完在运行时崩。理由是取舍而非能力：Cordis 的服务图是对方的内部架构，还在 developer preview 且明说契约会变，跟着走等于把我们的生命周期绑在别人的内核上。tool 契约不同——它稳定、可枚举、与 MCP 语义一一对应。
+`inject` 里出现 `tools` 以外的服务（`llm`、`sessions`、`sandbox`、`agentLoop` 等），bridge **在加载阶段就拒绝并报出缺哪个服务**，不是加载完在运行时崩。理由是取舍而非能力：那张服务图是上游的内部架构，仍在演进且明说契约会变，跟着走等于把我们的生命周期绑在别人的内核上。tool 契约不同——它稳定、可枚举、与 MCP 语义一一对应。
 
 已知落差，写进 bridge 文档：
 
-| DSH | 我们的处理 |
+| 上游契约的空缺 | 我们的处理 |
 |---|---|
 | 无权限/确认模型 | 走 `mcp__dsh-<pkg>` 权限规则 |
 | 无 streaming / progress | 暂不映射，`execute` 返回即结束 |
@@ -573,46 +573,56 @@ daemon 持有 `Option<Arc<dyn PluginHost>>`，feature 关闭时恒为 `None`。*
 
 ---
 
-## 9. 与 DeepSeek Harness 的对照
+## 9. 扩展接缝的覆盖盘点
 
-DSH 的口号是 "everything is a plugin"——model、tool、skill、session、sandbox、storage、loop、调度、UI 全是插件，跑在 Cordis 内核上。这在 TS 里成立的前提是：动态 import 成本近零，运行期换实现不必重编，不存在跨语言边界。它换来极高的可替换性，代价是所有插件与宿主同权限、同进程、无隔离——安全边界完全等于"你信不信这个 npm 包"。
+把"插件能改什么"逐条列出来，按**配置式 / 决策式 / 实现式**三档归位。这张表的用处是
+让"我们放弃了可替换性"这类粗略说法失效——绝大多数扩展诉求都有降级方案，真正的空白
+只有一个。
 
-我们的前提相反，所以取舍不同。但按"配置式 / 决策式 / 实现式"三档重新盘点后，覆盖面比"我们放弃了替换"这个粗略说法要好得多：
+| 扩展诉求 | 我们的方案 | 档位 |
+|---|---|---|
+| 注册工具 | 工具面（§3.1） | — |
+| 定义 agent | `[[agent]]` → `AgentTypeDefinition` | 配置式 |
+| 定制系统提示 | **插件场景**（§3.3） | 配置式 |
+| 接新模型端点 | 插件贡献 `ProviderConfig` | 配置式，推理路径零插件代码 |
+| 文件访问策略 | 插件贡献 `PermissionRule` + `PreToolUse` 决议 | 配置式 + 决策式 |
+| 换命令执行后端 | MCP server 提供执行工具 + 场景 `disallowed_tools` 去掉 `Bash` | 实现式，但在进程外 |
+| 换关押机制 | 同上——容器执行的 MCP server 就是一个沙箱后端 | 实现式，但在进程外 |
+| 会话存别处 | 事件面广播，插件自己存 | 观察式 |
+| 后台任务 | `crates/task` + 后台 agent | 可用不可换 |
+| 人向命令入口 | 折进激活（§6）——进入插件场景即入口 | — |
+| 常驻终端 | 无对应概念 | — |
+| 每 agent 隔离注册域 | `allowed_tools` / `disallowed_tools` | 粒度更粗 |
+| 拦截管线 | 事件面（§3.2），限低频、限观察+否决 | 决策式 |
+| **不同的循环形状** | **无** | **唯一空白** |
 
-| DSH seam | 真实需求 | 我们的方案 | 档位 |
-|---|---|---|---|
-| `ctx.tools` | 注册工具 | 工具面（§3.1） | — |
-| `ctx.agents` | 定义 agent | `[[agent]]` → `AgentTypeDefinition` | 配置式 |
-| `ctx.systemPrompt` | 定制提示 | **插件场景**（§3.3） | 配置式 |
-| `ctx.llm` | 接新模型端点 | 插件贡献 `ProviderConfig` | 配置式，推理路径零插件代码 |
-| `ctx.fs` | 访问策略 | 插件贡献 `PermissionRule` + `PreToolUse` 决议 | 配置式 + 决策式 |
-| `ctx.shell` / `subprocess` | 换执行后端 | MCP server 提供执行工具 + 场景 `disallowed_tools` 去掉 `Bash` | 实现式，但在进程外 |
-| `ctx.sandbox` | 换关押机制 | 同上——容器执行的 MCP server 就是一个沙箱后端 | 实现式，但在进程外 |
-| `ctx.sessions` | 会话存别处 | 事件面广播，插件自己存 | 观察式 |
-| `ctx.jobs` | 后台任务 | `crates/task` + 后台 agent | 可用不可换 |
-| `ctx.commands` | 人向命令 | 折进激活（§6）——进入插件场景即入口 | — |
-| `ctx.terminals` | 常驻终端 | 无对应概念 | — |
-| `agent.ctx` | 每 agent 隔离注册域 | `allowed_tools` / `disallowed_tools` | 粒度更粗 |
-| 事件族（waterfall / serial） | 拦截管线 | 事件面（§3.2），限低频、限观察+否决 | 决策式 |
-| **`ctx.agentLoop`** | **不同的循环形状** | **无** | **唯一空白** |
+### 9.1 关于沙箱可替换性的澄清
 
-### 9.1 关于 `ctx.sandbox` 的澄清
+"沙箱"在这里指**agent 要执行的命令关在哪里**，跟插件隔离不是一回事。我们的实现是
+`crates/tools/src/bash/sandbox.rs`：macOS `sandbox-exec` + TinyScheme profile，Linux
+`bwrap --ro-bind`，Windows 不做。
 
-DSH 的 `ctx.sandbox`（"process confinement"）与 `ctx.shell` / `ctx.subprocess` 是一组，管的是**agent 要执行的命令关在哪里**，跟插件隔离无关。我们的对应物是 `crates/tools/src/bash/sandbox.rs`：macOS `sandbox-exec` + TinyScheme profile，Linux `bwrap --ro-bind`，Windows 不做。
-
-替换它的意思是换成 docker / gVisor / 远程 VM 去跑 agent 的命令。**WASM 做不了**（插件没有 OS 权限去建 namespace 或写 seatbelt profile），**MCP 可以**——一个"在容器里执行命令"的 MCP server 就是一个沙箱后端。缺的开关是"把内建 Bash 换掉"，而场景面正好有：`disallowed_tools` 去掉 `Bash`，`tools` 放行 `mcp__docker__exec`。
+替换它的意思是换成 docker / gVisor / 远程 VM 去跑 agent 的命令。**WASM 做不了**（插件
+没有 OS 权限去建 namespace 或写 seatbelt profile），**MCP 可以**——一个"在容器里执行
+命令"的 MCP server 就是一个沙箱后端。缺的开关是"把内建 Bash 换掉"，而场景面正好有：
+`disallowed_tools` 去掉 `Bash`，`tools` 放行 `mcp__docker__exec`。
 
 相关的既有缺口见 §10.3。
 
 ### 9.2 唯一的空白，以及为什么它是边界而非待办
 
-`ctx.agentLoop` 是唯一既没有降级方案、代价又过高的 seam。没有配置式降级，因为循环的**形状**不是参数能表达的；实现式又落在 §3.2.3 的禁区（每步搬运全上下文）。
+自定义**循环形状**是唯一既没有降级方案、代价又过高的接缝。没有配置式降级，因为循环
+的形状不是参数能表达的；实现式又落在 §3.2.3 的禁区（每步搬运全上下文）。
 
-插件场景给的是循环的**包络**——压缩阈值、保留条数、轮次上限、工具面、系统提示、每轮提醒、记忆提取。大部分人说"我要自定义循环"，想要的其实是这些。真正要不同**形状**的（树搜索、辩论式、回溯投票），插件场景也给不了。
+插件场景给的是循环的**包络**——压缩阈值、保留条数、轮次上限、工具面、系统提示、每轮
+提醒、记忆提取。大部分人说"我要自定义循环"，想要的其实是这些。真正要不同**形状**的
+（树搜索、辩论式、回溯投票），插件场景也给不了。
 
-**这一条写成设计边界，不是待办事项：要不同循环形状的人，应该 fork 场景或写自己的 harness，不该走插件。**
+**这一条写成设计边界，不是待办事项：要不同循环形状的人，应该 fork 场景或写自己的
+harness，不该走插件。**
 
 ---
+
 
 ## 10. 实现现状
 
@@ -623,7 +633,7 @@ DSH 的 `ctx.sandbox`（"process confinement"）与 `ctx.shell` / `ctx.subproces
 | `crates/plugin` | 清单解析、版本化缓存、市场、启停状态、安装期披露。依赖极轻，daemon 可编译裁掉 |
 | `crates/plugin-host` | 唯一同时认识清单与引擎类型的地方：适配工具、构造场景、翻译 agent 类型、校验配置、分发事件 |
 | `crates/wasm-host` | wasmtime 引擎、WIT 绑定、capability 强制、每次调用一个 Store、AOT 缓存、健康记录 |
-| `bridges/atta-dsh-bridge` | 独立 Node 进程，把 DSH 插件当成 MCP server 提供出去 |
+| `bridges/atta-dsh-bridge` | 独立 Node 进程，把外部 JS 插件当成 MCP server 提供出去 |
 
 `crates/runtime` **不依赖** `crates/plugin`——这是插件子系统能整体编译裁掉的前提。
 
@@ -662,7 +672,7 @@ feature 关闭时恒为 `None`。
 
 ### 10.5 已知边界
 
-- **自定义循环形状**（`ctx.agentLoop` 的对应物）不提供，见 §9.2。
+- **自定义循环形状**不提供，见 §9.2。
 - **`Tool::validate_input` 在引擎里没有生产调用点**，所以 WIT 不导出
   `validate-input`——否则那是一份给插件作者的、永远不会被调用的契约。
 - **运行期仍链接 Cranelift**。AOT 缓存让加载不再编译（`Component::serialize`
@@ -674,7 +684,6 @@ feature 关闭时恒为 `None`。
 
 ## 参考
 
-- [DeepSeek Harness — Everything is a plugin](https://deepseek.com/harness/en/) / [插件开发](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/) / [Build a tool](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/tool)
 - [Life of a Zed Extension: Rust, WIT, Wasm](https://zed.dev/blog/zed-decoded-extensions) —— Rust + WIT + wasmtime 扩展系统的实证
 - [Wasm Components — Rust Project Goals 2026](https://rust-lang.github.io/rust-project-goals/2026/wasm-components.html) —— 工具链成熟度现状
 - [wasmtime::component API](https://docs.wasmtime.dev/api/wasmtime/component/index.html)

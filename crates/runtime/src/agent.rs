@@ -648,9 +648,9 @@ impl Agent {
         &self.telemetry_handle
     }
 
-    /// VCR status — None if VCR is disabled.
-    pub fn vcr(&self) -> Option<&base::interface::settings::VcrConfig> {
-        self.settings.vcr.as_ref()
+    /// Recorder status — None when no recording is configured.
+    pub fn recorder(&self) -> Option<&base::interface::settings::RecorderConfig> {
+        self.settings.recorder.as_ref()
     }
 
     /// Access the permission handler (read-only).
@@ -880,7 +880,7 @@ pub struct Builder {
     skip_warmup: bool,
     /// Pre-built FrozenContext — skips lazy collection on first turn.
     /// When set, the Agent uses this snapshot instead of calling
-    /// `FrozenContext::collect()`. Essential for deterministic VCR replay.
+    /// `FrozenContext::collect()`. Essential for deterministic replay.
     frozen: Option<base::frozen::FrozenContext>,
     wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
     /// Everything installed plugins contribute to this session — see
@@ -931,7 +931,7 @@ pub struct Builder {
 /// the `<name>/SKILL.md` subdirectory convention (what
 /// `discover_for_paths`/`reload_skill` already supported) are
 /// picked up at startup — a project skill authored the SKILL.md way used to
-/// silently never load until its first live-reload edit. Found via the VCR
+/// silently never load until its first live-reload edit. Found via the recording
 /// test suite: the fixture project's `code-review` skill (subdirectory
 /// format) was completely absent from every recorded system prompt.
 ///
@@ -1167,7 +1167,7 @@ impl Builder {
     }
 
     /// Pre-seed the FrozenContext snapshot (skips lazy collection on first turn).
-    /// Essential for deterministic VCR replay across runs.
+    /// Essential for deterministic replay across runs.
     pub fn frozen(mut self, ctx: base::frozen::FrozenContext) -> Self {
         self.frozen = Some(ctx);
         self
@@ -1968,7 +1968,7 @@ mod tests {
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
-            vcr: None,
+            recorder: None,
             telemetry_url: None,
             session_dir: None,
             memory_enabled: true,

@@ -21,7 +21,7 @@
 //! | `crate::adapter`     | this module           |
 //!
 //! The HTTP layer is deliberately not abstracted behind a trait the way
-//! `crate::client::AnthropicClient` is: that trait exists so the VCR/mock
+//! `crate::client::AnthropicClient` is: that trait exists so the mock
 //! recorder can substitute a fake, and nothing records OpenAI traffic yet.
 //! When it does, the split point is [`OpenAICompatibleModel::stream`].
 

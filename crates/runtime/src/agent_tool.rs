@@ -1065,7 +1065,7 @@ fn fallback_settings(
         instruction_file: instruction_file.cloned(),
         prompt_append: None,
         prompt_override: None,
-        vcr: None,
+        recorder: None,
         telemetry_url: None,
         session_dir: None,
         memory_enabled: true,

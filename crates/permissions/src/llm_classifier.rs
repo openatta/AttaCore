@@ -307,6 +307,7 @@ impl AutoClassifier for LlmClassifier {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
+            origin: None,
         };
 
         // 3. Call the model

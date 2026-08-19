@@ -42,6 +42,24 @@ pub struct StreamParams {
     /// Cache edits: tool_use_ids whose tool result content should be deleted from the
     /// server-side cached prefix. Wired to the Anthropic `cache_edits` content block.
     pub cache_edits: Vec<String>,
+    /// Where this call sits in the conversation. Carried for observers only —
+    /// no adapter reads it, and it never reaches the wire.
+    pub origin: Option<CallOrigin>,
+}
+
+/// A call's position in the session that issued it.
+///
+/// `None` on [`StreamParams::origin`] marks a call that belongs to no turn:
+/// compaction summaries, permission classification, session titling. They are
+/// real model calls and worth observing, but numbering them as turn work would
+/// make the turn/step coordinates lie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallOrigin {
+    pub session_id: String,
+    pub turn: u32,
+    /// Index of this model call within its turn — a turn that calls tools runs
+    /// several.
+    pub step: u32,
 }
 
 /// Tool definition sent to the model.
@@ -136,7 +154,8 @@ pub type ModelStream =
     Box<dyn futures::Stream<Item = Result<ModelEvent, ModelError>> + Send + Unpin>;
 
 /// Events emitted by the model during streaming.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelEvent {
     TextDelta {
         text: String,
@@ -161,6 +180,16 @@ pub enum ModelEvent {
         id: String,
         name: String,
         input: Value,
+    },
+    /// One raw fragment of a tool call's arguments, exactly as the model
+    /// produced it. Observational only: the adapter still concatenates the
+    /// fragments and emits the assembled [`ModelEvent::ToolUse`], which is what
+    /// the engine acts on. Forwarded alongside it because a malformed or
+    /// truncated argument stream is precisely the case worth investigating
+    /// afterwards, and concatenation destroys the evidence.
+    ToolArgsDelta {
+        id: String,
+        partial_json: String,
     },
     ContentBlockStart {
         index: usize,

@@ -1148,6 +1148,7 @@ async fn drain(
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
         cache_edits: vec![],
+        origin: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut stream = model

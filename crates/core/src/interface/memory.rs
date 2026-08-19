@@ -1030,6 +1030,7 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
         cache_edits: vec![],
+        origin: None,
     };
 
     let stream_result = model

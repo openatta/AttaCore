@@ -334,7 +334,7 @@ Just input, no expected output marker.
     fn session_mode_defaults_to_per_turn() {
         // Every existing case (and every cassette recorded against one) relies
         // on this default — a shared session changes the message history, which
-        // changes the VCR request hash, which invalidates the recording.
+        // changes the request, which a replay reports as a divergence.
         let script = "no directive here\n\n>>>>>>>>>>>>>>>>\nhi\n";
         let tc = parse_test_script(script, "t.test").unwrap();
         assert_eq!(tc.session_mode, SessionMode::PerTurn);

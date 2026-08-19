@@ -189,6 +189,7 @@ impl LlmSummarizer {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
+            origin: None,
         };
 
         // The cancel token is dropped with the future on timeout, which is what

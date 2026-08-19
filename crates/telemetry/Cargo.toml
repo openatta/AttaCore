@@ -5,7 +5,7 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 license      = { workspace = true }
 publish      = false
-description  = "AttaCore — telemetry, usage stats, VCR, perf"
+description  = "AttaCore — telemetry, usage stats, LLM call recording, perf"
 
 [dependencies]
 base          = { workspace = true }
@@ -28,3 +28,4 @@ hex           = { workspace = true }
 
 [dev-dependencies]
 model       = { workspace = true }
+tempfile    = { workspace = true }

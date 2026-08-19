@@ -4,27 +4,31 @@ use crate::interface::memory::{build_memory_prompt, MemoryStore};
 use crate::interface::rules::build_rules_prompt;
 use crate::interface::scene::{AgentScene, ScenePromptContext};
 use crate::interface::settings::Settings;
+use serde::{Deserialize, Serialize};
 
 /// Protocol-agnostic prompt block.
 ///
 /// Each Model implementation translates these into its API-specific format.
 /// `cache_strategy` carries Anthropic cache_control semantics (Ephemeral/Global)
 /// but is ignored by non-Anthropic models.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptBlock {
     pub role: BlockRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_strategy: Option<CacheStrategy>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockRole {
     System,
     User,
     Assistant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheStrategy {
     Ephemeral,
     Global,
@@ -187,7 +191,7 @@ mod tests {
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,
-            vcr: None,
+            recorder: None,
             telemetry_url: None,
             memory_enabled: true,
             disable_skill_shell_execution: false,

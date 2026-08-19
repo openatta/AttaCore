@@ -5,22 +5,22 @@
 use base::interface::event::AgentEvent;
 use base::interface::model::Model;
 use base::interface::scene::AgentScene;
-use base::interface::settings::{PermissionMode, ThinkingMode, VcrConfig, VcrMode};
+use base::interface::settings::{PermissionMode, RecorderConfig, RecorderMode, ThinkingMode};
 use base::provider::ApiType;
 use base::tool::InMemoryToolRegistry;
 use runtime::agent::{Builder, EventReceiver, InputMessage, InputSender};
 use std::path::PathBuf;
 use std::sync::Arc;
-use telemetry::vcr::VcrModel;
+use telemetry::recorder::RecorderModel;
 use tokio_util::sync::CancellationToken;
 
 use crate::script::TestCase;
 
 pub struct AgentRunnerConfig {
     pub model: Arc<dyn Model>,
-    pub vcr_mode: VcrMode,
-    pub vcr_scenario: String,
-    pub vcr_dir: PathBuf,
+    pub recorder_mode: RecorderMode,
+    pub recorder_name: String,
+    pub recordings_dir: PathBuf,
     pub telemetry_path: Option<PathBuf>,
     /// 模板项目 fixture 目录（如 `tests/fixtures/template_project`）。设置后，
     /// 每次跑用例前会把它拷贝到临时工作目录，Settings 通过真实的
@@ -182,26 +182,19 @@ async fn build_agent(
 ) -> anyhow::Result<RunningAgent> {
     let _ = std::fs::create_dir_all(tmp);
 
-    // Explicitly passing a VcrConfig here (rather than None) bypasses
-    // VcrModel's own env-var resolution, so this harness has to ask for the
-    // same answer instead of re-deriving it — re-deriving it is exactly how
-    // `ATTA_VCR_STRICT` shipped as a silent no-op the first time. See
-    // `VcrModel::replay_fallback_on_miss` for the policy (strict by default
-    // under a test runner / CI, `ATTA_VCR_FALLBACK=1` to opt back in).
-    // Record mode never reads the flag — it calls the real model by design.
-    let fallback_on_miss = match config.vcr_mode {
-        VcrMode::Record => true,
-        VcrMode::Replay => VcrModel::replay_fallback_on_miss(),
-    };
-    let vcr_model = Arc::new(VcrModel::new(
+    // Passing an explicit config bypasses the recorder's own env-var
+    // resolution, so this harness asks the function that owns the divergence
+    // policy rather than re-deriving it — re-deriving it is exactly how the
+    // equivalent flag once shipped as a silent no-op.
+    let recorder_model = Arc::new(RecorderModel::new(
         config.model.clone(),
-        Some(VcrConfig {
-            mode: config.vcr_mode,
-            scenario: config.vcr_scenario.clone(),
-            fallback_on_miss,
+        Some(RecorderConfig {
+            mode: config.recorder_mode,
+            name: Some(config.recorder_name.clone()),
+            root: config.recordings_dir.clone(),
+            on_divergence: RecorderModel::default_divergence(),
         }),
-        PathBuf::from("/tmp/atta_vcr_nonexistent"),
-        config.vcr_dir.clone(),
+        env!("CARGO_PKG_VERSION"),
     ));
 
     let model_name =
@@ -250,7 +243,7 @@ async fn build_agent(
 
     let mut builder = Builder::new()
         .scene(config.scene.clone())
-        .model(vcr_model)
+        .model(recorder_model)
         .tools(tools_registry)
         .settings(settings.clone())
         .session_id(session_id)

@@ -19,7 +19,7 @@ AttaCore is **not** an end-user AI assistant. It is a **developer-facing agent e
 | **Multi-Agent** | First-class team coordination: Coordinator, Mailbox, shared memory — compose agents like microservices |
 | **Multi-Provider Routing** | Declare several LLM providers in `settings.json` and route by task type — sub-agent spawns can run on a cheaper/different model than the main conversation, resolved and validated at daemon startup |
 | **Scene Customization** | Agent behavior — system prompt, tool whitelist, execution limits — lives behind the `AgentScene` trait, not hardcoded. Three built-in scenes double as a copy-from-here ladder: full reference, compact reference, minimal skeleton |
-| **Observability** | 40+ structured telemetry events, OpenTelemetry export, VCR record/replay for deterministic testing, cost tracking |
+| **Observability** | 40+ structured telemetry events, OpenTelemetry export, LLM interaction recording and deterministic replay, cost tracking |
 | **Embeddable** | Library mode (Rust API) or Daemon mode (JSON-RPC 2.0 over Unix socket / TCP, token-handshake authenticated) — same engine, your choice of integration surface |
 
 ## Architecture
@@ -59,13 +59,13 @@ AttaCore is a 5-layer, strictly-layered Rust workspace. Dependencies only flow u
 ### The Layers
 
 **L0 — Cross-Cutting Services** (zero internal deps)
-`auth` (OAuth 2.0 PKCE), `hooks` (lifecycle callbacks — 11 event types, command/prompt/HTTP/agent hooks), `plugin` (marketplace + dependency resolution + version cache), `telemetry` (40+ structured events, OpenTelemetry export, VCR record/replay).
+`auth` (OAuth 2.0 PKCE), `hooks` (lifecycle callbacks — 11 event types, command/prompt/HTTP/agent hooks), `plugin` (marketplace + dependency resolution + version cache), `telemetry` (40+ structured events, OpenTelemetry export, LLM interaction recording and replay).
 
 **L1 — Foundation** (`core` / `base` crate)
 Shared types and traits for the entire system: `Model` (LLM backend abstraction), `AgentScene` (agent behavior), `Permission` (tool authorization), `Tool` (unified tool interface v7). Plus `Id` (BASE58 UUIDv4), `EngineConfig`, `SessionState`, `FrozenContext`, `ToolContext`, and the message/content block types.
 
 **L2 — Infrastructure**
-`model` — Anthropic Messages API adapter with streaming, tokenization, VCR wrapper, fallback routing. `history` — JSONL persistence with path sanitization and transcript chunking. `permissions` — glob-based rule engine with allow/deny/ask matching, path safety (Unicode NFC/NFD normalization), YOLO mode, LLM classifier. `mcp` — full MCP client: stdio / SSE / Streamable HTTP transports, tool adaptation, OAuth bearer tokens. `compaction` — multi-strategy context compression with reactive triggers and circuit breakers. `session` — in-memory session state and auto-naming.
+`model` — Anthropic Messages API adapter with streaming, tokenization, fallback routing. `history` — JSONL persistence with path sanitization and transcript chunking. `permissions` — glob-based rule engine with allow/deny/ask matching, path safety (Unicode NFC/NFD normalization), YOLO mode, LLM classifier. `mcp` — full MCP client: stdio / SSE / Streamable HTTP transports, tool adaptation, OAuth bearer tokens. `compaction` — multi-strategy context compression with reactive triggers and circuit breakers. `session` — in-memory session state and auto-naming.
 
 **L3 — Domain Logic**
 `tools` — 30+ built-in tools (Bash, Read, Write, Edit, Glob, Grep, LSP, WebFetch, WebSearch, CronCreate, TaskCreate, Skill, Agent, NotebookEdit, Monitor, PushNotification, …). `skills` — filesystem skill resolver + loader + watcher. `scene` — built-in scenes: Coding, Chat, Demo. `team` — multi-agent coordination: Coordinator, TeamTool, Mailbox. `task` — background task lifecycle: running, cron, store, delete.
@@ -194,11 +194,11 @@ Full Model Context Protocol support across all three transports:
 
 MCP tools are adapted to the native `Tool` trait and injected into the system prompt. MCP servers can also register as skills for user invocation. OAuth 2.0 bearer token exchange supported.
 
-### Telemetry & VCR
+### Telemetry & Recorder
 
 40+ structured event types covering the full agent lifecycle: turn start/complete, tool execution, API errors, permission decisions, compaction operations, memory snapshots, MCP connect/disconnect, session lifecycle, startup timing, model routing, hook execution, slash command usage.
 
-**VCR mode**: wrap any `Model` with `VcrModel` to record LLM interactions to JSONL, then replay deterministically — zero API cost for integration tests, perfectly reproducible runs.
+**Recorder**: wrap any `Model` with `RecorderModel` to record every LLM call — the assembled system blocks, the full tool table, every message, and the response stream down to token boundaries — then replay it deterministically. Zero API cost for integration tests, and a recording is a self-contained directory you can hand to someone.
 
 ## Crate Map
 
@@ -207,7 +207,7 @@ MCP tools are adapted to the native `Tool` trait and injected into the system pr
 | L0 | `auth` | OAuth 2.0 PKCE client | `OAuth2Client`, `TokenStore`, `PkceVerifier` |
 | L0 | `hooks` | Lifecycle hook runner | `HookRunner`, `HookConfig`, `HookEvent` (11 types) |
 | L0 | `plugin` | Plugin marketplace + resolution | `Plugin`, `PluginManifest`, `DependencyResolver` |
-| L0 | `telemetry` | Telemetry + VCR | `TelemetryHandle`, `TelemetryEvent` (40+), `VcrModel`, `FileRecorder` |
+| L0 | `telemetry` | Telemetry + Recorder | `TelemetryHandle`, `TelemetryEvent` (40+), `RecorderModel`, `FileRecorder` |
 | L1 | `core` (base) | Shared types, traits, ID | `Model`, `AgentScene`, `Permission`, `Tool`, `Id`, `EngineConfig`, `FrozenContext` |
 | L2 | `model` | Anthropic API adapter | `AnthropicModel`, `AnthropicClient`, `ModelEvent`, `Usage` |
 | L2 | `history` | JSONL session persistence | `HistoryStore`, `TranscriptEntry` |
@@ -372,8 +372,8 @@ Builder::new()
 | `ANTHROPIC_BASE_URL` | Custom API endpoint (proxies, compatible providers) |
 | `ATTACORE_DAEMON_TOKEN` | TCP mode authentication token |
 | `ATTA_CONFIG_HOME` | Config root directory (default: `$HOME/.atta/<scene>`) |
-| `ATTA_VCR_RECORD` | Record mode: `ATTA_VCR_RECORD=<scenario_name>` |
-| `ATTA_VCR_REPLAY` | Replay mode: `ATTA_VCR_REPLAY=<scenario_name>` |
+| `ATTA_RECORD` | Record mode: `ATTA_RECORD=<recording_name>` (with `ATTA_RECORDINGS_DIR`) |
+| `ATTA_REPLAY` | Replay mode: `ATTA_REPLAY=<recording_name>` (with `ATTA_RECORDINGS_DIR`) |
 
 ## ID System
 
@@ -398,7 +398,7 @@ let id = Id::parse(s)?;        // Validate and decode external input (checks 16-
 2. **Trait injection.** `Model`, `Permission`, `AgentScene` — core behaviors are traits you implement. The engine owns no policy.
 3. **Tool alignment.** 30+ tools, behavior-verified against Claude Code's TypeScript implementation. Systematic `TS parity:` annotations throughout.
 4. **Safe by default.** Three-tier permission model, Unicode-normalized path safety, sandboxed execution — you opt into less safety, not more.
-5. **Observable everywhere.** 40+ structured telemetry events. VCR for deterministic replay. Cost tracking. OpenTelemetry export.
+5. **Observable everywhere.** 40+ structured telemetry events. Recorded LLM calls replay deterministically. Cost tracking. OpenTelemetry export.
 
 ## Project Structure
 

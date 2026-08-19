@@ -54,6 +54,7 @@ impl PromptHookExecutor for ModelPromptHookExecutor {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
+            origin: None,
         };
         let messages = vec![ModelMessage {
             role: MessageRole::User,
