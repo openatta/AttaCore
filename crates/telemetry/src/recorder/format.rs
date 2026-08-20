@@ -9,7 +9,7 @@
 //! response is stored as the model events themselves rather than a parallel
 //! representation, so there is no second shape that can drift from the first.
 
-use base::interface::model::{ModelError, ModelEvent, Usage};
+use base::interface::model::{InputMap, ModelError, ModelEvent, Usage};
 use base::interface::settings::ThinkingMode;
 use base::provider::ApiType;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,10 @@ pub const FORMAT_VERSION: u32 = 1;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Record {
     Recording(Header),
-    Call(CallRecord),
+    /// Boxed: a `CallRecord` is three times the size of a `ChunkRecord`, and a
+    /// `Record` is built once per streamed token — so an unboxed variant would
+    /// make every chunk pay for the largest thing the enum can hold.
+    Call(Box<CallRecord>),
     Chunk(ChunkRecord),
     TextChunks(TextRun),
     ThinkingChunks(TextRun),
@@ -46,8 +49,14 @@ pub struct Header {
     pub version: u32,
     pub name: String,
     pub session_id: String,
+    /// The session that spawned this one. With `created_at` and the per-record
+    /// timestamps, this is what turns a directory of recordings into a single
+    /// tree on one timeline instead of a pile of unrelated files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Which kind of agent this session runs, when it is a sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
     pub created_at: u64,
     pub engine_version: String,
 }
@@ -56,8 +65,28 @@ pub struct Header {
 pub struct CallRecord {
     pub seq: u64,
     pub ts: u64,
+    /// Which session issued this call. The header names one session, but a
+    /// recording configured with an explicit name holds a parent's calls and
+    /// its sub-agents' interleaved, and replay hands each live session only its
+    /// own — so the file has to say per call, not once at the top.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The lineage of `session_id`, repeated on every call for the same reason
+    /// `session_id` is: the header can only describe one session, and a
+    /// recording written under an explicit name holds several. Without this a
+    /// sub-agent's parentage is simply absent from any recording but its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
     pub turn: u32,
     pub step: u32,
+    /// Present for a call made outside any turn — `compact`, `memory`, and so
+    /// on; see `docs/recorder_design.md` for the conventional values. Absent
+    /// for turn work, where `turn`/`step` are the coordinates that mean
+    /// something. Deliberately not part of the replay divergence check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
     pub provider: String,
     pub api_type: ApiType,
     pub params: RecordedParams,
@@ -67,6 +96,11 @@ pub struct CallRecord {
     pub system: Vec<BlobId>,
     pub tools: BlobId,
     pub messages: Vec<BlobId>,
+    /// What the turn's user message is made of, as coordinates over
+    /// `messages`. Absent for a call that started no turn, or when compaction
+    /// folded the message away before this call went out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_map: Option<InputMap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -209,11 +243,15 @@ mod tests {
 
     #[test]
     fn call_record_round_trips() {
-        let record = Record::Call(CallRecord {
+        let record = Record::Call(Box::new(CallRecord {
             seq: 3,
             ts: 1_755_500_000_123,
+            session_id: Some("S1".into()),
+            parent_session_id: None,
+            agent_type: None,
             turn: 2,
             step: 1,
+            purpose: None,
             provider: "anthropic".into(),
             api_type: ApiType::Anthropic,
             params: RecordedParams {
@@ -226,7 +264,8 @@ mod tests {
             system: vec![BlobId("aaaaaaaaaaaaaaaa".into())],
             tools: BlobId("bbbbbbbbbbbbbbbb".into()),
             messages: vec![BlobId("cccccccccccccccc".into())],
-        });
+            input_map: None,
+        }));
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains(r#""type":"call""#));
         let back: Record = serde_json::from_str(&json).unwrap();

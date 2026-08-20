@@ -136,6 +136,10 @@ pub struct LlmSummarizer {
     model_name: String,
     max_tokens: u32,
     timeout: Duration,
+    /// The session whose conversation is being summarized. Carried so the call
+    /// is filed under that session rather than under a shared name that every
+    /// other session's auxiliary calls also write to.
+    session_id: Option<String>,
 }
 
 impl LlmSummarizer {
@@ -145,7 +149,13 @@ impl LlmSummarizer {
             model_name: model_name.into(),
             max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
             timeout: DEFAULT_SUMMARY_TIMEOUT,
+            session_id: None,
         }
+    }
+
+    pub fn for_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -189,7 +199,13 @@ impl LlmSummarizer {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
-            origin: None,
+            origin: self.session_id.as_ref().map(|id| {
+                base::interface::model::CallOrigin::auxiliary(
+                    id,
+                    base::interface::model::call_purpose::COMPACT,
+                )
+            }),
+            input_map: None,
         };
 
         // The cancel token is dropped with the future on timeout, which is what

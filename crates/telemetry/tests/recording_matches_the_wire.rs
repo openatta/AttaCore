@@ -147,11 +147,13 @@ fn system_blocks(turn: u32) -> Vec<PromptBlock> {
             role: BlockRole::System,
             content: "You are a coding agent.".into(),
             cache_strategy: Some(CacheStrategy::Ephemeral),
+            source: Some("identity".into()),
         },
         PromptBlock {
             role: BlockRole::System,
             content: "## Available Skills\n- atta-implement\n- atta-review".into(),
             cache_strategy: None,
+            source: Some(base::interface::prompt::source::SKILLS.into()),
         },
         // Differs per turn, so the blob set has to grow rather than collapse
         // to one — which is what proves dedup is content-driven and not just
@@ -160,6 +162,7 @@ fn system_blocks(turn: u32) -> Vec<PromptBlock> {
             role: BlockRole::System,
             content: format!("<env>turn={turn}</env>"),
             cache_strategy: None,
+            source: Some("env".into()),
         },
     ]
 }
@@ -174,6 +177,7 @@ fn tool_table() -> Vec<ToolDef> {
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"]
             }),
+            source: Some("builtin".into()),
         },
         ToolDef {
             name: "Bash".into(),
@@ -182,6 +186,7 @@ fn tool_table() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {"command": {"type": "string"}}
             }),
+            source: Some("builtin".into()),
         },
     ]
 }
@@ -236,11 +241,11 @@ async fn every_recorded_call_matches_what_crossed_the_boundary() {
                     thinking_mode: ThinkingMode::Off,
                     fallback_model: Some("claude-sonnet-5".into()),
                     cache_edits: vec![],
-                    origin: Some(CallOrigin {
-                        session_id: "S1".into(),
-                        turn: 1,
-                        step,
-                    }),
+                    origin: Some(
+                        CallOrigin::turn("S1", 1, step)
+                            .with_lineage(Some("P0".into()), Some("code-reviewer".into())),
+                    ),
+                    input_map: None,
                 },
                 CancellationToken::new(),
             )
@@ -319,8 +324,11 @@ async fn every_recorded_call_matches_what_crossed_the_boundary() {
             actual.params.fallback_model
         );
         let origin = actual.params.origin.as_ref().unwrap();
-        assert_eq!(recorded.request.turn, origin.turn);
-        assert_eq!(recorded.request.step, origin.step);
+        assert_eq!(
+            (recorded.request.turn, recorded.request.step),
+            origin.turn_step()
+        );
+        assert_eq!(recorded.request.purpose.as_deref(), origin.purpose());
 
         // ── response: every event, in order, verbatim ──
         assert_eq!(
@@ -365,6 +373,7 @@ async fn token_boundaries_and_argument_fragments_survive_the_round_trip() {
                 fallback_model: None,
                 cache_edits: vec![],
                 origin: None,
+                input_map: None,
             },
             CancellationToken::new(),
         )
@@ -435,6 +444,7 @@ async fn replaying_a_recording_reproduces_the_boundary_traffic() {
         fallback_model: None,
         cache_edits: vec![],
         origin: None,
+        input_map: None,
     };
 
     let recorder = RecorderModel::new(tap, Some(config(RecorderMode::Record)), "test");

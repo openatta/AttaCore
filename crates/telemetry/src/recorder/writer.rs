@@ -53,6 +53,16 @@ impl RecordingWriter {
         self.seq.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Reserve `n` consecutive line numbers, returning the first.
+    ///
+    /// A packed row covers several chunks and promises `seq0 + k` names the
+    /// k-th of them, so its numbers have to be handed out together — one at a
+    /// time would let a concurrently recording session interleave into the
+    /// middle of the block and make that promise false.
+    pub fn next_seq_block(&self, n: usize) -> u64 {
+        self.seq.fetch_add(n as u64, Ordering::SeqCst)
+    }
+
     pub fn append(&self, record: &Record) -> std::io::Result<()> {
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -115,6 +125,7 @@ mod tests {
             name: name.into(),
             session_id: "S1".into(),
             parent: None,
+            agent_type: None,
             created_at: now_ms(),
             engine_version: "test".into(),
         }

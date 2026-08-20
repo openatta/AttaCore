@@ -28,8 +28,10 @@
 
 pub mod blob;
 pub mod format;
+pub mod override_doc;
 pub mod pack;
 pub mod reader;
+pub mod rerun;
 pub mod writer;
 
 use async_trait::async_trait;
@@ -55,25 +57,167 @@ use pack::RunPacker;
 use reader::Recording;
 use writer::RecordingWriter;
 
-/// Name used when a call carries no session identity and the config named no
-/// recording — auxiliary calls made outside any session.
-const UNATTRIBUTED: &str = "unattributed";
+/// The recording a call belongs to, or nothing.
+///
+/// There used to be a shared `unattributed` name for calls with no session
+/// identity. It filed genuinely unrelated calls together, and since a writer
+/// truncates the file it opens, two concurrent sessions using it erased each
+/// other. A call that cannot name its session has no recording to belong to,
+/// and saying so is better than inventing one.
+fn recording_name_of(config: &RecorderConfig, params: &StreamParams) -> Option<String> {
+    if let Some(name) = &config.name {
+        return Some(name.clone());
+    }
+    params.origin.as_ref().map(|o| o.session_id.clone())
+}
+
+/// Everything a set of recordings shares: the open writers and the replay
+/// cursors, keyed by recording name.
+///
+/// Held behind an `Arc` and shared by every [`RecorderModel`] that records into
+/// the same root. Multi-provider routing hands out one `Model` per provider,
+/// and each of them needs wrapping to be recorded at all — but they must not
+/// each open their own writer for the same file, or the second one to write
+/// truncates the first one's recording out from under it. One shared state, one
+/// writer per name, appends serialized by that writer's lock.
+#[derive(Default)]
+pub struct Recorder {
+    writers: Mutex<HashMap<String, Arc<RecordingWriter>>>,
+    replays: Mutex<HashMap<String, ReplayState>>,
+}
+
+impl Recorder {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Report any replay that did not run to the end of what was recorded.
+    ///
+    /// A run that made *fewer* calls than the recording holds passes every
+    /// other check — nothing diverged, nothing ran out — while having quietly
+    /// stopped doing part of the work. Overshooting is already an error at the
+    /// call that overshoots; this is the other direction, and it can only be
+    /// asked at the end. Returns one line per unfinished session, empty when
+    /// every cursor was drained.
+    pub fn unconsumed(&self) -> Vec<String> {
+        let replays = self.replays.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (name, state) in replays.iter() {
+            for recorded in &state.recorded_sessions {
+                let total = state.calls_of(recorded).len();
+                let used = state.cursor(recorded);
+                if used < total {
+                    out.push(format!(
+                        "recording {name:?} session {recorded:?}: replayed {used} of {total} call(s)"
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
 
 pub struct RecorderModel {
     inner: Arc<dyn Model>,
     config: Option<RecorderConfig>,
     engine_version: String,
-    /// One writer per recording name. A sub-agent runs its own session through
-    /// the same model, and its calls belong in their own recording rather than
-    /// interleaved into the parent's — which would also break replay, whose
-    /// positions are per session.
-    writers: Mutex<HashMap<String, Arc<RecordingWriter>>>,
-    replays: Mutex<HashMap<String, ReplayState>>,
+    /// The provider id this instance fronts, as named in settings.json. The
+    /// api type alone cannot tell two OpenAI-compatible endpoints apart.
+    provider_id: Option<String>,
+    shared: Arc<Recorder>,
 }
 
+/// One recording being replayed, sliced per session.
+///
+/// A single cursor over the whole file works only when the file holds one
+/// session. When a parent and its sub-agents record under one name their calls
+/// interleave, and the order they interleave in is a scheduling detail that
+/// will not repeat — so each live session walks only the calls that were made
+/// by its counterpart, and the interleaving is allowed to differ.
 struct ReplayState {
     recording: Recording,
-    cursor: usize,
+    /// Recorded session ids in order of first appearance, which is the order
+    /// live sessions bind to them when the ids themselves don't match.
+    recorded_sessions: Vec<String>,
+    /// Live session id → the recorded session it replays against.
+    bound: HashMap<String, String>,
+    /// Recorded session id → how many of its calls have been handed out.
+    ///
+    /// Kept apart from `bound` so advancing a cursor needs no second lookup
+    /// into `bound` — one that could only be written as an `unwrap()` resting
+    /// on an invariant held across two functions with nothing enforcing it.
+    consumed: HashMap<String, usize>,
+}
+
+impl ReplayState {
+    fn new(recording: Recording) -> Self {
+        let mut recorded_sessions: Vec<String> = Vec::new();
+        for call in &recording.calls {
+            let session = call
+                .request
+                .session_id
+                .clone()
+                .unwrap_or_else(|| recording.header.session_id.clone());
+            if !recorded_sessions.contains(&session) {
+                recorded_sessions.push(session);
+            }
+        }
+        Self {
+            recording,
+            recorded_sessions,
+            bound: HashMap::new(),
+            consumed: HashMap::new(),
+        }
+    }
+
+    /// Which recorded session `live` replays against.
+    ///
+    /// An id that appears in the recording binds to itself — a replay driven
+    /// with the same session ids it was recorded with is exact. Otherwise
+    /// sessions bind in the order they first call, which is what a live run
+    /// can guarantee: the parent necessarily streams before it can delegate.
+    /// Returns the recorded session id, or `None` when the run has introduced
+    /// more distinct sessions than the recording holds.
+    fn bind(&mut self, live: &str) -> Option<String> {
+        if let Some(recorded) = self.bound.get(live) {
+            return Some(recorded.clone());
+        }
+        let recorded = if self.recorded_sessions.iter().any(|s| s == live) {
+            live.to_string()
+        } else {
+            self.recorded_sessions
+                .iter()
+                .find(|s| !self.bound.values().any(|taken| taken == *s))?
+                .clone()
+        };
+        self.bound.insert(live.to_string(), recorded.clone());
+        Some(recorded)
+    }
+
+    fn cursor(&self, recorded_session: &str) -> usize {
+        self.consumed.get(recorded_session).copied().unwrap_or(0)
+    }
+
+    fn advance(&mut self, recorded_session: &str) {
+        *self
+            .consumed
+            .entry(recorded_session.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn calls_of(&self, recorded_session: &str) -> Vec<&reader::RecordedCall> {
+        self.recording
+            .calls
+            .iter()
+            .filter(|c| {
+                c.request
+                    .session_id
+                    .as_deref()
+                    .unwrap_or(&self.recording.header.session_id)
+                    == recorded_session
+            })
+            .collect()
+    }
 }
 
 impl RecorderModel {
@@ -82,13 +226,30 @@ impl RecorderModel {
         config: Option<RecorderConfig>,
         engine_version: &str,
     ) -> Self {
+        Self::shared(inner, config, engine_version, Recorder::new())
+    }
+
+    /// Wrap `inner` sharing `shared` with every other model recording into the
+    /// same root — the constructor multi-provider routing uses, so a session's
+    /// calls land in one recording however many providers served them.
+    pub fn shared(
+        inner: Arc<dyn Model>,
+        config: Option<RecorderConfig>,
+        engine_version: &str,
+        shared: Arc<Recorder>,
+    ) -> Self {
         Self {
             inner,
             config: config.or_else(Self::env_config),
             engine_version: engine_version.to_string(),
-            writers: Mutex::new(HashMap::new()),
-            replays: Mutex::new(HashMap::new()),
+            provider_id: None,
+            shared,
         }
+    }
+
+    pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = Some(provider_id.into());
+        self
     }
 
     /// `ATTA_RECORD=<name>` / `ATTA_REPLAY=<name>` with `ATTA_RECORDINGS_DIR`
@@ -117,26 +278,17 @@ impl RecorderModel {
         }
     }
 
-    fn recording_name(&self, params: &StreamParams) -> String {
-        if let Some(config) = &self.config {
-            if let Some(name) = &config.name {
-                return name.clone();
-            }
-        }
-        params
-            .origin
-            .as_ref()
-            .map(|o| o.session_id.clone())
-            .unwrap_or_else(|| UNATTRIBUTED.to_string())
-    }
-
     fn writer_for(
         &self,
         config: &RecorderConfig,
         name: &str,
         params: &StreamParams,
     ) -> Arc<RecordingWriter> {
-        let mut writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writers = self
+            .shared
+            .writers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         writers
             .entry(name.to_string())
             .or_insert_with(|| {
@@ -150,7 +302,14 @@ impl RecorderModel {
                             .as_ref()
                             .map(|o| o.session_id.clone())
                             .unwrap_or_default(),
-                        parent: None,
+                        // Fixed by the first call, which is why a sub-agent has
+                        // to know its lineage at spawn time rather than
+                        // discovering it later.
+                        parent: params
+                            .origin
+                            .as_ref()
+                            .and_then(|o| o.parent_session_id.clone()),
+                        agent_type: params.origin.as_ref().and_then(|o| o.agent_type.clone()),
                         created_at: now_ms(),
                         engine_version: self.engine_version.clone(),
                     },
@@ -309,16 +468,37 @@ impl Model for RecorderModel {
                 .stream(prompt_blocks, tools, messages, params, cancel)
                 .await;
         };
-        let name = self.recording_name(&params);
+        let Some(name) = recording_name_of(&config, &params) else {
+            return self
+                .inner
+                .stream(prompt_blocks, tools, messages, params, cancel)
+                .await;
+        };
 
         match config.mode {
             RecorderMode::Replay => {
                 let shape = RequestShape::of(&prompt_blocks, &tools, &messages, &params);
-                self.replay(&config, &name, shape)
+                let live_session = params
+                    .origin
+                    .as_ref()
+                    .map(|o| o.session_id.as_str())
+                    .unwrap_or_default();
+                self.replay(&config, &name, live_session, shape)
             }
             RecorderMode::Record => {
                 let writer = self.writer_for(&config, &name, &params);
                 self.record(writer, prompt_blocks, tools, messages, params, cancel)
+                    .await
+            }
+            // Rerun drives the provider from a recording rather than from a
+            // live session, so it does not sit on this path — see
+            // [`rerun::rerun_one`]. A session that somehow runs under this mode
+            // just talks to the model, which is the only honest thing to do
+            // here: intercepting would mean answering a live request with a
+            // response recorded for some other request.
+            RecorderMode::Rerun => {
+                self.inner
+                    .stream(prompt_blocks, tools, messages, params, cancel)
                     .await
             }
         }
@@ -406,18 +586,36 @@ impl RecorderModel {
         let (turn, step) = params
             .origin
             .as_ref()
-            .map(|o| (o.turn, o.step))
+            .map(|o| o.turn_step())
             .unwrap_or((0, 0));
 
-        writer.append(&Record::Call(CallRecord {
+        writer.append(&Record::Call(Box::new(CallRecord {
             seq: call_seq,
             ts: now_ms(),
+            session_id: params.origin.as_ref().map(|o| o.session_id.clone()),
+            parent_session_id: params
+                .origin
+                .as_ref()
+                .and_then(|o| o.parent_session_id.clone()),
+            agent_type: params.origin.as_ref().and_then(|o| o.agent_type.clone()),
             turn,
             step,
-            provider: match self.inner.api_type() {
-                ApiType::Anthropic => "anthropic".into(),
-                ApiType::OpenAICompatible => "openai_compatible".into(),
-            },
+            purpose: params
+                .origin
+                .as_ref()
+                .and_then(|o| o.purpose())
+                .map(str::to_string),
+            // The provider as configured, when routing named one. Falling back
+            // to the api type keeps single-provider recordings readable, but it
+            // cannot distinguish two OpenAI-compatible endpoints — which is why
+            // the routed path supplies the id.
+            provider: self.provider_id.clone().unwrap_or_else(|| {
+                match self.inner.api_type() {
+                    ApiType::Anthropic => "anthropic",
+                    ApiType::OpenAICompatible => "openai_compatible",
+                }
+                .into()
+            }),
             api_type: self.inner.api_type(),
             params: RecordedParams {
                 model: params.model.clone(),
@@ -426,10 +624,11 @@ impl RecorderModel {
                 fallback_model: params.fallback_model.clone(),
                 cache_edits: params.cache_edits.clone(),
             },
+            input_map: params.input_map.clone(),
             system,
             tools: tools_id,
             messages: message_ids,
-        }))?;
+        })))?;
         writer.flush()
     }
 
@@ -437,13 +636,19 @@ impl RecorderModel {
         &self,
         config: &RecorderConfig,
         name: &str,
+        live_session: &str,
         shape: RequestShape,
     ) -> Result<ModelStream, ModelError> {
-        let mut replays = self.replays.lock().unwrap_or_else(|e| e.into_inner());
+        let mut replays = self
+            .shared
+            .replays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = match replays.get_mut(name) {
             Some(state) => state,
             None => {
-                let recording = reader::load(&config.root.join(name)).map_err(|e| {
+                let dir = config.root.join(name);
+                let mut recording = reader::load(&dir).map_err(|e| {
                     ModelError::Internal(format!("recorder: cannot replay {name:?}: {e}"))
                 })?;
                 if recording.damaged > 0 {
@@ -453,28 +658,55 @@ impl RecorderModel {
                         "recorder: replaying a recording with unreadable lines"
                     );
                 }
-                replays.entry(name.to_string()).or_insert(ReplayState {
-                    recording,
-                    cursor: 0,
-                })
+                // A hand-written override is deliberate, so a broken one fails
+                // the replay instead of being skipped — an edit that silently
+                // did nothing is worse than one that says why it could not.
+                if let Some(doc) = override_doc::load(&dir)
+                    .map_err(|e| ModelError::Internal(format!("recorder: {name:?}: {e}")))?
+                {
+                    let mut responses: Vec<Vec<ModelEvent>> =
+                        recording.calls.iter().map(|c| c.response.clone()).collect();
+                    override_doc::apply(&doc, &mut responses)
+                        .map_err(|e| ModelError::Internal(format!("recorder: {name:?}: {e}")))?;
+                    for (call, response) in recording.calls.iter_mut().zip(responses) {
+                        call.response = response;
+                    }
+                    tracing::info!(name, "recorder: replaying with an override applied");
+                }
+                replays
+                    .entry(name.to_string())
+                    .or_insert(ReplayState::new(recording))
             }
         };
 
-        let Some(call) = state.recording.calls.get(state.cursor) else {
+        let sessions = state.recorded_sessions.len();
+        let Some(recorded_session) = state.bind(live_session) else {
             return Err(ModelError::Internal(format!(
-                "recorder: recording {:?} has {} calls, live run asked for #{}",
-                name,
-                state.recording.calls.len(),
-                state.cursor + 1
+                "recorder: recording {name:?} holds {sessions} session(s), \
+                 live run introduced another ({live_session:?})"
             )));
         };
-        state.cursor += 1;
+        let cursor = state.cursor(&recorded_session);
+
+        let calls = state.calls_of(&recorded_session);
+        let Some(call) = calls.get(cursor).copied().cloned() else {
+            return Err(ModelError::Internal(format!(
+                "recorder: recording {:?} has {} call(s) for session {:?}, \
+                 live run asked for #{}",
+                name,
+                calls.len(),
+                recorded_session,
+                cursor + 1
+            )));
+        };
+        state.advance(&recorded_session);
 
         let differences = diverges(&call.request, &shape);
         if !differences.is_empty() {
             let report = format!(
-                "recorder: call #{} diverges from recording {:?}:\n  {}",
-                state.cursor,
+                "recorder: call #{} of session {:?} diverges from recording {:?}:\n  {}",
+                cursor + 1,
+                recorded_session,
                 name,
                 differences.join("\n  ")
             );
@@ -536,8 +768,10 @@ struct RecordingStream {
 }
 
 impl RecordingStream {
-    fn write(&mut self, records: Vec<Record>) {
-        for record in &records {
+    fn write(&mut self, mut records: Vec<Record>) {
+        for record in &mut records {
+            let from = self.writer.next_seq_block(pack::seq_width(record));
+            pack::stamp_seqs(record, from);
             if let Err(e) = self.writer.append(record) {
                 tracing::warn!(error = %e, "recorder: failed to write chunk");
                 return;
@@ -576,7 +810,8 @@ impl futures::Stream for RecordingStream {
                     this.usage = usage.clone();
                 }
                 let records = this.packer.push(ChunkRecord {
-                    seq: this.writer.next_seq(),
+                    // Numbered on the way out, not here — see `pack::stamp_seqs`.
+                    seq: 0,
                     ts: now_ms(),
                     call: this.call_seq,
                     chunk: event.clone(),
@@ -693,6 +928,7 @@ mod tests {
             role: BlockRole::System,
             content: text.into(),
             cache_strategy: None,
+            source: None,
         }]
     }
 
@@ -701,6 +937,7 @@ mod tests {
             name: "Bash".into(),
             description: "run".into(),
             input_schema: serde_json::json!({}),
+            source: None,
         }]
     }
 
@@ -711,11 +948,8 @@ mod tests {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
-            origin: Some(CallOrigin {
-                session_id: session.into(),
-                turn: 0,
-                step,
-            }),
+            origin: Some(CallOrigin::turn(session, 0, step)),
+            input_map: None,
         }
     }
 
@@ -1129,6 +1363,425 @@ mod tests {
                 .calls
                 .len(),
             1
+        );
+    }
+
+    /// The header is what lets a directory of recordings be read as one tree.
+    #[tokio::test]
+    async fn a_sub_agents_header_names_its_parent_and_kind() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(RecorderConfig {
+                mode: RecorderMode::Record,
+                name: None,
+                root: root.path().to_path_buf(),
+                on_divergence: Divergence::Strict,
+            }),
+            "test",
+        );
+        let mut child = params("child", 0);
+        child.origin = child
+            .origin
+            .map(|o| o.with_lineage(Some("parent".into()), Some("code-reviewer".into())));
+        drain(
+            recorder
+                .stream(
+                    prompt("sys"),
+                    tools(),
+                    vec![],
+                    child,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        drop(recorder);
+
+        let header = reader::load(&root.path().join("child")).unwrap().header;
+        assert_eq!(header.parent.as_deref(), Some("parent"));
+        assert_eq!(header.agent_type.as_deref(), Some("code-reviewer"));
+    }
+
+    /// An auxiliary call belongs to the session that made it, not to a shared
+    /// name that concurrent sessions would then truncate out from under it.
+    #[tokio::test]
+    async fn an_auxiliary_call_is_filed_under_its_own_session() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(RecorderConfig {
+                mode: RecorderMode::Record,
+                name: None,
+                root: root.path().to_path_buf(),
+                on_divergence: Divergence::Strict,
+            }),
+            "test",
+        );
+        let mut aux = params("S9", 0);
+        aux.origin = Some(CallOrigin::auxiliary("S9", "compact"));
+        drain(
+            recorder
+                .stream(
+                    prompt("sys"),
+                    tools(),
+                    vec![],
+                    aux,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        drop(recorder);
+
+        assert!(
+            !root.path().join("unattributed").exists(),
+            "auxiliary calls must not land in a shared directory"
+        );
+        let call = &reader::load(&root.path().join("S9")).unwrap().calls[0].request;
+        assert_eq!(call.purpose.as_deref(), Some("compact"));
+        assert_eq!(
+            (call.turn, call.step),
+            (0, 0),
+            "a call outside a turn has no turn coordinates to report"
+        );
+    }
+
+    /// A parent and its sub-agent recording under one name interleave on disk,
+    /// and the order they interleave in is scheduling luck. Replay must hand
+    /// each session its own calls in its own order, not the file's order.
+    #[tokio::test]
+    async fn interleaved_sessions_replay_as_separate_slices() {
+        let root = tempfile::tempdir().unwrap();
+        let config = |mode| RecorderConfig {
+            mode,
+            // One shared name: this is the setup that interleaves.
+            name: Some("run".into()),
+            root: root.path().to_path_buf(),
+            on_divergence: Divergence::Strict,
+        };
+
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![ModelEvent::TextDelta { text: "x".into() }]),
+            Some(config(RecorderMode::Record)),
+            "test",
+        );
+        // parent, child, child, parent — the child's calls land between the
+        // parent's, exactly as a real delegation would.
+        for (session, step) in [("P", 0), ("C", 0), ("C", 1), ("P", 1)] {
+            let mut p = params(session, step);
+            p.origin = Some(CallOrigin::turn(session, 0, step));
+            drain(
+                recorder
+                    .stream(prompt("sys"), tools(), vec![], p, CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+        }
+        drop(recorder);
+
+        let recording = reader::load(&root.path().join("run")).unwrap();
+        assert_eq!(recording.calls.len(), 4);
+
+        // Replaying the child first must still get the child's two calls, even
+        // though the parent's call is first in the file.
+        let replayer = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(config(RecorderMode::Replay)),
+            "test",
+        );
+        for step in [0, 1] {
+            let mut p = params("C", step);
+            p.origin = Some(CallOrigin::turn("C", 0, step));
+            let events = drain(
+                replayer
+                    .stream(prompt("sys"), tools(), vec![], p, CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(events.len(), 1, "child call #{step} should replay");
+        }
+        // A third child call is one more than the child ever made.
+        let mut extra = params("C", 2);
+        extra.origin = Some(CallOrigin::turn("C", 0, 2));
+        let Err(err) = replayer
+            .stream(
+                prompt("sys"),
+                tools(),
+                vec![],
+                extra,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("a third child call has nothing to replay against")
+        };
+        assert!(
+            err.to_string().contains("2 call(s) for session"),
+            "the error should name the session that ran out: {err}"
+        );
+    }
+
+    /// Live session ids are freshly random every run, so the ids in a recording
+    /// are never the ids of the run replaying it. Binding therefore falls back
+    /// to first-call order — and since that is the *production* path, exact-id
+    /// matching alone proving out is not enough.
+    #[tokio::test]
+    async fn sessions_with_new_ids_bind_in_first_call_order() {
+        let root = tempfile::tempdir().unwrap();
+        let config = |mode| RecorderConfig {
+            mode,
+            name: Some("run".into()),
+            root: root.path().to_path_buf(),
+            on_divergence: Divergence::Warn,
+        };
+
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![ModelEvent::TextDelta { text: "x".into() }]),
+            Some(config(RecorderMode::Record)),
+            "test",
+        );
+        // Parent calls first, then its child — the order a live run guarantees.
+        for (session, step) in [("REC-parent", 0), ("REC-child", 0), ("REC-parent", 1)] {
+            let mut p = params(session, step);
+            p.origin = Some(CallOrigin::turn(session, 0, step));
+            drain(
+                recorder
+                    .stream(prompt("sys"), tools(), vec![], p, CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+        }
+        drop(recorder);
+
+        let replayer = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(config(RecorderMode::Replay)),
+            "test",
+        );
+        // Entirely different ids, same order of first call.
+        let mut consumed = Vec::new();
+        for (session, step) in [("LIVE-a", 0), ("LIVE-b", 0), ("LIVE-a", 1)] {
+            let mut p = params(session, step);
+            p.origin = Some(CallOrigin::turn(session, 0, step));
+            let events = drain(
+                replayer
+                    .stream(prompt("sys"), tools(), vec![], p, CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            consumed.push(events.len());
+        }
+        assert_eq!(
+            consumed,
+            vec![1, 1, 1],
+            "each live session should have replayed its counterpart's calls"
+        );
+
+        // `LIVE-a` claimed the parent (2 calls), so a third call on it is one
+        // past the end — proof it bound to the parent and not the child.
+        let mut extra = params("LIVE-a", 2);
+        extra.origin = Some(CallOrigin::turn("LIVE-a", 0, 2));
+        let Err(err) = replayer
+            .stream(
+                prompt("sys"),
+                tools(),
+                vec![],
+                extra,
+                CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("the parent's slice holds only two calls")
+        };
+        assert!(
+            err.to_string().contains("REC-parent"),
+            "the error should name the recorded session it bound to: {err}"
+        );
+    }
+
+    /// An override edits the replayed response without touching the recording,
+    /// which is what makes "what if the model had said X" a reviewable file
+    /// rather than a destroyed fixture.
+    #[tokio::test]
+    async fn an_override_replaces_a_response_and_leaves_the_recording_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let config = |mode| RecorderConfig {
+            mode,
+            name: Some("run".into()),
+            root: root.path().to_path_buf(),
+            on_divergence: Divergence::Strict,
+        };
+
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![ModelEvent::TextDelta {
+                text: "recorded".into(),
+            }]),
+            Some(config(RecorderMode::Record)),
+            "test",
+        );
+        drain(
+            recorder
+                .stream(
+                    prompt("sys"),
+                    tools(),
+                    vec![],
+                    params("S1", 0),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        drop(recorder);
+
+        let before = std::fs::read_to_string(root.path().join("run").join("calls.jsonl")).unwrap();
+        std::fs::write(
+            root.path().join("run").join(override_doc::OVERRIDE_FILE),
+            r#"{"patches":[{"at":0,"response":[{"kind":"text_delta","text":"edited"}]}]}"#,
+        )
+        .unwrap();
+
+        let replayer = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(config(RecorderMode::Replay)),
+            "test",
+        );
+        let events = drain(
+            replayer
+                .stream(
+                    prompt("sys"),
+                    tools(),
+                    vec![],
+                    params("S1", 0),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            format!("{events:?}"),
+            format!(
+                "{:?}",
+                vec![ModelEvent::TextDelta {
+                    text: "edited".into()
+                }]
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("run").join("calls.jsonl")).unwrap(),
+            before,
+            "the recording itself must be untouched"
+        );
+    }
+
+    /// A run that stops short of the recording passes every per-call check.
+    /// The only place to notice is at the end.
+    #[tokio::test]
+    async fn a_replay_that_stops_short_is_reported_at_the_end() {
+        let root = tempfile::tempdir().unwrap();
+        let config = |mode| RecorderConfig {
+            mode,
+            name: Some("run".into()),
+            root: root.path().to_path_buf(),
+            on_divergence: Divergence::Strict,
+        };
+
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(config(RecorderMode::Record)),
+            "test",
+        );
+        for step in [0, 1] {
+            drain(
+                recorder
+                    .stream(
+                        prompt("sys"),
+                        tools(),
+                        vec![],
+                        params("S1", step),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+        }
+        drop(recorder);
+
+        let shared = Recorder::new();
+        let replayer = RecorderModel::shared(
+            ScriptedModel::ok(vec![]),
+            Some(config(RecorderMode::Replay)),
+            "test",
+            shared.clone(),
+        );
+        // Only one of the two recorded calls.
+        drain(
+            replayer
+                .stream(
+                    prompt("sys"),
+                    tools(),
+                    vec![],
+                    params("S1", 0),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let unconsumed = shared.unconsumed();
+        assert_eq!(unconsumed.len(), 1, "got {unconsumed:?}");
+        assert!(
+            unconsumed[0].contains("replayed 1 of 2"),
+            "got {unconsumed:?}"
+        );
+    }
+
+    /// A call that cannot name a session has no recording to belong to, and
+    /// must pass straight through rather than inventing one.
+    #[tokio::test]
+    async fn a_call_with_no_session_is_not_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = RecorderModel::new(
+            ScriptedModel::ok(vec![]),
+            Some(RecorderConfig {
+                mode: RecorderMode::Record,
+                name: None,
+                root: root.path().to_path_buf(),
+                on_divergence: Divergence::Strict,
+            }),
+            "test",
+        );
+        let mut anonymous = params("ignored", 0);
+        anonymous.origin = None;
+        drain(
+            recorder
+                .stream(
+                    prompt("sys"),
+                    tools(),
+                    vec![],
+                    anonymous,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        drop(recorder);
+
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "nothing should have been written"
         );
     }
 

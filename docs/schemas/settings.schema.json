@@ -28,10 +28,26 @@
       ],
       "type": "object"
     },
+    "Divergence": {
+      "description": "What replay does when a live request differs from the one recorded at the\nsame position.",
+      "oneOf": [
+        {
+          "const": "strict",
+          "description": "Fail the call, naming the fields that differ. The default wherever a\ndivergence means a broken test.",
+          "type": "string"
+        },
+        {
+          "const": "warn",
+          "description": "Report the difference and play the recorded response anyway.",
+          "type": "string"
+        }
+      ]
+    },
     "ExecutionSettings": {
       "description": "Execution constraints.",
       "properties": {
         "max_api_calls_per_turn": {
+          "description": "Ceiling on LLM round trips in one turn, before the turn ends with\n`stop_reason: \"max_turns\"`.\n\nThis is a runaway guard, not a task budget. Every comparable agent\nruntime treats it that way and lands in the same range — the OpenAI\nAgents SDK defaults `max_turns` to 10, LangGraph's `recursion_limit`\nto 25, LangChain's `max_iterations` to 15. A long task is meant to be\nserved by compaction, delegation and resuming, not by a high ceiling:\nraising this does not rescue an agent stuck in a loop, it only buys\nthe loop more iterations before it stops.\n\nRaise it deliberately for a genuinely long single turn. Nothing here\ndetects a *lack of progress* — a model repeating the same failing\ntool call burns the whole allowance either way.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -123,14 +139,14 @@
           "description": "Enable reactive compaction — proactive context compression triggered\nbefore the budget is fully exhausted, based on token usage velocity.",
           "type": "boolean"
         },
+        "recorder_auto_detect": {
+          "default": false,
+          "description": "Enable recorder auto-detection in test environments.",
+          "type": "boolean"
+        },
         "team_mode": {
           "default": false,
           "description": "Enable multi-agent team coordination mode.",
-          "type": "boolean"
-        },
-        "vcr_auto_detect": {
-          "default": false,
-          "description": "Enable VCR auto-detection in test environments.",
           "type": "boolean"
         }
       },
@@ -192,7 +208,7 @@
       "properties": {
         "global_data_dir": {
           "default": "",
-          "description": "User-level, cross-scene global root — flat, shared by every scene\n(e.g. `~/.atta/`). Used by resources that don't have a scene tier\n(`memory`/`sessions`/`vcr`/`mcp`) and as the base layer for resources\nthat do (`settings.json`/`skills`/`plugins`/`agents`/`rules`/`hooks`).\nSee `base::paths::ConfigPaths` module docs for the full breakdown.",
+          "description": "User-level, cross-scene global root — flat, shared by every scene\n(e.g. `~/.atta/`). Used by resources that don't have a scene tier\n(`memory`/`sessions`/`recordings`/`mcp`) and as the base layer for resources\nthat do (`settings.json`/`skills`/`plugins`/`agents`/`rules`/`hooks`).\nSee `base::paths::ConfigPaths` module docs for the full breakdown.",
           "type": "string"
         },
         "local_data_dir": {
@@ -286,12 +302,30 @@
       ],
       "type": "object"
     },
+    "PluginsConfig": {
+      "description": "Runtime control over the plugin subsystem, for a build that has it\ncompiled in.\n\nThe compile-time feature decides whether plugins *can* exist; this\ndecides whether they may. A deployment that wants none should prefer the\nfeature, since that leaves nothing to switch back on — this is for the\ncase where the same binary serves several deployments.",
+      "properties": {
+        "allow": {
+          "description": "When non-empty, only these plugin names load. An allow-list, so a\nname that is not on it is refused rather than merely unmentioned.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Load installed plugins at all.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "ProviderConfig": {
       "description": "A single provider's connection + model config, as written in settings.json.",
       "properties": {
         "api_key": {
           "default": null,
-          "description": "Stored in plaintext, same as every other settings.json field — see\nthe \"安全提示\" section in `docs/LLM_PROVIDERS.md`.",
+          "description": "Stored in plaintext, same as every other settings.json field.",
           "type": [
             "string",
             "null"
@@ -330,6 +364,51 @@
         }
       },
       "type": "object"
+    },
+    "RecorderConfig": {
+      "description": "Recorder (record/replay) configuration. `None` on [`Settings`] leaves the\nmodel wrapper a pass-through.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/RecorderMode"
+        },
+        "name": {
+          "default": null,
+          "description": "Directory name for this recording under `root`. `None` uses the session\nid, which is what production recording wants; tests name theirs so a\nreplay can find it again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_divergence": {
+          "$ref": "#/$defs/Divergence",
+          "default": "strict"
+        },
+        "root": {
+          "description": "Where recordings live. Each one is a self-contained directory beneath\nit, so a host retires a recording by deleting that directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "root"
+      ],
+      "type": "object"
+    },
+    "RecorderMode": {
+      "oneOf": [
+        {
+          "enum": [
+            "record",
+            "replay"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "rerun",
+          "description": "Re-issue a recording's requests against a real provider.\n\nThe third mode exists because the other two cannot answer \"what would\nthe model have said if the prompt were different\". `Replay` never reads\na request's content — it compares blob *ids* and returns the recorded\nresponse — so editing a blob changes nothing it observes. `Rerun` loads\nthe request back from the blobs (picking up any edit), sends it, and\nreports how the new response differs from the recorded one.",
+          "type": "string"
+        }
+      ]
     },
     "SandboxConfig": {
       "description": "Sandbox/security configuration.",
@@ -422,36 +501,6 @@
           "type": "object"
         }
       ]
-    },
-    "VcrConfig": {
-      "description": "VCR (record/replay) configuration.",
-      "properties": {
-        "fallback_on_miss": {
-          "default": true,
-          "description": "On replay, fall back to real API when no match? (default true)",
-          "type": "boolean"
-        },
-        "mode": {
-          "$ref": "#/$defs/VcrMode",
-          "description": "\"record\" or \"replay\""
-        },
-        "scenario": {
-          "description": "Scenario name (JSONL filename without extension)",
-          "type": "string"
-        }
-      },
-      "required": [
-        "mode",
-        "scenario"
-      ],
-      "type": "object"
-    },
-    "VcrMode": {
-      "enum": [
-        "record",
-        "replay"
-      ],
-      "type": "string"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -484,7 +533,7 @@
     "execution": {
       "$ref": "#/$defs/ExecutionSettings",
       "default": {
-        "max_api_calls_per_turn": 200,
+        "max_api_calls_per_turn": 25,
         "max_budget_tokens": null,
         "max_parallelism": 10,
         "permission_prompt_timeout_secs": 300,
@@ -503,8 +552,8 @@
         "extended_memory": false,
         "plugin_marketplace": false,
         "reactive_compact": false,
-        "team_mode": false,
-        "vcr_auto_detect": false
+        "recorder_auto_detect": false,
+        "team_mode": false
       },
       "description": "Feature flags — compile-time + runtime gate for experimental features."
     },
@@ -554,6 +603,12 @@
       },
       "type": "array"
     },
+    "plugins": {
+      "$ref": "#/$defs/PluginsConfig",
+      "default": {
+        "enabled": true
+      }
+    },
     "prompt_append": {
       "default": null,
       "description": "Appended to the end of the system prompt.",
@@ -574,8 +629,20 @@
       "additionalProperties": {
         "$ref": "#/$defs/ProviderConfig"
       },
-      "description": "Multi-provider LLM registry, keyed by provider id. See\n`docs/LLM_PROVIDERS.md`.",
+      "description": "Multi-provider LLM registry, keyed by provider id.",
       "type": "object"
+    },
+    "recorder": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RecorderConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "LLM interaction recording. None = pass-through."
     },
     "sandbox": {
       "$ref": "#/$defs/SandboxConfig",
@@ -613,18 +680,6 @@
         "string",
         "null"
       ]
-    },
-    "vcr": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/VcrConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "description": "VCR record/replay configuration. None = pass-through."
     }
   },
   "required": [

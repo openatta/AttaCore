@@ -1495,28 +1495,58 @@ impl SessionPool {
         resume: bool,
     ) -> Result<String, String> {
         let scene_id = scene.id().to_string();
+        let task_router = self.task_router.read().await.clone();
+
         // Wrap the model in a recorder if this session asked for one.
-        let model: Arc<dyn base::interface::model::Model> =
-            match options.and_then(|o| o.recorder.as_ref()) {
-                Some(recorder) => Arc::new(RecorderModel::new(
-                    self.model.clone(),
-                    Some(RecorderConfig {
-                        mode: match recorder.mode.as_str() {
-                            "record" => RecorderMode::Record,
-                            _ => RecorderMode::Replay,
-                        },
-                        name: recorder.name.clone(),
-                        root: std::path::PathBuf::from(&recorder.dir),
-                        on_divergence: if recorder.strict {
-                            Divergence::Strict
-                        } else {
-                            Divergence::Warn
-                        },
-                    }),
-                    env!("CARGO_PKG_VERSION"),
-                )),
-                None => self.model.clone(),
-            };
+        //
+        // Both the conversation's model *and* every routed provider get
+        // wrapped, sharing one `Recorder` so they write into one recording.
+        // Wrapping only the conversation's model left sub-agents, compaction
+        // and memory extraction — everything reached through the router —
+        // recording nothing whenever `providers` was configured.
+        let recorder_config =
+            options
+                .and_then(|o| o.recorder.as_ref())
+                .map(|recorder| RecorderConfig {
+                    mode: match recorder.mode.as_str() {
+                        "record" => RecorderMode::Record,
+                        // `rerun` is driven from a recording, not from a live
+                        // session, so a session asking for it just talks to the
+                        // provider — see `telemetry::recorder::rerun`.
+                        "rerun" => RecorderMode::Rerun,
+                        _ => RecorderMode::Replay,
+                    },
+                    name: recorder.name.clone(),
+                    root: recordings_root(&base_settings, recorder.dir.as_deref()),
+                    on_divergence: if recorder.strict {
+                        Divergence::Strict
+                    } else {
+                        Divergence::Warn
+                    },
+                });
+        let (model, task_router) = match recorder_config {
+            None => (self.model.clone(), task_router),
+            Some(config) => {
+                let shared = telemetry::recorder::Recorder::new();
+                let wrap =
+                    |provider_id: Option<&str>, inner: Arc<dyn base::interface::model::Model>| {
+                        let mut m = RecorderModel::shared(
+                            inner,
+                            Some(config.clone()),
+                            env!("CARGO_PKG_VERSION"),
+                            shared.clone(),
+                        );
+                        if let Some(id) = provider_id {
+                            m = m.with_provider_id(id);
+                        }
+                        Arc::new(m) as Arc<dyn base::interface::model::Model>
+                    };
+                (
+                    wrap(None, self.model.clone()),
+                    task_router.map(|r| Arc::new(r.map_models(|id, inner| wrap(Some(id), inner)))),
+                )
+            }
+        };
 
         // The prompt timeout is a daemon-level flag but the wait it bounds
         // lives in the engine, so it travels as a setting rather than as a
@@ -1545,7 +1575,7 @@ impl SessionPool {
         if let Some(ref store) = self.history_store {
             builder = builder.history_store(store.clone());
         }
-        if let Some(router) = self.task_router.read().await.clone() {
+        if let Some(router) = task_router {
             builder = builder.task_router(router);
         }
         builder = builder.scene_registry(self.scene_registry());
@@ -3873,6 +3903,7 @@ impl SessionPool {
                     fallback_model: None,
                     cache_edits: vec![],
                     origin: None,
+                    input_map: None,
                 },
                 CancellationToken::new(),
             )
@@ -3989,6 +4020,24 @@ fn build_pool_telemetry(settings: &Settings) -> telemetry::TelemetryHandle {
             telemetry::TelemetryHandle::noop()
         }
     }
+}
+
+/// Where recordings go: what the caller asked for, else what this deployment
+/// configured, else the conventional user-level directory.
+///
+/// The per-call override stays because a test harness points recordings at a
+/// fixture directory, but it is no longer the only source — a host that simply
+/// wants recording on should not have to invent a path. `settings.recorder` has
+/// existed and been deserializable all along with nothing in the daemon reading
+/// it; this is where it starts meaning something.
+fn recordings_root(settings: &Settings, requested: Option<&str>) -> PathBuf {
+    if let Some(dir) = requested {
+        return PathBuf::from(dir);
+    }
+    if let Some(recorder) = &settings.recorder {
+        return recorder.root.clone();
+    }
+    base::paths::ConfigPaths::from_settings(&settings.paths).global_recordings_dir()
 }
 
 /// A `TelemetryRecorder` that forwards turn/tool events to OpenTelemetry, or

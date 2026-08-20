@@ -69,11 +69,29 @@ impl BlobStore {
         self.put_raw(&json)
     }
 
+    /// Store `json`, returning the id it is addressed by.
+    ///
+    /// An existing file with the same id normally holds the same bytes, so it
+    /// is left alone. But a blob can be edited by hand — that is a supported
+    /// way to explore a recording — and an edited file no longer matches the
+    /// name it sits under. Overwriting it silently would make the next
+    /// recording discard the edit without saying so, so the mismatch is
+    /// reported and the correct content restored.
     pub fn put_raw(&self, json: &str) -> Result<BlobId, std::io::Error> {
         let id = BlobId::of(json);
         let path = self.dir.join(&id.0);
-        if path.exists() {
-            return Ok(id);
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if existing == json => return Ok(id),
+            Ok(_) => {
+                tracing::warn!(
+                    blob = %id,
+                    dir = %self.dir.display(),
+                    "recorder: blob content does not match its id — an edit is being overwritten \
+                     by a fresh recording; copy it elsewhere first"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&path, json)?;
@@ -144,5 +162,26 @@ mod tests {
         let id = store.put(&"anything").unwrap();
         assert_eq!(id.0.len(), 16);
         assert!(id.0.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Reading a blob does not verify its hash, which is what makes editing one
+    /// by hand a usable way to explore a recording. The cost is that a later
+    /// recording finds a file whose content no longer matches its name — it
+    /// must restore the real content rather than trust the name and skip.
+    #[test]
+    fn a_hand_edited_blob_is_restored_rather_than_trusted() {
+        let (store, dir) = store();
+        let id = store.put(&"original").unwrap();
+        let path = dir.path().join("blobs").join(&id.0);
+        std::fs::write(&path, "tampered").unwrap();
+        assert_eq!(store.get_raw(&id).unwrap().as_deref(), Some("tampered"));
+
+        let again = store.put(&"original").unwrap();
+        assert_eq!(again, id);
+        assert_eq!(
+            store.get::<String>(&id).unwrap().as_deref(),
+            Some("original"),
+            "re-recording must not leave a blob whose content contradicts its id"
+        );
     }
 }

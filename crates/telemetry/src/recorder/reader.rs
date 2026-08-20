@@ -85,7 +85,7 @@ pub fn load(dir: &Path) -> Result<Recording, ReadError> {
                 header = Some(h);
             }
             Record::Call(request) => calls.push(RecordedCall {
-                request,
+                request: *request,
                 response: Vec::new(),
                 end: None,
             }),
@@ -196,6 +196,7 @@ mod tests {
             name: "run".into(),
             session_id: "S1".into(),
             parent: None,
+            agent_type: None,
             created_at: now_ms(),
             engine_version: "test".into(),
         }
@@ -205,8 +206,12 @@ mod tests {
         CallRecord {
             seq,
             ts: 1000,
+            session_id: Some("S1".into()),
+            parent_session_id: None,
+            agent_type: None,
             turn: 0,
             step: 0,
+            purpose: None,
             provider: "anthropic".into(),
             api_type: ApiType::Anthropic,
             params: RecordedParams {
@@ -219,13 +224,16 @@ mod tests {
             system: vec![BlobId("a".repeat(16))],
             tools: BlobId("b".repeat(16)),
             messages: vec![],
+            input_map: None,
         }
     }
 
     /// Writes a call, three text deltas (which pack into one row), and an end.
     fn write_one_call(root: &Path) {
         let writer = RecordingWriter::create(root, header());
-        writer.append(&Record::Call(call_record(0))).unwrap();
+        writer
+            .append(&Record::Call(Box::new(call_record(0))))
+            .unwrap();
         let chunks: Vec<_> = (0..3)
             .map(|i| ChunkRecord {
                 seq: i + 1,
@@ -306,7 +314,9 @@ mod tests {
     fn a_call_cut_off_mid_stream_reads_back_without_an_end() {
         let root = tempfile::tempdir().unwrap();
         let writer = RecordingWriter::create(root.path(), header());
-        writer.append(&Record::Call(call_record(0))).unwrap();
+        writer
+            .append(&Record::Call(Box::new(call_record(0))))
+            .unwrap();
         writer
             .append(&Record::Chunk(ChunkRecord {
                 seq: 1,
@@ -331,7 +341,9 @@ mod tests {
         let mut h = header();
         h.version = FORMAT_VERSION + 1;
         let writer = RecordingWriter::create(root.path(), h);
-        writer.append(&Record::Call(call_record(0))).unwrap();
+        writer
+            .append(&Record::Call(Box::new(call_record(0))))
+            .unwrap();
         writer.flush().unwrap();
 
         assert!(matches!(

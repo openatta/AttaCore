@@ -556,6 +556,15 @@ pub struct RecorderConfig {
 pub enum RecorderMode {
     Record,
     Replay,
+    /// Re-issue a recording's requests against a real provider.
+    ///
+    /// The third mode exists because the other two cannot answer "what would
+    /// the model have said if the prompt were different". `Replay` never reads
+    /// a request's content — it compares blob *ids* and returns the recorded
+    /// response — so editing a blob changes nothing it observes. `Rerun` loads
+    /// the request back from the blobs (picking up any edit), sends it, and
+    /// reports how the new response differs from the recorded one.
+    Rerun,
 }
 
 /// What replay does when a live request differs from the one recorded at the

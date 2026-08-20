@@ -931,6 +931,9 @@ A memory that summarizes repo state (activity logs, architecture snapshots) is f
 /// Falls back to substring `search()` if the model call fails.
 ///
 /// Returns a list of memory names (slugs) that are most relevant to the query.
+/// - `session_id`: the session this recall belongs to, so the model call it may
+///   make is attributed to that session rather than to nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn select_memories_with_llm(
     store: &MemoryStore,
     query: &str,
@@ -939,6 +942,7 @@ pub async fn select_memories_with_llm(
     already_surfaced: &std::collections::HashSet<String>,
     recent_tools: &[String],
     model_name: &str,
+    session_id: Option<&str>,
 ) -> Vec<String> {
     let _start = std::time::Instant::now();
     let mut headers = store.load_all();
@@ -1030,7 +1034,13 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
         cache_edits: vec![],
-        origin: None,
+        origin: session_id.map(|id| {
+            crate::interface::model::CallOrigin::auxiliary(
+                id,
+                crate::interface::model::call_purpose::MEMORY,
+            )
+        }),
+        input_map: None,
     };
 
     let stream_result = model

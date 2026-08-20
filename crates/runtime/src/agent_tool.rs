@@ -2258,8 +2258,15 @@ impl AgentTool {
         let tag = SubagentTag::new(&self.inner, &sid, subagent_type, parent);
         let sid_for_hook = sid.clone();
         let sid_for_meta = sid.clone();
+        // Resolved once and shared by the sub-agent's own lineage and its `Meta`
+        // line — two answers to "who spawned this" that must not be able to
+        // disagree.
+        let parent_session_id = parent
+            .map(|(sid, _)| sid.to_string())
+            .or_else(|| self.inner.parent_session_id());
         let mut builder = Builder::new()
             .session_id(sid)
+            .lineage(parent_session_id.clone(), subagent_type)
             .scene(scene)
             .model(self.inner.model_for_subagent())
             .tools(tools)
@@ -2283,9 +2290,6 @@ impl AgentTool {
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
         if let Some(store) = &history_store {
-            let parent_session_id = parent
-                .map(|(sid, _)| sid.to_string())
-                .or_else(|| self.inner.parent_session_id());
             write_sidechain_meta(
                 store,
                 &sid_for_meta,

@@ -63,14 +63,45 @@ fn payload(chunk: &ChunkRecord) -> String {
 }
 
 /// Whether `next` extends a run ending at `prev`.
+///
+/// Adjacency is arrival order into a packer, which only ever sees one call's
+/// stream — deliberately *not* `seq` adjacency. `seq` is a line number handed
+/// out by the writer, and when a parent and its sub-agent record into the same
+/// file their line numbers interleave; requiring them to be consecutive meant
+/// every run broke after one member and packing silently stopped working in
+/// exactly the case it was needed for. Line numbers are assigned to a run when
+/// it is written ([`stamp_seqs`]), so a row's block stays contiguous regardless.
 fn continues(prev: &ChunkRecord, next: &ChunkRecord, kind: RunKind) -> bool {
-    if next.call != prev.call || next.seq != prev.seq + 1 {
+    if next.call != prev.call {
         return false;
     }
     if kind == RunKind::ToolArgs && tool_args_id(prev) != tool_args_id(next) {
         return false;
     }
     true
+}
+
+/// How many chunks a record stands for — its share of the line numbering.
+pub fn seq_width(record: &Record) -> usize {
+    match record {
+        Record::TextChunks(run) | Record::ThinkingChunks(run) => run.texts.len(),
+        Record::ToolArgsChunks(run) => run.args.len(),
+        _ => 1,
+    }
+}
+
+/// Assign `record` a block of line numbers starting at `from`.
+///
+/// Called when the record is about to be appended rather than when its chunks
+/// arrived, so a packed row always occupies a contiguous block and `seq0 + k`
+/// keeps naming the k-th member even with another stream writing in between.
+pub fn stamp_seqs(record: &mut Record, from: u64) {
+    match record {
+        Record::Chunk(c) => c.seq = from,
+        Record::TextChunks(run) | Record::ThinkingChunks(run) => run.seq0 = from,
+        Record::ToolArgsChunks(run) => run.seq0 = from,
+        _ => {}
+    }
 }
 
 fn build_row(kind: RunKind, run: &[ChunkRecord]) -> Record {
@@ -357,10 +388,36 @@ mod tests {
         assert_round_trip(chunks);
     }
 
+    /// A gap in line numbers means another stream wrote in between, not that
+    /// this call's chunks stopped being consecutive. Breaking the run there is
+    /// what made packing collapse whenever a parent and a sub-agent shared a
+    /// recording — the case packing matters most for.
     #[test]
-    fn a_sequence_gap_breaks_the_run() {
+    fn a_gap_in_line_numbers_does_not_break_the_run() {
         let chunks = vec![text(0, 100, "a"), text(1, 110, "b"), text(9, 120, "c")];
-        assert_round_trip(chunks);
+        let packed = pack(chunks);
+        assert_eq!(packed.len(), 1, "got {packed:?}");
+    }
+
+    /// The row's line numbers are assigned when it is written, so `seq0 + k`
+    /// names the k-th member no matter what the members arrived as.
+    #[test]
+    fn stamping_renumbers_a_row_into_one_contiguous_block() {
+        let mut packed = pack(vec![
+            text(0, 100, "a"),
+            text(1, 110, "b"),
+            text(9, 120, "c"),
+        ]);
+        assert_eq!(seq_width(&packed[0]), 3);
+        stamp_seqs(&mut packed[0], 40);
+        let Record::TextChunks(run) = &packed[0] else {
+            panic!("expected a packed run, got {packed:?}")
+        };
+        let expanded = expand_text_run(run, false).unwrap();
+        assert_eq!(
+            expanded.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            vec![40, 41, 42]
+        );
     }
 
     #[test]

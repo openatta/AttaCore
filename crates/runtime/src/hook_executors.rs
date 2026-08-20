@@ -25,14 +25,22 @@ pub struct ModelPromptHookExecutor {
     model: Arc<dyn Model>,
     default_model_name: String,
     max_tokens: u32,
+    /// The session whose hooks these are, so the call is filed under it.
+    session_id: Option<String>,
 }
 
 impl ModelPromptHookExecutor {
-    pub fn new(model: Arc<dyn Model>, default_model_name: String, max_tokens: u32) -> Self {
+    pub fn new(
+        model: Arc<dyn Model>,
+        default_model_name: String,
+        max_tokens: u32,
+        session_id: Option<String>,
+    ) -> Self {
         Self {
             model,
             default_model_name,
             max_tokens,
+            session_id,
         }
     }
 }
@@ -54,7 +62,13 @@ impl PromptHookExecutor for ModelPromptHookExecutor {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
-            origin: None,
+            origin: self.session_id.as_ref().map(|id| {
+                base::interface::model::CallOrigin::auxiliary(
+                    id,
+                    base::interface::model::call_purpose::HOOK,
+                )
+            }),
+            input_map: None,
         };
         let messages = vec![ModelMessage {
             role: MessageRole::User,
@@ -176,7 +190,7 @@ mod tests {
         let model: Arc<dyn Model> = Arc::new(StubModel {
             response: r#"{"decision":"approve"}"#,
         });
-        let executor = ModelPromptHookExecutor::new(model, "test-model".into(), 100);
+        let executor = ModelPromptHookExecutor::new(model, "test-model".into(), 100, None);
         let out = executor
             .execute("is this safe?", None, &test_input())
             .await

@@ -244,6 +244,41 @@ impl TaskRouter {
     pub fn model_name_for(&self, task: &str) -> Option<&str> {
         self.resolved.get(task).map(|r| r.model.as_str())
     }
+
+    /// A router with every provider's model replaced by `wrap(provider_id, model)`.
+    ///
+    /// Exists so a decorator can be applied to *all* routed models at once.
+    /// Wrapping only the conversation's model left every routed call — every
+    /// sub-agent, every summarizer — running through an undecorated instance,
+    /// which is how recording a session with providers configured silently
+    /// captured only part of it.
+    ///
+    /// `default` is one of `providers`' own values, so it is remapped to that
+    /// provider's wrapped instance rather than wrapped a second time.
+    pub fn map_models(
+        &self,
+        wrap: impl Fn(
+            &str,
+            Arc<dyn crate::interface::model::Model>,
+        ) -> Arc<dyn crate::interface::model::Model>,
+    ) -> Self {
+        let providers: HashMap<String, Arc<dyn crate::interface::model::Model>> = self
+            .providers
+            .iter()
+            .map(|(id, model)| (id.clone(), wrap(id, model.clone())))
+            .collect();
+        let default = self
+            .providers
+            .iter()
+            .find(|(_, model)| Arc::ptr_eq(model, &self.default))
+            .and_then(|(id, _)| providers.get(id).cloned())
+            .unwrap_or_else(|| wrap("default", self.default.clone()));
+        Self {
+            providers,
+            resolved: self.resolved.clone(),
+            default,
+        }
+    }
 }
 
 #[cfg(test)]

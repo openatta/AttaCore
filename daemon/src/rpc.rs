@@ -311,13 +311,18 @@ pub struct SessionOptions {
 /// Record or replay this session's LLM calls.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RecorderOptions {
-    pub mode: String, // "record" | "replay"
+    pub mode: String, // "record" | "replay" | "rerun"
     /// Directory name for the recording under `dir`. Omitted, the session id
     /// is used — which is what production recording wants, and what a replay
     /// must therefore override with the name of the recording it wants back.
     #[serde(default)]
     pub name: Option<String>,
-    pub dir: String, // absolute path to the recordings root
+    /// Absolute path to the recordings root. Omitted, the daemon's own root is
+    /// used — `settings.recorder.root` if configured, else
+    /// `ConfigPaths::global_recordings_dir()`. A caller that just wants
+    /// recording on no longer has to know where recordings live.
+    #[serde(default)]
+    pub dir: Option<String>,
     /// On replay, whether a live request that differs from the recorded one
     /// fails the call (`true`) or only warns (`false`).
     #[serde(default)]
