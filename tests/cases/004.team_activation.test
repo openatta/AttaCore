@@ -15,6 +15,8 @@
 # 预期: 模型识别出"团队/并行"意图 → 调用 TeamCreate（name + 至少两个 agents，各自 prompt
 #       对应一个子任务）→ 两个子 agent 各自算出一部分的和 → 模型把两部分结果相加汇总告诉用户
 #       → 用户确认后模型调用 TeamDelete 清理。
+# fixture: tests/fixtures/team_project
+# scene: coding
 
 >>>>>>>>>>>>>>>>
 请开一个 team，分两个子 agent 并行处理：

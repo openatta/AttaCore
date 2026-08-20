@@ -96,6 +96,7 @@ fn runner_config(recordings_dir: &std::path::Path, scenario: &str) -> AgentRunne
         telemetry_path: None,
         fixture_dir: None,
         scene: Arc::new(scene::scene::coding::CodingScene),
+        recorder: telemetry::recorder::Recorder::new(),
     }
 }
 

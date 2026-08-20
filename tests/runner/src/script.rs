@@ -26,6 +26,11 @@ pub struct TestCase {
     pub source_path: String,
     /// 会话模式：每轮独立会话（默认）还是全用例共享一个会话
     pub session_mode: SessionMode,
+    /// 用例声明的模板项目 fixture（`fixture: tests/fixtures/template_project`）。
+    /// 命令行 `--fixture` 优先。
+    pub fixture: Option<String>,
+    /// 用例声明的场景（`scene: chat`）。命令行 `--scene` 优先。
+    pub scene: Option<String>,
     /// 多轮对话
     pub turns: Vec<Turn>,
 }
@@ -147,6 +152,8 @@ pub fn parse_test_script(content: &str, source_path: &str) -> anyhow::Result<Tes
                 meta: String::new(),
                 source_path: source_path.to_string(),
                 session_mode: SessionMode::default(),
+                fixture: None,
+                scene: None,
                 turns: vec![Turn {
                     index: 0,
                     input: content.to_string(),
@@ -160,6 +167,8 @@ pub fn parse_test_script(content: &str, source_path: &str) -> anyhow::Result<Tes
     };
 
     let session_mode = parse_session_mode(&meta)?;
+    let fixture = parse_meta_field(&meta, "fixture");
+    let scene = parse_meta_field(&meta, "scene");
 
     // 解析轮次
     let turns = parse_turns(body)?;
@@ -171,8 +180,28 @@ pub fn parse_test_script(content: &str, source_path: &str) -> anyhow::Result<Tes
         meta,
         source_path: source_path.to_string(),
         session_mode,
+        fixture,
+        scene,
         turns,
     })
+}
+
+/// A `key: value` line in the meta block, if the case declares one.
+///
+/// Prerequisites used to live only in the prose header (`# 前置: --fixture …
+/// --scene chat`), which meant every runner invocation had to remember to pass
+/// them by hand — and `tests/run_api.sh` never did. A case that needs MCP, or a
+/// scene other than the default, was therefore recorded without them: the
+/// recording looked fine and exercised none of what the case was written for.
+/// Declaring it here makes the runner configure itself from the case.
+fn parse_meta_field(meta: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    meta.lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches('#').trim();
+            line.strip_prefix(&prefix).map(|v| v.trim().to_string())
+        })
+        .rfind(|v: &String| !v.is_empty())
 }
 
 /// 从元信息区（第一个 `>>>>` 之前）读 `session:` 声明。
@@ -328,6 +357,36 @@ Just input, no expected output marker.
         assert_eq!(tc.turns.len(), 1);
         assert_eq!(tc.turns[0].input, "Just input, no expected output marker.");
         assert!(tc.turns[0].expected.is_empty());
+    }
+
+    /// The prose header said `# 前置: --fixture … --scene chat` and nothing
+    /// read it, so `run_api.sh` recorded every such case without either. A
+    /// declaration the runner actually consults is the difference between a
+    /// recording that exercises MCP and one that silently does not.
+    #[test]
+    fn a_case_declares_its_own_fixture_and_scene() {
+        let script = "# 前置: --fixture tests/fixtures/template_project\n\
+                      # fixture: tests/fixtures/template_project\n\
+                      # scene: chat\n\n>>>>>>>>>>>>>>>>\nhi\n";
+        let tc = parse_test_script(script, "t.test").unwrap();
+        assert_eq!(
+            tc.fixture.as_deref(),
+            Some("tests/fixtures/template_project")
+        );
+        assert_eq!(tc.scene.as_deref(), Some("chat"));
+    }
+
+    /// The prose line alone must not be mistaken for a declaration — it is
+    /// free text and says `--fixture`, not `fixture:`.
+    #[test]
+    fn a_case_that_declares_nothing_leaves_both_absent() {
+        let tc = parse_test_script(
+            "# 前置: 无（--scene chat）\n\n>>>>>>>>>>>>>>>>\nhi\n",
+            "t.test",
+        )
+        .unwrap();
+        assert_eq!(tc.fixture, None);
+        assert_eq!(tc.scene, None);
     }
 
     #[test]

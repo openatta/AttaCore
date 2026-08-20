@@ -7,6 +7,8 @@
 #       crates/skills/src/watcher.rs::SkillWatcher（本轮之前未接线，这个会话新增
 #       enable_watching() 调用是本次修复的一部分）真的在跑，新增文件不需要重启进程/
 #       重建 session 就能在下一轮生效。
+# fixture: tests/fixtures/template_project
+# scene: coding
 
 >>>>>>>>>>>>>>>>
 不用读任何文件，直接告诉我：现在有没有一个叫 flaky-fixer 的 skill 可以用？

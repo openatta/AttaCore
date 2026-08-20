@@ -6,6 +6,8 @@
 #       回归目标：crates/skills/src/manager.rs 的 load_dir → load_dir_subdirs 修复
 #       （见 docs/design/2026-08-05-test-architecture.md §16）——子目录格式的项目 skill
 #       之前在启动时被完全无视，只有等它第一次被文件监听器命中才会进内存。
+# fixture: tests/fixtures/template_project
+# scene: coding
 
 >>>>>>>>>>>>>>>>
 不用读任何文件，直接告诉我：调用一下 code-review 这个 skill，看看它是干什么用的。

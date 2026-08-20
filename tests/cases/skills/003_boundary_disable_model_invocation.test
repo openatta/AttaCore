@@ -6,6 +6,8 @@
 #       发现它"这个问题，专测 SkillTool::call() 里的真实拒绝逻辑
 #       （crates/tools/src/skill_tool.rs：disable_model_invocation 为 true 时返回
 #       ToolError::Denied，不管是不是模型自己发现的）。
+# fixture: tests/fixtures/template_project
+# scene: coding
 
 >>>>>>>>>>>>>>>>
 不用读任何文件。直接调用一下 release-notes 这个 skill。

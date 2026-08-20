@@ -19,6 +19,39 @@
 回放模式（默认）不联网也不花钱。要重录用 `ATTA_RECORD=<用例>`，
 需要真的 API key。
 
+**用例自带前置，不靠调用方记得传。** `.test` 的元信息区里写：
+
+```
+# fixture: tests/fixtures/template_project
+# scene: chat
+# session: shared
+```
+
+在此之前前置只写在散文注释里（`# 前置: --fixture … --scene chat`），没有任何东西读它，
+而 `tests/run_api.sh` 从不传这两个参数——于是 `003.fixture_full` 每次都是**在没有 fixture
+的情况下**被录的：MCP server、hooks、skill 一个都没起来，录像看着正常，验的东西一个没验到。
+命令行 `--fixture` / `--scene` 仍然优先，用于临时覆盖。
+
+**验录像还成立吗：`--rerun`。** 把录像里的输入原样重发给真模型，看输出是否还是同一个
+意思。工具调用逐参数精确比对（不交判官），文本交语义判官。产出终端摘要 + 
+`tests/output/<用例>/rerun.md`。花钱，人工触发，不进 `cargo test`。详见
+`docs/recorder_design.md` §6.1–6.5。
+
+```sh
+./tests/run_rerun.sh                 # 当前轮次所有有录像的用例
+./tests/run_rerun.sh 000.c_project   # 单个
+```
+
+判定分三档：**一致**（工具与文本都没动）、**措辞漂移**（工具一致、文本判官认为同义）、
+**分歧**（工具调用变了，或文本已非同义）。
+
+每条调用**独立重跑**——发出去的是录像里存的输入，不含本次的任何结果，所以前面有没有分歧
+都不影响后面那条的判定。分歧之后的标 `↓`（本次对话不会走到这里），但判定照给。
+
+**开场调用标 `开` 并单列统计**：那是模型只凭提示词自由选第一步的位置，工具选择的抖动本来
+就大（`Bash` vs `Write`、`TodoWrite` vs 直接作答）。摘要末尾的"开场调用之外的分歧数"才是
+先该看的那个数。
+
 **测试进程不碰你的 `~/.atta`。** 每个测试自己拿 tempdir 当状态根；
 `daemon/tests/home_is_never_discovered.rs` 保证没有哪个 crate 会自己去找 `$HOME`。
 跑测试之后 `~/.atta` 里不该多出任何东西——如果多了，那是 bug。

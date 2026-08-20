@@ -22,6 +22,7 @@
 # 录制/回放:
 #   ATTA_VCR_RECORD=001_multi_turn_recall cargo run -p test-runner -- \
 #     --mode api --case tests/cases/session/001_multi_turn_recall.test
+# scene: coding
 
 >>>>>>>>>>>>>>>>
 先记住这三条信息，不要写任何文件、不要调用任何工具，只回复"已记住"：

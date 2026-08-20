@@ -338,50 +338,57 @@ async fn every_transport_answers_the_same_request() {
 /// The property an aggregate client cannot express: a token arrives while
 /// the turn is still running.
 ///
-/// The discrimination is in the timing, so the numbers matter. The model
-/// drips five chunks 150ms apart, so the turn takes ~750ms end to end, and
-/// the first chunk is available at ~0ms. The deadline below is 300ms:
-/// comfortably after a *streamed* first token, comfortably before a
-/// *buffered* one — a daemon that collected the turn and flushed at the end
-/// would still be waiting on the model when the deadline passed.
+/// The discrimination is in the timing, and the measurement is the **spread
+/// between the first token and the last** rather than a wall-clock budget for
+/// the first. The model drips five chunks 150ms apart, so a daemon forwarding
+/// each frame as it has it delivers them ~600ms apart end to end, while one
+/// that collects the turn and flushes at the end delivers all five within a
+/// few milliseconds of each other. Those two are never close.
 ///
-/// A longer deadline would pass either way. That is worth stating because
-/// this test's entire value is being able to fail.
+/// The earlier form gave the first token an absolute 300ms deadline measured
+/// from `begin_turn`. That budget also had to cover connecting, dispatch and
+/// scheduling, so on a loaded machine it expired before the daemon had done
+/// anything wrong — the test failed for reasons it does not test. Load shifts
+/// the first and last arrival by the same amount, so it cancels in the spread
+/// and the property stays exactly as falsifiable: a buffering daemon still
+/// fails, on any machine.
 #[tokio::test]
 async fn a_token_reaches_the_client_before_the_turn_ends_on_every_transport() {
     const CHUNK_GAP: Duration = Duration::from_millis(150);
-    /// Between one streamed chunk (~0ms) and a whole buffered turn (~750ms).
-    const DEADLINE: Duration = Duration::from_millis(300);
+    const CHUNKS: [&str; 5] = ["one ", "two ", "three ", "four ", "five"];
+    /// Halfway between a buffered flush (~0) and streamed delivery (~600ms).
+    const MIN_SPREAD: Duration = Duration::from_millis(300);
+    /// Only to stop a hung daemon from hanging the suite; not a discriminator.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
 
-    let h = Harness::dripping(&["one ", "two ", "three ", "four ", "five"], CHUNK_GAP).await;
+    let h = Harness::dripping(&CHUNKS, CHUNK_GAP).await;
 
     for mut client in h.clients().await {
         let name = client.transport_name();
         let mut stream = client.begin_turn(None, "go", "t1", None).await.unwrap();
 
         let mut first_text: Option<String> = None;
-        while first_text.is_none() {
-            let item = tokio::time::timeout(DEADLINE, stream.next())
+        let mut first_at: Option<std::time::Instant> = None;
+        let mut last_at: Option<std::time::Instant> = None;
+
+        loop {
+            let item = tokio::time::timeout(HANG_GUARD, stream.next())
                 .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "{name}: no token within {DEADLINE:?} — the daemon is collecting the \
-                         turn instead of forwarding each frame as it has it"
-                    )
-                })
-                .unwrap_or_else(|e| panic!("{name}: stream error: {e}"))
-                .unwrap_or_else(|| panic!("{name}: stream ended with no text"));
+                .unwrap_or_else(|_| panic!("{name}: the turn never finished"))
+                .unwrap_or_else(|e| panic!("{name}: stream error: {e}"));
 
             match item {
-                TurnItem::Event(event) => {
+                Some(TurnItem::Event(event)) => {
                     if event["kind"] == "text_delta" {
-                        first_text = Some(event["text"].as_str().unwrap_or_default().to_string());
+                        let now = std::time::Instant::now();
+                        first_at.get_or_insert(now);
+                        last_at = Some(now);
+                        first_text.get_or_insert_with(|| {
+                            event["text"].as_str().unwrap_or_default().to_string()
+                        });
                     }
                 }
-                TurnItem::Response(resp) => panic!(
-                    "{name}: the turn finished before a single token arrived — the daemon \
-                     buffered instead of streaming: {resp:?}"
-                ),
+                Some(TurnItem::Response(_)) | None => break,
             }
         }
 
@@ -389,12 +396,18 @@ async fn a_token_reaches_the_client_before_the_turn_ends_on_every_transport() {
         // as it arrived rather than assembled first.
         assert_eq!(first_text.as_deref(), Some("one "), "{name}");
 
-        // Drain the rest so the session is left idle for the next client.
-        while let Some(item) = stream.next().await.unwrap() {
-            if matches!(item, TurnItem::Response(_)) {
-                break;
-            }
-        }
+        let spread = last_at
+            .zip(first_at)
+            .map(|(last, first)| last - first)
+            .unwrap_or_default();
+        assert!(
+            spread >= MIN_SPREAD,
+            "{name}: all {} tokens arrived within {spread:?} of each other — the daemon \
+             collected the turn and flushed it, instead of forwarding each frame as it \
+             had it (streamed delivery spreads them over ~{:?})",
+            CHUNKS.len(),
+            CHUNK_GAP * (CHUNKS.len() as u32 - 1),
+        );
     }
 
     h.stop().await;

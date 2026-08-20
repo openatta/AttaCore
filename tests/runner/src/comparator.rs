@@ -95,6 +95,7 @@ pub async fn compare_output(
         fallback_model: None,
         cache_edits: vec![],
         origin: None,
+        input_map: None,
     };
 
     let cancel = CancellationToken::new();

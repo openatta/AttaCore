@@ -13,6 +13,7 @@
 #       想要跨轮对话记忆的用例，在元信息区写 `session: shared` 显式选进去
 #       （见 docs/TESTING_GUIDE.md §13.1，参考 tests/cases/session/）——本用例
 #       故意保持默认，它已录制的 cassette 依赖这个模式。
+# scene: research
 
 >>>>>>>>>>>>>>>>
 我在对比两种缓存失效策略，给你两段材料：

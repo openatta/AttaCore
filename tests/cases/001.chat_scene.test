@@ -4,6 +4,7 @@
 #       自己没有编辑/执行权限（Chat 场景 disallowed_tools 排除了 Bash/Edit/
 #       Write/NotebookEdit），建议换到编程场景，而不是假装能做或用其他工具
 #       硬凑一个变通方案。
+# scene: chat
 
 >>>>>>>>>>>>>>>>
 用一两句话说明一下，什么是 Rust 里的所有权（ownership）机制？

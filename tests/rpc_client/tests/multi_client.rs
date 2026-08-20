@@ -400,15 +400,36 @@ async fn a_late_tab_is_handed_the_pending_permission_ask() {
         }
     });
 
-    // Give the turn time to reach the ask, then arrive late.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut late = h.tab().await;
-    let sub = late
-        .session_subscribe(&sid)
-        .await
-        .unwrap()
-        .result
-        .expect("subscribe");
+    // Arrive once the turn is actually sitting on the ask.
+    //
+    // Sleeping a fixed 300ms instead assumed the turn had got that far, which
+    // is a guess about machine speed rather than a fact about the daemon: on a
+    // loaded machine it had not, the subscribe came back with no pending
+    // prompt, and the test failed for a reason that had nothing to do with
+    // what it tests. Subscribing until the ask shows up waits for the
+    // condition itself, so a slow machine only makes it slower.
+    const ASK_APPEARS_WITHIN: Duration = Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + ASK_APPEARS_WITHIN;
+    let (mut late, sub) = loop {
+        let mut tab = h.tab().await;
+        let sub = tab
+            .session_subscribe(&sid)
+            .await
+            .unwrap()
+            .result
+            .expect("subscribe");
+        if sub["pending_prompts"]
+            .as_array()
+            .is_some_and(|p| !p.is_empty())
+        {
+            break (tab, sub);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn never reached its permission ask within {ASK_APPEARS_WITHIN:?}: {sub}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
 
     let pending = sub["pending_prompts"].as_array().expect("an array");
     assert_eq!(

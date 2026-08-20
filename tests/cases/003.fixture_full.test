@@ -6,6 +6,8 @@
 #       预注入（reviewer.md 现在带 `skills: code-review`，子 agent 启动时应该已经拿到
 #       code-review skill 的完整正文，不需要自己再调用 Skill 工具去发现它）。
 #       这几件事之前从没有一次被真实跑通过验证——之前的用例都没传 --fixture。
+# fixture: tests/fixtures/template_project
+# scene: coding
 
 >>>>>>>>>>>>>>>>
 看一下 src/main.py 的内容，用 code-review 这个 skill 帮我审查一下，然后用 python3 src/main.py 跑一下，确认输出符合预期。

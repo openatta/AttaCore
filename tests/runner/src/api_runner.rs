@@ -31,6 +31,13 @@ pub struct AgentRunnerConfig {
     /// 用哪个 `AgentScene` 跑这个用例——之前这里写死 `CodingScene`，chat/research
     /// 场景从没被端到端跑过。调用方（`main.rs`）负责按 `--scene` 解析出实例。
     pub scene: Arc<dyn AgentScene>,
+    /// 一次运行里所有 Agent 共用的录制状态。
+    ///
+    /// 必须共享：`run_test_case` 每个测试轮次新建一个 Agent，而 `recorder_name`
+    /// 是整份用例一个名字，于是它们指向同一个 `calls.jsonl`。writer 打开文件时
+    /// 是 truncate 的（见 `RecordingWriter::open`），各造各的 writer 会让后一轮
+    /// 把前一轮的录像清空——录像看起来完整，其实只剩最后一轮。
+    pub recorder: Arc<telemetry::recorder::Recorder>,
 }
 
 pub struct TurnOutput {
@@ -186,7 +193,7 @@ async fn build_agent(
     // resolution, so this harness asks the function that owns the divergence
     // policy rather than re-deriving it — re-deriving it is exactly how the
     // equivalent flag once shipped as a silent no-op.
-    let recorder_model = Arc::new(RecorderModel::new(
+    let recorder_model = Arc::new(RecorderModel::shared(
         config.model.clone(),
         Some(RecorderConfig {
             mode: config.recorder_mode,
@@ -195,6 +202,7 @@ async fn build_agent(
             on_divergence: RecorderModel::default_divergence(),
         }),
         env!("CARGO_PKG_VERSION"),
+        config.recorder.clone(),
     ));
 
     let model_name =
