@@ -131,6 +131,10 @@ impl Tool for McpToolAdapter {
         self.input_schema.clone()
     }
 
+    fn source(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("mcp:{}", self.server_name))
+    }
+
     async fn prompt(&self, _: &PromptContext) -> String {
         self.description.clone()
     }
@@ -329,6 +333,16 @@ mod tests {
         assert_eq!(adapter.name(), "mcp__github__create_issue");
         assert_eq!(adapter.server_name(), "github");
         assert_eq!(adapter.tool_name(), "create_issue");
+    }
+
+    /// The `mcp__` prefix already implies the answer, but a naming convention
+    /// is not a declaration — it holds only until someone registers a builtin
+    /// whose name starts that way. The adapter says which server it fronts.
+    #[tokio::test]
+    async fn source_names_the_server_it_fronts() {
+        let client = Arc::new(MockMcpClient::new("github", vec![]));
+        let adapter = McpToolAdapter::new(client, meta("create_issue"));
+        assert_eq!(adapter.source(), "mcp:github");
     }
 
     #[tokio::test]

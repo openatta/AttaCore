@@ -103,6 +103,12 @@ pub struct LlmClassifier {
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// When false, `classify()` always returns `Defer`.
     enabled: bool,
+    /// The session this classifier serves, so its model call is attributed.
+    ///
+    /// Carried on the struct rather than passed to `classify()`: a classifier
+    /// is built per session, while `AutoClassifier::classify` is a narrow
+    /// decision interface that has no business growing a session parameter.
+    session_id: Option<String>,
 }
 
 impl LlmClassifier {
@@ -117,7 +123,14 @@ impl LlmClassifier {
             model_name: model_name.into(),
             cache: Mutex::new(HashMap::new()),
             enabled: true,
+            session_id: None,
         }
+    }
+
+    /// Attribute this classifier's model calls to `session_id`.
+    pub fn for_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 
     /// Set the enabled state. When disabled, all calls return `Defer`.
@@ -294,6 +307,7 @@ impl AutoClassifier for LlmClassifier {
             role: BlockRole::System,
             content: CLASSIFIER_SYSTEM_PROMPT.to_string(),
             cache_strategy: None,
+            source: Some("classifier".into()),
         }];
 
         let user_msg = ModelMessage {
@@ -307,7 +321,13 @@ impl AutoClassifier for LlmClassifier {
             thinking_mode: ThinkingMode::Off,
             fallback_model: None,
             cache_edits: vec![],
-            origin: None,
+            origin: self.session_id.as_ref().map(|id| {
+                base::interface::model::CallOrigin::auxiliary(
+                    id,
+                    base::interface::model::call_purpose::CLASSIFY,
+                )
+            }),
+            input_map: None,
         };
 
         // 3. Call the model

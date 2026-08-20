@@ -574,6 +574,7 @@ impl Agent {
                     .unwrap_or_default();
                 let recent_tools = self.tools.names();
                 let model_name = self.settings.model.model_name.clone();
+                let session_id = self.session.session_id.clone();
                 Some(tokio::spawn(async move {
                     base::interface::memory::select_memories_with_llm(
                         &store,
@@ -583,6 +584,7 @@ impl Agent {
                         &already_surfaced,
                         &recent_tools,
                         &model_name,
+                        Some(&session_id),
                     )
                     .await
                 }))
@@ -637,16 +639,36 @@ impl Agent {
         //
         // A reference that can't be resolved comes back as a visible error
         // block, never an error that fails the turn.
+        let mut spans = vec![base::interface::model::InputSpan {
+            source: base::interface::model::input_source::USER_PROMPT.into(),
+            block: 0,
+            range: Some((0, content.len())),
+        }];
         if let Some(resources) = self.mcp.resolve_resource_refs(&content).await {
+            let from = content.len();
             content.push_str(&resources);
+            spans.push(base::interface::model::InputSpan {
+                source: base::interface::model::input_source::MCP_RESOURCE.into(),
+                block: 0,
+                range: Some((from, content.len())),
+            });
         }
 
         let mut user_blocks = vec![ModelContentBlock::Text { text: content }];
         user_blocks.extend(resolve_attachments(&attachments).await);
-        self.session.push_message(ModelMessage {
+        for block in 1..user_blocks.len() {
+            spans.push(base::interface::model::InputSpan {
+                source: base::interface::model::input_source::ATTACHMENT.into(),
+                block,
+                range: None,
+            });
+        }
+        let message = ModelMessage {
             role: MessageRole::User,
             content: user_blocks,
-        });
+        };
+        self.pending_input = user_text_fingerprint(&message).map(|fp| (fp, spans));
+        self.session.push_message(message);
 
         // ── Memory recall: collect the prefetch and inject it into this turn ──
         //
@@ -805,11 +827,17 @@ impl Agent {
             // 2. Assemble the request
             let step = api_calls;
             api_calls += 1;
-            let origin = Some(base::interface::model::CallOrigin {
-                session_id: self.session.session_id.clone(),
-                turn: self.session.turn_count,
-                step,
-            });
+            let origin = Some(
+                base::interface::model::CallOrigin::turn(
+                    self.session.session_id.clone(),
+                    self.session.turn_count,
+                    step,
+                )
+                .with_lineage(
+                    self.session.parent_session_id().map(str::to_string),
+                    self.agent_type.clone(),
+                ),
+            );
             let request = self
                 .prepare_request(&effective_model, effective_max_tokens, origin.clone())
                 .await;
@@ -1710,6 +1738,7 @@ or project context that should survive across sessions.
                 name: t.name().to_string(),
                 description,
                 input_schema: t.input_schema(),
+                source: Some(t.source().into_owned()),
             });
         }
         defs
@@ -1741,9 +1770,10 @@ or project context that should survive across sessions.
         if model_name.is_empty() {
             return None;
         }
-        Some(compaction::llm_summary::LlmSummarizer::new(
-            model, model_name,
-        ))
+        Some(
+            compaction::llm_summary::LlmSummarizer::new(model, model_name)
+                .for_session(self.session.session_id.clone()),
+        )
     }
 
     /// Record `turn_complete` for an early-exit path that has no result
@@ -2460,6 +2490,19 @@ or project context that should survive across sessions.
         )
     }
 
+    /// Locate this turn's user message in the request that is about to go out.
+    ///
+    /// Searches from the end because a turn's later steps append tool-result
+    /// user messages after it. Returns `None` when compaction has folded the
+    /// message away — an absent map says "not present", which is true, where a
+    /// stale index would say something false.
+    fn resolve_input_map(
+        &self,
+        messages: &[ModelMessage],
+    ) -> Option<base::interface::model::InputMap> {
+        resolve_input_map(self.pending_input.as_ref(), messages)
+    }
+
     async fn build_prompt_for_turn(
         &mut self,
         effective_model: &str,
@@ -2487,6 +2530,7 @@ or project context that should survive across sessions.
         origin: Option<base::interface::model::CallOrigin>,
     ) -> ModelRequest {
         let (prompt_blocks, tool_defs, messages) = self.build_prompt_for_turn(model).await;
+        let input_map = self.resolve_input_map(&messages);
         ModelRequest {
             prompt_blocks,
             tool_defs,
@@ -2498,6 +2542,7 @@ or project context that should survive across sessions.
                 fallback_model: self.settings.model.fallback_model.clone(),
                 cache_edits: self.cached_mc.consume_pending_edits(),
                 origin,
+                input_map,
             },
         }
     }
@@ -2522,6 +2567,7 @@ or project context that should survive across sessions.
         fallback_model: Option<String>,
         origin: Option<base::interface::model::CallOrigin>,
     ) -> ModelRequest {
+        let input_map = self.resolve_input_map(&messages);
         ModelRequest {
             prompt_blocks: self.build_prompt_blocks(model),
             tool_defs,
@@ -2533,6 +2579,7 @@ or project context that should survive across sessions.
                 fallback_model,
                 cache_edits: Vec::new(),
                 origin,
+                input_map,
             },
         }
     }
@@ -2692,6 +2739,42 @@ fn should_continue_token_budget(
 /// The per-tool JSON is serialized compactly; the API sends the schema as
 /// structured JSON rather than a string, so this is an approximation of the
 /// same shape, not of the exact bytes.
+/// Locate this turn's user message in the request that is about to go out.
+///
+/// Searches from the end because a turn's later steps append tool-result user
+/// messages after it. Returns `None` when compaction has folded the message
+/// away — an absent map says "not present", which is true, where a stale index
+/// would say something false.
+fn resolve_input_map(
+    pending: Option<&(u64, Vec<base::interface::model::InputSpan>)>,
+    messages: &[ModelMessage],
+) -> Option<base::interface::model::InputMap> {
+    let (fingerprint, spans) = pending?;
+    let user_message = messages.iter().rposition(|m| {
+        m.role == MessageRole::User && user_text_fingerprint(m) == Some(*fingerprint)
+    })?;
+    Some(base::interface::model::InputMap {
+        user_message,
+        spans: spans.clone(),
+    })
+}
+
+/// Hash of a message's leading text block, used to find that message again
+/// after compaction has reshuffled the list. Only the first block: it is the
+/// one holding the prompt, and hashing an attached image would mean hashing
+/// megabytes of base64 to identify a message by its text.
+fn user_text_fingerprint(message: &ModelMessage) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    match message.content.first() {
+        Some(ModelContentBlock::Text { text }) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            Some(hasher.finish())
+        }
+        _ => None,
+    }
+}
+
 fn estimate_request_overhead(prompt_blocks: &[PromptBlock], tool_defs: &[ToolDef]) -> usize {
     let mut blocks: Vec<ModelContentBlock> = prompt_blocks
         .iter()
@@ -5738,6 +5821,7 @@ Return only a JSON array of memories. If nothing is worth saving, return []."
         fallback_model: None,
         cache_edits: vec![],
         origin: None,
+        input_map: None,
     };
     let mut full_text = String::new();
     let stream_result = model
@@ -6779,5 +6863,111 @@ mod prompt_assembly_tests {
             25,
             "a scene cannot widen past the deployment-wide setting"
         );
+    }
+
+    // ── input_map: locating the turn's user message in the outgoing request ──
+
+    mod input_map {
+        use super::super::{resolve_input_map, user_text_fingerprint};
+        use base::interface::model::{InputSpan, MessageRole, ModelContentBlock, ModelMessage};
+
+        fn user(text: &str) -> ModelMessage {
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![ModelContentBlock::Text { text: text.into() }],
+            }
+        }
+
+        fn assistant(text: &str) -> ModelMessage {
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ModelContentBlock::Text { text: text.into() }],
+            }
+        }
+
+        fn pending(text: &str) -> (u64, Vec<InputSpan>) {
+            (
+                user_text_fingerprint(&user(text)).unwrap(),
+                vec![InputSpan {
+                    source: base::interface::model::input_source::USER_PROMPT.into(),
+                    block: 0,
+                    range: Some((0, text.len())),
+                }],
+            )
+        }
+
+        #[test]
+        fn points_at_the_message_it_was_built_from() {
+            let messages = vec![user("older"), assistant("reply"), user("this turn")];
+            let map = resolve_input_map(Some(&pending("this turn")), &messages).unwrap();
+            assert_eq!(map.user_message, 2);
+            assert_eq!(map.spans.len(), 1);
+        }
+
+        /// Compaction rewrites the message list between the push and the
+        /// request, so the index has to be found, not remembered. Here the
+        /// same message sits two slots earlier than when it was pushed.
+        #[test]
+        fn survives_the_message_list_being_rewritten() {
+            let pending = pending("this turn");
+            let before = vec![user("a"), assistant("b"), user("this turn")];
+            let after_compaction = vec![user("summary"), user("this turn")];
+            assert_eq!(
+                resolve_input_map(Some(&pending), &before)
+                    .unwrap()
+                    .user_message,
+                2
+            );
+            assert_eq!(
+                resolve_input_map(Some(&pending), &after_compaction)
+                    .unwrap()
+                    .user_message,
+                1
+            );
+        }
+
+        /// A turn's later steps append tool-result user messages after the
+        /// prompt, so the search runs from the end and must not stop on those.
+        #[test]
+        fn is_not_confused_by_tool_result_messages_appended_after_it() {
+            let messages = vec![
+                user("this turn"),
+                assistant("calling a tool"),
+                user("<tool_result>…</tool_result>"),
+            ];
+            assert_eq!(
+                resolve_input_map(Some(&pending("this turn")), &messages)
+                    .unwrap()
+                    .user_message,
+                0
+            );
+        }
+
+        /// Compaction folding the message away means there is nothing to point
+        /// at. Absent is the honest answer; an index would name another message.
+        #[test]
+        fn a_compacted_away_message_yields_no_map() {
+            let messages = vec![user("summary of everything"), assistant("ok")];
+            assert!(resolve_input_map(Some(&pending("this turn")), &messages).is_none());
+        }
+
+        #[test]
+        fn no_pending_input_yields_no_map() {
+            assert!(resolve_input_map(None, &[user("anything")]).is_none());
+        }
+
+        /// An image-first message has no text to fingerprint, so it can never
+        /// be mistaken for the prompt.
+        #[test]
+        fn a_message_with_no_leading_text_has_no_fingerprint() {
+            let image_only = ModelMessage {
+                role: MessageRole::User,
+                content: vec![ModelContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            };
+            assert!(user_text_fingerprint(&image_only).is_none());
+        }
     }
 }

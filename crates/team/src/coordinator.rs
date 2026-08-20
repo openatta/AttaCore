@@ -777,8 +777,15 @@ impl Coordinator for DefaultCoordinator {
 
             if let Some(mode) = stage.aggregate {
                 if !sections.is_empty() {
-                    sections =
-                        aggregate(&*model, &config.model, mode, &stage.name, &sections).await;
+                    sections = aggregate(
+                        &*model,
+                        &config.model,
+                        mode,
+                        &stage.name,
+                        &sections,
+                        Some(ctx.session_id.as_str()),
+                    )
+                    .await;
                 }
             }
 
@@ -1039,11 +1046,14 @@ pub async fn aggregate(
     mode: AggregateMode,
     stage_name: &str,
     sections: &[(String, String, bool)],
+    session_id: Option<&str>,
 ) -> Vec<(String, String, bool)> {
     match mode {
         AggregateMode::Concat => sections.to_vec(),
         AggregateMode::Best => {
-            if let Some(label) = pick_best(model, model_name, stage_name, sections).await {
+            if let Some(label) =
+                pick_best(model, model_name, stage_name, sections, session_id).await
+            {
                 sections
                     .iter()
                     .filter(|(l, _, _)| *l == label)
@@ -1054,7 +1064,7 @@ pub async fn aggregate(
             }
         }
         AggregateMode::Aggregate => {
-            let text = merge(model, model_name, stage_name, sections)
+            let text = merge(model, model_name, stage_name, sections, session_id)
                 .await
                 .unwrap_or_else(|| {
                     let mut a = String::new();
@@ -1074,8 +1084,9 @@ pub async fn aggregate_stage_results(
     mode: AggregateMode,
     stage_name: &str,
     sections: &[(String, String, bool)],
+    session_id: Option<&str>,
 ) -> Vec<(String, String, bool)> {
-    aggregate(model, model_name, mode, stage_name, sections).await
+    aggregate(model, model_name, mode, stage_name, sections, session_id).await
 }
 
 async fn pick_best(
@@ -1083,6 +1094,7 @@ async fn pick_best(
     model_name: &str,
     stage_name: &str,
     sections: &[(String, String, bool)],
+    session_id: Option<&str>,
 ) -> Option<String> {
     let formatted: Vec<String> = sections
         .iter()
@@ -1097,7 +1109,7 @@ async fn pick_best(
          Pick the single best result. Return ONLY the agent label, nothing else.",
         formatted.join("\n\n"),
     );
-    let label = drain(model, model_name, prompt, 100).await?;
+    let label = drain(model, model_name, prompt, 100, session_id).await?;
     let label = label.trim().to_string();
     if sections.iter().any(|(l, _, _)| l == &label) {
         Some(label)
@@ -1111,6 +1123,7 @@ async fn merge(
     model_name: &str,
     stage_name: &str,
     sections: &[(String, String, bool)],
+    session_id: Option<&str>,
 ) -> Option<String> {
     let formatted: Vec<String> = sections
         .iter()
@@ -1124,7 +1137,7 @@ async fn merge(
          Combine into one document. Capture best insights, remove redundancy, preserve facts.",
         formatted.join("\n\n"),
     );
-    drain(model, model_name, prompt, 4096).await
+    drain(model, model_name, prompt, 4096, session_id).await
 }
 
 async fn drain(
@@ -1132,11 +1145,13 @@ async fn drain(
     model_name: &str,
     prompt: String,
     max_tokens: u32,
+    session_id: Option<&str>,
 ) -> Option<String> {
     let blocks = vec![PromptBlock {
         role: BlockRole::System,
         content: "You are a strict judge. Output only the requested text, nothing else.".into(),
         cache_strategy: None,
+        source: Some("team_judge".into()),
     }];
     let messages = vec![base::interface::model::ModelMessage {
         role: base::interface::model::MessageRole::User,
@@ -1148,7 +1163,13 @@ async fn drain(
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
         cache_edits: vec![],
-        origin: None,
+        origin: session_id.map(|id| {
+            base::interface::model::CallOrigin::auxiliary(
+                id,
+                base::interface::model::call_purpose::TEAM_JUDGE,
+            )
+        }),
+        input_map: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut stream = model

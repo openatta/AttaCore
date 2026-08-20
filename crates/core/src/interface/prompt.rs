@@ -17,6 +17,29 @@ pub struct PromptBlock {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_strategy: Option<CacheStrategy>,
+    /// Which assembly stage produced this block — see the `source` module.
+    ///
+    /// Annotation only: no adapter reads it, so it never reaches the wire and
+    /// two blocks differing only here are byte-identical to the model. It
+    /// exists because block boundaries alone do not say which block is the
+    /// skills inventory and which is the MCP instructions, and the count
+    /// shifts with configuration (rules, MCP and `prompt_append` are each
+    /// optional), so position is not a reliable answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Values for [`PromptBlock::source`]. Scene skeleton blocks carry their own
+/// section name instead of a constant from here.
+pub mod source {
+    pub const SKILLS: &str = "skills";
+    pub const MEMORY: &str = "memory";
+    pub const RULES: &str = "rules";
+    pub const MCP: &str = "mcp";
+    pub const PROMPT_APPEND: &str = "prompt_append";
+    pub const PROMPT_OVERRIDE: &str = "prompt_override";
+    /// A scene block whose scene does not name its sections.
+    pub const SCENE: &str = "scene";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +63,7 @@ impl PromptBlock {
             role: BlockRole::System,
             content: content.into(),
             cache_strategy: None,
+            source: None,
         }
     }
 
@@ -48,6 +72,7 @@ impl PromptBlock {
             role: BlockRole::System,
             content: content.into(),
             cache_strategy: Some(CacheStrategy::Ephemeral),
+            source: None,
         }
     }
 
@@ -56,7 +81,13 @@ impl PromptBlock {
             role: BlockRole::User,
             content: content.into(),
             cache_strategy: None,
+            source: None,
         }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 }
 
@@ -83,18 +114,25 @@ pub fn assemble_prompt(
 ) -> Vec<PromptBlock> {
     // If override is set, return it as the sole system block.
     if let Some(ref ov) = settings.prompt_override {
-        return vec![PromptBlock::system(ov.clone())];
+        return vec![PromptBlock::system(ov.clone()).with_source(source::PROMPT_OVERRIDE)];
     }
 
     let mut blocks = Vec::new();
 
-    // 1. Scene skeleton
-    blocks.extend(scene.build_system_prompt(ctx));
+    // 1. Scene skeleton — a scene names its own sections; only fill in for one
+    // that doesn't, so a scene's own labels are never overwritten here.
+    blocks.extend(scene.build_system_prompt(ctx).into_iter().map(|b| {
+        if b.source.is_some() {
+            b
+        } else {
+            b.with_source(source::SCENE)
+        }
+    }));
 
     // 2. Skills
     if let Some(text) = skills_text {
         if !text.is_empty() {
-            blocks.push(PromptBlock::system(text.to_string()));
+            blocks.push(PromptBlock::system(text.to_string()).with_source(source::SKILLS));
         }
     }
 
@@ -104,7 +142,7 @@ pub fn assemble_prompt(
     // Gated by settings.memory_enabled (default: true).
     if settings.memory_enabled {
         let mem_dir = &settings.paths.global_data_dir.join("memory");
-        blocks.push(PromptBlock::system(build_memory_prompt(mem_dir)));
+        blocks.push(PromptBlock::system(build_memory_prompt(mem_dir)).with_source(source::MEMORY));
     }
 
     // 3b. Rules — lightweight discovery index only (filenames + first-line
@@ -112,19 +150,19 @@ pub fn assemble_prompt(
     // files exist anywhere, so sessions that don't use this feature pay zero
     // extra tokens. See `crate::interface::rules` module docs.
     if let Some(text) = build_rules_prompt(&settings.paths) {
-        blocks.push(PromptBlock::system(text));
+        blocks.push(PromptBlock::system(text).with_source(source::RULES));
     }
 
     // 4. MCP instructions
     if let Some(text) = mcp_instructions {
         if !text.is_empty() {
-            blocks.push(PromptBlock::system(text.to_string()));
+            blocks.push(PromptBlock::system(text.to_string()).with_source(source::MCP));
         }
     }
 
     // 5. User append
     if let Some(ref append) = settings.prompt_append {
-        blocks.push(PromptBlock::system(append.clone()));
+        blocks.push(PromptBlock::system(append.clone()).with_source(source::PROMPT_APPEND));
     }
 
     blocks

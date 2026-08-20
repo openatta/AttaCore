@@ -213,6 +213,7 @@ struct SystemPromptSection<'a> {
 }
 
 struct ResolvedSection {
+    name: &'static str,
     phase: SectionPhase,
     text: String,
 }
@@ -285,6 +286,7 @@ fn resolve_sections(sections: Vec<SystemPromptSection<'_>>) -> Vec<ResolvedSecti
         if let Some(t) = text {
             if !t.trim().is_empty() {
                 out.push(ResolvedSection {
+                    name: s.name,
                     phase: s.phase,
                     text: t,
                 });
@@ -300,6 +302,7 @@ fn render_prompt_blocks(sections: Vec<ResolvedSection>) -> Vec<PromptBlock> {
     // busting the cache for all other static sections.
     let mut out = Vec::new();
     let mut dynamic_texts = Vec::new();
+    let mut dynamic_names = Vec::new();
     for s in sections {
         match s.phase {
             SectionPhase::Static => {
@@ -307,9 +310,13 @@ fn render_prompt_blocks(sections: Vec<ResolvedSection>) -> Vec<PromptBlock> {
                     role: base::interface::prompt::BlockRole::System,
                     content: s.text,
                     cache_strategy: Some(CacheStrategy::Global),
+                    source: Some(s.name.to_string()),
                 });
             }
-            SectionPhase::Dynamic => dynamic_texts.push(s.text),
+            SectionPhase::Dynamic => {
+                dynamic_texts.push(s.text);
+                dynamic_names.push(s.name);
+            }
         }
     }
     let d = dynamic_texts.join("\n\n");
@@ -318,6 +325,11 @@ fn render_prompt_blocks(sections: Vec<ResolvedSection>) -> Vec<PromptBlock> {
             role: base::interface::prompt::BlockRole::System,
             content: d,
             cache_strategy: Some(CacheStrategy::Ephemeral),
+            // The merged block keeps the names of what went into it. Splitting
+            // it into one block per section would label them individually but
+            // would also change the cache partitioning, which is the whole
+            // point of merging the dynamic tail into one ephemeral block.
+            source: Some(dynamic_names.join(",")),
         });
     }
     out
@@ -1087,5 +1099,25 @@ mod tests {
              call with the same cwd/branch/worktree — got: {dynamic_clean}"
         );
         assert!(!dynamic_clean.contains("M src/main.rs"));
+    }
+
+    /// Every block says where it came from, and the merged dynamic tail names
+    /// all the sections that went into it rather than one of them.
+    #[test]
+    fn every_block_names_its_section() {
+        let blocks = CodingScene.build_system_prompt(&ctx());
+        assert!(
+            blocks.iter().all(|b| b.source.is_some()),
+            "an unlabelled block leaves a reader counting positions"
+        );
+        assert_eq!(blocks[0].source.as_deref(), Some("identity"));
+
+        let tail = blocks.last().unwrap();
+        assert_eq!(tail.cache_strategy, Some(CacheStrategy::Ephemeral));
+        assert!(
+            tail.source.as_deref().unwrap().contains(','),
+            "the merged tail should list its sections, got {:?}",
+            tail.source
+        );
     }
 }

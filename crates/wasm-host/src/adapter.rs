@@ -110,6 +110,10 @@ impl Tool for WasmToolAdapter {
         &self.description
     }
 
+    fn source(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("plugin:{}", self.plugin))
+    }
+
     fn input_schema(&self) -> Value {
         self.input_schema.clone()
     }

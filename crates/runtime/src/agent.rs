@@ -208,6 +208,19 @@ pub struct Agent {
     pub(crate) claude_md_injected: bool,
     /// Track invoked skill names during the turn (for post-compact recovery T1.4).
     pub(crate) invoked_skills: Vec<String>,
+    /// This turn's user message: a fingerprint of its text and what the text is
+    /// made of, for `StreamParams::input_map`.
+    ///
+    /// The message is identified by content rather than by the index it had
+    /// when it was pushed, because compaction rewrites the message list before
+    /// the request is assembled. A message compaction dropped simply fails to
+    /// resolve, which is the honest outcome — better than an index that now
+    /// names a different message.
+    pub(crate) pending_input: Option<(u64, Vec<base::interface::model::InputSpan>)>,
+    /// Which agent type this session runs, for a sub-agent spawned as one.
+    /// `None` for a top-level session. Travels onto every `CallOrigin` so a
+    /// recording says what kind of agent produced it.
+    pub(crate) agent_type: Option<String>,
     /// Tokens the last assembled request spent *before* any conversation
     /// content: the system prompt blocks plus every tool definition.
     ///
@@ -698,6 +711,7 @@ impl Agent {
                             name: m.name,
                             description: m.description.unwrap_or_default(),
                             input_schema: m.input_schema,
+                            source: Some(format!("mcp:{}", client.server_name())),
                         })
                         .collect();
                     if !tool_defs.is_empty() {
@@ -877,6 +891,12 @@ pub struct Builder {
     telemetry_handle_override: Option<TelemetryHandle>,
     instruction_file: Option<PathBuf>,
     session_id: Option<String>,
+    /// The session that spawned this one, and which agent type it runs. Set by
+    /// `AgentTool` at spawn time so the sub-agent knows its own lineage from
+    /// its first call — waiting until something asks would be too late, since a
+    /// recording's header is fixed by that first call.
+    parent_session_id: Option<String>,
+    agent_type: Option<String>,
     skip_warmup: bool,
     /// Pre-built FrozenContext — skips lazy collection on first turn.
     /// When set, the Agent uses this snapshot instead of calling
@@ -993,6 +1013,7 @@ fn build_hook_runner(
     model: Arc<dyn Model>,
     agent_tool: Arc<crate::agent_tool::AgentTool>,
     plugin_host: Option<&Arc<dyn crate::plugin_host::PluginHost>>,
+    session_id: Option<String>,
 ) -> Arc<HookRunner> {
     let parsed: hooks::HooksSettings = match &settings.hooks_config {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
@@ -1010,6 +1031,7 @@ fn build_hook_runner(
         model,
         settings.model.model_name.clone(),
         settings.model.max_tokens,
+        session_id,
     ));
     let agent_spawner: Arc<dyn base::interface::agent_spawner::AgentSpawner> = Arc::new(
         crate::agent_spawner_impl::RuntimeAgentSpawner::new(agent_tool),
@@ -1050,6 +1072,8 @@ impl Builder {
             telemetry_url: None,
             instruction_file: None,
             session_id: None,
+            parent_session_id: None,
+            agent_type: None,
             telemetry_handle_override: None,
             skip_warmup: false,
             frozen: None,
@@ -1134,6 +1158,12 @@ impl Builder {
     }
     pub fn session_id(mut self, id: impl Into<String>) -> Self {
         self.session_id = Some(id.into());
+        self
+    }
+    /// The lineage a sub-agent spawn already knows: who spawned it and as what.
+    pub fn lineage(mut self, parent_session_id: Option<String>, agent_type: Option<&str>) -> Self {
+        self.parent_session_id = parent_session_id;
+        self.agent_type = agent_type.map(str::to_string);
         self
     }
     pub fn instruction(mut self, path: impl Into<PathBuf>) -> Self {
@@ -1347,7 +1377,11 @@ impl Builder {
         // Session: `self.history_store` (set via `Builder::history_store(...)`)
         // makes this incrementally persisted to disk once per turn; `None`
         // (the default) keeps it in-memory only, matching prior behavior.
-        let mut session = SessionManager::new(self.history_store.clone(), self.session_id, None);
+        let mut session = SessionManager::new(
+            self.history_store.clone(),
+            self.session_id,
+            self.parent_session_id.clone(),
+        );
         // Session-memory sidecar (`session_memory.md`) — only for sessions
         // that actually persist (matches `resume`'s only being meaningful
         // with a `HistoryStore`; an in-memory-only session's id doesn't
@@ -1455,6 +1489,7 @@ impl Builder {
                 model.clone(),
                 agent_tool_arc.clone(),
                 self.plugin_host.as_ref(),
+                Some(session.session_id_str().to_string()),
             )
         });
         // P2: Wire the wake receiver into hooks for async rewake support.
@@ -1898,6 +1933,8 @@ impl Builder {
                 frozen: self.frozen, // pre-seeded or lazily computed on first turn
                 claude_md_content,
                 claude_md_injected: false,
+                pending_input: None,
+                agent_type: self.agent_type,
                 invoked_skills: Vec::new(),
                 request_overhead_tokens: 0,
                 last_had_tool_uses: true, // true → first turn scans for skills
@@ -3902,7 +3939,7 @@ mod tests {
     fn build_hook_runner_defaults_to_empty_without_hooks_config() {
         let settings = test_settings();
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None, None);
         assert!(runner.is_empty());
     }
 
@@ -3915,7 +3952,7 @@ mod tests {
             ]
         }));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None, None);
         assert!(!runner.is_empty());
         assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
     }
@@ -3926,7 +3963,7 @@ mod tests {
         // Wrong shape: hooks value must be a map of event -> Vec<HookConfig>.
         settings.hooks_config = Some(serde_json::json!("not-a-hooks-map"));
         let model: Arc<dyn Model> = Arc::new(DummyModel);
-        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None, None);
         assert!(runner.is_empty());
     }
 

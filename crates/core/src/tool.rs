@@ -331,6 +331,16 @@ pub trait Tool: Send + Sync + 'static {
         ""
     }
     fn input_schema(&self) -> Value;
+
+    /// Where this tool came from, for [`crate::interface::model::ToolDef::source`].
+    ///
+    /// The name prefixes (`mcp__`, `plugin__`) already imply the answer, but a
+    /// naming convention is not a declaration: it holds only for as long as
+    /// nobody registers a builtin whose name happens to start that way. An
+    /// adapter that knows which server or plugin it is fronting says so here.
+    fn source(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("builtin")
+    }
     async fn prompt(&self, _: &PromptContext) -> String {
         self.prompt_fragment()
     }
@@ -573,5 +583,14 @@ mod tests {
         let r = InMemoryToolRegistry::new();
         r.register(Arc::new(F));
         assert!(r.find("f").is_some());
+    }
+
+    /// A tool that says nothing about where it came from is a builtin. This is
+    /// the default every registered tool inherits, so the ones that override it
+    /// (MCP, plugins) are the exceptions rather than the other way round — a
+    /// newly written builtin cannot forget to declare itself.
+    #[test]
+    fn a_tool_that_says_nothing_is_a_builtin() {
+        assert_eq!(F.source(), "builtin");
     }
 }

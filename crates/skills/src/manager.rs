@@ -756,6 +756,7 @@ mod tests {
             name: "search".into(),
             description: "search things".into(),
             input_schema: serde_json::json!({"type": "object"}),
+            source: None,
         };
         let entries =
             crate::mcp_builder::build_skills_from_mcp("test-server-get-skill-content", &[tool]);

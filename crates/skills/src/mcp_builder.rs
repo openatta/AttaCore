@@ -119,6 +119,7 @@ mod tests {
                     "query": {"type": "string"}
                 }
             }),
+            source: None,
         }
     }
 
@@ -171,6 +172,7 @@ mod tests {
             name: "fetch".into(),
             description: "Fetch a URL".into(),
             input_schema: schema,
+            source: None,
         };
         let body = build_tool_prompt("fetcher", &tool);
         assert!(body.contains("fetch"));

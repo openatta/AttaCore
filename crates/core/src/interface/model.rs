@@ -45,21 +45,148 @@ pub struct StreamParams {
     /// Where this call sits in the conversation. Carried for observers only —
     /// no adapter reads it, and it never reaches the wire.
     pub origin: Option<CallOrigin>,
+    /// What this turn's user message is made of. Observers only, like `origin`.
+    pub input_map: Option<InputMap>,
 }
 
-/// A call's position in the session that issued it.
+/// The composition of the user message a turn was started by.
 ///
-/// `None` on [`StreamParams::origin`] marks a call that belongs to no turn:
-/// compaction summaries, permission classification, session titling. They are
-/// real model calls and worth observing, but numbering them as turn work would
-/// make the turn/step coordinates lie.
+/// A user message goes out as one message whose first block holds the prompt
+/// text, and it has to stay that way: splitting the sources into separate
+/// content blocks would change the bytes the model receives. So composition is
+/// expressed as coordinates over the message rather than in its structure —
+/// the same reason [`crate::interface::prompt::PromptBlock::source`] is a
+/// field and not a delimiter inside the content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputMap {
+    /// Index into the request's messages. Resolved when the request is
+    /// assembled, not when the message was pushed: compaction rewrites the
+    /// message list in between, and an index captured earlier would point at
+    /// whatever moved into that slot.
+    pub user_message: usize,
+    pub spans: Vec<InputSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputSpan {
+    /// One of the constants in [`input_source`].
+    pub source: String,
+    /// Which content block of the message.
+    pub block: usize,
+    /// Byte range within that block's text. Absent for a non-text block, which
+    /// has no interior to point into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<(usize, usize)>,
+}
+
+/// Values for [`InputSpan::source`].
+pub mod input_source {
+    /// What the user actually typed.
+    pub const USER_PROMPT: &str = "user_prompt";
+    /// An `@server:scheme://path` reference resolved and inlined into the
+    /// prompt text.
+    pub const MCP_RESOURCE: &str = "mcp_resource";
+    /// A file or image the user attached, carried as its own content block.
+    pub const ATTACHMENT: &str = "attachment";
+}
+
+/// Which session issued a call, and what the call is doing there.
+///
+/// Every model call has one. It used to be optional, with `None` standing for
+/// "not turn work" — which also erased the session id, so those calls could
+/// only be filed under a shared `unattributed` name that concurrent sessions
+/// then overwrote. Naming the *kind* instead keeps the session known while
+/// still refusing to give an auxiliary call turn coordinates it does not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOrigin {
     pub session_id: String,
-    pub turn: u32,
-    /// Index of this model call within its turn — a turn that calls tools runs
-    /// several.
-    pub step: u32,
+    /// The session that spawned this one — a sub-agent's parent. `None` for a
+    /// top-level session. This is what lets a set of recordings be read as one
+    /// tree rather than as unrelated files.
+    pub parent_session_id: Option<String>,
+    /// Which kind of agent this session runs, for a sub-agent that has one.
+    pub agent_type: Option<String>,
+    pub kind: CallKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallKind {
+    /// A call the turn loop made.
+    Turn {
+        turn: u32,
+        /// Index of this model call within its turn — a turn that calls tools
+        /// runs several.
+        step: u32,
+    },
+    /// A call made outside any turn: compaction, memory extraction, permission
+    /// classification, session titling, a hook.
+    ///
+    /// `purpose` is a free string on purpose. The set grows with the engine,
+    /// and an enum would mean editing this crate for every addition; the
+    /// conventional values are listed in `docs/recorder_design.md`. Readers
+    /// treat it as opaque, and it takes no part in replay divergence checks —
+    /// renaming a classification must not turn a passing replay red.
+    Auxiliary { purpose: String },
+}
+
+impl CallOrigin {
+    /// A turn-loop call in `session_id`.
+    pub fn turn(session_id: impl Into<String>, turn: u32, step: u32) -> Self {
+        Self {
+            session_id: session_id.into(),
+            parent_session_id: None,
+            agent_type: None,
+            kind: CallKind::Turn { turn, step },
+        }
+    }
+
+    /// A call outside any turn, still belonging to `session_id`.
+    pub fn auxiliary(session_id: impl Into<String>, purpose: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            parent_session_id: None,
+            agent_type: None,
+            kind: CallKind::Auxiliary {
+                purpose: purpose.into(),
+            },
+        }
+    }
+
+    pub fn with_lineage(
+        mut self,
+        parent_session_id: Option<String>,
+        agent_type: Option<String>,
+    ) -> Self {
+        self.parent_session_id = parent_session_id;
+        self.agent_type = agent_type;
+        self
+    }
+
+    /// Turn coordinates, or `(0, 0)` for a call that has none.
+    pub fn turn_step(&self) -> (u32, u32) {
+        match &self.kind {
+            CallKind::Turn { turn, step } => (*turn, *step),
+            CallKind::Auxiliary { .. } => (0, 0),
+        }
+    }
+
+    pub fn purpose(&self) -> Option<&str> {
+        match &self.kind {
+            CallKind::Turn { .. } => None,
+            CallKind::Auxiliary { purpose } => Some(purpose),
+        }
+    }
+}
+
+/// Conventional values for [`CallKind::Auxiliary::purpose`].
+pub mod call_purpose {
+    pub const COMPACT: &str = "compact";
+    pub const MEMORY: &str = "memory";
+    pub const CLASSIFY: &str = "classify";
+    pub const TITLE: &str = "title";
+    pub const HOOK: &str = "hook";
+    /// Team aggregation picking or merging its agents' results.
+    pub const TEAM_JUDGE: &str = "team_judge";
 }
 
 /// Tool definition sent to the model.
@@ -68,6 +195,13 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Where this tool came from — `builtin`, `mcp:<server>`, `plugin:<id>`.
+    ///
+    /// Annotation only, like [`crate::interface::prompt::PromptBlock::source`]:
+    /// both adapters translate a `ToolDef` field by field, so this one is
+    /// simply not copied and never reaches the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// A message in the model's conversation history.

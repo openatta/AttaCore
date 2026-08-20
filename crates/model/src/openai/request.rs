@@ -339,6 +339,8 @@ mod tests {
                     content: "You are a coding agent.".into(),
                     // Dropped — OpenAI has no cache_control surface.
                     cache_strategy: Some(CacheStrategy::Ephemeral),
+                    // Dropped too: annotation never reaches the wire.
+                    source: Some("scene".into()),
                 },
                 PromptBlock::system("Be terse."),
                 // Empty blocks must not produce stray blank lines.
@@ -348,6 +350,8 @@ mod tests {
                 name: "Bash".into(),
                 description: "Run a shell command".into(),
                 input_schema: json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+                // Dropped by `to_chat_tool` — asserted below.
+                source: Some("builtin".into()),
             }],
             vec![msg(MessageRole::User, vec![text("hi")])],
             Some(4096),
@@ -377,6 +381,11 @@ mod tests {
             "Run a shell command"
         );
         assert_eq!(v["tools"][0]["function"]["parameters"]["type"], "object");
+
+        // Recorder annotations are not part of the protocol. A request carrying
+        // them must serialize to the same bytes as one that does not, or every
+        // labelled request becomes a cache miss.
+        assert!(!serde_json::to_string(&req).unwrap().contains("source"));
     }
 
     /// No system blocks ⇒ no system message at all (not an empty one), and no
