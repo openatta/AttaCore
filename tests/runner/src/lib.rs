@@ -10,4 +10,5 @@ pub mod fixture;
 pub mod mutations;
 pub mod plugin_fixture;
 pub mod reporter;
+pub mod rerun;
 pub mod script;

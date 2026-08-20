@@ -73,8 +73,10 @@ struct Args {
     /// research, or demo. `api_runner.rs` used to hard-code `CodingScene`;
     /// chat/research were never exercised end-to-end anywhere in the repo
     /// until this flag existed.
-    #[clap(long, default_value = "coding")]
-    scene: String,
+    /// Scene to run under. Omitted, the case's own `scene:` declaration wins,
+    /// and failing that `DEFAULT_SCENE`.
+    #[clap(long)]
+    scene: Option<String>,
 
     /// Build one `Agent` for the whole case and send every turn to it in
     /// sequence, instead of a fresh `Agent` per turn — see
@@ -88,11 +90,21 @@ struct Args {
     /// whether its turns depend on each other; a command line doesn't).
     #[clap(long)]
     same_session: bool,
+
+    /// Re-issue this recording's requests against the live model and judge
+    /// whether the answers still mean the same thing — i.e. whether the
+    /// recording still holds. Costs one real call per recorded call. Not a
+    /// correctness check: the recording is the baseline.
+    #[clap(long)]
+    rerun: bool,
 }
 
 /// Mirrors `daemon/src/main.rs::resolve_scene` — kept as a small independent
 /// copy rather than a shared dependency, since `test-runner` shouldn't need
 /// to depend on the `daemon` binary crate just for this one match.
+/// What a case runs under when neither the command line nor the case says.
+const DEFAULT_SCENE: &str = "coding";
+
 fn resolve_scene(
     name: &str,
 ) -> anyhow::Result<std::sync::Arc<dyn base::interface::scene::AgentScene>> {
@@ -174,6 +186,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&output_dir);
     let _ = std::fs::create_dir_all(&report_dir);
 
+    if args.rerun {
+        return run_rerun_mode(&args, &scenario, &cassette_dir, &output_dir, &config_path).await;
+    }
+
     match args.mode.as_str() {
         "api" | "agent" => {
             run_api_mode(
@@ -231,14 +247,35 @@ async fn run_api_mode(
     let scenario_leaf = scenario.rsplit('/').next().unwrap_or(scenario);
     let telemetry_path = output_dir.join(format!("{scenario_leaf}.telemetry.md"));
 
+    // A case knows what it needs; the command line does not. Falling back to
+    // the case's own declaration is what stops a run from silently recording
+    // `003.fixture_full` with no fixture at all — which is what every recording
+    // of it did before, MCP server and hooks and all simply absent.
+    let fixture_dir = args
+        .fixture
+        .clone()
+        .or_else(|| case.fixture.as_ref().map(PathBuf::from));
+    let scene_name = args
+        .scene
+        .clone()
+        .or_else(|| case.scene.clone())
+        .unwrap_or_else(|| DEFAULT_SCENE.to_string());
+    if let (None, Some(from_case)) = (&args.fixture, &fixture_dir) {
+        eprintln!("Fixture from the case: {}", from_case.display());
+    }
+    if args.scene.is_none() && case.scene.is_some() {
+        eprintln!("Scene from the case: {scene_name}");
+    }
+
     let runner_config = api_runner::AgentRunnerConfig {
         model: model.clone(),
         recorder_mode,
         recorder_name: scenario_leaf.to_string(),
         recordings_dir: cassette_dir.to_path_buf(),
         telemetry_path: Some(telemetry_path),
-        fixture_dir: args.fixture.clone(),
-        scene: resolve_scene(&args.scene)?,
+        fixture_dir: fixture_dir.clone(),
+        scene: resolve_scene(&scene_name)?,
+        recorder: telemetry::recorder::Recorder::new(),
     };
 
     let case_mutations = mutations::load_for_case(&args.case)?;
@@ -276,6 +313,16 @@ async fn run_cli_mode(
         .ok()
         .map(|_| "record".into())
         .or_else(|| std::env::var("ATTA_REPLAY").ok().map(|_| "replay".into()));
+    // Same fallback as the api path: the case declares what it needs.
+    let fixture_dir = args
+        .fixture
+        .clone()
+        .or_else(|| case.fixture.as_ref().map(PathBuf::from));
+    let scene_name = args
+        .scene
+        .clone()
+        .or_else(|| case.scene.clone())
+        .unwrap_or_else(|| DEFAULT_SCENE.to_string());
     let config = cli_runner::CliRunnerConfig {
         socket_path: args.socket.clone(),
         daemon_binary: args.daemon_binary.clone(),
@@ -284,8 +331,8 @@ async fn run_cli_mode(
         recorder_mode,
         cassette_dir: cassette_dir.to_path_buf(),
         output_dir: output_dir.to_path_buf(),
-        fixture_dir: args.fixture.clone(),
-        scene: args.scene.clone(),
+        fixture_dir,
+        scene: scene_name,
         same_session: shared_session(args, case, false),
     };
 
@@ -381,6 +428,74 @@ async fn run_comparison(
     if failed > 0 {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Rerun a recording and report whether it still holds.
+///
+/// The model here is the real provider, deliberately unwrapped by any recorder:
+/// a replaying decorator would answer with the recorded response and make every
+/// verdict vacuously "consistent".
+async fn run_rerun_mode(
+    args: &Args,
+    scenario: &str,
+    cassette_dir: &Path,
+    output_dir: &Path,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    let model_config = config::load_env_config(Path::new(config_path))?;
+    let model = build_model(&model_config)?;
+    let scenario_leaf = scenario.rsplit('/').next().unwrap_or(scenario);
+    // `--mode` selects how a case is *driven*; a recording is a recording
+    // whichever mode produced it. Looking under the sibling mode rather than
+    // failing keeps `--rerun` from needing a `--mode` that has no meaning here.
+    let mut dir = cassette_dir.join(scenario_leaf);
+    if !dir.join("calls.jsonl").exists() {
+        let alternatives = ["api", "agent", "cli"];
+        let found =
+            alternatives.iter().find_map(|mode| {
+                let candidate = cassette_dir.parent().and_then(|round| round.parent()).map(
+                    |scenario_root| {
+                        scenario_root
+                            .join(mode)
+                            .join(cassette_dir.file_name().unwrap_or_default())
+                            .join(scenario_leaf)
+                    },
+                )?;
+                candidate.join("calls.jsonl").exists().then_some(candidate)
+            });
+        match found {
+            Some(c) => dir = c,
+            None => anyhow::bail!(
+                "no recording at {} — record it first (tests/run_api.sh {scenario})",
+                dir.display()
+            ),
+        }
+    }
+    eprintln!(
+        "Rerun: {} (judge={})",
+        dir.display(),
+        model_config.fast_model
+    );
+
+    let report =
+        test_runner::rerun::rerun_recording(&dir, &model, model.as_ref(), &model_config.fast_model)
+            .await?;
+
+    eprintln!("\n{}", test_runner::rerun::terminal_summary(&report));
+
+    let path = output_dir.join("rerun.md");
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(&path, test_runner::rerun::markdown_report(&report))?;
+    eprintln!("报告: {}", path.display());
+
+    if !report.holds() {
+        // A divergence is the finding, not a crash — but the exit code has to
+        // say so, or a script wrapping this reports success on a broken
+        // recording.
+        anyhow::bail!("{} 条调用与录像分歧（详见报告）", report.diverged());
+    }
+    let _ = args;
     Ok(())
 }
 
