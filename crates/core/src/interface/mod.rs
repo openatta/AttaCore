@@ -32,6 +32,7 @@
 //! | [`tool::SecondaryLlm`] | the small model tools may call |
 //! | [`token_counter::TokenCounter`] | how big the context is judged to be |
 //! | [`prompt_registry::PromptRegistry`] | what goes into the system prompt |
+//! | [`prompt_assembly::AssemblyHook`] | a last pass over the assembled prompt |
 //!
 //! The engine's other replaceable contracts live in the crate that owns them
 //! and **cannot be re-exported here** without pointing a dependency edge
@@ -55,6 +56,7 @@ pub use crate::memory;
 pub mod model;
 pub mod model_factory;
 pub mod permission;
+pub mod prompt_assembly;
 pub mod prompt_registry;
 #[deprecated(note = "moved to `base::prompt` — prompt data types and the assembler function")]
 pub use crate::prompt;

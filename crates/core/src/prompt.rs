@@ -325,14 +325,22 @@ pub fn assemble_prompt_with(
     merged.sort_by_key(|(order, _)| *order);
 
     let variables = registry.variables();
-    merged
+    let assembled: Vec<PromptBlock> = merged
         .into_iter()
         .map(|(_, mut b)| {
             b.content =
                 crate::interface::prompt_registry::interpolate(&b.content, &variables, ctx);
             b
         })
-        .collect()
+        .collect();
+
+    // Last: the passes that see the whole thing. Interpolation runs before
+    // them so a hook reads the text the model will read, not a template.
+    crate::interface::prompt_assembly::run_assembly_hooks(
+        assembled,
+        &registry.assembly_hooks(),
+        ctx,
+    )
 }
 
 #[cfg(test)]
@@ -751,5 +759,99 @@ mod tests {
             .find(|b| b.name.as_deref() == Some("mine.greeting"))
             .unwrap();
         assert_eq!(mine.content, "welcome to atta");
+    }
+
+    /// End to end, through the real assembly: a downloaded extension that
+    /// declared nothing cannot delete a kernel block, and the block is still
+    /// in the prompt that goes out.
+    #[test]
+    fn a_declaration_free_plugin_hook_cannot_delete_a_block_from_the_real_prompt() {
+        use crate::interface::prompt_assembly::{
+            AssemblyCapabilities, AssemblyHook, Authority, PromptAssembly,
+        };
+        use crate::interface::prompt_registry::{InMemoryPromptRegistry, PromptRegistry};
+
+        struct DeletesSkills;
+        impl AssemblyHook for DeletesSkills {
+            fn on_assemble(
+                &self,
+                asm: &mut PromptAssembly,
+                _ctx: &ScenePromptContext<'_>,
+            ) -> Result<(), String> {
+                // Tries anyway, and is refused. A hook is allowed to ask.
+                let _ = asm.remove(names::SKILLS_CATALOG);
+                asm.push(PromptBlock::system("plugin note").named("example.note"));
+                Ok(())
+            }
+        }
+
+        let registry = InMemoryPromptRegistry::new();
+        registry.register_assembly_hook(
+            std::sync::Arc::new(DeletesSkills),
+            Authority::plugin("example", AssemblyCapabilities::default()),
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let blocks = assemble_prompt_with(
+            registry.as_ref(),
+            &TestScene,
+            &test_settings(),
+            &store,
+            &test_ctx(),
+            Some("skills inventory"),
+            None,
+        );
+        let named: Vec<&str> = blocks.iter().filter_map(|b| b.name.as_deref()).collect();
+        assert!(
+            named.contains(&names::SKILLS_CATALOG),
+            "an undeclared removal must not take effect: {named:?}"
+        );
+        assert!(
+            named.contains(&"example.note"),
+            "and the additions it was allowed to make must stand: {named:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_script_hook_may_rewrite_a_kernel_block_in_the_real_prompt() {
+        use crate::interface::prompt_assembly::{AssemblyHook, Authority, PromptAssembly};
+        use crate::interface::prompt_registry::{InMemoryPromptRegistry, PromptRegistry};
+
+        struct RewritesSkills;
+        impl AssemblyHook for RewritesSkills {
+            fn on_assemble(
+                &self,
+                asm: &mut PromptAssembly,
+                _ctx: &ScenePromptContext<'_>,
+            ) -> Result<(), String> {
+                asm.modify(names::SKILLS_CATALOG, "skills: (curated)".into())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+        }
+
+        let registry = InMemoryPromptRegistry::new();
+        registry.register_assembly_hook(
+            std::sync::Arc::new(RewritesSkills),
+            Authority::local(BlockOrigin::Script("./.atta/scripts/prompt.js".into())),
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let blocks = assemble_prompt_with(
+            registry.as_ref(),
+            &TestScene,
+            &test_settings(),
+            &store,
+            &test_ctx(),
+            Some("skills inventory"),
+            None,
+        );
+        let skills = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some(names::SKILLS_CATALOG))
+            .unwrap();
+        assert_eq!(skills.content, "skills: (curated)");
     }
 }

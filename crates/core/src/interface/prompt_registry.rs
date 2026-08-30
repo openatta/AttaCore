@@ -29,6 +29,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::interface::prompt_assembly::{AssemblyHook, Authority};
 use crate::interface::scene::ScenePromptContext;
 use crate::prompt::{BlockOrigin, BlockRole, CacheStrategy};
 use crate::tool::{Disposer, RegistrationId};
@@ -147,12 +148,31 @@ pub trait PromptRegistry: Send + Sync {
     /// Make `{{name}}` expand to whatever `provider` returns, in every block.
     fn register_variable(&self, name: &str, provider: VariableProvider) -> Disposer;
 
+    /// Add a pass over the whole assembled prompt — see
+    /// [`crate::interface::prompt_assembly`]. `authority` is what that pass
+    /// may do beyond adding, and is the registrar's to establish honestly:
+    /// nothing downstream can tell a plugin apart from a script except by
+    /// what it was registered as.
+    fn register_assembly_hook(
+        &self,
+        hook: Arc<dyn AssemblyHook>,
+        authority: Authority,
+    ) -> Disposer;
+
     /// Everything registered, in registration order. Assembly sorts.
     fn blocks(&self) -> Vec<RegisteredBlock>;
 
     /// Every registered variable, by name.
     fn variables(&self) -> Vec<(String, VariableProvider)>;
+
+    /// Every registered pass, in the order they run.
+    fn assembly_hooks(&self) -> Vec<(Arc<dyn AssemblyHook>, Authority)> {
+        Vec::new()
+    }
 }
+
+/// One registered assembly pass and the authority it runs under.
+type HookEntry = (RegistrationId, Arc<dyn AssemblyHook>, Authority);
 
 /// A registry nothing has registered with, and nothing can.
 ///
@@ -167,6 +187,14 @@ impl PromptRegistry for NoRegistrations {
     }
 
     fn register_variable(&self, _name: &str, _provider: VariableProvider) -> Disposer {
+        Disposer::inert(RegistrationId::next())
+    }
+
+    fn register_assembly_hook(
+        &self,
+        _hook: Arc<dyn AssemblyHook>,
+        _authority: Authority,
+    ) -> Disposer {
         Disposer::inert(RegistrationId::next())
     }
 
@@ -187,6 +215,7 @@ pub struct InMemoryPromptRegistry {
     // dropped.
     blocks: Arc<Mutex<Vec<(RegistrationId, RegisteredBlock)>>>,
     variables: Arc<Mutex<Vec<(RegistrationId, String, VariableProvider)>>>,
+    hooks: Arc<Mutex<Vec<HookEntry>>>,
 }
 
 impl InMemoryPromptRegistry {
@@ -226,12 +255,40 @@ impl PromptRegistry for InMemoryPromptRegistry {
         })
     }
 
+    fn register_assembly_hook(
+        &self,
+        hook: Arc<dyn AssemblyHook>,
+        authority: Authority,
+    ) -> Disposer {
+        let id = RegistrationId::next();
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((id, hook, authority));
+        let hooks = self.hooks.clone();
+        Disposer::new(id, move |id| {
+            hooks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(entry, _, _)| *entry != id);
+        })
+    }
+
     fn blocks(&self) -> Vec<RegisteredBlock> {
         self.blocks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|(_, b)| b.clone())
+            .collect()
+    }
+
+    fn assembly_hooks(&self) -> Vec<(Arc<dyn AssemblyHook>, Authority)> {
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, h, a)| (h.clone(), a.clone()))
             .collect()
     }
 
