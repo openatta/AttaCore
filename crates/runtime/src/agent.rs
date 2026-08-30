@@ -2492,16 +2492,49 @@ mod tests {
     /// `Elicitation` hook must actually fire.
     #[tokio::test]
     async fn build_wires_mcp_elicitation_urls_to_the_elicitation_hook() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker_path = dir.path().join("elicitation.marker");
+        // Observed through an injected hook executor, in this process. The
+        // previous version configured a `command` hook that appended to a file
+        // and polled for it, which measured how long the machine took to fork
+        // a shell under a full `cargo test --workspace` — not what this test is
+        // about, and it timed out at sixty seconds saying so. An `http` hook is
+        // not an option either: the SSRF guard blocks loopback, correctly.
+        struct RecordingPromptExecutor {
+            fired: tokio::sync::mpsc::Sender<serde_json::Value>,
+        }
 
-        let mut settings = test_settings();
-        settings.hooks_config = Some(serde_json::json!({
-            "Elicitation": [
-                { "type": "command", "command": format!("echo fired >> {}", marker_path.display()) }
-            ]
-        }));
-        let settings = Arc::new(settings);
+        #[async_trait::async_trait]
+        impl hooks::runner::PromptHookExecutor for RecordingPromptExecutor {
+            async fn execute(
+                &self,
+                _prompt: &str,
+                _model: Option<&str>,
+                payload: &hooks::HookInput,
+            ) -> Result<String, String> {
+                let _ = self
+                    .fired
+                    .send(payload.tool_input.clone().unwrap_or_default())
+                    .await;
+                Ok("{}".to_string())
+            }
+        }
+
+        let (fired_tx, mut fired_rx) = tokio::sync::mpsc::channel(1);
+        let mut hooks_settings: hooks::HooksSettings = Default::default();
+        hooks_settings.insert(
+            hooks::HookEvent::Elicitation,
+            vec![hooks::config::HookConfig::Prompt {
+                prompt: "an elicitation happened".into(),
+                timeout: None,
+                model: None,
+            }],
+        );
+        let runner = Arc::new(
+            hooks::HookRunner::new(hooks_settings)
+                .with_prompt_executor(Arc::new(RecordingPromptExecutor { fired: fired_tx })),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Arc::new(test_settings());
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
 
@@ -2530,6 +2563,7 @@ mod tests {
             .scene(scene)
             .model(model)
             .settings(settings)
+            .hooks(runner)
             .mcp_manager(mcp_manager)
             .skip_warmup(true)
             .build()
@@ -2547,29 +2581,22 @@ mod tests {
             .await
             .expect("mock tool call succeeds");
 
-        // The hook is dispatched through `tokio::spawn` from a sync callback
-        // and then shells out, so the marker appears some time after `call`
-        // returns. Poll for it instead of sleeping a fixed amount: a single
-        // 500 ms sleep passes on an idle machine and fails under a loaded
-        // `cargo test --workspace`, where this test competes with ~1900
-        // others for the shell it needs.
-        // 10s was already the second attempt here (it started at a flat 500ms
-        // sleep). It still times out under a loaded `cargo test --workspace`,
-        // where this case competes with ~2300 others for the shell it needs to
-        // spawn. The wait is a *ceiling*, not a cost: the assertion below fires
-        // the moment the marker appears, so on an idle machine this test still
-        // finishes in milliseconds and only a genuine break pays the full
-        // budget.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !marker_path.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-
-        assert!(
-            marker_path.exists(),
-            "an MCP tool result containing an elicitation URL should have fired the \
-             Elicitation hook"
+        // The callback dispatches through `tokio::spawn`, so this arrives
+        // after `call` returns. Waiting on the dispatch itself means a slow
+        // machine makes the test slower and never makes it fail.
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(30), fired_rx.recv())
+            .await
+            .expect(
+                "an MCP tool result containing an elicitation URL should have fired the \
+                 Elicitation hook",
+            )
+            .expect("the executor sends before returning");
+        assert_eq!(
+            payload["url"],
+            serde_json::json!("elicitation://example.com/auth/123"),
+            "the hook must be told which URL, got: {payload}"
         );
+        assert_eq!(payload["server_name"], serde_json::json!("test-server"));
     }
 
     /// P2: `Builder::skill_catalog` must be used as-is, with `build()` never
@@ -4249,24 +4276,55 @@ mod tests {
     /// instruction file, edit that file, and confirm the hook really runs.
     #[tokio::test]
     async fn build_starts_file_watching_for_the_instruction_file_when_a_hook_wants_it() {
+        // Two guesses about machine speed used to stand between this test and
+        // its assertion: 200ms for the OS watcher to register, then 1500ms for
+        // the debounce, the dispatch and a shell to run. Both are gone. The
+        // hook is observed in this process through an injected executor, and
+        // the file is rewritten until the notification arrives — so a watcher
+        // that registers late costs another loop rather than a failure.
+        struct RecordingPromptExecutor {
+            fired: tokio::sync::mpsc::Sender<()>,
+        }
+
+        #[async_trait::async_trait]
+        impl hooks::runner::PromptHookExecutor for RecordingPromptExecutor {
+            async fn execute(
+                &self,
+                _prompt: &str,
+                _model: Option<&str>,
+                _payload: &hooks::HookInput,
+            ) -> Result<String, String> {
+                let _ = self.fired.try_send(());
+                Ok("{}".to_string())
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let instruction_path = dir.path().join("AGENTS.md");
         std::fs::write(&instruction_path, "# instructions").unwrap();
-        let marker_path = dir.path().join("fired.marker");
 
-        let mut settings = test_settings();
-        settings.hooks_config = Some(serde_json::json!({
-            "FileChanged": [
-                { "type": "command", "command": format!("echo fired >> {}", marker_path.display()) }
-            ]
-        }));
+        let (fired_tx, mut fired_rx) = tokio::sync::mpsc::channel(1);
+        let mut hooks_settings: hooks::HooksSettings = Default::default();
+        hooks_settings.insert(
+            hooks::HookEvent::FileChanged,
+            vec![hooks::config::HookConfig::Prompt {
+                prompt: "the instruction file changed".into(),
+                timeout: None,
+                model: None,
+            }],
+        );
+        let runner = Arc::new(
+            hooks::HookRunner::new(hooks_settings)
+                .with_prompt_executor(Arc::new(RecordingPromptExecutor { fired: fired_tx })),
+        );
+
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::coding::CodingScene);
-
         let (agent, _event_rx, _input_tx) = Builder::new()
             .scene(scene)
             .model(model)
-            .settings(settings.into())
+            .settings(Arc::new(test_settings()))
+            .hooks(runner)
             .instruction(instruction_path.clone())
             .skip_warmup(true)
             .build()
@@ -4274,15 +4332,24 @@ mod tests {
 
         assert!(agent.hooks().has_hooks_for(hooks::HookEvent::FileChanged));
 
-        // Let the watcher thread register with the OS before mutating the file.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        std::fs::write(&instruction_path, "# instructions, edited").unwrap();
-        // Debounce window (300ms default) + async hook dispatch + shell exec.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut edits = 0u32;
+        let fired = loop {
+            edits += 1;
+            std::fs::write(&instruction_path, format!("# instructions, edit {edits}")).unwrap();
+            match tokio::time::timeout(std::time::Duration::from_millis(500), fired_rx.recv()).await
+            {
+                Ok(Some(())) => break true,
+                Ok(None) => break false,
+                Err(_) if std::time::Instant::now() >= deadline => break false,
+                Err(_) => continue,
+            }
+        };
 
         assert!(
-            marker_path.exists(),
-            "editing the watched instruction file should have fired the FileChanged hook"
+            fired,
+            "editing the watched instruction file should have fired the FileChanged hook \
+             ({edits} edits over 30s without one)"
         );
     }
 

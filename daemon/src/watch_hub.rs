@@ -301,8 +301,24 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// How long to wait for a notification that should arrive.
+    ///
+    /// A ceiling, not a measurement. Every use below is a *positive* wait —
+    /// the `timeout` returns the moment `recv()` resolves, so on a healthy
+    /// machine these tests still finish in milliseconds and only a genuine
+    /// break pays the budget. What sets the floor is not in this process:
+    /// filesystem events cross the kernel and a debounce window, and under a
+    /// loaded `cargo test --workspace` that can take far longer than the
+    /// event itself.
+    ///
+    /// This is not the usual "the test failed so raise the timeout". These
+    /// tests are worth having because they can fail when a notification never
+    /// arrives; none of them is worth anything for its ability to fail when
+    /// one arrives *late*. The one place timing is the subject — the burst
+    /// below, which asserts a second notification does **not** arrive — keeps
+    /// its own short budget, because there the wait is the assertion.
     fn settle() -> Duration {
-        DEBOUNCE + Duration::from_millis(400)
+        DEBOUNCE + Duration::from_secs(15)
     }
 
     #[tokio::test]

@@ -453,6 +453,33 @@ mod tests {
         assert!(ctx.git_branch.is_some());
     }
 
+    /// Runs a `git` command and fails loudly if it did not work.
+    ///
+    /// The `.output().unwrap()` this replaces only caught a spawn failure. A
+    /// `git init` that ran and exited non-zero — which is what a machine out
+    /// of file descriptors or process slots produces — left a directory that
+    /// is not a repository, and the test then failed several lines later with
+    /// `left: None, right: Some("original-branch")`: a true statement about
+    /// the wrong thing, and nothing to act on. Checking here turns that into
+    /// git's own words about what it could not do.
+    fn run_git(cwd: &std::path::Path) -> impl Fn(&[&str]) + '_ {
+        move |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap_or_else(|e| panic!("could not run `git {}`: {e}", args.join(" ")));
+            assert!(
+                out.status.success(),
+                "`git {}` failed ({}): {}{}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout),
+            );
+        }
+    }
+
     /// `refresh_git` exists precisely to relax the module's "not refreshed
     /// during a session" characteristic for the git-derived fields — this
     /// pins down that calling it after the branch actually changes on disk
@@ -460,13 +487,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_git_picks_up_a_branch_change() {
         let dir = TempDir::new().unwrap();
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .unwrap()
-        };
+        let run = run_git(dir.path());
         run(&["init", "-q"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test"]);
@@ -498,13 +519,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_git_status_picks_up_a_commit_made_mid_session() {
         let dir = TempDir::new().unwrap();
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .unwrap()
-        };
+        let run = run_git(dir.path());
         run(&["init", "-q"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test"]);
