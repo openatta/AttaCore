@@ -19,6 +19,7 @@
 //! | Contract | Replaces |
 //! |---|---|
 //! | [`model::Model`] | the LLM backend / wire protocol |
+//! | [`model_factory::ModelFactory`] | how a protocol is built from config |
 //! | [`tool::Tool`] / [`tool::ToolRegistry`] | a tool, or the whole tool set |
 //! | [`scene::AgentScene`] | system prompt, tool surface, budgets |
 //! | [`permission::Permission`] | tool authorization |
@@ -48,6 +49,7 @@ pub mod log;
 #[deprecated(note = "moved to `base::memory` — a concrete store, not an injectable contract")]
 pub use crate::memory;
 pub mod model;
+pub mod model_factory;
 pub mod permission;
 #[deprecated(note = "moved to `base::prompt` — prompt data types and the assembler function")]
 pub use crate::prompt;

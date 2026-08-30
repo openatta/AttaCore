@@ -2,94 +2,18 @@
 //! from parsed `settings.json` provider config — the piece
 //! `base::provider::resolve_task_models` deliberately leaves undone (it only
 //! resolves *which* provider/model a task should use, as pure data; it
-//! can't construct a `model::adapter::AnthropicModel` itself without `base`
-//! depending on `model`, inverting the crate layering).
+//! can't construct a model itself without `base` depending on `model`,
+//! inverting the crate layering).
+//!
+//! Which protocols can be built is no longer decided here. This assembles a
+//! router from whatever is in a
+//! [`ModelFactoryRegistry`](base::interface::model_factory::ModelFactoryRegistry);
+//! `model::factory::builtin_registry()` is the default contents, and a host
+//! that wants a third protocol adds to it rather than editing this file.
 
+use base::interface::model_factory::ModelFactoryRegistry;
 use base::provider::{ProviderConfig, ResolvedModel, TaskRouter};
-use model::adapter::AnthropicModel;
-use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
 use std::collections::HashMap;
-use std::sync::Arc;
-
-/// Construct the `Arc<dyn Model>` a single provider config describes.
-///
-/// Both `api_type` values now have a runtime implementation: `anthropic`
-/// (unset means this too — same default as `base::provider::ApiType`'s serde
-/// attribute) builds an `HttpAnthropicClient`, `openai_compatible` builds a
-/// `model::OpenAICompatibleModel` speaking OpenAI Chat Completions.
-///
-/// `openai_compatible` used to be a valid *config* value with no `Model` impl
-/// behind it, so configuring one was a hard startup error — which made the
-/// multi-provider story Anthropic-only in practice
-/// (OpenAI, Gemini-via-proxy, vLLM and Ollama were all unreachable).
-///
-/// Anything else is still a hard error surfaced at startup (via `Err`, which
-/// `main.rs` turns into `anyhow::bail!`), not a silent downgrade or a runtime
-/// panic on first use.
-fn build_provider_model(
-    provider_id: &str,
-    cfg: &ProviderConfig,
-) -> Result<Arc<dyn base::interface::model::Model>, String> {
-    match cfg.api_type.as_deref() {
-        Some("openai_compatible") => {
-            // `base_url` is required here, unlike the Anthropic branch below:
-            // there is no default OpenAI-compatible host to fall back to, and
-            // guessing one would produce a confusing auth failure at first
-            // use rather than a clear config error at startup.
-            let base_url = cfg
-                .base_url
-                .clone()
-                .filter(|u| !u.is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "provider '{provider_id}': api_type 'openai_compatible' requires base_url"
-                    )
-                })?;
-            let api_key = cfg
-                .api_key
-                .clone()
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| format!("provider '{provider_id}': missing api_key"))?;
-            let default_model = cfg.default_model.clone().unwrap_or_default();
-            Ok(Arc::new(
-                model::OpenAICompatibleModel::new(&base_url, api_key, default_model)
-                    .map_err(|e| format!("provider '{provider_id}': {e}"))?,
-            ))
-        }
-        Some(other) if other != "anthropic" => Err(format!(
-            "provider '{provider_id}': unrecognized api_type '{other}' (expected 'anthropic' \
-             or 'openai_compatible')"
-        )),
-        _ => {
-            let api_key = cfg
-                .api_key
-                .clone()
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| format!("provider '{provider_id}': missing api_key"))?;
-            let auth = AuthMode::ApiKey(api_key);
-            let client: Arc<dyn AnthropicClient> = match cfg.base_url.as_deref() {
-                Some(url) if !url.is_empty() => {
-                    let mut url = url.to_string();
-                    if !url.ends_with('/') {
-                        url.push('/');
-                    }
-                    let base = reqwest::Url::parse(&url).map_err(|e| {
-                        format!("provider '{provider_id}': invalid base_url '{url}': {e}")
-                    })?;
-                    Arc::new(
-                        HttpAnthropicClient::with_base(auth, base)
-                            .map_err(|e| format!("provider '{provider_id}': {e}"))?,
-                    )
-                }
-                _ => Arc::new(
-                    HttpAnthropicClient::new(auth)
-                        .map_err(|e| format!("provider '{provider_id}': {e}"))?,
-                ),
-            };
-            Ok(Arc::new(AnthropicModel::new(client)))
-        }
-    }
-}
 
 /// Build a [`TaskRouter`] from parsed provider config + the result of
 /// `base::provider::resolve_task_models` (already validated — this is the
@@ -108,9 +32,25 @@ pub fn build_task_router(
     default_provider: &str,
     resolved: HashMap<String, ResolvedModel>,
 ) -> Result<TaskRouter, String> {
+    build_task_router_with(
+        providers_cfg,
+        default_provider,
+        resolved,
+        &model::factory::builtin_registry(),
+    )
+}
+
+/// [`build_task_router`] against a registry the caller chose — the entry
+/// point for a host that registered a protocol of its own.
+pub fn build_task_router_with(
+    providers_cfg: &HashMap<String, ProviderConfig>,
+    default_provider: &str,
+    resolved: HashMap<String, ResolvedModel>,
+    factories: &ModelFactoryRegistry,
+) -> Result<TaskRouter, String> {
     let mut providers = HashMap::with_capacity(providers_cfg.len());
     for (id, cfg) in providers_cfg {
-        providers.insert(id.clone(), build_provider_model(id, cfg)?);
+        providers.insert(id.clone(), factories.build(id, cfg)?);
     }
     let default = providers
         .get(default_provider)
@@ -133,6 +73,10 @@ mod tests {
         }
     }
 
+    fn builtins() -> ModelFactoryRegistry {
+        model::factory::builtin_registry()
+    }
+
     fn anthropic_provider(api_key: &str) -> ProviderConfig {
         ProviderConfig {
             api_type: Some("anthropic".into()),
@@ -144,16 +88,16 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_model_succeeds_for_anthropic() {
+    fn provider_config_succeeds_for_anthropic() {
         let cfg = anthropic_provider("sk-ant-test");
-        assert!(build_provider_model("anthropic", &cfg).is_ok());
+        assert!(builtins().build("anthropic", &cfg).is_ok());
     }
 
     #[test]
-    fn build_provider_model_defaults_missing_api_type_to_anthropic() {
+    fn provider_config_defaults_missing_api_type_to_anthropic() {
         let mut cfg = anthropic_provider("sk-ant-test");
         cfg.api_type = None;
-        assert!(build_provider_model("anthropic", &cfg).is_ok());
+        assert!(builtins().build("anthropic", &cfg).is_ok());
     }
 
     /// N-16: `openai_compatible` builds a real model now. It needs an
@@ -161,48 +105,48 @@ mod tests {
     /// requirement has to be reported clearly rather than as an auth failure
     /// on the first call.
     #[test]
-    fn build_provider_model_accepts_openai_compatible_with_a_base_url() {
+    fn provider_config_accepts_openai_compatible_with_a_base_url() {
         let mut cfg = anthropic_provider("key");
         cfg.api_type = Some("openai_compatible".into());
         cfg.base_url = Some("https://api.example.com/v1".into());
-        let built = build_provider_model("oa", &cfg).expect("should build");
+        let built = builtins().build("oa", &cfg).expect("should build");
         assert_eq!(built.api_type(), base::provider::ApiType::OpenAICompatible);
     }
 
     #[test]
-    fn build_provider_model_requires_base_url_for_openai_compatible() {
+    fn provider_config_requires_base_url_for_openai_compatible() {
         let mut cfg = anthropic_provider("key");
         cfg.api_type = Some("openai_compatible".into());
         cfg.base_url = None;
-        let err = err_of(build_provider_model("oa", &cfg));
+        let err = err_of(builtins().build("oa", &cfg));
         assert!(err.contains("base_url"), "{err}");
     }
 
     #[test]
-    fn build_provider_model_rejects_unknown_api_type() {
+    fn provider_config_rejects_unknown_api_type() {
         let mut cfg = anthropic_provider("key");
         cfg.api_type = Some("bedrock".into());
-        let err = err_of(build_provider_model("b", &cfg));
+        let err = err_of(builtins().build("b", &cfg));
         assert!(err.contains("bedrock"));
     }
 
     #[test]
-    fn build_provider_model_requires_api_key() {
+    fn provider_config_requires_api_key() {
         let mut cfg = anthropic_provider("");
         cfg.api_key = None;
-        let err = err_of(build_provider_model("anthropic", &cfg));
+        let err = err_of(builtins().build("anthropic", &cfg));
         assert!(err.contains("api_key"));
 
         cfg.api_key = Some(String::new());
-        let err = err_of(build_provider_model("anthropic", &cfg));
+        let err = err_of(builtins().build("anthropic", &cfg));
         assert!(err.contains("api_key"));
     }
 
     #[test]
-    fn build_provider_model_rejects_invalid_base_url() {
+    fn provider_config_rejects_invalid_base_url() {
         let mut cfg = anthropic_provider("key");
         cfg.base_url = Some("not a url".into());
-        let err = err_of(build_provider_model("anthropic", &cfg));
+        let err = err_of(builtins().build("anthropic", &cfg));
         assert!(err.contains("invalid base_url"));
     }
 
@@ -242,5 +186,76 @@ mod tests {
         let err = err_of(build_task_router(&providers, "anthropic", HashMap::new()));
         assert!(err.contains("broken"));
         assert!(err.contains("bedrock"));
+    }
+
+    /// The point of the registry: a protocol the engine does not implement,
+    /// reachable by configuration alone. No kernel edit, no new `ApiType`
+    /// variant, and the router hands it out for the tasks that name it.
+    #[test]
+    fn a_protocol_the_engine_never_heard_of_can_be_registered_and_routed_to() {
+        struct Fictional;
+
+        #[async_trait::async_trait]
+        impl base::interface::model::Model for Fictional {
+            fn api_type(&self) -> base::provider::ApiType {
+                base::provider::ApiType::OpenAICompatible
+            }
+            async fn stream(
+                &self,
+                _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+                _tools: Vec<base::interface::model::ToolDef>,
+                _messages: Vec<base::interface::model::ModelMessage>,
+                _params: base::interface::model::StreamParams,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> Result<
+                base::interface::model::ModelStream,
+                base::interface::model::ModelError,
+            > {
+                unimplemented!("never called — this test is about construction and routing")
+            }
+        }
+
+        struct FictionalFactory;
+
+        impl base::interface::model_factory::ModelFactory for FictionalFactory {
+            fn api_type(&self) -> &str {
+                "fictional"
+            }
+            fn build(
+                &self,
+                _provider_id: &str,
+                _cfg: &ProviderConfig,
+            ) -> Result<std::sync::Arc<dyn base::interface::model::Model>, String> {
+                Ok(std::sync::Arc::new(Fictional))
+            }
+        }
+
+        let mut factories = builtins();
+        factories.register(std::sync::Arc::new(FictionalFactory));
+
+        let mut cfg = anthropic_provider("key");
+        cfg.api_type = Some("fictional".into());
+        let providers = HashMap::from([("mine".to_string(), cfg)]);
+
+        let router = build_task_router_with(
+            &providers,
+            "mine",
+            HashMap::from([(
+                "main".to_string(),
+                ResolvedModel {
+                    provider_id: "mine".into(),
+                    model: "whatever".into(),
+                },
+            )]),
+            &factories,
+        )
+        .expect("a registered protocol must build");
+
+        assert_eq!(
+            router.model_for("main").api_type(),
+            base::provider::ApiType::OpenAICompatible,
+            "the task must be routed to the model the registered factory built"
+        );
+        assert_eq!(router.model_name_for("main"), Some("whatever"));
     }
 }

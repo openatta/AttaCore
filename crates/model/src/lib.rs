@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod client;
 pub mod error;
+pub mod factory;
 pub mod mock;
 pub mod openai;
 pub mod parser;
