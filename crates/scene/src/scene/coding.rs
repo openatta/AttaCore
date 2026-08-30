@@ -310,7 +310,8 @@ fn render_prompt_blocks(sections: Vec<ResolvedSection>) -> Vec<PromptBlock> {
                     role: base::interface::prompt::BlockRole::System,
                     content: s.text,
                     cache_strategy: Some(CacheStrategy::Global),
-                    source: Some(s.name.to_string()),
+                    name: Some(s.name.to_string()),
+                    origin: base::prompt::BlockOrigin::Kernel,
                 });
             }
             SectionPhase::Dynamic => {
@@ -329,7 +330,8 @@ fn render_prompt_blocks(sections: Vec<ResolvedSection>) -> Vec<PromptBlock> {
             // it into one block per section would label them individually but
             // would also change the cache partitioning, which is the whole
             // point of merging the dynamic tail into one ephemeral block.
-            source: Some(dynamic_names.join(",")),
+            name: Some(dynamic_names.join(",")),
+            origin: base::prompt::BlockOrigin::Kernel,
         });
     }
     out
@@ -1107,17 +1109,17 @@ mod tests {
     fn every_block_names_its_section() {
         let blocks = CodingScene.build_system_prompt(&ctx());
         assert!(
-            blocks.iter().all(|b| b.source.is_some()),
+            blocks.iter().all(|b| b.name.is_some()),
             "an unlabelled block leaves a reader counting positions"
         );
-        assert_eq!(blocks[0].source.as_deref(), Some("identity"));
+        assert_eq!(blocks[0].name.as_deref(), Some("identity"));
 
         let tail = blocks.last().unwrap();
         assert_eq!(tail.cache_strategy, Some(CacheStrategy::Ephemeral));
         assert!(
-            tail.source.as_deref().unwrap().contains(','),
+            tail.name.as_deref().unwrap().contains(','),
             "the merged tail should list its sections, got {:?}",
-            tail.source
+            tail.name
         );
     }
 }

@@ -147,13 +147,15 @@ fn system_blocks(turn: u32) -> Vec<PromptBlock> {
             role: BlockRole::System,
             content: "You are a coding agent.".into(),
             cache_strategy: Some(CacheStrategy::Ephemeral),
-            source: Some("identity".into()),
+            name: Some("identity".into()),
+            origin: Default::default(),
         },
         PromptBlock {
             role: BlockRole::System,
             content: "## Available Skills\n- atta-implement\n- atta-review".into(),
             cache_strategy: None,
-            source: Some(base::interface::prompt::source::SKILLS.into()),
+            name: Some(base::prompt::names::SKILLS_CATALOG.into()),
+            origin: Default::default(),
         },
         // Differs per turn, so the blob set has to grow rather than collapse
         // to one — which is what proves dedup is content-driven and not just
@@ -162,7 +164,8 @@ fn system_blocks(turn: u32) -> Vec<PromptBlock> {
             role: BlockRole::System,
             content: format!("<env>turn={turn}</env>"),
             cache_strategy: None,
-            source: Some("env".into()),
+            name: Some("env".into()),
+            origin: Default::default(),
         },
     ]
 }

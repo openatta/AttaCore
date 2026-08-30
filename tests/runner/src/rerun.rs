@@ -154,7 +154,7 @@ pub async fn rerun_recording(
         let system_sources = request
             .prompt_blocks
             .iter()
-            .map(|b| b.source.clone().unwrap_or_else(|| "(unlabelled)".into()))
+            .map(|b| b.name.clone().unwrap_or_else(|| "(unlabelled)".into()))
             .collect();
         let tool_count = request.tools.len();
         let message_count = request.messages.len();

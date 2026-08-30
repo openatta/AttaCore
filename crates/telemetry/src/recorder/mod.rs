@@ -928,7 +928,8 @@ mod tests {
             role: BlockRole::System,
             content: text.into(),
             cache_strategy: None,
-            source: None,
+            name: None,
+            origin: Default::default(),
         }]
     }
 

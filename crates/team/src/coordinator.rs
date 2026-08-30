@@ -1151,7 +1151,8 @@ async fn drain(
         role: BlockRole::System,
         content: "You are a strict judge. Output only the requested text, nothing else.".into(),
         cache_strategy: None,
-        source: Some("team_judge".into()),
+        name: Some("team.judge".into()),
+        origin: base::prompt::BlockOrigin::Kernel,
     }];
     let messages = vec![base::interface::model::ModelMessage {
         role: base::interface::model::MessageRole::User,

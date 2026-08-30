@@ -340,7 +340,8 @@ mod tests {
                     // Dropped — OpenAI has no cache_control surface.
                     cache_strategy: Some(CacheStrategy::Ephemeral),
                     // Dropped too: annotation never reaches the wire.
-                    source: Some("scene".into()),
+                    name: Some("scene.skeleton".into()),
+                    origin: Default::default(),
                 },
                 PromptBlock::system("Be terse."),
                 // Empty blocks must not produce stray blank lines.

@@ -307,7 +307,8 @@ impl AutoClassifier for LlmClassifier {
             role: BlockRole::System,
             content: CLASSIFIER_SYSTEM_PROMPT.to_string(),
             cache_strategy: None,
-            source: Some("classifier".into()),
+            name: Some("permissions.classifier".into()),
+            origin: base::prompt::BlockOrigin::Kernel,
         }];
 
         let user_msg = ModelMessage {
