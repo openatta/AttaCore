@@ -954,6 +954,7 @@ impl Agent {
             let permission_for_exec = Arc::clone(&self.permission);
             let session_state_for_exec = Arc::clone(&self.session_state);
             let elicitation_for_exec = Arc::clone(&self.elicitation);
+            let tool_middleware_for_exec = Arc::clone(&self.tool_middleware);
             let tool_images: Arc<std::sync::Mutex<Vec<PendingToolImage>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let tool_images_for_exec = Arc::clone(&tool_images);
@@ -978,6 +979,7 @@ impl Agent {
                         permission: Arc::clone(&permission_for_exec),
                         session_state: Arc::clone(&session_state_for_exec),
                         elicitation: Arc::clone(&elicitation_for_exec),
+                        tool_middleware: Arc::clone(&tool_middleware_for_exec),
                         discontinued: Arc::clone(&discontinued_for_exec),
                         images: Arc::clone(&tool_images_for_exec),
                     };
@@ -2841,6 +2843,10 @@ pub(crate) struct ToolExecCtx {
     /// what to do with the answer — hooks, telemetry, the deadline — and this
     /// decides how the question reaches a human at all.
     pub elicitation: Arc<dyn base::interface::elicitation::Elicitation>,
+    /// Rings around every tool call — see
+    /// [`base::interface::tool_middleware`]. Empty in every session that
+    /// registered none, which is the case dispatch short-circuits.
+    pub tool_middleware: Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
     /// Images returned by tools this round, collected out-of-band.
     ///
     /// The tool-dispatch closure returns `(String, Option<Vec<Value>>)` — text
@@ -3022,7 +3028,34 @@ pub(crate) async fn execute_tool_with_telemetry(
     name: &str,
     input: serde_json::Value,
 ) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
-    execute_tool_inner(ctx, name, input).await
+    // No wrappers means no wrapping: the call goes straight through, with no
+    // context clone and no future inside a future. A seam nobody uses should
+    // cost nothing on the hot path.
+    if ctx.tool_middleware.is_empty() {
+        return execute_tool_inner(ctx, name, input).await;
+    }
+    let chain = Arc::clone(&ctx.tool_middleware);
+    let call = base::interface::tool_middleware::ToolCall {
+        name: name.to_string(),
+        input: input.clone(),
+    };
+    base::interface::tool_middleware::dispatch_through(
+        &chain,
+        call,
+        ctx.cancel.clone(),
+        move |cancel| {
+            // Each pass through gets the signal the wrappers settled on. The
+            // rest of the context is the same one dispatch always had, which
+            // is what keeps a retry a retry rather than a differently
+            // configured call.
+            let mut ctx = ctx.clone();
+            ctx.cancel = cancel;
+            let name = name.to_string();
+            let input = input.clone();
+            async move { execute_tool_inner(&ctx, &name, input).await }
+        },
+    )
+    .await
 }
 
 /// Lower `EngineConfig`'s sandbox policy into the cross-crate view a tool
@@ -4243,6 +4276,7 @@ mod tests {
             permission,
             session_state: Arc::new(base::context::SessionState::new(std::env::temp_dir())),
             elicitation: Arc::new(base::interface::elicitation::DeclineAll),
+            tool_middleware: Arc::new(Vec::new()),
             images: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -4827,6 +4861,7 @@ mod tests {
             config: Arc::new(base::context::EngineConfig::defaults_for("test")),
             permission,
             session_state: Arc::new(base::context::SessionState::new(dir.path().to_path_buf())),
+            tool_middleware: Arc::new(Vec::new()),
             elicitation: base::interface::elicitation::FixedElicitation::new(
                 base::interface::elicitation::ElicitOutcome::answered(
                     &crate::agent::PermissionDecision::PermitAlways {

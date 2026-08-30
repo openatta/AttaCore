@@ -22,6 +22,7 @@
 //! | [`model_factory::ModelFactory`] | how a protocol is built from config |
 //! | [`credentials::CredentialSource`] | where a provider's API key comes from |
 //! | [`tool::Tool`] / [`tool::ToolRegistry`] | a tool, or the whole tool set |
+//! | [`tool_middleware::ToolMiddleware`] | a ring around every tool call |
 //! | [`scene::AgentScene`] | system prompt, tool surface, budgets |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
@@ -65,6 +66,7 @@ pub use crate::rules;
 pub mod scene;
 pub mod token_counter;
 pub mod tool;
+pub mod tool_middleware;
 #[deprecated(note = "moved to `base::settings` — declarative configuration types")]
 pub use crate::settings;
 

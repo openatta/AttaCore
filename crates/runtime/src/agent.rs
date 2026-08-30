@@ -180,6 +180,9 @@ pub struct Agent {
     /// What else contributes to this session's system prompt — see
     /// [`Builder::prompt_registry`].
     pub(crate) prompt_registry: Arc<dyn base::interface::prompt_registry::PromptRegistry>,
+    /// Rings around every tool call — see [`Builder::tool_middleware`].
+    pub(crate) tool_middleware:
+        Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
     /// Cancellation token of the turn currently in flight — replaced by
     /// `run()` before each turn, cancelled by the input demultiplexer on
     /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
@@ -949,6 +952,8 @@ pub struct Builder {
     elicitation: Option<Arc<dyn base::interface::elicitation::Elicitation>>,
     /// Contributions to the system prompt — see [`Builder::prompt_registry`].
     prompt_registry: Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>>,
+    /// Rings around tool dispatch — see [`Builder::tool_middleware`].
+    tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
     /// Extra destinations for this session's events, beyond the `event_rx`
     /// `build()` returns — see [`Builder::event_sink`].
     event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
@@ -1141,6 +1146,7 @@ impl Builder {
             skill_catalog: None,
             elicitation: None,
             prompt_registry: None,
+            tool_middleware: Vec::new(),
             event_sinks: Vec::new(),
             agent_depth: 0,
         }
@@ -1192,6 +1198,24 @@ impl Builder {
         r: Arc<dyn base::interface::prompt_registry::PromptRegistry>,
     ) -> Self {
         self.prompt_registry = Some(r);
+        self
+    }
+
+    /// Wrap every tool call in this session.
+    ///
+    /// Wrappers nest in the order they are added: the first added is
+    /// outermost, so it sees an inner one's retries as one call. A wrapper can
+    /// impose a stricter deadline, answer without dispatching, or dispatch
+    /// more than once; it cannot rewrite the call's arguments, which is a
+    /// different act with different trust rules and belongs to a different
+    /// hook point.
+    ///
+    /// [`ToolMiddleware`]: base::interface::tool_middleware::ToolMiddleware
+    pub fn tool_middleware(
+        mut self,
+        m: Arc<dyn base::interface::tool_middleware::ToolMiddleware>,
+    ) -> Self {
+        self.tool_middleware.push(m);
         self
     }
 
@@ -2037,6 +2061,7 @@ impl Builder {
                 prompt_registry: self
                     .prompt_registry
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
+                tool_middleware: Arc::new(self.tool_middleware),
                 pending_permissions,
                 current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
                 memory_store,
@@ -4165,6 +4190,101 @@ mod tests {
             marker_path.exists(),
             "editing the watched instruction file should have fired the FileChanged hook"
         );
+    }
+
+
+    /// P2-4's acceptance: a wrapper gives one tool a deadline, and the tool
+    /// actually feels it. Without the wrapper `Hang` waits for the session's
+    /// own cancellation, which this test never sends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registered_wrapper_can_put_a_deadline_on_one_tool() {
+        use base::interface::tool_middleware::{
+            NextDispatch, ToolCall, ToolExec, ToolMiddleware, ToolOutcome,
+        };
+
+        struct DeadlineFor {
+            tool: &'static str,
+            after: std::time::Duration,
+            wrapped: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolMiddleware for DeadlineFor {
+            async fn around(
+                &self,
+                call: &ToolCall,
+                exec: &mut ToolExec,
+                next: NextDispatch<'_>,
+            ) -> ToolOutcome {
+                if call.name == self.tool {
+                    self.wrapped
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    exec.with_timeout(self.after);
+                }
+                next.run(call, exec).await
+            }
+        }
+
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(HangingTool));
+        let wrapped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Hang",
+        });
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(tools)
+            .tool_middleware(Arc::new(DeadlineFor {
+                tool: "Hang",
+                after: std::time::Duration::from_millis(50),
+                wrapped: wrapped.clone(),
+            }))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let session = CancellationToken::new();
+        let engine = {
+            let session = session.clone();
+            tokio::spawn(async move { agent.run(session).await })
+        };
+        input_tx
+            .send(InputMessage::User {
+                content: "hang please".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        // The turn completes without the session ever being cancelled, which
+        // it could not do if `Hang` were still waiting on the session token.
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { stop_reason, .. }) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before the turn completed"),
+                }
+            }
+        })
+        .await
+        .expect(
+            "the wrapper's deadline must end the hanging tool — if this times out, the \
+             signal it installed is not reaching dispatch",
+        );
+        assert_eq!(stop, "end_turn");
+        assert_eq!(
+            wrapped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wrapper must have seen the call it was registered for"
+        );
+
+        session.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
     #[test]
