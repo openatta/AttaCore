@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::interface::credentials::{ConfigCredentials, CredentialSource};
 use crate::interface::model::Model;
 use crate::provider::ProviderConfig;
 
@@ -39,13 +40,33 @@ pub trait ModelFactory: Send + Sync {
     /// `provider_id` is only for the error message — it is the name the user
     /// wrote, and an error that does not name it makes them guess which of
     /// their providers is broken.
-    fn build(&self, provider_id: &str, config: &ProviderConfig) -> Result<Arc<dyn Model>, String>;
+    ///
+    /// The credential comes from `credentials`, never from `config.api_key`
+    /// directly: a factory that reads the field itself silently opts its
+    /// protocol out of whatever the host arranged, which is exactly the bug
+    /// the source exists to prevent.
+    fn build(
+        &self,
+        provider_id: &str,
+        config: &ProviderConfig,
+        credentials: &dyn CredentialSource,
+    ) -> Result<Arc<dyn Model>, String>;
 }
 
 /// Every wire protocol this process can construct.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ModelFactoryRegistry {
     by_api_type: HashMap<String, Arc<dyn ModelFactory>>,
+    credentials: Arc<dyn CredentialSource>,
+}
+
+impl Default for ModelFactoryRegistry {
+    fn default() -> Self {
+        Self {
+            by_api_type: HashMap::new(),
+            credentials: Arc::new(ConfigCredentials),
+        }
+    }
 }
 
 impl ModelFactoryRegistry {
@@ -63,6 +84,17 @@ impl ModelFactoryRegistry {
     pub fn register(&mut self, factory: Arc<dyn ModelFactory>) -> Option<Arc<dyn ModelFactory>> {
         self.by_api_type
             .insert(factory.api_type().to_string(), factory)
+    }
+
+    /// Ask `source` for every credential instead of reading `settings.json`.
+    ///
+    /// One source for the whole registry, not one per protocol: "where do
+    /// this deployment's credentials come from" is a property of the
+    /// deployment, and letting it vary per protocol would mean a host could
+    /// secure one and forget the other.
+    pub fn with_credentials(mut self, source: Arc<dyn CredentialSource>) -> Self {
+        self.credentials = source;
+        self
     }
 
     pub fn get(&self, api_type: &str) -> Option<&Arc<dyn ModelFactory>> {
@@ -93,7 +125,7 @@ impl ModelFactoryRegistry {
     ) -> Result<Arc<dyn Model>, String> {
         let api_type = config.api_type.as_deref().unwrap_or("anthropic");
         match self.by_api_type.get(api_type) {
-            Some(f) => f.build(provider_id, config),
+            Some(f) => f.build(provider_id, config, self.credentials.as_ref()),
             None => Err(format!(
                 "provider '{provider_id}': unrecognized api_type '{api_type}' (expected {})",
                 self.api_types()
@@ -116,7 +148,12 @@ mod tests {
         fn api_type(&self) -> &str {
             self.0
         }
-        fn build(&self, _id: &str, _cfg: &ProviderConfig) -> Result<Arc<dyn Model>, String> {
+        fn build(
+            &self,
+            _id: &str,
+            _cfg: &ProviderConfig,
+            _credentials: &dyn CredentialSource,
+        ) -> Result<Arc<dyn Model>, String> {
             Err("stub".into())
         }
     }

@@ -33,7 +33,7 @@ pub enum ApiType {
 }
 
 /// A single provider's connection + model config, as written in settings.json.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ProviderConfig {
     /// "anthropic" | "openai_compatible". Kept as a plain string (not
@@ -41,7 +41,11 @@ pub struct ProviderConfig {
     /// a hard parse failure of the whole settings.json.
     pub api_type: Option<String>,
     pub base_url: Option<String>,
-    /// Stored in plaintext, same as every other settings.json field.
+    /// Stored in plaintext, same as every other settings.json field — which
+    /// is why [`Debug`](std::fmt::Debug) is hand-written below rather than
+    /// derived. A host that must not keep a credential on disk supplies one
+    /// through [`CredentialSource`](crate::interface::credentials::CredentialSource)
+    /// and leaves this unset.
     pub api_key: Option<String>,
     /// Model used when a task_models override doesn't name one explicitly,
     /// or when a named model fails the `models` allow-list check below.
@@ -87,6 +91,24 @@ impl TaskModelOverride {
 pub struct ResolvedModel {
     pub provider_id: String,
     pub model: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    /// Everything but the key.
+    ///
+    /// A credential does not leak because someone logged the credential; it
+    /// leaks because someone logged the struct that happened to hold one.
+    /// Derived `Debug` put the key one `{:?}` away from any log line, any
+    /// error context, any telemetry payload built by formatting.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_type", &self.api_type)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("default_model", &self.default_model)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 /// Resolve every `task_models` entry (plus an implicit `default_provider`

@@ -20,6 +20,7 @@
 //! |---|---|
 //! | [`model::Model`] | the LLM backend / wire protocol |
 //! | [`model_factory::ModelFactory`] | how a protocol is built from config |
+//! | [`credentials::CredentialSource`] | where a provider's API key comes from |
 //! | [`tool::Tool`] / [`tool::ToolRegistry`] | a tool, or the whole tool set |
 //! | [`scene::AgentScene`] | system prompt, tool surface, budgets |
 //! | [`permission::Permission`] | tool authorization |
@@ -41,6 +42,7 @@
 //! index, not this directory.
 
 pub mod agent_spawner;
+pub mod credentials;
 pub mod elicitation;
 pub mod event_sink;
 #[deprecated(note = "moved to `base::event` — event payloads, not an injectable contract")]

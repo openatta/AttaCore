@@ -376,10 +376,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Auth ───────────────────────────────────────────────────────────
-    let api_key = std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .map_err(|_| anyhow::anyhow!("set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY"))?;
-    let auth = AuthMode::ApiKey(api_key);
+    // Through the contract rather than reading the environment inline, so
+    // this and the per-provider clients built by `model_router` get their
+    // credentials the same way — a host that swaps the source swaps both.
+    let credentials = base::interface::credentials::EnvCredentials::anthropic();
+    let api_key = base::interface::credentials::CredentialSource::api_key(
+        &credentials,
+        "default",
+        &base::provider::ProviderConfig::default(),
+    )
+    .map_err(|_| anyhow::anyhow!("set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY"))?;
+    let auth = AuthMode::ApiKey(api_key.expose().to_string());
     let client: Arc<dyn AnthropicClient> = match std::env::var("ANTHROPIC_BASE_URL").ok() {
         Some(mut url) => {
             // Ensure trailing slash so Url::join appends instead of replacing

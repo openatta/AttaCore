@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use base::interface::credentials::CredentialSource;
 use base::interface::model::Model;
 use base::interface::model_factory::{ModelFactory, ModelFactoryRegistry};
 use base::provider::ProviderConfig;
@@ -25,13 +26,16 @@ impl ModelFactory for AnthropicFactory {
         "anthropic"
     }
 
-    fn build(&self, provider_id: &str, cfg: &ProviderConfig) -> Result<Arc<dyn Model>, String> {
-        let api_key = cfg
-            .api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| format!("provider '{provider_id}': missing api_key"))?;
-        let auth = AuthMode::ApiKey(api_key);
+    fn build(
+        &self,
+        provider_id: &str,
+        cfg: &ProviderConfig,
+        credentials: &dyn CredentialSource,
+    ) -> Result<Arc<dyn Model>, String> {
+        let api_key = credentials
+            .api_key(provider_id, cfg)
+            .map_err(|e| format!("provider '{provider_id}': {e}"))?;
+        let auth = AuthMode::ApiKey(api_key.expose().to_string());
         let client: Arc<dyn AnthropicClient> = match cfg.base_url.as_deref() {
             Some(url) if !url.is_empty() => {
                 let mut url = url.to_string();
@@ -63,7 +67,12 @@ impl ModelFactory for OpenAICompatibleFactory {
         "openai_compatible"
     }
 
-    fn build(&self, provider_id: &str, cfg: &ProviderConfig) -> Result<Arc<dyn Model>, String> {
+    fn build(
+        &self,
+        provider_id: &str,
+        cfg: &ProviderConfig,
+        credentials: &dyn CredentialSource,
+    ) -> Result<Arc<dyn Model>, String> {
         // Required here, unlike the Anthropic factory: there is no default
         // OpenAI-compatible host to fall back to, and guessing one produces a
         // confusing auth failure at first use instead of a clear config error
@@ -75,14 +84,12 @@ impl ModelFactory for OpenAICompatibleFactory {
             .ok_or_else(|| {
                 format!("provider '{provider_id}': api_type 'openai_compatible' requires base_url")
             })?;
-        let api_key = cfg
-            .api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| format!("provider '{provider_id}': missing api_key"))?;
+        let api_key = credentials
+            .api_key(provider_id, cfg)
+            .map_err(|e| format!("provider '{provider_id}': {e}"))?;
         let default_model = cfg.default_model.clone().unwrap_or_default();
         Ok(Arc::new(
-            crate::OpenAICompatibleModel::new(&base_url, api_key, default_model)
+            crate::OpenAICompatibleModel::new(&base_url, api_key.expose(), default_model)
                 .map_err(|e| format!("provider '{provider_id}': {e}"))?,
         ))
     }

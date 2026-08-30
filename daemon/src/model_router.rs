@@ -225,6 +225,7 @@ mod tests {
                 &self,
                 _provider_id: &str,
                 _cfg: &ProviderConfig,
+                _credentials: &dyn base::interface::credentials::CredentialSource,
             ) -> Result<std::sync::Arc<dyn base::interface::model::Model>, String> {
                 Ok(std::sync::Arc::new(Fictional))
             }
@@ -257,5 +258,28 @@ mod tests {
             "the task must be routed to the model the registered factory built"
         );
         assert_eq!(router.model_name_for("main"), Some("whatever"));
+    }
+
+    /// A host that must not keep credentials on disk: the key is absent from
+    /// config entirely, and the provider still builds.
+    #[test]
+    fn a_credential_source_can_supply_what_settings_json_does_not_hold() {
+        use base::interface::credentials::{Secret, StaticCredentials};
+
+        let mut cfg = anthropic_provider("");
+        cfg.api_key = None;
+        assert!(
+            builtins().build("vaulted", &cfg).is_err(),
+            "with no key anywhere, this must still fail"
+        );
+
+        let factories = builtins().with_credentials(std::sync::Arc::new(StaticCredentials::new([(
+            "vaulted".to_string(),
+            Secret::new("sk-from-the-vault"),
+        )])));
+        assert!(
+            factories.build("vaulted", &cfg).is_ok(),
+            "the registry must ask the source, not the config field"
+        );
     }
 }
