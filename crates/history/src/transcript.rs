@@ -92,7 +92,13 @@ pub fn resume_projection_report(entries: &[EnvelopedEntry]) -> ResumeProjectionR
             continue;
         }
         match &env.entry {
-            LogEntry::Meta { .. } | LogEntry::System { .. } | LogEntry::UsageSnapshot { .. } => {
+            LogEntry::Meta { .. }
+            | LogEntry::System { .. }
+            | LogEntry::UsageSnapshot { .. }
+            // Counted as metadata so the report still explains itself: a
+            // session with many entries and few messages should say where the
+            // difference went, and an extension's entries are part of it.
+            | LogEntry::Extension { .. } => {
                 report.metadata_entry_count += 1;
             }
             LogEntry::Compact {
@@ -181,6 +187,7 @@ pub fn latest_projected_message_entry_id(entries: &[EnvelopedEntry]) -> Option<I
         | LogEntry::Compact { .. }
         | LogEntry::UsageSnapshot { .. }
         | LogEntry::PasteRef { .. }
+        | LogEntry::Extension { .. }
         | LogEntry::SessionEnd { .. } => None,
     })
 }
@@ -192,6 +199,12 @@ fn apply_entry_to_messages(entry: &LogEntry, messages: &mut Vec<Message>) {
         | LogEntry::UsageSnapshot { .. }
         | LogEntry::PasteRef { .. }
         | LogEntry::SessionEnd { .. } => {} // PasteRef hydrated by store::load()
+        // An extension's state is not model-visible. Whether it could be —
+        // and what would have to be true for it to be reconstructible from
+        // the log if it were — is the projection question, not this one.
+        // Skipping here is what makes an entry from an uninstalled plugin
+        // inert rather than fatal.
+        LogEntry::Extension { .. } => {}
         LogEntry::User { content } => messages.push(Message::User {
             content: content.clone(),
         }),
@@ -757,5 +770,97 @@ mod tests {
             Some(ResumeProjectionWarning::EmptyCompactBoundary)
         );
         assert_eq!(report.compact_boundary_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod extension_entry_tests {
+    use super::*;
+    use crate::entry::LogEntry;
+    use base::message::ContentBlock;
+    use base::session::SessionId;
+
+    fn text(t: &str) -> LogEntry {
+        LogEntry::User {
+            content: vec![ContentBlock::Text {
+                text: t.into(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    fn ext(ns: &str) -> LogEntry {
+        LogEntry::Extension {
+            ns: ns.into(),
+            event: "checkpoint".into(),
+            payload: serde_json::json!({"step": 3}),
+        }
+    }
+
+    /// The invariant that makes uninstalling a plugin safe: its entries are
+    /// still in the log, and the conversation reads exactly as it did.
+    #[test]
+    fn entries_from_an_unknown_namespace_change_nothing_the_model_sees() {
+        let s = SessionId::new();
+        let without: Vec<_> = [text("one"), text("two")]
+            .into_iter()
+            .map(|e| EnvelopedEntry::new(s, e))
+            .collect();
+        let with: Vec<_> = [
+            ext("com.example.gone"),
+            text("one"),
+            ext("com.example.gone"),
+            text("two"),
+            ext("com.example.gone"),
+        ]
+        .into_iter()
+        .map(|e| EnvelopedEntry::new(s, e))
+        .collect();
+
+        assert_eq!(
+            project_messages(&with).len(),
+            project_messages(&without).len(),
+            "an extension's state is not a message"
+        );
+        assert_eq!(
+            latest_projected_message_entry_id(&with),
+            with.iter()
+                .rev()
+                .find(|e| matches!(e.entry, LogEntry::User { .. }))
+                .map(|e| e.id),
+            "the last model-visible entry must not become an extension's"
+        );
+    }
+
+    /// Fork copies entries forward by cloning and re-appending them; an entry
+    /// the kernel cannot read must still come out the far side byte for byte,
+    /// or forking a session would quietly strip an extension's state.
+    #[test]
+    fn an_extension_entry_survives_being_copied_forward() {
+        let original = ext("com.example.gone");
+        let line = serde_json::to_string(&original).unwrap();
+        let parsed: LogEntry = serde_json::from_str(&line).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), line);
+
+        let LogEntry::Extension { ns, event, payload } = parsed else {
+            panic!("expected an extension entry");
+        };
+        assert_eq!(ns, "com.example.gone");
+        assert_eq!(event, "checkpoint");
+        assert_eq!(payload, serde_json::json!({"step": 3}));
+    }
+
+    #[test]
+    fn resume_counts_an_extension_entry_without_warning_about_it() {
+        let s = SessionId::new();
+        let entries: Vec<_> = [text("one"), ext("com.example.gone")]
+            .into_iter()
+            .map(|e| EnvelopedEntry::new(s, e))
+            .collect();
+        let report = resume_projection_report(&entries);
+        assert_eq!(report.entry_count, 2);
+        assert_eq!(report.projected_message_count, 1);
+        assert_eq!(report.metadata_entry_count, 1);
+        assert!(report.warning.is_none(), "{:?}", report.warning);
     }
 }

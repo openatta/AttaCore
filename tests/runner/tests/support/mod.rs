@@ -214,6 +214,9 @@ pub fn normalize_log(entries: &[history::entry::EnvelopedEntry]) -> String {
             history::entry::LogEntry::UsageSnapshot { .. } => "UsageSnapshot".to_string(),
             history::entry::LogEntry::PasteRef { .. } => "PasteRef".to_string(),
             history::entry::LogEntry::SessionEnd { state } => format!("SessionEnd {state:?}"),
+            history::entry::LogEntry::Extension { ns, event, .. } => {
+                format!("Extension {ns}/{event}")
+            }
         };
         out.push_str(&line);
         out.push('\n');

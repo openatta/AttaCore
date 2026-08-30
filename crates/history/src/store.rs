@@ -1684,6 +1684,38 @@ mod contract_tests {
         );
     });
 
+    for_each_store!(an_extension_entry_comes_back_exactly_as_written, |store| {
+        let s = SessionId::new();
+        store.append(s, meta(None)).await.unwrap();
+        store
+            .append(
+                s,
+                LogEntry::Extension {
+                    ns: "com.example.gone".into(),
+                    event: "checkpoint".into(),
+                    payload: serde_json::json!({"step": 3, "nested": {"a": [1, 2]}}),
+                },
+            )
+            .await
+            .unwrap();
+        store.append(s, user("after")).await.unwrap();
+
+        let loaded = store.load(s).await.unwrap();
+        assert_eq!(loaded.len(), 3, "an unreadable entry is still an entry");
+        let LogEntry::Extension { ns, event, payload } = &loaded[1].entry else {
+            panic!("expected the extension entry in position, got {:?}", loaded[1].entry);
+        };
+        assert_eq!(ns, "com.example.gone");
+        assert_eq!(event, "checkpoint");
+        assert_eq!(payload, &serde_json::json!({"step": 3, "nested": {"a": [1, 2]}}));
+
+        assert_eq!(
+            store.load_messages(s).await.unwrap().len(),
+            1,
+            "it must not have become something the model sees"
+        );
+    });
+
     for_each_store!(messages_are_projected_from_the_log, |store| {
         let s = SessionId::new();
         store.append(s, meta(None)).await.unwrap();

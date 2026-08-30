@@ -201,6 +201,43 @@ pub enum LogEntry {
     /// `session.resume` rejects a sidechain that has one with
     /// `SIDECHAIN_TERMINAL` (docs/daemon_rpc_protocol.md §3.3/§9).
     SessionEnd { state: SessionEndState },
+
+    /// State belonging to something outside the kernel — a plugin, a script,
+    /// a host's own bookkeeping.
+    ///
+    /// The engine's rule is that state lives in the log. A closed enum makes
+    /// that rule impossible to follow for anyone extending the engine: their
+    /// state has to live somewhere else, out of order with everything it
+    /// happened between, and gone on resume. This is the variant that lets
+    /// them follow it.
+    ///
+    /// The kernel does not interpret `payload`. What it does promise is
+    /// ordering against every other entry, persistence, and that the entry
+    /// survives a load / fork / resume unchanged.
+    ///
+    /// # An unknown `ns` is inert, never an error
+    ///
+    /// A log outlives the extension that wrote it. Uninstall a plugin and its
+    /// entries are still there, and the session must still load, fork and
+    /// resume exactly as before — an unreadable line is not a reason to
+    /// refuse a conversation. That works because nothing here parses
+    /// `payload`: an entry whose `ns` nobody claims is carried along and
+    /// otherwise ignored.
+    ///
+    /// Whether an extension entry can become something the model sees is a
+    /// separate question, and today the answer is no — projection skips it.
+    Extension {
+        /// Who it belongs to. A plugin name or script path; the kernel treats
+        /// it as an opaque key and only ever compares it.
+        ns: String,
+        /// What happened, in the extension's own vocabulary. Named `event`
+        /// rather than the more natural `kind` because `kind` is this enum's
+        /// own serde tag, and a variant field cannot share it.
+        event: String,
+        /// The extension's state. Opaque here.
+        #[serde(default)]
+        payload: serde_json::Value,
+    },
 }
 
 /// Outcome recorded by [`LogEntry::SessionEnd`].
