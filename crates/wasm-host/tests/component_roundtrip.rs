@@ -50,7 +50,7 @@ fn caps(net: Vec<String>, timeout_ms: u64) -> Arc<ResolvedCapabilities> {
         ..Default::default()
     };
     Arc::new(
-        ResolvedCapabilities::resolve(&c, &std::env::temp_dir(), &std::env::temp_dir()).unwrap(),
+        wasm_host::capabilities::resolve(&c, &std::env::temp_dir(), &std::env::temp_dir()).unwrap(),
     )
 }
 

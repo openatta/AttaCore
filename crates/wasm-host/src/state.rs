@@ -168,7 +168,7 @@ mod tests {
             ..Default::default()
         };
         let mut resolved =
-            ResolvedCapabilities::resolve(&c, Path::new("/ws"), Path::new("/plug")).unwrap();
+            crate::capabilities::resolve(&c, Path::new("/ws"), Path::new("/plug")).unwrap();
         resolved.fs_read = fs_read;
         resolved.fs_write = fs_write;
         Arc::new(resolved)

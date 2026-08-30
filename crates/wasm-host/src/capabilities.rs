@@ -1,148 +1,59 @@
-//! Turning a manifest's capability declaration into something the host
-//! enforces.
+//! Turning a WebAssembly plugin's manifest into the engine's capability
+//! table.
 //!
-//! The manifest is a promise about what a plugin will reach; this module is
-//! where that promise becomes the only thing it *can* reach. Two rules shape
-//! everything here:
+//! The table and every predicate over it live in
+//! [`base::interface::capabilities`], above this carrier and shared with every
+//! other one. This module is the manifest-shaped half: it converts what a
+//! `plugin.toml` declares into the neutral declaration the kernel resolves,
+//! and adds nothing.
 //!
-//! - **Nothing is granted by omission.** An undeclared capability is denied,
-//!   so a plugin that declares nothing can compute and no more.
-//! - **Resolution happens once, at load.** Variables like `${workspace}` are
-//!   expanded and paths canonicalized before the component runs, so no check
-//!   at call time depends on state a plugin could influence.
+//! There is deliberately no allow-check here. Two carriers with two
+//! allow-lists drift, and the one that drifts is found by an incident rather
+//! than by a test — so the second carrier gets the same function, not its own.
 
-use anyhow::{bail, Result};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use anyhow::Result;
+use std::path::Path;
 
-/// A capability declaration with its paths resolved against a concrete
-/// workspace, ready to enforce.
-#[derive(Debug, Clone)]
-pub struct ResolvedCapabilities {
-    pub fs_read: Vec<PathBuf>,
-    pub fs_write: Vec<PathBuf>,
-    net: HashSet<String>,
-    env: HashSet<String>,
-    pub max_memory_bytes: usize,
-    pub timeout: std::time::Duration,
-}
+pub use base::interface::capabilities::{host_of, Capabilities as ResolvedCapabilities};
 
-impl ResolvedCapabilities {
-    /// Resolve a manifest declaration. `workspace` backs `${workspace}`;
-    /// `plugin_root` backs `${plugin}`.
-    ///
-    /// A path that escapes neither anchor is rejected rather than accepted
-    /// literally: an absolute `/` in `fs_read` would otherwise read as a
-    /// grant of the whole filesystem, which is exactly the kind of thing a
-    /// reviewer skims past.
-    pub fn resolve(
-        caps: &plugin::manifest::Capabilities,
-        workspace: &Path,
-        plugin_root: &Path,
-    ) -> Result<Self> {
-        let expand = |list: &[String]| -> Result<Vec<PathBuf>> {
-            list.iter()
-                .map(|raw| resolve_path(raw, workspace, plugin_root))
-                .collect()
-        };
-        Ok(Self {
-            fs_read: expand(&caps.fs_read)?,
-            fs_write: expand(&caps.fs_write)?,
-            net: caps.net.iter().map(|h| h.to_ascii_lowercase()).collect(),
-            env: caps.env.iter().cloned().collect(),
-            max_memory_bytes: (caps.max_memory_mb as usize).saturating_mul(1024 * 1024),
-            timeout: std::time::Duration::from_millis(caps.timeout_ms),
-        })
-    }
-
-    /// May the component fetch this URL?
-    ///
-    /// Matched on host, exactly. No suffix matching: `evil-github.com` must
-    /// not satisfy a declaration of `github.com`, and a plugin that wants a
-    /// subdomain can name it.
-    pub fn allows_url(&self, url: &str) -> bool {
-        match host_of(url) {
-            Some(host) => self.net.contains(&host),
-            None => false,
-        }
-    }
-
-    /// May the component read this environment variable?
-    pub fn allows_env(&self, key: &str) -> bool {
-        self.env.contains(key)
-    }
-
-    /// Does this grant anything beyond pure computation? Drives what the
-    /// installer has to put in front of the user.
-    pub fn reaches_outside(&self) -> bool {
-        !self.fs_read.is_empty()
-            || !self.fs_write.is_empty()
-            || !self.net.is_empty()
-            || !self.env.is_empty()
+/// What a `plugin.toml` declared, as the kernel's neutral declaration.
+fn declaration(caps: &plugin::manifest::Capabilities) -> base::interface::capabilities::CapabilityDeclaration {
+    base::interface::capabilities::CapabilityDeclaration {
+        fs_read: caps.fs_read.clone(),
+        fs_write: caps.fs_write.clone(),
+        net: caps.net.clone(),
+        env: caps.env.clone(),
+        max_memory_mb: caps.max_memory_mb,
+        timeout_ms: caps.timeout_ms,
     }
 }
 
-/// Lowercased host of an absolute http(s) URL.
-///
-/// Public because an error message must be able to name what was refused
-/// *without* echoing the URL: a plugin may have built it from a secret it
-/// fetched through `host.secret`, and a refusal that quotes the whole thing
-/// puts that secret into the model's context and the session transcript.
-///
-/// Deliberately narrow: anything that isn't plainly `http://host/...` or
-/// `https://host/...` yields `None`, and `None` means denied. A parser that
-/// tries to be clever about malformed input is a parser an attacker gets to
-/// negotiate with.
-pub fn host_of(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    // Strip userinfo, which is the classic way to make a URL look like it
-    // points somewhere it doesn't (`https://github.com@evil.example/`).
-    let authority = authority.rsplit('@').next()?;
-    let host = authority.split(':').next()?;
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
-}
-
-fn resolve_path(raw: &str, workspace: &Path, plugin_root: &Path) -> Result<PathBuf> {
-    let expanded = if let Some(rest) = raw.strip_prefix("${workspace}") {
-        workspace.join(rest.trim_start_matches('/'))
-    } else if let Some(rest) = raw.strip_prefix("${plugin}") {
-        plugin_root.join(rest.trim_start_matches('/'))
-    } else {
-        bail!(
-            "capability path `{raw}` must start with ${{workspace}} or ${{plugin}} — \
-             an unanchored path would grant more than a reviewer can judge"
-        );
-    };
-    if expanded
-        .components()
-        .any(|c| c == std::path::Component::ParentDir)
-    {
-        bail!("capability path `{raw}` may not contain `..`");
-    }
-    Ok(expanded)
+/// Resolve a manifest declaration against a concrete workspace.
+pub fn resolve(
+    caps: &plugin::manifest::Capabilities,
+    workspace: &Path,
+    plugin_root: &Path,
+) -> Result<ResolvedCapabilities> {
+    ResolvedCapabilities::resolve(&declaration(caps), workspace, plugin_root)
+        .map_err(|e| anyhow::anyhow!(e.0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn caps() -> plugin::manifest::Capabilities {
         plugin::manifest::Capabilities::default()
     }
 
-    fn resolve(c: plugin::manifest::Capabilities) -> Result<ResolvedCapabilities> {
-        ResolvedCapabilities::resolve(&c, Path::new("/ws"), Path::new("/plug"))
+    fn resolve_for_test(c: plugin::manifest::Capabilities) -> Result<ResolvedCapabilities> {
+        resolve(&c, Path::new("/ws"), Path::new("/plug"))
     }
 
     #[test]
     fn an_empty_declaration_grants_nothing() {
-        let r = resolve(caps()).unwrap();
+        let r = resolve_for_test(caps()).unwrap();
         assert!(!r.reaches_outside());
         assert!(!r.allows_url("https://example.com/x"));
         assert!(!r.allows_env("PATH"));
@@ -154,7 +65,7 @@ mod tests {
         let mut c = caps();
         c.fs_read = vec!["${workspace}/src".into()];
         c.fs_write = vec!["${plugin}/scratch".into()];
-        let r = resolve(c).unwrap();
+        let r = resolve_for_test(c).unwrap();
         assert_eq!(r.fs_read, [PathBuf::from("/ws/src")]);
         assert_eq!(r.fs_write, [PathBuf::from("/plug/scratch")]);
     }
@@ -166,7 +77,7 @@ mod tests {
     fn an_unanchored_path_is_refused() {
         let mut c = caps();
         c.fs_read = vec!["/".into()];
-        let err = resolve(c).unwrap_err().to_string();
+        let err = resolve_for_test(c).unwrap_err().to_string();
         assert!(err.contains("${workspace}"), "{err}");
     }
 
@@ -174,14 +85,14 @@ mod tests {
     fn a_traversal_is_refused() {
         let mut c = caps();
         c.fs_read = vec!["${workspace}/../../etc".into()];
-        assert!(resolve(c).unwrap_err().to_string().contains(".."));
+        assert!(resolve_for_test(c).unwrap_err().to_string().contains(".."));
     }
 
     #[test]
     fn net_matches_the_host_exactly() {
         let mut c = caps();
         c.net = vec!["api.github.com".into()];
-        let r = resolve(c).unwrap();
+        let r = resolve_for_test(c).unwrap();
 
         assert!(r.allows_url("https://api.github.com/repos"));
         assert!(
@@ -207,7 +118,7 @@ mod tests {
     fn userinfo_cannot_disguise_the_real_host() {
         let mut c = caps();
         c.net = vec!["allowed.example".into()];
-        let r = resolve(c).unwrap();
+        let r = resolve_for_test(c).unwrap();
         assert!(!r.allows_url("https://allowed.example@evil.example/x"));
         assert!(r.allows_url("https://user:pw@allowed.example/x"));
     }
@@ -216,7 +127,7 @@ mod tests {
     fn non_http_urls_are_denied_rather_than_parsed() {
         let mut c = caps();
         c.net = vec!["example.com".into()];
-        let r = resolve(c).unwrap();
+        let r = resolve_for_test(c).unwrap();
         for url in [
             "file:///etc/passwd",
             "ftp://example.com/x",
@@ -232,7 +143,7 @@ mod tests {
     fn env_matches_exactly_and_is_case_sensitive() {
         let mut c = caps();
         c.env = vec!["GITHUB_TOKEN".into()];
-        let r = resolve(c).unwrap();
+        let r = resolve_for_test(c).unwrap();
         assert!(r.allows_env("GITHUB_TOKEN"));
         assert!(!r.allows_env("github_token"));
         assert!(!r.allows_env("GITHUB_TOKEN_2"));
@@ -244,7 +155,7 @@ mod tests {
         let mut c = caps();
         c.max_memory_mb = 32;
         c.timeout_ms = 1500;
-        let r = resolve(c).unwrap();
+        let r = resolve_for_test(c).unwrap();
         assert_eq!(r.max_memory_bytes, 32 * 1024 * 1024);
         assert_eq!(r.timeout, std::time::Duration::from_millis(1500));
     }

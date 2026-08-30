@@ -18,7 +18,7 @@ use runtime::plugin_host::PluginHost;
 use std::path::Path;
 use std::sync::Arc;
 use wasm_host::health::HealthRegistry;
-use wasm_host::{ResolvedCapabilities, WasmEngine, WasmToolAdapter};
+use wasm_host::{WasmEngine, WasmToolAdapter};
 
 /// How many plugins may be loaded at once.
 ///
@@ -530,7 +530,7 @@ async fn load_payload(
     Vec<Arc<dyn base::tool::Tool>>,
     Vec<ToolText>,
 )> {
-    let caps = Arc::new(ResolvedCapabilities::resolve(
+    let caps = Arc::new(wasm_host::capabilities::resolve(
         &payload.capabilities,
         workspace,
         &plugin.root,

@@ -95,7 +95,6 @@ impl Host for PluginState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::ResolvedCapabilities;
     use crate::state::{KvNamespace, ProgressSink};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -106,7 +105,7 @@ mod tests {
             env,
             ..Default::default()
         };
-        let caps = ResolvedCapabilities::resolve(&c, Path::new("/ws"), Path::new("/plug")).unwrap();
+        let caps = crate::capabilities::resolve(&c, Path::new("/ws"), Path::new("/plug")).unwrap();
         PluginState::new("p", Arc::new(caps), Arc::new(KvNamespace::new()), None).unwrap()
     }
 
@@ -214,7 +213,7 @@ mod tests {
         }
 
         let recorder = Arc::new(Recorder::default());
-        let caps = ResolvedCapabilities::resolve(
+        let caps = crate::capabilities::resolve(
             &plugin::manifest::Capabilities::default(),
             Path::new("/ws"),
             Path::new("/plug"),

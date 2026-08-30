@@ -51,6 +51,7 @@
 //! index, not this directory.
 
 pub mod agent_spawner;
+pub mod capabilities;
 pub mod catalog;
 pub mod credentials;
 pub mod elicitation;
