@@ -6,6 +6,7 @@ pub mod agent_tool;
 mod agent_type_watcher;
 pub mod commands;
 pub mod context;
+pub mod elicitation;
 pub mod event_bus;
 pub mod hook_executors;
 pub mod plugin_host;

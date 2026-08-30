@@ -20,9 +20,22 @@ use crate::frozen::{
     detect_import_sources, execute_import, import_already_decided, mark_imported, mark_skipped,
     ImportSource,
 };
+use crate::interface::elicitation::{
+    ElicitKind, ElicitOption, ElicitOutcome, ElicitRequest, Elicitation,
+};
 
 /// What the host decided after being shown the detected import sources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Wire shape: `{"type":"import","source":"claude_code"}` / `{"type":"skip"}`
+/// / `{"type":"defer"}` — what an [`Elicitation`] implementation returns for
+/// an [`ElicitKind::Import`] question. Adjacently tagged rather than
+/// internally tagged so the `Import` variant can keep carrying its kind
+/// directly instead of being widened into a struct variant nobody asked for.
+///
+/// [`Elicitation`]: crate::interface::elicitation::Elicitation
+/// [`ElicitKind::Import`]: crate::interface::elicitation::ElicitKind::Import
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "source", rename_all = "snake_case")]
 pub enum ImportDecision {
     /// Import from exactly one of the offered sources (single-select by
     /// design — see migration doc §3.0).
@@ -37,6 +50,13 @@ pub enum ImportDecision {
 
 /// Implemented by hosts that can synchronously present detected import
 /// sources to a human and get a decision back.
+///
+/// Superseded by [`Elicitation`], which is the one place the engine asks a
+/// person anything. This stays because it is a published trait and hosts
+/// implement it; [`maybe_detect_and_import`] adapts it to the new contract,
+/// so an existing implementation keeps working unchanged.
+///
+/// [`Elicitation`]: crate::interface::elicitation::Elicitation
 #[async_trait]
 pub trait ImportCallback: Send + Sync {
     /// Called once per process (at most) when importable sources are
@@ -70,29 +90,100 @@ pub async fn maybe_detect_and_import(
     callback: Option<&Arc<dyn ImportCallback>>,
     timeout: Duration,
 ) -> Option<crate::frozen::ImportSummary> {
+    let asker: Arc<dyn Elicitation> = match callback {
+        Some(cb) => Arc::new(CallbackAsAsker {
+            callback: cb.clone(),
+            cwd: cwd.to_path_buf(),
+        }),
+        None => return None,
+    };
+    maybe_detect_and_import_asking(cwd, Some(&asker), timeout).await
+}
+
+/// Same as [`maybe_detect_and_import`], asking through the engine's one
+/// human-question contract instead of a callback of its own.
+///
+/// `None` for a host that cannot ask anybody; so is an [`Elicitation`] that
+/// declines, and both mean the same thing here — no import, no marker, ask
+/// again next process start. Which is the point of routing it through the
+/// contract: a host that registered nothing gets the same answer as one whose
+/// user said "later", instead of each path inventing its own idea of what
+/// silence means.
+pub async fn maybe_detect_and_import_asking(
+    cwd: &Path,
+    asker: Option<&Arc<dyn Elicitation>>,
+    timeout: Duration,
+) -> Option<crate::frozen::ImportSummary> {
     if import_already_decided(cwd).await {
         return None;
     }
-    let cb = callback?;
+    let asker = asker?;
     let sources = detect_import_sources(cwd).await;
     if sources.is_empty() {
         return None;
     }
-    match tokio::time::timeout(timeout, cb.on_import_detected(&sources)).await {
-        Ok(ImportDecision::Import(kind)) => {
+    let request = ElicitRequest {
+        id: format!("import:{}", cwd.display()),
+        kind: ElicitKind::Import {
+            sources: sources.iter().map(|s| s.kind().as_str().to_string()).collect(),
+        },
+        message: "Configuration from another agent tool was found here. Import it?".to_string(),
+        options: sources
+            .iter()
+            .map(|s| ElicitOption {
+                key: s.kind().as_str().to_string(),
+                label: s.kind().as_str().to_string(),
+            })
+            .collect(),
+    };
+    let decision = match tokio::time::timeout(timeout, asker.ask(request)).await {
+        Ok(outcome) => outcome
+            .answer_as::<ImportDecision>()
+            .unwrap_or(ImportDecision::Defer),
+        // A host that never answers is a host that has not decided.
+        Err(_) => ImportDecision::Defer,
+    };
+    match decision {
+        ImportDecision::Import(kind) => {
             let chosen = sources.iter().find(|s| s.kind() == kind)?;
             let summary = execute_import(cwd, chosen).await.ok()?;
             let _ = mark_imported(cwd, &sources, kind).await;
             Some(summary)
         }
-        Ok(ImportDecision::Skip) => {
+        ImportDecision::Skip => {
             let _ = mark_skipped(cwd, &sources, None).await;
             None
         }
-        Ok(ImportDecision::Defer) | Err(_) => {
-            // Timeout or explicit defer: no marker, ask again next process start.
+        ImportDecision::Defer => {
+            // Timeout, explicit defer, or nobody to ask: no marker, ask again
+            // next process start.
             None
         }
+    }
+}
+
+/// Lets a host's existing [`ImportCallback`] answer the import question now
+/// that the question comes through [`Elicitation`].
+struct CallbackAsAsker {
+    callback: Arc<dyn ImportCallback>,
+    cwd: std::path::PathBuf,
+}
+
+#[async_trait]
+impl Elicitation for CallbackAsAsker {
+    async fn ask(&self, request: ElicitRequest) -> ElicitOutcome {
+        if !matches!(request.kind, ElicitKind::Import { .. }) {
+            return ElicitOutcome::declined(
+                "this host's import callback answers import questions only",
+            );
+        }
+        // The request carries source *names*, and the callback's published
+        // signature takes whole `ImportSource`s — paths and parsed content
+        // included. Rather than widen the request with a type only this one
+        // question uses, the adapter re-runs what is a cheap directory probe,
+        // once per process, on a path that is already doing filesystem work.
+        let sources = detect_import_sources(&self.cwd).await;
+        ElicitOutcome::answered(&self.callback.on_import_detected(&sources).await)
     }
 }
 
@@ -253,6 +344,47 @@ mod tests {
             !import_already_decided(dir.path()).await,
             "defer must not persist a marker — ask again next time"
         );
+    }
+
+    /// The contract path, and the property it exists for: a host that
+    /// registered nothing to ask with gets the same "not now" as a user who
+    /// said "later" — no import, and no marker that would stop it asking
+    /// again.
+    #[tokio::test]
+    async fn a_host_that_cannot_ask_imports_nothing_and_records_nothing() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("CLAUDE.md"), "be concise")
+            .await
+            .unwrap();
+
+        let asker: Arc<dyn Elicitation> = Arc::new(crate::interface::elicitation::DeclineAll);
+        let result =
+            maybe_detect_and_import_asking(dir.path(), Some(&asker), Duration::from_secs(5)).await;
+        assert!(result.is_none());
+        assert!(
+            !import_already_decided(dir.path()).await,
+            "a decline is not a decision to skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_elicitation_answer_drives_the_import() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("CLAUDE.md"), "be concise")
+            .await
+            .unwrap();
+
+        let asker: Arc<dyn Elicitation> = crate::interface::elicitation::FixedElicitation::new(
+            ElicitOutcome::answered(&ImportDecision::Import(
+                crate::frozen::ImportSourceKind::ClaudeCode,
+            )),
+        );
+        let summary =
+            maybe_detect_and_import_asking(dir.path(), Some(&asker), Duration::from_secs(5))
+                .await
+                .expect("an answer of `import` must import");
+        assert_eq!(summary.kind, crate::frozen::ImportSourceKind::ClaudeCode);
+        assert!(import_already_decided(dir.path()).await);
     }
 
     #[tokio::test]

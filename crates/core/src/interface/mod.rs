@@ -26,6 +26,7 @@
 //! | [`import_callback::ImportCallback`] | the host's answer to an import prompt |
 //! | [`log::Logger`] | log routing |
 //! | [`event_sink::EventSink`] | where the engine's events go |
+//! | [`elicitation::Elicitation`] | how the engine asks a person something |
 //! | [`tool::SecondaryLlm`] | the small model tools may call |
 //!
 //! The engine's other replaceable contracts live in the crate that owns them
@@ -38,6 +39,7 @@
 //! index, not this directory.
 
 pub mod agent_spawner;
+pub mod elicitation;
 pub mod event_sink;
 #[deprecated(note = "moved to `base::event` — event payloads, not an injectable contract")]
 pub use crate::event;

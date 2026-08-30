@@ -274,6 +274,12 @@ pub struct ToolContext {
     pub events_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::context::task::BackgroundAgentProgressData>,
     >,
+    /// How a tool asks the user something — see
+    /// [`crate::interface::elicitation::Elicitation`]. `None` where nothing
+    /// can reach a person (a test context, a background run), which every
+    /// asking tool must read as a refusal rather than as permission to make
+    /// the answer up.
+    pub elicitation: Option<Arc<dyn crate::interface::elicitation::Elicitation>>,
 }
 impl ToolContext {
     pub fn for_test(cwd: PathBuf) -> Self {
@@ -297,6 +303,7 @@ impl ToolContext {
             parent_messages: None,
             agent_depth: 0,
             events_tx: None,
+            elicitation: None,
         }
     }
     pub fn from_engine_ctx(cwd: PathBuf, cancel: CancellationToken) -> Self {
@@ -320,6 +327,7 @@ impl ToolContext {
             parent_messages: None,
             agent_depth: 0,
             events_tx: None,
+            elicitation: None,
         }
     }
 }

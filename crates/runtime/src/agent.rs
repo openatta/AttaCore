@@ -172,6 +172,11 @@ pub struct Agent {
     /// by `prompt_id` and fires it. A `prompt_id` with no entry (already
     /// timed out, or a stale/duplicate response) is silently ignored.
     pub(crate) pending_permissions: PendingPermissions,
+    /// How this session asks a person something — see
+    /// [`base::interface::elicitation::Elicitation`]. Defaults to
+    /// [`crate::elicitation::ChannelElicitation`], which speaks the event /
+    /// input-channel protocol hosts already use.
+    pub(crate) elicitation: Arc<dyn base::interface::elicitation::Elicitation>,
     /// Cancellation token of the turn currently in flight — replaced by
     /// `run()` before each turn, cancelled by the input demultiplexer on
     /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
@@ -936,6 +941,9 @@ pub struct Builder {
     /// callers (tests, library embedding): `build()` self-scans and starts
     /// its own watcher, same as always.
     skill_catalog: Option<Arc<skills::manager::SkillManager>>,
+    /// Replaces the built-in way of asking a person something — see
+    /// [`Builder::elicitation`].
+    elicitation: Option<Arc<dyn base::interface::elicitation::Elicitation>>,
     /// Extra destinations for this session's events, beyond the `event_rx`
     /// `build()` returns — see [`Builder::event_sink`].
     event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
@@ -1126,6 +1134,7 @@ impl Builder {
             scene_registry: None,
             shared_agent_types: None,
             skill_catalog: None,
+            elicitation: None,
             event_sinks: Vec::new(),
             agent_depth: 0,
         }
@@ -1141,6 +1150,26 @@ impl Builder {
     /// would see a stream that starts in the middle and have no way to tell.
     pub fn event_sink(mut self, sink: Arc<dyn base::interface::event_sink::EventSink>) -> Self {
         self.event_sinks.push(sink);
+        self
+    }
+
+    /// Answer this session's questions to a human here instead of over the
+    /// event / input-channel protocol.
+    ///
+    /// A library embedder that can put a dialog on screen implements
+    /// [`Elicitation`] and gets the question directly, rather than pumping
+    /// `AgentEvent::PermissionPrompt` and `InputMessage::PermissionResponse`
+    /// by hand. Whatever is registered here is also what the engine asks when
+    /// it needs a clarification or an import confirmation — the built-in
+    /// implementation declines those, because the channel protocol has no
+    /// wire form for them.
+    ///
+    /// [`Elicitation`]: base::interface::elicitation::Elicitation
+    pub fn elicitation(
+        mut self,
+        e: Arc<dyn base::interface::elicitation::Elicitation>,
+    ) -> Self {
+        self.elicitation = Some(e);
         self
     }
 
@@ -1977,6 +2006,12 @@ impl Builder {
                 config,
                 agent_depth,
                 permission,
+                elicitation: self.elicitation.unwrap_or_else(|| {
+                    Arc::new(crate::elicitation::ChannelElicitation::new(
+                        event_tx.clone(),
+                        pending_permissions.clone(),
+                    ))
+                }),
                 pending_permissions,
                 current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
                 memory_store,

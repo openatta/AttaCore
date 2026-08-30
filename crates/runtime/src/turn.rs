@@ -953,8 +953,7 @@ impl Agent {
             let config_for_exec = Arc::clone(&self.config);
             let permission_for_exec = Arc::clone(&self.permission);
             let session_state_for_exec = Arc::clone(&self.session_state);
-            let pending_permissions_for_exec = Arc::clone(&self.pending_permissions);
-            let event_tx_for_exec = self.event_tx.clone();
+            let elicitation_for_exec = Arc::clone(&self.elicitation);
             let tool_images: Arc<std::sync::Mutex<Vec<PendingToolImage>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let tool_images_for_exec = Arc::clone(&tool_images);
@@ -978,8 +977,7 @@ impl Agent {
                         config: Arc::clone(&config_for_exec),
                         permission: Arc::clone(&permission_for_exec),
                         session_state: Arc::clone(&session_state_for_exec),
-                        pending_permissions: Arc::clone(&pending_permissions_for_exec),
-                        event_tx: event_tx_for_exec.clone(),
+                        elicitation: Arc::clone(&elicitation_for_exec),
                         discontinued: Arc::clone(&discontinued_for_exec),
                         images: Arc::clone(&tool_images_for_exec),
                     };
@@ -2838,21 +2836,10 @@ pub(crate) struct ToolExecCtx {
     /// file snapshots, todos, plan mode) is visible to the next tool call
     /// instead of being dropped with a per-call throwaway.
     pub session_state: Arc<base::context::SessionState>,
-    /// See `Agent.pending_permissions`'s doc comment — shared so a `Prompt`
-    /// outcome here can register a receiver that `process_turn`'s
-    /// `PermissionResponse` branch later wakes.
-    pub pending_permissions: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::oneshot::Sender<crate::agent::PermissionDecision>,
-            >,
-        >,
-    >,
-    /// Real event sender — lets `execute_tool_inner` emit
-    /// `AgentEvent::PermissionPrompt` directly, same channel `Agent::run`'s
-    /// `SystemInit`/etc. events go out on.
-    pub event_tx: crate::agent::EventSender,
+    /// How this session asks a person to authorize a call. The turn decides
+    /// what to do with the answer — hooks, telemetry, the deadline — and this
+    /// decides how the question reaches a human at all.
+    pub elicitation: Arc<dyn base::interface::elicitation::Elicitation>,
     /// Images returned by tools this round, collected out-of-band.
     ///
     /// The tool-dispatch closure returns `(String, Option<Vec<Value>>)` — text
@@ -3147,20 +3134,18 @@ async fn execute_tool_inner(
                     .with_reason(format!("waiting for a permission decision on `{name}`"))
             })
             .await;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            ctx.pending_permissions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(prompt_id.clone(), tx);
-            let _ = ctx
-                .event_tx
-                .send(base::interface::event::AgentEvent::PermissionPrompt {
-                    prompt_id: prompt_id.clone(),
-                    tool_name: name.to_string(),
+            let ask = ctx
+                .elicitation
+                .ask(base::interface::elicitation::ElicitRequest {
+                    id: prompt_id.clone(),
+                    kind: base::interface::elicitation::ElicitKind::Authorization {
+                        tool_name: name.to_string(),
+                        paths,
+                    },
                     message,
-                    paths,
-                    turn_id: ctx.turn_id.clone(),
+                    options: crate::elicitation::ChannelElicitation::authorization_options(),
                 });
+            tokio::pin!(ask);
             // `0` means wait indefinitely; `tokio::select!` needs a future
             // either way, so an unbounded wait becomes one that never
             // resolves rather than a branch that isn't there.
@@ -3177,13 +3162,9 @@ async fn execute_tool_inner(
                 _ = &mut timeout_fut => {
                     // Fail closed. An unanswered prompt is not consent, and a
                     // host that never answers must not be able to hold a tool
-                    // call open forever. Drop the registration so a late
-                    // answer for this id is discarded rather than waking a
-                    // call that already resolved.
-                    ctx.pending_permissions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&prompt_id);
+                    // call open forever. Dropping `ask` here is what discards
+                    // a late answer for this id — see `ChannelElicitation`'s
+                    // registration guard.
                     fire_ctx_lifecycle_hook(ctx, hooks::HookEvent::PermissionDenied, |i| {
                         i.with_tool(name, input.clone())
                             .with_reason("permission prompt timed out")
@@ -3193,10 +3174,10 @@ async fn execute_tool_inner(
                         "Denied by permission: no answer to the permission prompt within {prompt_timeout}s"
                     ));
                 }
-                result = rx => {
-                    match result {
-                        Ok(crate::agent::PermissionDecision::Permit) => {}
-                        Ok(crate::agent::PermissionDecision::PermitAlways { scope }) => {
+                outcome = &mut ask => {
+                    match outcome.answer_as::<crate::agent::PermissionDecision>() {
+                        Some(crate::agent::PermissionDecision::Permit) => {}
+                        Some(crate::agent::PermissionDecision::PermitAlways { scope }) => {
                             // Same content derivation the rule engine itself
                             // uses to match a tool call against a rule (see
                             // `PermissionGate::check` step 3 — `RuleHit`
@@ -3237,7 +3218,7 @@ async fn execute_tool_inner(
                                 }
                             }
                         }
-                        Ok(crate::agent::PermissionDecision::Deny { reason }) => {
+                        Some(crate::agent::PermissionDecision::Deny { reason }) => {
                             // Denied by the *host's* answer to the prompt, as
                             // opposed to the rule-engine `Deny` above. Same
                             // event either way — a hook watching for denials
@@ -3250,24 +3231,27 @@ async fn execute_tool_inner(
                             .await;
                             return Err(format!("Denied by permission: {reason}"));
                         }
-                        Err(_) => {
-                            // Sender dropped without ever sending — shouldn't
-                            // happen (we hold the only registration and only
-                            // remove it here or on cancellation below), but
-                            // fail closed rather than silently proceed.
-                            ctx.pending_permissions
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&prompt_id);
-                            return Err("permission request channel closed without an answer".into());
+                        // Declined, or answered with something that is not a
+                        // decision. Either way nobody authorized this call, and
+                        // the reason is the decliner's own words — a host that
+                        // cannot ask says so, and the model is told what it was
+                        // told rather than a phrase invented here.
+                        None => {
+                            let reason = outcome
+                                .decline_reason()
+                                .unwrap_or("the answer to the permission prompt was not a decision")
+                                .to_string();
+                            fire_ctx_lifecycle_hook(
+                                ctx,
+                                hooks::HookEvent::PermissionDenied,
+                                |i| i.with_tool(name, input.clone()).with_reason(reason.clone()),
+                            )
+                            .await;
+                            return Err(reason);
                         }
                     }
                 }
                 _ = ctx.cancel.cancelled() => {
-                    ctx.pending_permissions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&prompt_id);
                     let _ = ctx.telemetry_handle.record(telemetry::TelemetryEvent::tool_cancelled(
                         &ctx.session_id,
                         ctx.turn_no,
@@ -3315,6 +3299,7 @@ async fn execute_tool_inner(
         parent_messages: None,
         agent_depth: ctx.agent_depth,
         events_tx: None,
+        elicitation: Some(Arc::clone(&ctx.elicitation)),
     };
     let input_for_post_hook = input.clone();
     let input_json_size = serde_json::to_string(&input)
@@ -4239,8 +4224,6 @@ mod tests {
         hooks: Arc<hooks::HookRunner>,
         permission: Arc<dyn base::interface::permission::Permission>,
     ) -> ToolExecCtx {
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let event_tx = crate::event_bus::EventBus::new(event_tx);
         ToolExecCtx {
             tools,
             cwd: std::env::temp_dir(),
@@ -4258,8 +4241,7 @@ mod tests {
             config: Arc::new(base::context::EngineConfig::defaults_for("test")),
             permission,
             session_state: Arc::new(base::context::SessionState::new(std::env::temp_dir())),
-            pending_permissions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            event_tx,
+            elicitation: Arc::new(base::interface::elicitation::DeclineAll),
             images: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -4664,6 +4646,21 @@ mod tests {
                 prompt_id: "unanswered",
             }),
         );
+        // The real asker, so the registration this test is about actually
+        // exists to be cleaned up.
+        let pending: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    String,
+                    tokio::sync::oneshot::Sender<crate::agent::PermissionDecision>,
+                >,
+            >,
+        > = Default::default();
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.elicitation = Arc::new(crate::elicitation::ChannelElicitation::new(
+            crate::event_bus::EventBus::new(events),
+            pending.clone(),
+        ));
         let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::channel(16);
         ctx.telemetry_handle = telemetry::TelemetryHandle::new(telemetry_tx);
 
@@ -4687,7 +4684,7 @@ mod tests {
         assert!(result.unwrap_err().contains("cancelled"));
         assert!(called.lock().unwrap().is_none());
         assert!(
-            ctx.pending_permissions.lock().unwrap().is_empty(),
+            pending.lock().unwrap().is_empty(),
             "the cancelled registration should have been cleaned up"
         );
 
@@ -4706,33 +4703,22 @@ mod tests {
             called: called.clone(),
         }));
         let hooks_runner = Arc::new(hooks::HookRunner::new(std::collections::HashMap::new()));
-        let ctx = test_exec_ctx_with_permission(
+        let mut ctx = test_exec_ctx_with_permission(
             tools,
             hooks_runner,
             Arc::new(PromptTestPermission {
                 prompt_id: "answered-deny",
             }),
         );
-
-        // Simulate `process_turn`'s `InputMessage::PermissionResponse`
-        // branch answering — poll until `execute_tool_inner` has registered
-        // the oneshot, then fire it.
-        let pending = ctx.pending_permissions.clone();
-        let responder = tokio::spawn(async move {
-            loop {
-                let sender = pending.lock().unwrap().remove("answered-deny");
-                if let Some(sender) = sender {
-                    let _ = sender.send(crate::agent::PermissionDecision::Deny {
-                        reason: "answered no".into(),
-                    });
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        });
+        ctx.elicitation = base::interface::elicitation::FixedElicitation::new(
+            base::interface::elicitation::ElicitOutcome::answered(
+                &crate::agent::PermissionDecision::Deny {
+                    reason: "answered no".into(),
+                },
+            ),
+        );
 
         let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
-        responder.await.unwrap();
         assert!(result.is_err(), "expected the real Deny response to win");
         assert!(result.unwrap_err().contains("answered no"));
         assert!(called.lock().unwrap().is_none());
@@ -4825,8 +4811,6 @@ mod tests {
             recorded: recorded.clone(),
         });
 
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let event_tx = crate::event_bus::EventBus::new(event_tx);
         let ctx = ToolExecCtx {
             tools,
             cwd: dir.path().to_path_buf(),
@@ -4842,27 +4826,17 @@ mod tests {
             config: Arc::new(base::context::EngineConfig::defaults_for("test")),
             permission,
             session_state: Arc::new(base::context::SessionState::new(dir.path().to_path_buf())),
-            pending_permissions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            event_tx,
+            elicitation: base::interface::elicitation::FixedElicitation::new(
+                base::interface::elicitation::ElicitOutcome::answered(
+                    &crate::agent::PermissionDecision::PermitAlways {
+                        scope: crate::agent::PersistScope::Local,
+                    },
+                ),
+            ),
             images: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
-        let pending = ctx.pending_permissions.clone();
-        let responder = tokio::spawn(async move {
-            loop {
-                let sender = pending.lock().unwrap().remove("permit-always-local");
-                if let Some(sender) = sender {
-                    let _ = sender.send(crate::agent::PermissionDecision::PermitAlways {
-                        scope: crate::agent::PersistScope::Local,
-                    });
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        });
-
         let result = execute_tool_with_telemetry(&ctx, "Probe", serde_json::json!({})).await;
-        responder.await.unwrap();
 
         assert!(
             result.is_ok(),
