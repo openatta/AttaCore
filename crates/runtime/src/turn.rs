@@ -955,6 +955,7 @@ impl Agent {
             let session_state_for_exec = Arc::clone(&self.session_state);
             let elicitation_for_exec = Arc::clone(&self.elicitation);
             let tool_middleware_for_exec = Arc::clone(&self.tool_middleware);
+            let result_transformers_for_exec = Arc::clone(&self.result_transformers);
             let tool_images: Arc<std::sync::Mutex<Vec<PendingToolImage>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let tool_images_for_exec = Arc::clone(&tool_images);
@@ -980,6 +981,7 @@ impl Agent {
                         session_state: Arc::clone(&session_state_for_exec),
                         elicitation: Arc::clone(&elicitation_for_exec),
                         tool_middleware: Arc::clone(&tool_middleware_for_exec),
+                        result_transformers: Arc::clone(&result_transformers_for_exec),
                         discontinued: Arc::clone(&discontinued_for_exec),
                         images: Arc::clone(&tool_images_for_exec),
                     };
@@ -2847,6 +2849,10 @@ pub(crate) struct ToolExecCtx {
     /// [`base::interface::tool_middleware`]. Empty in every session that
     /// registered none, which is the case dispatch short-circuits.
     pub tool_middleware: Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
+    /// The last hands on a tool's output — see
+    /// [`base::interface::tool_result`].
+    pub result_transformers:
+        Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
     /// Images returned by tools this round, collected out-of-band.
     ///
     /// The tool-dispatch closure returns `(String, Option<Vec<Value>>)` — text
@@ -3492,7 +3498,66 @@ async fn execute_tool_inner(
         }
     }
 
-    outcome
+    apply_result_transformers(ctx, name, &input_for_post_hook, outcome)
+}
+
+/// Run the registered transformers over this call's outcome.
+///
+/// Deliberately the last thing that touches it — after every hook, after the
+/// lifecycle events, immediately before the caller gets it. That ordering is
+/// what makes a redacting transformer a guarantee: nothing downstream can put
+/// back what it removed.
+///
+/// The images a tool returned were deposited in `ctx.images` on the way
+/// through, so a transformer that drops one has to reach in there rather than
+/// hand back a value. They are pulled out, offered, and put back — the
+/// side-channel exists because the dispatch signature has no room for binary
+/// content, not because images are supposed to be untouchable.
+fn apply_result_transformers(
+    ctx: &ToolExecCtx,
+    name: &str,
+    input: &serde_json::Value,
+    outcome: Result<(String, Option<Vec<serde_json::Value>>), String>,
+) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
+    if ctx.result_transformers.is_empty() {
+        return outcome;
+    }
+    let call = base::interface::tool_middleware::ToolCall {
+        name: name.to_string(),
+        input: input.clone(),
+    };
+    let (text, is_error, new_messages) = match outcome {
+        Ok((text, msgs)) => (text, false, msgs),
+        Err(e) => (e, true, None),
+    };
+    let images = std::mem::take(&mut *ctx.images.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut draft = base::interface::tool_result::ToolResultDraft {
+        text,
+        images: images
+            .into_iter()
+            .map(|i| base::interface::tool_result::ResultImage {
+                media_type: i.media_type,
+                data: i.data,
+            })
+            .collect(),
+        is_error,
+    };
+    base::interface::tool_result::apply(&ctx.result_transformers, &call, &mut draft);
+
+    *ctx.images.lock().unwrap_or_else(|e| e.into_inner()) = draft
+        .images
+        .into_iter()
+        .map(|i| PendingToolImage {
+            media_type: i.media_type,
+            data: i.data,
+        })
+        .collect();
+
+    if draft.is_error {
+        Err(draft.text)
+    } else {
+        Ok((draft.text, new_messages))
+    }
 }
 
 /// Register any of `mcp`'s current tool adapters that aren't already in
@@ -4277,6 +4342,7 @@ mod tests {
             session_state: Arc::new(base::context::SessionState::new(std::env::temp_dir())),
             elicitation: Arc::new(base::interface::elicitation::DeclineAll),
             tool_middleware: Arc::new(Vec::new()),
+            result_transformers: Arc::new(Vec::new()),
             images: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -4862,6 +4928,7 @@ mod tests {
             permission,
             session_state: Arc::new(base::context::SessionState::new(dir.path().to_path_buf())),
             tool_middleware: Arc::new(Vec::new()),
+            result_transformers: Arc::new(Vec::new()),
             elicitation: base::interface::elicitation::FixedElicitation::new(
                 base::interface::elicitation::ElicitOutcome::answered(
                     &crate::agent::PermissionDecision::PermitAlways {

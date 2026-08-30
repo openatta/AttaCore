@@ -23,6 +23,7 @@
 //! | [`credentials::CredentialSource`] | where a provider's API key comes from |
 //! | [`tool::Tool`] / [`tool::ToolRegistry`] | a tool, or the whole tool set |
 //! | [`tool_middleware::ToolMiddleware`] | a ring around every tool call |
+//! | [`tool_result::ToolResultTransformer`] | what a result may look like |
 //! | [`scene::AgentScene`] | system prompt, tool surface, budgets |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
@@ -67,6 +68,7 @@ pub mod scene;
 pub mod token_counter;
 pub mod tool;
 pub mod tool_middleware;
+pub mod tool_result;
 #[deprecated(note = "moved to `base::settings` — declarative configuration types")]
 pub use crate::settings;
 

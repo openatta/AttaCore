@@ -183,6 +183,10 @@ pub struct Agent {
     /// Rings around every tool call — see [`Builder::tool_middleware`].
     pub(crate) tool_middleware:
         Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
+    /// The last hands on a tool's output — see
+    /// [`Builder::tool_result_transformer`].
+    pub(crate) result_transformers:
+        Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
     /// Cancellation token of the turn currently in flight — replaced by
     /// `run()` before each turn, cancelled by the input demultiplexer on
     /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
@@ -954,6 +958,8 @@ pub struct Builder {
     prompt_registry: Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>>,
     /// Rings around tool dispatch — see [`Builder::tool_middleware`].
     tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
+    /// Result policies — see [`Builder::tool_result_transformer`].
+    result_transformers: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
     /// Extra destinations for this session's events, beyond the `event_rx`
     /// `build()` returns — see [`Builder::event_sink`].
     event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
@@ -1147,6 +1153,7 @@ impl Builder {
             elicitation: None,
             prompt_registry: None,
             tool_middleware: Vec::new(),
+            result_transformers: Vec::new(),
             event_sinks: Vec::new(),
             agent_depth: 0,
         }
@@ -1216,6 +1223,22 @@ impl Builder {
         m: Arc<dyn base::interface::tool_middleware::ToolMiddleware>,
     ) -> Self {
         self.tool_middleware.push(m);
+        self
+    }
+
+    /// Decide what a tool result may look like before the model reads it.
+    ///
+    /// Transformers run in the order they are added, and they run *last* —
+    /// after every hook, immediately before the outcome is handed back. That
+    /// is what makes a redacting transformer a guarantee rather than a
+    /// suggestion: nothing after it can put back what it removed.
+    ///
+    /// [`ToolResultTransformer`]: base::interface::tool_result::ToolResultTransformer
+    pub fn tool_result_transformer(
+        mut self,
+        t: Arc<dyn base::interface::tool_result::ToolResultTransformer>,
+    ) -> Self {
+        self.result_transformers.push(t);
         self
     }
 
@@ -2062,6 +2085,7 @@ impl Builder {
                     .prompt_registry
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
                 tool_middleware: Arc::new(self.tool_middleware),
+                result_transformers: Arc::new(self.result_transformers),
                 pending_permissions,
                 current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
                 memory_store,
@@ -4284,6 +4308,89 @@ mod tests {
         );
 
         session.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+
+    /// P2-5's point: a deployment can guarantee a string never reaches the
+    /// model, and the guarantee holds through the path a tool result actually
+    /// takes — including when the tool failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_transformer_is_the_last_thing_to_touch_a_tool_result() {
+        use base::interface::tool_result::RedactLiterals;
+
+        struct LeaksATokenTool;
+        #[async_trait::async_trait]
+        impl base::tool::Tool for LeaksATokenTool {
+            fn name(&self) -> &str {
+                "Leak"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: base::tool::ToolContext,
+                _progress: base::tool::ProgressSender,
+            ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+                Ok(base::tool::ToolResult {
+                    content: base::tool::ToolResultContent::Text(
+                        "ANTHROPIC_API_KEY=sk-live-abc123".into(),
+                    ),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(LeaksATokenTool));
+
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Leak",
+        });
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(tools)
+            .tool_result_transformer(Arc::new(RedactLiterals::new(["sk-live-abc123"])))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "run it".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let result_text = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::ToolResult { content, .. }) => break content,
+                    Some(AgentEvent::TurnComplete { .. }) => {
+                        panic!("the turn ended without a tool result")
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the tool should have run");
+
+        assert!(
+            !result_text.contains("sk-live-abc123"),
+            "the secret reached the result the model is shown: {result_text}"
+        );
+        assert!(result_text.contains("<redacted>"), "{result_text}");
+
+        drop(input_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
