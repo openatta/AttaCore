@@ -36,6 +36,10 @@
 //! | [`prompt_registry::PromptRegistry`] | what goes into the system prompt |
 //! | [`prompt_assembly::AssemblyHook`] | a last pass over the assembled prompt |
 //!
+//! [`catalog`] is the whole picture, including the contracts below that this
+//! directory cannot re-export: every extension point as data, with when it
+//! fires, what it may change, how often, and who is allowed to use it.
+//!
 //! The engine's other replaceable contracts live in the crate that owns them
 //! and **cannot be re-exported here** without pointing a dependency edge
 //! downward: `Compactor` (`compaction`), `HistoryStore` (`history`),
@@ -46,6 +50,7 @@
 //! index, not this directory.
 
 pub mod agent_spawner;
+pub mod catalog;
 pub mod credentials;
 pub mod elicitation;
 pub mod event_sink;
