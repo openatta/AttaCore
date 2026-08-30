@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 20] = [
+static POINTS: [ExtensionPoint; 23] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -342,6 +342,36 @@ static POINTS: [ExtensionPoint; 20] = [
             frequency: Frequency::PerTurn,
             trust: Trust::operator_full_plugin_adds(),
             defined_in: "history::entry::LogEntry::Extension",
+        },
+        ExtensionPoint {
+            id: "memory.storage",
+            kind: Kind::Contract,
+            summary: "where durable memories are kept",
+            timing: "recall, and whenever a memory is written",
+            rewrites: "how and where memories persist",
+            frequency: Frequency::PerTurn,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::memory_contracts::MemoryStorage",
+        },
+        ExtensionPoint {
+            id: "memory.retriever",
+            kind: Kind::Contract,
+            summary: "which memories a turn recalls",
+            timing: "once per user message, in the background",
+            rewrites: "the recalled set",
+            frequency: Frequency::PerTurn,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::memory_contracts::MemoryRetriever",
+        },
+        ExtensionPoint {
+            id: "memory.retrieval_hook",
+            kind: Kind::Interception,
+            summary: "the recall question before it is asked, the answer before it is used",
+            timing: "around retrieval",
+            rewrites: "the query and the recalled names",
+            frequency: Frequency::PerTurn,
+            trust: Trust::operator_full_plugin_declares(),
+            defined_in: "base::interface::memory_contracts::RetrievalHook",
         },
         ExtensionPoint {
             id: "compaction",

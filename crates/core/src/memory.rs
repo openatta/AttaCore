@@ -944,8 +944,52 @@ pub async fn select_memories_with_llm(
     model_name: &str,
     session_id: Option<&str>,
 ) -> Vec<String> {
+    select_memories_from(
+        &store.load_all(),
+        query,
+        model,
+        max_results,
+        already_surfaced,
+        recent_tools,
+        model_name,
+        session_id,
+    )
+    .await
+}
+
+/// The substring fallback the LLM path drops to.
+///
+/// Identical to what `MemoryStore::search` does, applied to memories already
+/// read rather than re-reading them — the caller is holding the same list the
+/// store would have handed back.
+fn substring_matches(memories: &[DurableMemory], query: &str) -> Vec<DurableMemory> {
+    memories
+        .iter()
+        .filter(|m| {
+            m.name.contains(query) || m.description.contains(query) || m.content.contains(query)
+        })
+        .cloned()
+        .collect()
+}
+
+/// [`select_memories_with_llm`] over memories already read.
+///
+/// Split out so a [`MemoryStorage`](crate::interface::memory_contracts::MemoryStorage)
+/// backend that is not this store can use the same selection — the judgement
+/// about relevance has nothing to do with where the memories were kept.
+#[allow(clippy::too_many_arguments)]
+pub async fn select_memories_from(
+    memories: &[DurableMemory],
+    query: &str,
+    model: &dyn crate::interface::model::Model,
+    max_results: usize,
+    already_surfaced: &std::collections::HashSet<String>,
+    recent_tools: &[String],
+    model_name: &str,
+    session_id: Option<&str>,
+) -> Vec<String> {
     let _start = std::time::Instant::now();
-    let mut headers = store.load_all();
+    let mut headers = memories.to_vec();
     let num_available = headers.len();
 
     if headers.is_empty() {
@@ -1055,7 +1099,7 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
 
     let Ok(mut stream) = stream_result else {
         // Fallback: substring search (with dedup)
-        let searched = store.search(query);
+        let searched = substring_matches(memories, query);
         let allowed: std::collections::HashSet<&str> =
             headers.iter().map(|h| h.name.as_str()).collect();
         let names: Vec<String> = searched
@@ -1106,7 +1150,7 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
     }
 
     // Final fallback: substring search (with dedup)
-    let searched = store.search(query);
+    let searched = substring_matches(memories, query);
     let allowed: std::collections::HashSet<&str> =
         headers.iter().map(|h| h.name.as_str()).collect();
     let names: Vec<String> = searched

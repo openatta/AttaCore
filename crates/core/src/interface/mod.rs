@@ -36,6 +36,8 @@
 //! | [`prompt_registry::PromptRegistry`] | what goes into the system prompt |
 //! | [`prompt_assembly::AssemblyHook`] | a last pass over the assembled prompt |
 //! | [`script::ScriptEngine`] | running the operator's own code at a hook point |
+//! | [`memory_contracts::MemoryStorage`] | where durable memories are kept |
+//! | [`memory_contracts::MemoryRetriever`] | which of them a turn sees |
 //!
 //! [`catalog`] is the whole picture, including the contracts below that this
 //! directory cannot re-export: every extension point as data, with when it
@@ -62,6 +64,7 @@ pub mod import_callback;
 pub mod log;
 #[deprecated(note = "moved to `base::memory` — a concrete store, not an injectable contract")]
 pub use crate::memory;
+pub mod memory_contracts;
 pub mod model;
 pub mod model_factory;
 pub mod permission;

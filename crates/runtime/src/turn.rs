@@ -575,16 +575,22 @@ impl Agent {
                 let recent_tools = self.tools.names();
                 let model_name = self.settings.model.model_name.clone();
                 let session_id = self.session.session_id.clone();
+                let retriever = Arc::clone(&self.memory_retriever);
+                let hooks = Arc::clone(&self.retrieval_hooks);
                 Some(tokio::spawn(async move {
-                    base::interface::memory::select_memories_with_llm(
-                        &store,
-                        &query,
+                    base::interface::memory_contracts::retrieve_with_hooks(
+                        retriever.as_ref(),
+                        &hooks,
+                        store.as_ref(),
                         model.as_ref(),
-                        5,
-                        &already_surfaced,
-                        &recent_tools,
-                        &model_name,
-                        Some(&session_id),
+                        base::interface::memory_contracts::RetrievalRequest {
+                            query,
+                            limit: 5,
+                            already_surfaced,
+                            recent_tools,
+                            model_name,
+                            session_id: Some(session_id),
+                        },
                     )
                     .await
                 }))

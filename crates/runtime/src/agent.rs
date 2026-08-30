@@ -187,6 +187,11 @@ pub struct Agent {
     /// [`Builder::tool_result_transformer`].
     pub(crate) result_transformers:
         Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
+    /// Which memories a turn sees — see [`Builder::memory_retriever`].
+    pub(crate) memory_retriever: Arc<dyn base::interface::memory_contracts::MemoryRetriever>,
+    /// A look at the recall question before, and the answer after.
+    pub(crate) retrieval_hooks:
+        Arc<Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>>,
     /// Cancellation token of the turn currently in flight — replaced by
     /// `run()` before each turn, cancelled by the input demultiplexer on
     /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
@@ -960,6 +965,9 @@ pub struct Builder {
     tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
     /// Result policies — see [`Builder::tool_result_transformer`].
     result_transformers: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
+    /// Recall — see [`Builder::memory_retriever`].
+    memory_retriever: Option<Arc<dyn base::interface::memory_contracts::MemoryRetriever>>,
+    retrieval_hooks: Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>,
     /// Extra destinations for this session's events, beyond the `event_rx`
     /// `build()` returns — see [`Builder::event_sink`].
     event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
@@ -1154,6 +1162,8 @@ impl Builder {
             prompt_registry: None,
             tool_middleware: Vec::new(),
             result_transformers: Vec::new(),
+            memory_retriever: None,
+            retrieval_hooks: Vec::new(),
             event_sinks: Vec::new(),
             agent_depth: 0,
         }
@@ -1239,6 +1249,35 @@ impl Builder {
         t: Arc<dyn base::interface::tool_result::ToolResultTransformer>,
     ) -> Self {
         self.result_transformers.push(t);
+        self
+    }
+
+    /// Decide which memories a turn recalls.
+    ///
+    /// The default asks the model, which is what the engine has always done
+    /// and is genuinely the right tool for judging relevance — it costs a
+    /// model call, which is why this seam exists. A deployment with an index,
+    /// or a test that needs recall to be a function of the store rather than a
+    /// judgement, supplies its own.
+    ///
+    /// [`MemoryRetriever`]: base::interface::memory_contracts::MemoryRetriever
+    pub fn memory_retriever(
+        mut self,
+        r: Arc<dyn base::interface::memory_contracts::MemoryRetriever>,
+    ) -> Self {
+        self.memory_retriever = Some(r);
+        self
+    }
+
+    /// See the recall question before it is asked and the answer before it is
+    /// used — expand the query, or drop results this session must not see.
+    ///
+    /// [`RetrievalHook`]: base::interface::memory_contracts::RetrievalHook
+    pub fn retrieval_hook(
+        mut self,
+        h: Arc<dyn base::interface::memory_contracts::RetrievalHook>,
+    ) -> Self {
+        self.retrieval_hooks.push(h);
         self
     }
 
@@ -2086,6 +2125,10 @@ impl Builder {
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
+                memory_retriever: self
+                    .memory_retriever
+                    .unwrap_or_else(|| Arc::new(base::interface::memory_contracts::LlmRetriever)),
+                retrieval_hooks: Arc::new(self.retrieval_hooks),
                 pending_permissions,
                 current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
                 memory_store,
@@ -4389,6 +4432,87 @@ mod tests {
             "the secret reached the result the model is shown: {result_text}"
         );
         assert!(result_text.contains("<redacted>"), "{result_text}");
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+
+    /// P2-9: recall goes through the contract, so a host can replace the
+    /// judgement with something deterministic — and a hook can see both ends
+    /// of it — without touching the engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_substituted_retriever_and_its_hooks_decide_what_is_recalled() {
+        use base::interface::memory_contracts::{
+            MemoryRetriever, MemoryStorage, RetrievalHook, RetrievalRequest,
+        };
+
+        struct Records {
+            asked: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl MemoryRetriever for Records {
+            async fn retrieve(
+                &self,
+                _storage: &dyn MemoryStorage,
+                _model: &dyn Model,
+                request: &RetrievalRequest,
+            ) -> Vec<String> {
+                self.asked.lock().unwrap().push(request.query.clone());
+                vec!["from-the-substitute".to_string()]
+            }
+        }
+
+        struct Expands;
+        impl RetrievalHook for Expands {
+            fn before_retrieve(&self, request: &mut RetrievalRequest) {
+                request.query = format!("[expanded] {}", request.query);
+            }
+        }
+
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(PlainReplyModel);
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(Arc::new(InMemoryToolRegistry::new()))
+            .memory_retriever(Arc::new(Records {
+                asked: asked.clone(),
+            }))
+            .retrieval_hook(Arc::new(Expands))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "what did we decide about deploys".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { .. }) => break,
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the turn should complete");
+
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "recall must have gone through the substitute");
+        assert_eq!(
+            asked[0], "[expanded] what did we decide about deploys",
+            "the hook must have seen the question before the retriever did"
+        );
 
         drop(input_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
