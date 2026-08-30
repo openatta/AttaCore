@@ -549,6 +549,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         execute_stream(
             stream,
@@ -614,6 +615,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         execute_stream(
             stream,
@@ -671,6 +673,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         let result = execute_stream(
             stream,
@@ -735,6 +738,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         execute_stream(
             stream,
@@ -777,6 +781,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         execute_stream(
             stream,
@@ -835,6 +840,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         execute_stream(
             stream,
@@ -911,6 +917,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         let started = std::time::Instant::now();
         execute_stream(
@@ -984,6 +991,7 @@ mod tests {
 
         let mut session = session::session::SessionManager::in_memory(None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::event_bus::EventBus::new(tx);
 
         execute_stream(
             stream,

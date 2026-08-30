@@ -5600,7 +5600,7 @@ mod catalog_tests {
     async fn subagent_events_reach_the_parent_channel_tagged_without_changing_the_text_result() {
         let (agent_tool, tools, _runs, dir) = wired_agent_tool("coding");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        agent_tool.set_event_sender(tx);
+        agent_tool.set_event_sender(crate::event_bus::EventBus::new(tx));
 
         let text = agent_tool
             .run_sub_tagged(

@@ -128,7 +128,12 @@ pub enum EngineCommand {
 
 pub type InputSender = mpsc::UnboundedSender<InputMessage>;
 pub type InputReceiver = mpsc::UnboundedReceiver<InputMessage>;
-pub type EventSender = mpsc::UnboundedSender<AgentEvent>;
+/// Where the engine emits. Every emission site in the runtime holds one of
+/// these, which is why swapping the raw channel for [`EventBus`] reached all
+/// of them at once — the bus keeps `send`'s signature deliberately.
+///
+/// [`EventBus`]: crate::event_bus::EventBus
+pub type EventSender = crate::event_bus::EventBus;
 pub type EventReceiver = mpsc::UnboundedReceiver<AgentEvent>;
 
 /// Registry of permission requests awaiting a host response, keyed by
@@ -931,6 +936,9 @@ pub struct Builder {
     /// callers (tests, library embedding): `build()` self-scans and starts
     /// its own watcher, same as always.
     skill_catalog: Option<Arc<skills::manager::SkillManager>>,
+    /// Extra destinations for this session's events, beyond the `event_rx`
+    /// `build()` returns — see [`Builder::event_sink`].
+    event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
     /// How many delegation hops separate this agent from the root session —
     /// see [`Builder::agent_depth`].
     agent_depth: u32,
@@ -1118,8 +1126,22 @@ impl Builder {
             scene_registry: None,
             shared_agent_types: None,
             skill_catalog: None,
+            event_sinks: Vec::new(),
             agent_depth: 0,
         }
+    }
+
+    /// Send this session's events to `sink` as well as to the `event_rx`
+    /// `build()` returns. Call it once per sink; sinks accumulate.
+    ///
+    /// The sink runs on its own task behind its own bounded queue, so it
+    /// cannot slow a turn down however slow it is — see
+    /// [`crate::event_bus`] for what that costs when a sink falls behind.
+    /// Sinks can only be attached before `build()`: one joining mid-session
+    /// would see a stream that starts in the middle and have no way to tell.
+    pub fn event_sink(mut self, sink: Arc<dyn base::interface::event_sink::EventSink>) -> Self {
+        self.event_sinks.push(sink);
+        self
     }
 
     /// Position of the agent being built in the delegation chain: `0` for a
@@ -1876,7 +1898,8 @@ impl Builder {
                 );
             }
         }
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (primary_tx, event_rx) = mpsc::unbounded_channel();
+        let event_tx = crate::event_bus::EventBus::with_sinks(primary_tx, self.event_sinks);
 
         // ── Sub-agent / team inheritance wiring ──
         // The `AgentTool` and `TeamCreateTool` are constructed above (they
@@ -1935,7 +1958,10 @@ impl Builder {
         // Only present when `settings.execution.team_enabled` registered the
         // team tools above.
         if let Some(ref t) = team_create_tool {
-            t.set_event_sender(event_tx.clone());
+            // `team` sits below `runtime` and takes a plain channel; the
+            // bridge keeps its progress events on the same stream as
+            // everything else, sinks included.
+            t.set_event_sender(event_tx.unbounded_bridge());
             t.set_telemetry_handle(telemetry_handle.clone());
         }
 
@@ -4084,7 +4110,151 @@ mod tests {
     #[test]
     fn channel_types_construct() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let _sender: EventSender = tx;
+        let _sender: EventSender = crate::event_bus::EventBus::new(tx);
+    }
+
+    /// Answers in one text block and stops. Enough to make a turn that emits
+    /// a handful of events and finishes immediately.
+    struct PlainReplyModel;
+
+    #[async_trait::async_trait]
+    impl Model for PlainReplyModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            let events: Vec<
+                Result<base::interface::model::ModelEvent, base::interface::model::ModelError>,
+            > = vec![
+                Ok(base::interface::model::ModelEvent::TextDelta {
+                    text: "hello".into(),
+                }),
+                Ok(base::interface::model::ModelEvent::EndTurn {
+                    stop_reason: "end_turn".into(),
+                    usage: Default::default(),
+                }),
+            ];
+            Ok(Box::new(futures::stream::iter(events)))
+        }
+    }
+
+    /// Drives one turn to completion and returns the events the host's
+    /// channel saw.
+    async fn run_one_turn_with_sinks(
+        sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
+    ) -> Vec<AgentEvent> {
+        let mut builder = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(PlainReplyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .tools(Arc::new(InMemoryToolRegistry::new()))
+            .skip_warmup(true);
+        for sink in sinks {
+            builder = builder.event_sink(sink);
+        }
+        let (mut agent, mut event_rx, input_tx) = builder.build().expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "say something".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut seen = Vec::new();
+            loop {
+                match event_rx.recv().await {
+                    Some(ev) => {
+                        let done = matches!(ev, AgentEvent::TurnComplete { .. });
+                        seen.push(ev);
+                        if done {
+                            break seen;
+                        }
+                    }
+                    None => panic!("event channel closed before the turn completed"),
+                }
+            }
+        })
+        .await
+        .expect("the turn should complete");
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+        observed
+    }
+
+    /// P1-2: a host can take the event stream in-process, without standing a
+    /// forwarding task between the engine's channel and its own world.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registered_sink_sees_the_same_stream_as_the_returned_channel() {
+        let sink = base::interface::event_sink::CollectingSink::new();
+        let observed = run_one_turn_with_sinks(vec![sink.clone()]).await;
+        assert!(
+            observed.len() >= 2,
+            "a turn should emit more than just its completion"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sink.len() < observed.len() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let as_json = |evs: &[AgentEvent]| {
+            evs.iter()
+                .map(|e| serde_json::to_value(e).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            as_json(&sink.events())[..observed.len()],
+            as_json(&observed)[..],
+            "the sink must see the same events, in the same order, as the channel"
+        );
+    }
+
+    /// P1-2: registering a sink is observation, not control.
+    ///
+    /// The sink here blocks forever rather than merely being slow, so the
+    /// test needs no timing threshold to be meaningful: if the turn were
+    /// waiting on it at any point, the turn would never complete and the
+    /// helper's timeout would fire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_sink_cannot_stop_a_turn_from_completing() {
+        #[derive(Default)]
+        struct Gate {
+            released: std::sync::Mutex<bool>,
+            wake: std::sync::Condvar,
+        }
+        struct Wedged(Arc<Gate>);
+        impl base::interface::event_sink::EventSink for Wedged {
+            fn emit(&self, _event: &AgentEvent) {
+                let mut released = self.0.released.lock().unwrap();
+                while !*released {
+                    released = self.0.wake.wait(released).unwrap();
+                }
+            }
+        }
+
+        let gate = Arc::new(Gate::default());
+        let observed = run_one_turn_with_sinks(vec![Arc::new(Wedged(gate.clone()))]).await;
+        assert!(
+            observed.len() >= 2,
+            "the turn ran to completion past a sink that never returns"
+        );
+
+        // Let the lane's task out before the runtime goes away.
+        *gate.released.lock().unwrap() = true;
+        gate.wake.notify_all();
     }
 
     #[test]

@@ -4240,6 +4240,7 @@ mod tests {
         permission: Arc<dyn base::interface::permission::Permission>,
     ) -> ToolExecCtx {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_tx = crate::event_bus::EventBus::new(event_tx);
         ToolExecCtx {
             tools,
             cwd: std::env::temp_dir(),
@@ -4825,6 +4826,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_tx = crate::event_bus::EventBus::new(event_tx);
         let ctx = ToolExecCtx {
             tools,
             cwd: dir.path().to_path_buf(),
