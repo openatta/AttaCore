@@ -7,6 +7,7 @@
 //! Sibling abort on error (any tool error cancels all siblings in the same batch).
 
 use crate::agent::EventSender;
+use std::sync::Arc;
 use base::interface::event::AgentEvent;
 use base::interface::model::{
     MessageRole, ModelContentBlock, ModelEvent, ModelMessage, ModelStream, Usage,
@@ -61,6 +62,7 @@ struct QueuedTool {
 /// concurrency-safe tool's `ToolResult` message in session order. Concurrent
 /// execution timing is unaffected — only when results get written to the
 /// session changed.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_stream<F, Fut, G>(
     stream: ModelStream,
     session: &mut session::session::SessionManager,
@@ -69,6 +71,7 @@ pub async fn execute_stream<F, Fut, G>(
     execute_tool: F,
     is_concurrency_safe: G,
     cancel: CancellationToken,
+    interceptors: &[Arc<dyn base::interface::model_interceptor::ModelInterceptor>],
 ) -> Result<StreamResult, crate::turn::TurnError>
 where
     F: Fn(String, serde_json::Value) -> Fut + Send + Sync + 'static,
@@ -167,7 +170,7 @@ where
                 // tool call have to be in the transcript ahead of the
                 // `tool_use` block, or the *next* request in this turn is
                 // rejected for a missing/misordered thinking block.
-                flush_assistant_prefix(session, &mut completed_thinking, &mut pending_text);
+                flush_assistant_prefix(session, &mut completed_thinking, &mut pending_text, interceptors);
                 // Buffer every ToolUse the model actually emitted — duplicate or
                 // not — it gets flushed together with its ToolResult once the
                 // batch resolves (see module-level doc comment).
@@ -295,6 +298,7 @@ where
                         &mut pending_use_blocks,
                         &mut pending_result_blocks,
                         &mut pending_new_msgs,
+                        interceptors,
                     );
 
                     // Start a new batch for subsequent concurrent-safe tools
@@ -318,7 +322,7 @@ where
     // Flush remaining thinking + pending text. On a no-tool turn this is the
     // only flush, and it is what puts the reasoning into the transcript so a
     // later turn (or a resume) still sees it.
-    flush_assistant_prefix(session, &mut completed_thinking, &mut pending_text);
+    flush_assistant_prefix(session, &mut completed_thinking, &mut pending_text, interceptors);
 
     // Drain any remaining in-flight concurrent tools, then flush the final batch.
     //
@@ -367,6 +371,7 @@ where
         &mut pending_use_blocks,
         &mut pending_result_blocks,
         &mut pending_new_msgs,
+        interceptors,
     );
 
     Ok(StreamResult {
@@ -433,6 +438,7 @@ fn flush_assistant_prefix(
     session: &mut session::session::SessionManager,
     completed_thinking: &mut Vec<ModelContentBlock>,
     pending_text: &mut String,
+    interceptors: &[Arc<dyn base::interface::model_interceptor::ModelInterceptor>],
 ) {
     if completed_thinking.is_empty() && pending_text.is_empty() {
         return;
@@ -443,12 +449,19 @@ fn flush_assistant_prefix(
             text: std::mem::take(pending_text),
         });
     }
-    session.push_message(ModelMessage {
+    // The message is whole here, which is the only point at which it is worth
+    // showing to anyone: a hook on the deltas that built it would run
+    // thousands of times and could produce something that never existed as a
+    // coherent message.
+    let mut message = ModelMessage {
         role: MessageRole::Assistant,
         content,
-    });
+    };
+    base::interface::model_interceptor::intercept_message(interceptors, &mut message);
+    session.push_message(message);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_tool_batch(
     session: &mut session::session::SessionManager,
     event_tx: &EventSender,
@@ -456,14 +469,17 @@ fn flush_tool_batch(
     pending_use_blocks: &mut Vec<ModelContentBlock>,
     pending_result_blocks: &mut Vec<(usize, ModelContentBlock)>,
     pending_new_msgs: &mut Vec<Vec<serde_json::Value>>,
+    interceptors: &[Arc<dyn base::interface::model_interceptor::ModelInterceptor>],
 ) {
     if pending_use_blocks.is_empty() {
         return;
     }
-    session.push_message(ModelMessage {
+    let mut message = ModelMessage {
         role: MessageRole::Assistant,
         content: std::mem::take(pending_use_blocks),
-    });
+    };
+    base::interface::model_interceptor::intercept_message(interceptors, &mut message);
+    session.push_message(message);
     let mut results = std::mem::take(pending_result_blocks);
     results.sort_by_key(|(idx, _)| *idx);
     session.push_message(ModelMessage {
@@ -559,6 +575,7 @@ mod tests {
             |_name, _input| async move { Ok(("ok".to_string(), None)) },
             |_name, _input| true,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -625,6 +642,7 @@ mod tests {
             |_name, _input| async move { Ok(("ok".to_string(), None)) },
             |_name, _input| true,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -683,6 +701,7 @@ mod tests {
             |_name, _input| async move { Ok(("ok".to_string(), None)) },
             |_name, _input| true,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -748,6 +767,7 @@ mod tests {
             |_name, _input| async move { Ok(("ok".to_string(), None)) },
             |name, _input| name == "Glob", // Glob concurrency-safe, Bash is not
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -791,6 +811,7 @@ mod tests {
             |_name, _input| async move { Ok(("ok".to_string(), None)) },
             |_name, _input| true,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -863,6 +884,7 @@ mod tests {
             },
             |_name, _input| true,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -939,6 +961,7 @@ mod tests {
             },
             |_name, _input| true,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");
@@ -1001,6 +1024,7 @@ mod tests {
             |_name, _input| async move { Ok(("ok".to_string(), None)) },
             |_name, _input| false,
             CancellationToken::new(),
+            &[],
         )
         .await
         .expect("execute_stream should succeed");

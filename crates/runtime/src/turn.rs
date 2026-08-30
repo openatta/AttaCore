@@ -1000,6 +1000,7 @@ impl Agent {
                         .unwrap_or(false)
                 },
                 cancel.clone(),
+                &self.model_interceptors,
             )
             .await?;
 
@@ -2604,6 +2605,14 @@ or project context that should survive across sessions.
         request: ModelRequest,
         cancel: CancellationToken,
     ) -> Result<ModelStream, base::interface::model::ModelError> {
+        // The last point at which the engine's idea of the request and the
+        // provider's can still be made to differ. Once per model call, never
+        // per chunk — see `base::interface::model_interceptor`.
+        let mut request = request;
+        base::interface::model_interceptor::intercept_request(
+            &self.model_interceptors,
+            &mut request,
+        );
         self.model
             .stream(
                 request.prompt_blocks,
@@ -4058,12 +4067,11 @@ fn strip_token_budget_directive(input: &str) -> String {
 /// The normal path and the two recovery paths differ only in how these four
 /// fields are produced, so they build one of these and hand it to
 /// [`Agent::send`] rather than each spelling out a `StreamParams` of its own.
-struct ModelRequest {
-    prompt_blocks: Vec<PromptBlock>,
-    tool_defs: Vec<ToolDef>,
-    messages: Vec<ModelMessage>,
-    params: base::interface::model::StreamParams,
-}
+/// A turn's model call, assembled.
+///
+/// The same type interceptors see — one shape rather than a private struct
+/// and a public mirror of it that have to be kept agreeing.
+type ModelRequest = base::interface::model_interceptor::ModelRequestView;
 
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {

@@ -55,7 +55,7 @@ pub struct StreamParams {
 /// text, and it has to stay that way: splitting the sources into separate
 /// content blocks would change the bytes the model receives. So composition is
 /// expressed as coordinates over the message rather than in its structure —
-/// the same reason [`crate::prompt::PromptBlock::source`] is a
+/// the same reason [`crate::prompt::PromptBlock::name`] is a
 /// field and not a delimiter inside the content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputMap {

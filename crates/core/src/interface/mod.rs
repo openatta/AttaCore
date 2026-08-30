@@ -20,6 +20,7 @@
 //! |---|---|
 //! | [`model::Model`] | the LLM backend / wire protocol |
 //! | [`model_factory::ModelFactory`] | how a protocol is built from config |
+//! | [`model_interceptor::ModelInterceptor`] | the request out, the message back |
 //! | [`credentials::CredentialSource`] | where a provider's API key comes from |
 //! | [`tool::Tool`] / [`tool::ToolRegistry`] | a tool, or the whole tool set |
 //! | [`tool_middleware::ToolMiddleware`] | a ring around every tool call |
@@ -67,6 +68,7 @@ pub use crate::memory;
 pub mod memory_contracts;
 pub mod model;
 pub mod model_factory;
+pub mod model_interceptor;
 pub mod permission;
 pub mod prompt_assembly;
 pub mod prompt_registry;

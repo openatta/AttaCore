@@ -187,6 +187,10 @@ pub struct Agent {
     /// [`Builder::tool_result_transformer`].
     pub(crate) result_transformers:
         Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
+    /// The request on its way out and the message on its way back — see
+    /// [`Builder::model_interceptor`].
+    pub(crate) model_interceptors:
+        Arc<Vec<Arc<dyn base::interface::model_interceptor::ModelInterceptor>>>,
     /// Which memories a turn sees — see [`Builder::memory_retriever`].
     pub(crate) memory_retriever: Arc<dyn base::interface::memory_contracts::MemoryRetriever>,
     /// A look at the recall question before, and the answer after.
@@ -965,6 +969,8 @@ pub struct Builder {
     tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
     /// Result policies — see [`Builder::tool_result_transformer`].
     result_transformers: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
+    /// Model request/response interception — see [`Builder::model_interceptor`].
+    model_interceptors: Vec<Arc<dyn base::interface::model_interceptor::ModelInterceptor>>,
     /// Recall — see [`Builder::memory_retriever`].
     memory_retriever: Option<Arc<dyn base::interface::memory_contracts::MemoryRetriever>>,
     retrieval_hooks: Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>,
@@ -1162,6 +1168,7 @@ impl Builder {
             prompt_registry: None,
             tool_middleware: Vec::new(),
             result_transformers: Vec::new(),
+            model_interceptors: Vec::new(),
             memory_retriever: None,
             retrieval_hooks: Vec::new(),
             event_sinks: Vec::new(),
@@ -1261,6 +1268,24 @@ impl Builder {
     /// judgement, supplies its own.
     ///
     /// [`MemoryRetriever`]: base::interface::memory_contracts::MemoryRetriever
+    /// See every model request before it is sent, and every complete message
+    /// before it is recorded.
+    ///
+    /// Both are called once per model call. There is deliberately no
+    /// per-chunk equivalent: a turn produces thousands of chunks, the cost of
+    /// a callback there is invisible to whoever writes it, and a hook that can
+    /// rewrite chunks can produce a message that never existed as a coherent
+    /// whole.
+    ///
+    /// [`ModelInterceptor`]: base::interface::model_interceptor::ModelInterceptor
+    pub fn model_interceptor(
+        mut self,
+        i: Arc<dyn base::interface::model_interceptor::ModelInterceptor>,
+    ) -> Self {
+        self.model_interceptors.push(i);
+        self
+    }
+
     pub fn memory_retriever(
         mut self,
         r: Arc<dyn base::interface::memory_contracts::MemoryRetriever>,
@@ -2125,6 +2150,7 @@ impl Builder {
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
+                model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self
                     .memory_retriever
                     .unwrap_or_else(|| Arc::new(base::interface::memory_contracts::LlmRetriever)),
@@ -4512,6 +4538,117 @@ mod tests {
         assert_eq!(
             asked[0], "[expanded] what did we decide about deploys",
             "the hook must have seen the question before the retriever did"
+        );
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+
+    /// Emits many text deltas, so a per-chunk hook would be obvious.
+    struct ChattyModel;
+
+    #[async_trait::async_trait]
+    impl Model for ChattyModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            _prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            let mut events: Vec<
+                Result<base::interface::model::ModelEvent, base::interface::model::ModelError>,
+            > = (0..64)
+                .map(|i| {
+                    Ok(base::interface::model::ModelEvent::TextDelta {
+                        text: format!("chunk {i} "),
+                    })
+                })
+                .collect();
+            events.push(Ok(base::interface::model::ModelEvent::EndTurn {
+                stop_reason: "end_turn".into(),
+                usage: Default::default(),
+            }));
+            Ok(Box::new(futures::stream::iter(events)))
+        }
+    }
+
+    /// P2-10's acceptance: the interceptor sees the request and the finished
+    /// message, and is *not* called per chunk. Sixty-four deltas produce one
+    /// message, and the counts say so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_interceptor_sees_whole_things_never_chunks() {
+        use base::interface::model_interceptor::{
+            ModelInterceptor, ModelRequestView,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counting {
+            requests: AtomicUsize,
+            messages: AtomicUsize,
+        }
+
+        impl ModelInterceptor for Counting {
+            fn on_request(&self, request: &mut ModelRequestView) {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                request.params.max_tokens = 4096;
+            }
+            fn on_message(&self, _message: &mut base::interface::model::ModelMessage) {
+                self.messages.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counting = Arc::new(Counting::default());
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(ChattyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .tools(Arc::new(InMemoryToolRegistry::new()))
+            .model_interceptor(counting.clone())
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "say a lot".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let deltas = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut deltas = 0usize;
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TextDelta { .. }) => deltas += 1,
+                    Some(AgentEvent::TurnComplete { .. }) => break deltas,
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the turn should complete");
+
+        assert!(deltas > 20, "the model streamed {deltas} deltas");
+        assert_eq!(
+            counting.requests.load(Ordering::SeqCst),
+            1,
+            "one request, one call"
+        );
+        let messages = counting.messages.load(Ordering::SeqCst);
+        assert_eq!(
+            messages, 1,
+            "{deltas} chunks must produce one interception, not {messages}"
         );
 
         drop(input_tx);

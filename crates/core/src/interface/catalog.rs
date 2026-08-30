@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 23] = [
+static POINTS: [ExtensionPoint; 25] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -302,6 +302,26 @@ static POINTS: [ExtensionPoint; 23] = [
             frequency: Frequency::PerProcess,
             trust: Trust::host_only(),
             defined_in: "base::interface::model_factory::ModelFactory",
+        },
+        ExtensionPoint {
+            id: "model.request",
+            kind: Kind::Interception,
+            summary: "the assembled request before it is sent: messages, tools, params",
+            timing: "immediately before each model call",
+            rewrites: "everything in the request",
+            frequency: Frequency::PerModelCall,
+            trust: Trust::operator_full_plugin_declares(),
+            defined_in: "base::interface::model_interceptor::ModelInterceptor::on_request",
+        },
+        ExtensionPoint {
+            id: "model.message",
+            kind: Kind::Interception,
+            summary: "a complete message the model produced, before it is recorded",
+            timing: "after the stream carrying it finishes",
+            rewrites: "the message content",
+            frequency: Frequency::PerModelCall,
+            trust: Trust::operator_full_plugin_declares(),
+            defined_in: "base::interface::model_interceptor::ModelInterceptor::on_message",
         },
         ExtensionPoint {
             id: "credentials",
