@@ -1,4 +1,6 @@
-//! Session persistence — JSONL format, path sanitization, transcript projection.
+//! Session persistence: the `HistoryStore` contract, the two implementations
+//! that ship with it (JSONL on disk, in memory), path sanitization and
+//! transcript projection.
 
 pub mod entry;
 pub mod error;

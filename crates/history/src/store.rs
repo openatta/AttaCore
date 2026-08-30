@@ -1,7 +1,11 @@
-//! `JsonlHistoryStore` —— 写一个会话目录下的 jsonl 文件。
+//! Session persistence: the [`HistoryStore`] contract and the two
+//! implementations that ship with the engine — one writing JSONL under a
+//! project directory, one holding everything in memory.
 //!
-//! 设计：每个 store 实例绑定**一个 cwd**。append/load/list 都对该 cwd 的项目目录。
-//! 多 session 共享一份 store；同 session 串行写（mutex 保护，避免并发 partial line）。
+//! A `JsonlHistoryStore` instance is bound to **one cwd**; append/load/list
+//! all address that cwd's project directory. Many sessions share one store,
+//! and writes within a session are serialized by a mutex so two appends
+//! cannot interleave into a partial line.
 
 use crate::entry::{EnvelopedEntry, LogEntry, PasteStore};
 use crate::error::HistoryError;
@@ -30,23 +34,42 @@ pub struct SessionSummary {
     pub compact_count: u64,
 }
 
-/// 持久化抽象。唯一实现是 jsonl；可挂内存版供测试。
+/// Where a session's log lives between runs.
+///
+/// The engine writes an append-only sequence of [`LogEntry`] per session and
+/// reads it back to resume, fork or list. Nothing above this trait knows how
+/// or where that happens: a backend may keep it in files, in a database, or
+/// in memory, and the two shipped implementations do two of those.
+///
+/// # What an implementation must guarantee
+///
+/// * **Append-only order.** [`load`](Self::load) returns entries in the order
+///   [`append`](Self::append) received them. Resume, fork and replay all read
+///   position as meaning, so a store that reorders is not a slower store, it
+///   is a wrong one.
+/// * **A missing session is [`HistoryError::SessionNotFound`]**, not an empty
+///   log. "Never existed" and "exists and is empty" are different answers and
+///   callers act on the difference.
+/// * **Durability is the backend's promise, not the caller's.** `append`
+///   returning `Ok` means the entry survives whatever that backend survives.
 #[async_trait]
 pub trait HistoryStore: Send + Sync {
     async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError>;
     async fn load(&self, session: SessionId) -> Result<Vec<EnvelopedEntry>, HistoryError>;
     async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError>;
 
-    /// 删除指定 session 的全部持久化数据（jsonl + metadata）。
+    /// Forget a session entirely — its log and anything the backend keeps
+    /// alongside it. Deleting a session that is not there is not an error.
     async fn delete(&self, session: SessionId) -> Result<(), HistoryError>;
 
-    /// 把 jsonl 解析成可直接喂 Engine 的 `Vec<Message>`。默认实现走 `load()`。
+    /// The session's log as messages the model can be given directly.
     ///
-    /// 规则：
-    /// - User / Assistant 直接对应；
-    /// - 连续多条 ToolResult 合并到单条 Message::User（API 要求 user 消息
-    ///   一次带齐所有 tool_result 块）；
-    /// - Meta / System / Compact / UsageSnapshot 不进 API。
+    /// Projection rules, which are the engine's and not a backend's:
+    /// - User / Assistant map across one to one;
+    /// - a run of ToolResult entries collapses into a single `Message::User`,
+    ///   because the API wants one user message carrying every `tool_result`
+    ///   block of a round;
+    /// - Meta / System / Compact / UsageSnapshot never reach the model.
     async fn load_messages(
         &self,
         session: SessionId,
@@ -55,8 +78,34 @@ pub trait HistoryStore: Send + Sync {
         Ok(project_messages(&entries))
     }
 
-    /// List all child sessions whose `LogEntry::Meta` has `parent_session_id` matching
-    /// the given value. Scans every session file; O(n) on the number of sessions.
+    /// Which session spawned this one, if any.
+    ///
+    /// Split out from [`child_sessions`](Self::child_sessions) so a backend
+    /// can answer it without materializing a whole transcript: the answer sits
+    /// in the log's `Meta` entry, and the default here has to read everything
+    /// to find it. Overriding this alone is enough to make the parent-child
+    /// walk cheap on any backend that can seek.
+    async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        let entries = match self.load(session).await {
+            Ok(e) => e,
+            Err(HistoryError::SessionNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(entries.iter().find_map(|env| match &env.entry {
+            LogEntry::Meta {
+                parent_session_id, ..
+            } => parent_session_id.clone(),
+            _ => None,
+        }))
+    }
+
+    /// Every session this one spawned.
+    ///
+    /// The default asks each known session who its parent is, which is one
+    /// [`session_parent`](Self::session_parent) call per session and no better
+    /// than linear. A backend that indexes the parent should override this
+    /// outright; one that can merely read a session's head cheaply gets most
+    /// of the win from overriding `session_parent` instead.
     async fn child_sessions(
         &self,
         parent_session_id: &str,
@@ -64,29 +113,15 @@ pub trait HistoryStore: Send + Sync {
         let all = self.list_sessions().await?;
         let mut out = Vec::new();
         for sid in all {
-            let entries = match self.load(sid).await {
-                Ok(e) => e,
-                Err(HistoryError::SessionNotFound(_)) => continue,
-                Err(e) => return Err(e),
-            };
-            for entry in &entries {
-                if let LogEntry::Meta {
-                    parent_session_id: Some(pid),
-                    ..
-                } = &entry.entry
-                {
-                    if pid == parent_session_id {
-                        out.push(entry.session_id);
-                        break;
-                    }
-                }
+            if self.session_parent(sid).await?.as_deref() == Some(parent_session_id) {
+                out.push(sid);
             }
         }
         Ok(out)
     }
 }
 
-/// 把 jsonl 落到 `<projects_root>/<sanitize(cwd)>/<session>.jsonl`。
+/// Writes to `<projects_root>/<sanitize(cwd)>/<session>.jsonl`.
 pub struct JsonlHistoryStore {
     projects_root: PathBuf,
     /// Sidecar root — see [`HistoryRoots`]; carried rather than re-derived so
@@ -553,16 +588,40 @@ impl HistoryStore for JsonlHistoryStore {
 
     async fn delete(&self, session: SessionId) -> Result<(), HistoryError> {
         let jsonl_path = self.session_file_path(&session);
-        // 删除 jsonl 文件
         match tokio::fs::remove_file(&jsonl_path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(HistoryError::Io(e)),
         }
-        // 删除 metadata 文件（如果存在）
         let meta_path = session_metadata_file(&self.sessions_root, &session);
         let _ = tokio::fs::remove_file(meta_path).await;
         Ok(())
+    }
+
+    /// Reads only as far as the `Meta` entry, which the engine writes first.
+    /// The default would parse — and hydrate every paste of — an entire
+    /// transcript to reach a field on its first line.
+    async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        let path = self.session_file_path(&session);
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(HistoryError::Io(e)),
+        };
+        for (i, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let env = serde_json::from_str::<EnvelopedEntry>(line)
+                .map_err(|error| HistoryError::Parse { line: i + 1, error })?;
+            if let LogEntry::Meta {
+                parent_session_id, ..
+            } = env.entry
+            {
+                return Ok(parent_session_id);
+            }
+        }
+        Ok(None)
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError> {
@@ -585,6 +644,67 @@ impl HistoryStore for JsonlHistoryStore {
             }
         }
         Ok(out)
+    }
+}
+
+/// Keeps every session's log in memory and forgets it when dropped.
+///
+/// The second implementation, and the one that makes [`HistoryStore`] a
+/// contract rather than one type's interface. Useful in its own right — a
+/// host embedding the engine for a throwaway conversation has no reason to
+/// touch the disk — and useful as the thing a new backend is checked against:
+/// it does nothing but honor the contract, so a test that passes here and
+/// fails elsewhere is testing the backend, not the engine.
+#[derive(Default)]
+pub struct InMemoryHistoryStore {
+    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, Vec<EnvelopedEntry>>>,
+}
+
+impl InMemoryHistoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl HistoryStore for InMemoryHistoryStore {
+    async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session)
+            .or_default()
+            .push(EnvelopedEntry::new(session, entry));
+        Ok(())
+    }
+
+    async fn load(&self, session: SessionId) -> Result<Vec<EnvelopedEntry>, HistoryError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .cloned()
+            // Absent is not empty: a caller resuming a session it believes in
+            // needs to hear that it is not here.
+            .ok_or_else(|| HistoryError::SessionNotFound(session.to_string()))
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError> {
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect())
+    }
+
+    async fn delete(&self, session: SessionId) -> Result<(), HistoryError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session);
+        Ok(())
     }
 }
 
@@ -1411,4 +1531,164 @@ mod tests {
             other => panic!("expected User message, got {other:?}"),
         }
     }
+}
+
+/// The contract, exercised against every implementation.
+///
+/// One body per property, run once per backend. A behavior asserted here is a
+/// promise [`HistoryStore`] makes, not a detail of how one backend keeps its
+/// bytes — which is the distinction that lets a host swap the backend and
+/// know what still holds.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::entry::SessionKind;
+    use base::permission::PermissionMode;
+
+    async fn jsonl() -> (Box<dyn HistoryStore>, Option<tempfile::TempDir>, tempfile::TempDir) {
+        let cwd = tempfile::TempDir::new().unwrap();
+        let projects = tempfile::TempDir::new().unwrap();
+        let store = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+            .await
+            .unwrap();
+        (Box::new(store), Some(cwd), projects)
+    }
+
+    fn in_memory() -> Box<dyn HistoryStore> {
+        Box::new(InMemoryHistoryStore::new())
+    }
+
+    fn user(text: &str) -> LogEntry {
+        LogEntry::User {
+            content: vec![base::message::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    fn meta(parent: Option<&str>) -> LogEntry {
+        LogEntry::Meta {
+            cwd: "/tmp".into(),
+            started_at: time::OffsetDateTime::now_utc(),
+            model: "test-model".into(),
+            permission_mode: format!("{:?}", PermissionMode::Default),
+            engine_version: "0.0.1".into(),
+            attacode_version: "0.0.1".into(),
+            parent_session_id: parent.map(str::to_string),
+            scene: None,
+            project_root: None,
+            session_kind: SessionKind::Primary,
+            schema_version: crate::entry::CURRENT_META_SCHEMA_VERSION,
+        }
+    }
+
+    /// Runs one property against both shipped backends, so a divergence is a
+    /// failing test rather than a surprise at the call site.
+    macro_rules! for_each_store {
+        ($name:ident, |$store:ident| $body:block) => {
+            #[tokio::test]
+            async fn $name() {
+                {
+                    let (boxed, _cwd, _projects) = jsonl().await;
+                    let $store: &dyn HistoryStore = boxed.as_ref();
+                    $body
+                }
+                {
+                    let boxed = in_memory();
+                    let $store: &dyn HistoryStore = boxed.as_ref();
+                    $body
+                }
+            }
+        };
+    }
+
+    for_each_store!(entries_come_back_in_the_order_they_went_in, |store| {
+        let s = SessionId::new();
+        for i in 0..5 {
+            store.append(s, user(&format!("m{i}"))).await.unwrap();
+        }
+        let loaded = store.load(s).await.unwrap();
+        let texts: Vec<String> = loaded
+            .iter()
+            .filter_map(|e| match &e.entry {
+                LogEntry::User { content } => content.iter().find_map(|b| match b {
+                    base::message::ContentBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["m0", "m1", "m2", "m3", "m4"]);
+    });
+
+    for_each_store!(a_session_that_was_never_written_is_not_an_empty_one, |store| {
+        let err = store.load(SessionId::new()).await.unwrap_err();
+        assert!(
+            matches!(err, HistoryError::SessionNotFound(_)),
+            "absent must be distinguishable from empty: {err:?}"
+        );
+    });
+
+    for_each_store!(listing_finds_every_written_session, |store| {
+        let a = SessionId::new();
+        let b = SessionId::new();
+        store.append(a, user("hi")).await.unwrap();
+        store.append(b, user("hi")).await.unwrap();
+        let mut listed: Vec<String> = store
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .map(SessionId::to_string)
+            .collect();
+        listed.sort();
+        let mut want = vec![a.to_string(), b.to_string()];
+        want.sort();
+        assert_eq!(listed, want);
+    });
+
+    for_each_store!(deleting_forgets_the_session_and_is_idempotent, |store| {
+        let s = SessionId::new();
+        store.append(s, user("hi")).await.unwrap();
+        store.delete(s).await.unwrap();
+        assert!(matches!(
+            store.load(s).await.unwrap_err(),
+            HistoryError::SessionNotFound(_)
+        ));
+        store
+            .delete(s)
+            .await
+            .expect("deleting what is not there is not an error");
+    });
+
+    for_each_store!(the_parent_link_is_readable_and_drives_the_child_walk, |store| {
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        let orphan = SessionId::new();
+        store.append(parent, meta(None)).await.unwrap();
+        store
+            .append(child, meta(Some(&parent.to_string())))
+            .await
+            .unwrap();
+        store.append(orphan, meta(None)).await.unwrap();
+
+        assert_eq!(store.session_parent(parent).await.unwrap(), None);
+        assert_eq!(
+            store.session_parent(child).await.unwrap(),
+            Some(parent.to_string())
+        );
+        assert_eq!(
+            store.child_sessions(&parent.to_string()).await.unwrap(),
+            vec![child]
+        );
+    });
+
+    for_each_store!(messages_are_projected_from_the_log, |store| {
+        let s = SessionId::new();
+        store.append(s, meta(None)).await.unwrap();
+        store.append(s, user("hello")).await.unwrap();
+        let messages = store.load_messages(s).await.unwrap();
+        assert_eq!(messages.len(), 1, "Meta must not reach the model");
+    });
 }
