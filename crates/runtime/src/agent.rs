@@ -177,6 +177,9 @@ pub struct Agent {
     /// [`crate::elicitation::ChannelElicitation`], which speaks the event /
     /// input-channel protocol hosts already use.
     pub(crate) elicitation: Arc<dyn base::interface::elicitation::Elicitation>,
+    /// What else contributes to this session's system prompt — see
+    /// [`Builder::prompt_registry`].
+    pub(crate) prompt_registry: Arc<dyn base::interface::prompt_registry::PromptRegistry>,
     /// Cancellation token of the turn currently in flight — replaced by
     /// `run()` before each turn, cancelled by the input demultiplexer on
     /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
@@ -944,6 +947,8 @@ pub struct Builder {
     /// Replaces the built-in way of asking a person something — see
     /// [`Builder::elicitation`].
     elicitation: Option<Arc<dyn base::interface::elicitation::Elicitation>>,
+    /// Contributions to the system prompt — see [`Builder::prompt_registry`].
+    prompt_registry: Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>>,
     /// Extra destinations for this session's events, beyond the `event_rx`
     /// `build()` returns — see [`Builder::event_sink`].
     event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
@@ -1135,6 +1140,7 @@ impl Builder {
             shared_agent_types: None,
             skill_catalog: None,
             elicitation: None,
+            prompt_registry: None,
             event_sinks: Vec::new(),
             agent_depth: 0,
         }
@@ -1170,6 +1176,22 @@ impl Builder {
         e: Arc<dyn base::interface::elicitation::Elicitation>,
     ) -> Self {
         self.elicitation = Some(e);
+        self
+    }
+
+    /// Let something other than the engine contribute to the system prompt.
+    ///
+    /// Registered blocks are merged with the kernel's stages and sorted with
+    /// them, so a contribution can sit before the skills inventory rather than
+    /// only after everything. Registering nothing assembles exactly the prompt
+    /// the engine assembled before this existed.
+    ///
+    /// [`PromptRegistry`]: base::interface::prompt_registry::PromptRegistry
+    pub fn prompt_registry(
+        mut self,
+        r: Arc<dyn base::interface::prompt_registry::PromptRegistry>,
+    ) -> Self {
+        self.prompt_registry = Some(r);
         self
     }
 
@@ -2012,6 +2034,9 @@ impl Builder {
                         pending_permissions.clone(),
                     ))
                 }),
+                prompt_registry: self
+                    .prompt_registry
+                    .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
                 pending_permissions,
                 current_turn_cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
                 memory_store,

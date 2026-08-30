@@ -9,7 +9,7 @@ use base::interface::memory::{DurableMemory, MemoryStore, MemoryType};
 use base::interface::model::{
     MessageRole, ModelContentBlock, ModelMessage, ModelStream, ToolDef, Usage,
 };
-use base::interface::prompt::{assemble_prompt, PromptBlock};
+use base::interface::prompt::PromptBlock;
 use base::interface::scene::ScenePromptContext;
 use base::tool::{ToolContext, ToolResultContent};
 use mcp::manager::McpManager;
@@ -2478,7 +2478,8 @@ or project context that should survive across sessions.
             self.tool_results_ever_cleared,
         );
         ctx.available_tools = tools_ref;
-        assemble_prompt(
+        base::interface::prompt::assemble_prompt_with(
+            self.prompt_registry.as_ref(),
             self.scene.as_ref(),
             &self.settings,
             &self.memory_store,

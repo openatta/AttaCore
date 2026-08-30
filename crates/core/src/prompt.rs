@@ -172,11 +172,44 @@ impl PromptBlock {
 pub fn assemble_prompt(
     scene: &dyn AgentScene,
     settings: &Settings,
+    memory_store: &MemoryStore,
+    ctx: &ScenePromptContext,
+    skills_text: Option<&str>,
+    mcp_instructions: Option<&str>,
+) -> Vec<PromptBlock> {
+    assemble_prompt_with(
+        &crate::interface::prompt_registry::NoRegistrations,
+        scene,
+        settings,
+        memory_store,
+        ctx,
+        skills_text,
+        mcp_instructions,
+    )
+}
+
+/// [`assemble_prompt`], merging in whatever else registered a contribution.
+///
+/// The kernel's own stages are registrations too — they are placed at the
+/// orders in [`orders`](crate::interface::prompt_registry::orders) and sorted
+/// alongside everything else, rather than being concatenated first and having
+/// contributions appended after. That is what makes "before the skills
+/// inventory" a thing an extension can ask for.
+///
+/// `prompt_override` still wins over all of it. Overriding the prompt means
+/// overriding the prompt; a contribution surviving it would make the setting
+/// mean something narrower than it says.
+pub fn assemble_prompt_with(
+    registry: &dyn crate::interface::prompt_registry::PromptRegistry,
+    scene: &dyn AgentScene,
+    settings: &Settings,
     _memory_store: &MemoryStore,
     ctx: &ScenePromptContext,
     skills_text: Option<&str>,
     mcp_instructions: Option<&str>,
 ) -> Vec<PromptBlock> {
+    use crate::interface::prompt_registry::{orders, PromptContent, RegisteredBlock};
+
     // If override is set, return it as the sole system block.
     if let Some(ref ov) = settings.prompt_override {
         return vec![PromptBlock::system(ov.clone())
@@ -184,25 +217,35 @@ pub fn assemble_prompt(
             .from_origin(BlockOrigin::Config)];
     }
 
-    let mut blocks = Vec::new();
+    let mut kernel: Vec<(i32, PromptBlock)> = Vec::new();
 
     // 1. Scene skeleton — a scene names its own sections; only fill in for one
     // that doesn't, so a scene's own labels are never overwritten here.
-    blocks.extend(scene.build_system_prompt(ctx).into_iter().map(|b| match &b.name {
-        // A scene that labels its own sections keeps those labels, under the
-        // `scene.` prefix so a name can never collide with a kernel block's.
-        Some(section) if !section.starts_with(names::SCENE_PREFIX) => {
-            let prefixed = format!("{}{section}", names::SCENE_PREFIX);
-            b.named(prefixed)
-        }
-        Some(_) => b,
-        None => b.named(names::SCENE_SKELETON),
-    }));
+    kernel.extend(
+        scene
+            .build_system_prompt(ctx)
+            .into_iter()
+            .map(|b| match &b.name {
+                // A scene that labels its own sections keeps those labels,
+                // under the `scene.` prefix so a name can never collide with a
+                // kernel block's.
+                Some(section) if !section.starts_with(names::SCENE_PREFIX) => {
+                    let prefixed = format!("{}{section}", names::SCENE_PREFIX);
+                    b.named(prefixed)
+                }
+                Some(_) => b,
+                None => b.named(names::SCENE_SKELETON),
+            })
+            .map(|b| (orders::SCENE, b)),
+    );
 
     // 2. Skills
     if let Some(text) = skills_text {
         if !text.is_empty() {
-            blocks.push(PromptBlock::system(text.to_string()).named(names::SKILLS_CATALOG));
+            kernel.push((
+                orders::SKILLS_CATALOG,
+                PromptBlock::system(text.to_string()).named(names::SKILLS_CATALOG),
+            ));
         }
     }
 
@@ -212,8 +255,10 @@ pub fn assemble_prompt(
     // Gated by settings.memory_enabled (default: true).
     if settings.memory_enabled {
         let mem_dir = &settings.paths.global_data_dir.join("memory");
-        blocks
-            .push(PromptBlock::system(build_memory_prompt(mem_dir)).named(names::MEMORY_SESSION));
+        kernel.push((
+            orders::MEMORY_SESSION,
+            PromptBlock::system(build_memory_prompt(mem_dir)).named(names::MEMORY_SESSION),
+        ));
     }
 
     // 3b. Rules — lightweight discovery index only (filenames + first-line
@@ -221,26 +266,73 @@ pub fn assemble_prompt(
     // files exist anywhere, so sessions that don't use this feature pay zero
     // extra tokens. See `crate::rules` module docs.
     if let Some(text) = build_rules_prompt(&settings.paths) {
-        blocks.push(PromptBlock::system(text).named(names::RULES));
+        kernel.push((orders::RULES, PromptBlock::system(text).named(names::RULES)));
     }
 
     // 4. MCP instructions
     if let Some(text) = mcp_instructions {
         if !text.is_empty() {
-            blocks.push(PromptBlock::system(text.to_string()).named(names::MCP_INSTRUCTIONS));
+            kernel.push((
+                orders::MCP_INSTRUCTIONS,
+                PromptBlock::system(text.to_string()).named(names::MCP_INSTRUCTIONS),
+            ));
         }
     }
 
     // 5. User append
     if let Some(ref append) = settings.prompt_append {
-        blocks.push(
+        kernel.push((
+            orders::CONFIG_PROMPT_APPEND,
             PromptBlock::system(append.clone())
                 .named(names::CONFIG_PROMPT_APPEND)
                 .from_origin(BlockOrigin::Config),
-        );
+        ));
     }
 
-    blocks
+    // Registered contributions join the kernel's stages and the whole lot
+    // sorts together. Stable, so blocks sharing an order keep the sequence
+    // they arrived in — which is what preserves a scene's own section order.
+    let mut merged: Vec<(i32, PromptBlock)> = kernel;
+    for block in registry.blocks() {
+        let RegisteredBlock {
+            name,
+            role,
+            order,
+            content,
+            cache_strategy,
+            origin,
+        } = block;
+        let text = match content {
+            PromptContent::Static(s) => Some(s),
+            PromptContent::Provider(p) => p(ctx),
+        };
+        // A provider with nothing to say contributes nothing, rather than an
+        // empty block that costs a separator and a cache boundary.
+        let Some(text) = text.filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        merged.push((
+            order,
+            PromptBlock {
+                role,
+                content: text,
+                cache_strategy,
+                name: Some(name),
+                origin,
+            },
+        ));
+    }
+    merged.sort_by_key(|(order, _)| *order);
+
+    let variables = registry.variables();
+    merged
+        .into_iter()
+        .map(|(_, mut b)| {
+            b.content =
+                crate::interface::prompt_registry::interpolate(&b.content, &variables, ctx);
+            b
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -517,5 +609,147 @@ mod tests {
 
         assert_eq!(blocks[0].name.as_deref(), Some("scene.identity"));
         assert_eq!(blocks[1].name.as_deref(), Some("scene.tools"));
+    }
+
+    /// The property that makes registration safe to land before anything
+    /// registers: an empty registry assembles exactly what the hardcoded
+    /// function did.
+    #[test]
+    fn an_empty_registry_assembles_the_identical_prompt() {
+        use crate::interface::prompt_registry::NoRegistrations;
+
+        let scene = TestScene;
+        let mut settings = test_settings();
+        settings.prompt_append = Some("appended".into());
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let ctx = test_ctx();
+
+        let direct = assemble_prompt(&scene, &settings, &store, &ctx, Some("skills"), Some("mcp"));
+        let through_registry = assemble_prompt_with(
+            &NoRegistrations,
+            &scene,
+            &settings,
+            &store,
+            &ctx,
+            Some("skills"),
+            Some("mcp"),
+        );
+        assert_eq!(direct, through_registry);
+    }
+
+    #[test]
+    fn a_registered_block_lands_where_its_order_puts_it_and_can_be_withdrawn() {
+        use crate::interface::prompt_registry::{
+            orders, InMemoryPromptRegistry, PromptRegistry, RegisteredBlock,
+        };
+
+        let scene = TestScene;
+        let settings = test_settings();
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let ctx = test_ctx();
+        let registry = InMemoryPromptRegistry::new();
+
+        // Between the scene and the skills inventory — the placement that was
+        // impossible before, since a contribution could only be appended.
+        let disposer = registry.register_block(
+            RegisteredBlock::system("mine.preamble", orders::SCENE + 50, "read this first")
+                .from_origin(BlockOrigin::Plugin("example".into())),
+        );
+
+        let blocks = assemble_prompt_with(
+            registry.as_ref(),
+            &scene,
+            &settings,
+            &store,
+            &ctx,
+            Some("skills inventory"),
+            None,
+        );
+        let names: Vec<&str> = blocks.iter().filter_map(|b| b.name.as_deref()).collect();
+        let mine = names.iter().position(|n| *n == "mine.preamble").unwrap();
+        let skills = names
+            .iter()
+            .position(|n| *n == names::SKILLS_CATALOG)
+            .unwrap();
+        assert!(mine < skills, "{names:?}");
+        assert!(mine > 0, "the scene still comes first: {names:?}");
+        assert_eq!(
+            blocks[mine].origin,
+            BlockOrigin::Plugin("example".into()),
+            "the block must carry whose it is into the assembled prompt"
+        );
+
+        disposer.dispose();
+        let after = assemble_prompt_with(
+            registry.as_ref(),
+            &scene,
+            &settings,
+            &store,
+            &ctx,
+            Some("skills inventory"),
+            None,
+        );
+        assert!(after.iter().all(|b| b.name.as_deref() != Some("mine.preamble")));
+    }
+
+    #[test]
+    fn a_context_provider_with_nothing_to_say_contributes_no_block() {
+        use crate::interface::prompt_registry::{InMemoryPromptRegistry, PromptRegistry};
+
+        let registry = InMemoryPromptRegistry::new();
+        registry.register_context(
+            "mine.sometimes",
+            50,
+            std::sync::Arc::new(|_: &ScenePromptContext<'_>| None),
+        );
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let blocks = assemble_prompt_with(
+            registry.as_ref(),
+            &TestScene,
+            &test_settings(),
+            &store,
+            &test_ctx(),
+            None,
+            None,
+        );
+        assert!(blocks.iter().all(|b| b.name.as_deref() != Some("mine.sometimes")));
+    }
+
+    #[test]
+    fn a_registered_variable_expands_inside_every_block() {
+        use crate::interface::prompt_registry::{InMemoryPromptRegistry, PromptRegistry};
+
+        let registry = InMemoryPromptRegistry::new();
+        registry.register_variable(
+            "project",
+            std::sync::Arc::new(|_: &ScenePromptContext<'_>| Some("atta".to_string())),
+        );
+        registry.register_context(
+            "mine.greeting",
+            50,
+            std::sync::Arc::new(|_: &ScenePromptContext<'_>| {
+                Some("welcome to {{project}}".to_string())
+            }),
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let blocks = assemble_prompt_with(
+            registry.as_ref(),
+            &TestScene,
+            &test_settings(),
+            &store,
+            &test_ctx(),
+            None,
+            None,
+        );
+        let mine = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("mine.greeting"))
+            .unwrap();
+        assert_eq!(mine.content, "welcome to atta");
     }
 }

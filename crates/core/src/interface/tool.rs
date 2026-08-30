@@ -472,7 +472,9 @@ pub trait Tool: Send + Sync + 'static {
 pub struct RegistrationId(u64);
 
 impl RegistrationId {
-    fn next() -> Self {
+    /// Mint an id. Public because every registry in the engine hands out
+    /// disposers keyed by one, and they do not all live in this module.
+    pub fn next() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
