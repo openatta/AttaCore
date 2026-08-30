@@ -104,6 +104,35 @@ pub fn estimate_model_block_tokens(block: &ModelContentBlock) -> usize {
     estimate_model_block_tokens_with(block, bpe())
 }
 
+/// The engine's default [`TokenCounter`]: everything above, behind the
+/// contract, so a host with a better answer can supply one.
+///
+/// Stateless — the BPE table and the memo cache are process-wide already —
+/// so constructing one costs nothing and any number of them agree.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TiktokenCounter;
+
+impl base::interface::token_counter::TokenCounter for TiktokenCounter {
+    fn count_text(&self, text: &str) -> usize {
+        count_text(bpe(), text)
+    }
+
+    fn count_block(&self, block: &ModelContentBlock) -> usize {
+        estimate_model_block_tokens_with(block, bpe())
+    }
+
+    fn count_messages(&self, messages: &[ModelMessage]) -> usize {
+        estimate_message_tokens(messages)
+    }
+}
+
+/// The counter used wherever nothing more specific was supplied.
+pub fn default_counter() -> std::sync::Arc<dyn base::interface::token_counter::TokenCounter> {
+    static C: OnceLock<std::sync::Arc<dyn base::interface::token_counter::TokenCounter>> =
+        OnceLock::new();
+    C.get_or_init(|| std::sync::Arc::new(TiktokenCounter)).clone()
+}
+
 fn estimate_model_block_tokens_with(block: &ModelContentBlock, bpe: &CoreBPE) -> usize {
     match block {
         ModelContentBlock::Text { text } => count_text(bpe, text),
@@ -388,5 +417,63 @@ mod tests {
             text: "这是一段用于测试的中文内容".repeat(100),
         }])];
         assert!(estimate_message_tokens(&msgs) > 0);
+    }
+}
+
+#[cfg(test)]
+mod counter_contract_tests {
+    use super::*;
+    use base::interface::token_counter::TokenCounter;
+
+    /// The contract's default implementation must be the algorithm the free
+    /// functions already use — otherwise "the number that trips compaction
+    /// and the number that decides what to drop are the same number" stops
+    /// being true the moment a caller moves to the trait.
+    #[test]
+    fn the_default_counter_agrees_with_the_free_functions() {
+        let counter = TiktokenCounter;
+        let messages = vec![ModelMessage {
+            role: base::interface::model::MessageRole::User,
+            content: vec![
+                ModelContentBlock::Text {
+                    text: "a moderately long piece of prose, long enough to matter".repeat(20),
+                },
+                ModelContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "git status"}),
+                },
+                ModelContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+            ],
+        }];
+
+        assert_eq!(
+            counter.count_messages(&messages),
+            estimate_message_tokens(&messages)
+        );
+        for block in &messages[0].content {
+            assert_eq!(
+                counter.count_block(block),
+                estimate_model_block_tokens(block)
+            );
+        }
+        assert_eq!(counter.count_text("hello there"), count_text(bpe(), "hello there"));
+    }
+
+    #[test]
+    fn the_default_counter_is_the_one_handed_out() {
+        let messages = vec![ModelMessage {
+            role: base::interface::model::MessageRole::User,
+            content: vec![ModelContentBlock::Text {
+                text: "hello".into(),
+            }],
+        }];
+        assert_eq!(
+            default_counter().count_messages(&messages),
+            estimate_message_tokens(&messages)
+        );
     }
 }

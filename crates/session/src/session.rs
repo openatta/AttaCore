@@ -35,6 +35,10 @@ pub struct SessionManager {
     /// each time it's called, so repeated calls (once per turn) don't
     /// re-append the same messages.
     persisted_up_to: usize,
+    /// How this session judges its own size — see
+    /// [`SessionManager::set_token_counter`]. `None` means the engine's
+    /// default estimator.
+    token_counter: Option<Arc<dyn base::interface::token_counter::TokenCounter>>,
 }
 
 impl SessionManager {
@@ -59,6 +63,7 @@ impl SessionManager {
             session_memory: None,
             parent_session_id,
             persisted_up_to: 0,
+            token_counter: None,
         }
     }
 
@@ -98,7 +103,26 @@ impl SessionManager {
     /// identically at 50 tokens, i.e. exactly the blocks that fill a context
     /// window were the ones it could not see.
     pub fn token_count(&self) -> usize {
-        model::tokens::estimate_message_tokens(&self.messages)
+        match &self.token_counter {
+            Some(counter) => counter.count_messages(&self.messages),
+            None => model::tokens::estimate_message_tokens(&self.messages),
+        }
+    }
+
+    /// Judge this session's size with `counter` instead of the engine's local
+    /// estimate.
+    ///
+    /// The default is documented to run 5–15% high, because Anthropic does not
+    /// publish its tokenizer and a local `cl100k_base` approximation is the
+    /// cheap stand-in. A host talking to a provider that does publish one, or
+    /// willing to spend a call on `count_tokens`, can be exact — and the
+    /// number this returns is the one compaction triggers on, so being exact
+    /// here is worth something.
+    pub fn set_token_counter(
+        &mut self,
+        counter: Arc<dyn base::interface::token_counter::TokenCounter>,
+    ) {
+        self.token_counter = Some(counter);
     }
 
     pub fn increment_turn(&mut self) {
@@ -1015,5 +1039,37 @@ mod tests {
         let mut mgr = SessionManager::new(Some(store), None, None);
         let err = mgr.resume(&SessionId::new().to_string()).await.unwrap_err();
         assert!(matches!(err, SessionError::NotFound(_)));
+    }
+}
+
+#[cfg(test)]
+mod token_counter_tests {
+    use super::*;
+    use base::interface::model::{MessageRole, ModelContentBlock};
+    use base::interface::token_counter::FixedTokenCounter;
+
+    fn say(text: &str) -> ModelMessage {
+        ModelMessage {
+            role: MessageRole::User,
+            content: vec![ModelContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// The number a host substitutes here is the number compaction triggers
+    /// on, which is the reason the seam is worth having.
+    #[test]
+    fn a_substituted_counter_is_what_the_session_reports() {
+        let mut session = SessionManager::in_memory(None);
+        session.messages.push(say("a conversation of some length"));
+
+        let default_estimate = session.token_count();
+        assert!(default_estimate > 0);
+
+        session.set_token_counter(Arc::new(FixedTokenCounter::new(0, 1_000)));
+        assert_eq!(
+            session.token_count(),
+            1_000,
+            "the session must ask the counter it was given, not the built-in one"
+        );
     }
 }

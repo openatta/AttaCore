@@ -29,6 +29,7 @@
 //! | [`event_sink::EventSink`] | where the engine's events go |
 //! | [`elicitation::Elicitation`] | how the engine asks a person something |
 //! | [`tool::SecondaryLlm`] | the small model tools may call |
+//! | [`token_counter::TokenCounter`] | how big the context is judged to be |
 //!
 //! The engine's other replaceable contracts live in the crate that owns them
 //! and **cannot be re-exported here** without pointing a dependency edge
@@ -56,6 +57,7 @@ pub use crate::prompt;
 #[deprecated(note = "moved to `base::rules` — this module defines no extension contract")]
 pub use crate::rules;
 pub mod scene;
+pub mod token_counter;
 pub mod tool;
 #[deprecated(note = "moved to `base::settings` — declarative configuration types")]
 pub use crate::settings;
