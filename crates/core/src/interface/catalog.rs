@@ -416,7 +416,7 @@ static POINTS: [ExtensionPoint; 26] = [
             rewrites: "the message history",
             frequency: Frequency::PerTurn,
             trust: Trust::host_only(),
-            defined_in: "compaction::Compactor",
+            defined_in: "compaction::compact::Compactor",
         },
         ExtensionPoint {
             id: "script.carrier",
@@ -441,7 +441,7 @@ static POINTS: [ExtensionPoint; 26] = [
                 script: Access::Full,
                 plugin: Access::Declared,
             },
-            defined_in: "hooks::HookRunner",
+            defined_in: "hooks::runner::HookRunner",
         },
 ];
 

@@ -510,12 +510,14 @@ AttaCore/
 | [README.md](README.md) | **You are here** — project overview, architecture, quick start |
 | [daemon_rpc_protocol.md](docs/daemon_rpc_protocol.md) | JSON-RPC method reference — fields, types, error codes, TCP auth handshake. The specification; start here to write a client |
 | [daemon_rpc_developer_guide.md](docs/daemon_rpc_developer_guide.md) | Task-oriented daemon integration guide — connect, run a turn, handle streaming events and errors |
+| [extension_points.md](docs/extension_points.md) | **Every seam in the engine** — what you can replace, contribute to or intercept, what it costs, who is allowed. Start here to build on AttaCore |
+| [EXTENSIBILITY_DESIGN.md](docs/EXTENSIBILITY_DESIGN.md) | Why the extension surface is shaped the way it is, and the eleven things that stay in the kernel |
 | [plugin_system_design.md](docs/plugin_system_design.md) | Plugin system design — manifest, capabilities, component loading, contribution points |
 | [recorder_design.md](docs/recorder_design.md) | LLM interaction recording and deterministic replay |
 | [session_and_scene_invariants.md](docs/session_and_scene_invariants.md) | Cross-module constraints on sessions and scenes — read before changing either |
 | [schemas/settings.schema.json](docs/schemas/settings.schema.json) | Generated JSON Schema for `settings.json` |
 
-There is currently no prose API reference for **Library mode**; the entry points are `runtime::agent::Builder` and the trait list under [Customizing Behavior](#customizing-behavior).
+There is currently no prose API reference for **Library mode**; the entry points are `runtime::agent::Builder` and [extension_points.md](docs/extension_points.md), which lists every trait the builder accepts along with a minimal example for each.
 
 ## License
 
