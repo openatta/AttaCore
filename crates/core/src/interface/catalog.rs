@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 19] = [
+static POINTS: [ExtensionPoint; 20] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -352,6 +352,16 @@ static POINTS: [ExtensionPoint; 19] = [
             frequency: Frequency::PerTurn,
             trust: Trust::host_only(),
             defined_in: "compaction::Compactor",
+        },
+        ExtensionPoint {
+            id: "script.carrier",
+            kind: Kind::Contract,
+            summary: "run the operator's own code at a hook point, in this process",
+            timing: "wherever the carrier is bound; governed by a per-turn quota",
+            rewrites: "whatever the bound point allows, under the script's own provenance",
+            frequency: Frequency::PerTurn,
+            trust: Trust::operator_full_plugin_declares(),
+            defined_in: "base::interface::script::ScriptEngine",
         },
         ExtensionPoint {
             id: "hooks",

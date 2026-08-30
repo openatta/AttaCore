@@ -103,7 +103,7 @@ impl Authority {
         }
     }
 
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match &self.origin {
             BlockOrigin::Plugin(name) => format!("plugin '{name}'"),
             BlockOrigin::Script(path) => format!("script '{path}'"),
@@ -269,6 +269,48 @@ pub trait AssemblyHook: Send + Sync {
         assembly: &mut PromptAssembly,
         ctx: &ScenePromptContext<'_>,
     ) -> Result<(), String>;
+}
+
+/// A pass over the assembled prompt that has to await something.
+///
+/// The synchronous [`AssemblyHook`] is the common case and stays
+/// synchronous — a Rust hook that only rearranges strings should not be an
+/// async function for the sake of the one backend that needs to be. This is
+/// the variant a script carrier implements, since running the operator's code
+/// means awaiting an engine.
+#[async_trait::async_trait]
+pub trait AsyncAssemblyHook: Send + Sync {
+    async fn on_assemble_async(
+        &self,
+        assembly: &mut PromptAssembly,
+        ctx: &ScenePromptContext<'_>,
+    ) -> Result<(), String>;
+}
+
+/// Run every async hook over `blocks`, each under its own authority.
+///
+/// Separate from [`run_assembly_hooks`] rather than replacing it: prompt
+/// assembly is a synchronous function called from the turn, and making the
+/// whole of it async to accommodate a backend nobody has configured would put
+/// an await point in every session's hot path to serve none of them.
+pub async fn run_async_assembly_hooks(
+    blocks: Vec<PromptBlock>,
+    hooks: &[(Arc<dyn AsyncAssemblyHook>, Authority)],
+    ctx: &ScenePromptContext<'_>,
+) -> Vec<PromptBlock> {
+    let mut blocks = blocks;
+    for (hook, authority) in hooks {
+        let mut assembly = PromptAssembly::new(blocks, authority.clone());
+        if let Err(e) = hook.on_assemble_async(&mut assembly, ctx).await {
+            tracing::warn!(
+                by = %authority.describe(),
+                error = %e,
+                "an async prompt assembly hook failed; its edits up to that point stand"
+            );
+        }
+        blocks = assembly.into_blocks();
+    }
+    blocks
 }
 
 /// Run every hook over `blocks`, each under its own authority.

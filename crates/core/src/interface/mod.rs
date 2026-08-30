@@ -35,6 +35,7 @@
 //! | [`token_counter::TokenCounter`] | how big the context is judged to be |
 //! | [`prompt_registry::PromptRegistry`] | what goes into the system prompt |
 //! | [`prompt_assembly::AssemblyHook`] | a last pass over the assembled prompt |
+//! | [`script::ScriptEngine`] | running the operator's own code at a hook point |
 //!
 //! [`catalog`] is the whole picture, including the contracts below that this
 //! directory cannot re-export: every extension point as data, with when it
@@ -70,6 +71,7 @@ pub use crate::prompt;
 #[deprecated(note = "moved to `base::rules` — this module defines no extension contract")]
 pub use crate::rules;
 pub mod scene;
+pub mod script;
 pub mod token_counter;
 pub mod tool;
 pub mod tool_middleware;
