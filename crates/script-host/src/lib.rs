@@ -1,0 +1,719 @@
+//! The script carrier's engine: QuickJS, behind
+//! [`base::interface::script::ScriptEngine`].
+//!
+//! This is the cheapest tier of hook-point backend — the operator's own code,
+//! in this process, in microseconds, between "recompile the engine" and "spawn
+//! a subprocess". The contract, the per-turn quota and the wall-clock budget
+//! live in `base::interface::script`; this is only the interpreter behind them.
+//!
+//! # A fresh runtime per call
+//!
+//! Every call builds a QuickJS runtime, evaluates the script into it, calls the
+//! entry point and throws the runtime away. That costs more than keeping one
+//! warm, and it buys something worth more at this stage: no state survives a
+//! call, so one session's script cannot stash anything another session's script
+//! can see, and a script cannot accumulate memory across a turn. Pooling
+//! runtimes is an optimization to make once there is a reason to; sharing one
+//! between sessions is a decision that would need arguing for.
+//!
+//! # Interruption is the engine's job
+//!
+//! `ScriptCarrier` puts a timeout around the future, and a timeout abandons a
+//! future without stopping a busy loop — `while(true){}` would keep a thread
+//! spinning after the caller gave up. So the runtime carries its own deadline
+//! through QuickJS's interrupt handler, which fires between bytecode
+//! instructions and can stop code that never yields. The carrier's budget is
+//! the second line; this is the first.
+//!
+//! # What a script can reach
+//!
+//! Nothing. No filesystem, no network, no clock beyond `Date`, no host
+//! bindings at all. A script gets its input and returns its output, both as
+//! JSON. Capabilities are declared and resolved through
+//! `base::interface::capabilities` like every other carrier's, and until
+//! something is wired to grant one, the honest answer is that this carrier
+//! grants none.
+
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use base::interface::script::{ScriptError, ScriptLimits, ScriptSource};
+
+/// QuickJS.
+pub struct QuickJsEngine {
+    /// Ceiling on a single runtime's heap. Independent of the per-call
+    /// timeout: a script can exhaust memory quickly or slowly.
+    memory_limit_bytes: usize,
+}
+
+impl Default for QuickJsEngine {
+    fn default() -> Self {
+        Self {
+            // Generous for string work, small enough that a script cannot
+            // starve the process it is a guest in.
+            memory_limit_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl QuickJsEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit_bytes = bytes;
+        self
+    }
+}
+
+/// Wrap the operator's code so the whole exchange is one call with strings on
+/// both sides.
+///
+/// JSON in and JSON out rather than converting Rust values through QuickJS's
+/// type system: the contract is already JSON-shaped, and going through
+/// `JSON.parse` / `JSON.stringify` means a script sees exactly what a command
+/// hook or a wasm component would see for the same point.
+///
+/// The user's code goes inside the function body, so `function onAssemble(…)`
+/// hoists and is in scope by the time it is called.
+fn wrap(code: &str, entry: &str) -> String {
+    format!(
+        "(function (__atta_input) {{\n\
+         {code}\n\
+         if (typeof {entry} !== 'function') {{\n\
+           throw new Error('script does not export a function named {entry}');\n\
+         }}\n\
+         var __atta_out = {entry}(JSON.parse(__atta_input));\n\
+         return __atta_out === undefined ? 'null' : JSON.stringify(__atta_out);\n\
+         }})"
+    )
+}
+
+fn run_blocking(
+    code: String,
+    entry: String,
+    input: String,
+    deadline: Instant,
+    memory_limit_bytes: usize,
+) -> Result<String, ScriptError> {
+    let runtime = rquickjs::Runtime::new().map_err(|e| ScriptError::Failed(e.to_string()))?;
+    runtime.set_memory_limit(memory_limit_bytes);
+    // Fires between instructions, which is what makes a script that never
+    // yields stoppable. Returning true unwinds the interpreter.
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+
+    let context =
+        rquickjs::Context::full(&runtime).map_err(|e| ScriptError::Failed(e.to_string()))?;
+
+    context.with(|ctx| {
+        let source = wrap(&code, &entry);
+        let func: rquickjs::Function = ctx
+            .eval(source.as_bytes())
+            .map_err(|e| script_error(&ctx, e, deadline))?;
+        let out: String = func
+            .call((input,))
+            .map_err(|e| script_error(&ctx, e, deadline))?;
+        Ok(out)
+    })
+}
+
+/// Turn a QuickJS error into something a caller can act on.
+///
+/// An interrupted script surfaces as an ordinary exception, so "did it run out
+/// of time" is answered by the clock rather than by the message — QuickJS does
+/// not distinguish them and a string match on its wording would break on the
+/// next release.
+fn script_error(ctx: &rquickjs::Ctx<'_>, e: rquickjs::Error, deadline: Instant) -> ScriptError {
+    if Instant::now() >= deadline {
+        return ScriptError::TimedOut {
+            after: Duration::ZERO,
+        };
+    }
+    if let rquickjs::Error::Exception = e {
+        let caught = ctx.catch();
+        if let Some(exception) = caught.as_exception() {
+            let message = exception
+                .message()
+                .unwrap_or_else(|| "uncaught exception".to_string());
+            return match exception.stack() {
+                Some(stack) if !stack.trim().is_empty() => {
+                    ScriptError::Failed(format!("{message}\n{stack}"))
+                }
+                _ => ScriptError::Failed(message),
+            };
+        }
+    }
+    ScriptError::Failed(e.to_string())
+}
+
+#[async_trait]
+impl base::interface::script::ScriptEngine for QuickJsEngine {
+    async fn eval(
+        &self,
+        script: &ScriptSource,
+        entry: &str,
+        input: serde_json::Value,
+        limits: &ScriptLimits,
+    ) -> Result<serde_json::Value, ScriptError> {
+        let input = serde_json::to_string(&input)
+            .map_err(|e| ScriptError::Failed(format!("input is not serializable: {e}")))?;
+        let code = script.code.clone();
+        let entry = entry.to_string();
+        let id = script.id.clone();
+        // The deadline is the engine's copy of the carrier's budget, because
+        // the carrier's `timeout` cannot reach inside a running interpreter.
+        let deadline = Instant::now() + limits.timeout;
+        let memory_limit_bytes = self.memory_limit_bytes;
+
+        // JavaScript is synchronous and CPU-bound. On an ordinary task it
+        // would hold a runtime worker for its whole execution; a script that
+        // spins would hold one until its deadline.
+        let joined = tokio::task::spawn_blocking(move || {
+            run_blocking(code, entry, input, deadline, memory_limit_bytes)
+        })
+        .await;
+
+        let out = match joined {
+            Ok(result) => result?,
+            Err(e) => {
+                tracing::warn!(script = %id, error = %e, "script task did not finish");
+                return Err(ScriptError::Failed(format!("script task failed: {e}")));
+            }
+        };
+
+        serde_json::from_str(&out).map_err(|e| {
+            ScriptError::Failed(format!("script returned something that is not JSON: {e}"))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base::interface::script::{ScriptCarrier, ScriptEngine};
+    use base::prompt::BlockOrigin;
+    use std::sync::Arc;
+
+    fn script(code: &str) -> ScriptSource {
+        ScriptSource {
+            id: "./.atta/scripts/test.js".into(),
+            origin: BlockOrigin::Script("./.atta/scripts/test.js".into()),
+            code: code.to_string(),
+        }
+    }
+
+    async fn call(code: &str, entry: &str, input: serde_json::Value) -> Result<serde_json::Value, ScriptError> {
+        QuickJsEngine::new()
+            .eval(&script(code), entry, input, &ScriptLimits::default())
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_script_transforms_its_input() {
+        let out = call(
+            "function onAssemble(blocks) { return blocks.map(b => b.name); }",
+            "onAssemble",
+            serde_json::json!([{"name": "a"}, {"name": "b"}]),
+        )
+        .await
+        .expect("the script runs");
+        assert_eq!(out, serde_json::json!(["a", "b"]));
+    }
+
+    #[tokio::test]
+    async fn a_script_returning_nothing_returns_null_rather_than_failing() {
+        let out = call("function f() {}", "f", serde_json::json!({}))
+            .await
+            .expect("the script runs");
+        assert_eq!(out, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_missing_entry_point_says_which_one() {
+        let err = call("function other() {}", "onAssemble", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ScriptError::Failed(m) if m.contains("onAssemble")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thrown_error_comes_back_as_a_failure_with_its_message() {
+        let err = call(
+            "function f() { throw new Error('deliberate'); }",
+            "f",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ScriptError::Failed(m) if m.contains("deliberate")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_syntax_error_is_a_failure_not_a_panic() {
+        let err = call("function f( {", "f", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ScriptError::Failed(_)), "{err:?}");
+    }
+
+    /// The property the carrier's timeout alone cannot deliver: a script that
+    /// never yields is stopped, not merely abandoned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_infinite_loop_is_interrupted_rather_than_left_spinning() {
+        let engine = QuickJsEngine::new();
+        let started = Instant::now();
+        let err = engine
+            .eval(
+                &script("function f() { while (true) {} }"),
+                "f",
+                serde_json::json!({}),
+                &ScriptLimits {
+                    timeout: Duration::from_millis(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, ScriptError::TimedOut { .. }), "{err:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the interpreter must have been stopped, not waited out: {elapsed:?}"
+        );
+    }
+
+    /// Through the carrier, which is how the engine is actually reached: the
+    /// budget and the quota are enforced outside it and the interruption
+    /// inside it, and both hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_script_costs_its_own_call_and_no_other() {
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let stuck = ScriptCarrier::new(
+            engine.clone(),
+            script("function f() { while (true) {} }"),
+            ScriptLimits {
+                timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        );
+        let fine = ScriptCarrier::new(
+            engine,
+            script("function f(x) { return x; }"),
+            ScriptLimits::default(),
+        );
+
+        let (stuck_out, fine_out) = tokio::join!(
+            stuck.call("f", serde_json::json!({})),
+            fine.call("f", serde_json::json!({"ok": true}))
+        );
+        assert!(matches!(stuck_out, Err(ScriptError::TimedOut { .. })), "{stuck_out:?}");
+        assert_eq!(fine_out, Ok(serde_json::json!({"ok": true})));
+    }
+
+    /// Nothing survives a call. Two calls to the same carrier cannot see each
+    /// other's globals, which is what makes one session's script unable to
+    /// leave anything for another's.
+    #[tokio::test]
+    async fn no_state_survives_between_calls() {
+        let engine = QuickJsEngine::new();
+        let code = "function f() { \
+                      if (typeof globalThis.__seen === 'undefined') { globalThis.__seen = 0; } \
+                      globalThis.__seen += 1; \
+                      return globalThis.__seen; \
+                    }";
+        for _ in 0..3 {
+            let out = engine
+                .eval(&script(code), "f", serde_json::json!({}), &ScriptLimits::default())
+                .await
+                .expect("runs");
+            assert_eq!(out, serde_json::json!(1), "a fresh runtime starts from nothing");
+        }
+    }
+
+    /// A script cannot reach the host: no `require`, no `process`, no `fetch`.
+    #[tokio::test]
+    async fn a_script_has_no_way_out() {
+        for probe in ["require", "process", "fetch", "XMLHttpRequest", "Deno"] {
+            let out = call(
+                &format!("function f() {{ return typeof {probe}; }}"),
+                "f",
+                serde_json::json!({}),
+            )
+            .await
+            .expect("the probe itself runs");
+            assert_eq!(
+                out,
+                serde_json::json!("undefined"),
+                "`{probe}` is reachable from a script"
+            );
+        }
+    }
+}
+
+/// Turning `settings.scripts` into registrations on a prompt registry.
+///
+/// Kept here rather than in the composition root so that the whole path from
+/// "a line in settings.json" to "a script running at a point" lives with the
+/// carrier that runs it, and so a build without this crate has no half of it.
+pub mod bindings {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use base::interface::prompt_assembly::{AssemblyCapabilities, Authority};
+    use base::interface::prompt_registry::PromptRegistry;
+    use base::interface::script::{
+        PromptAssemblyScript, ScriptCarrier, ScriptEngine, ScriptLimits, ScriptSource,
+    };
+    use base::prompt::BlockOrigin;
+    use base::settings::ScriptBinding;
+
+    /// Points a script may be bound to today.
+    ///
+    /// A short list on purpose. Every entry is a place where a script's cost
+    /// is bounded and its authority is defined; adding one means answering
+    /// both questions for the new place, not appending a string here.
+    pub const BINDABLE_POINTS: &[&str] = &["prompt.assemble"];
+
+    /// Why a binding could not be honored.
+    ///
+    /// Every variant is a startup failure rather than a warning. A script that
+    /// silently never runs is worse than one that refuses to load: the author
+    /// changes their prompt, sees no difference, and concludes the engine
+    /// ignored them.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum BindingError {
+        Unreadable { path: String, reason: String },
+        UnknownPoint { point: String },
+        UnbindablePoint { point: String },
+    }
+
+    impl std::fmt::Display for BindingError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Unreadable { path, reason } => {
+                    write!(f, "script `{path}` could not be read: {reason}")
+                }
+                Self::UnknownPoint { point } => write!(
+                    f,
+                    "no extension point is called `{point}` — see docs/extension_points.md"
+                ),
+                Self::UnbindablePoint { point } => write!(
+                    f,
+                    "`{point}` exists but scripts cannot be bound to it; today that is {}",
+                    BINDABLE_POINTS.join(", ")
+                ),
+            }
+        }
+    }
+
+    /// Where a script came from, which is what decides what it may do.
+    ///
+    /// Inside the project root means the operator wrote it, and it gets their
+    /// authority. Anywhere else — a plugin's directory, a shared location —
+    /// means it arrived from outside, and it may add and no more. The check is
+    /// on the resolved path rather than on anything the binding declares,
+    /// because a declaration is exactly what an outside script would lie in.
+    fn origin_of(path: &Path, project_root: &Path) -> BlockOrigin {
+        let inside = path
+            .canonicalize()
+            .ok()
+            .zip(project_root.canonicalize().ok())
+            .map(|(p, root)| p.starts_with(root))
+            .unwrap_or(false);
+        if inside {
+            BlockOrigin::Script(path.display().to_string())
+        } else {
+            BlockOrigin::Plugin(path.display().to_string())
+        }
+    }
+
+    fn authority_for(origin: &BlockOrigin) -> Authority {
+        if origin.is_local() {
+            Authority::local(origin.clone())
+        } else {
+            // Nothing declared anything, so nothing beyond adding.
+            Authority::plugin(
+                match origin {
+                    BlockOrigin::Plugin(name) => name.clone(),
+                    _ => "script".to_string(),
+                },
+                AssemblyCapabilities::default(),
+            )
+        }
+    }
+
+    /// Register every binding, or say which one is wrong.
+    ///
+    /// All-or-nothing: a partially applied script configuration is a
+    /// configuration nobody wrote.
+    pub fn register_all(
+        registry: &dyn PromptRegistry,
+        engine: Arc<dyn ScriptEngine>,
+        bindings: &[ScriptBinding],
+        project_root: &Path,
+    ) -> Result<usize, BindingError> {
+        let mut prepared = Vec::new();
+        for binding in bindings {
+            if base::interface::catalog::find(&binding.point).is_none() {
+                return Err(BindingError::UnknownPoint {
+                    point: binding.point.clone(),
+                });
+            }
+            if !BINDABLE_POINTS.contains(&binding.point.as_str()) {
+                return Err(BindingError::UnbindablePoint {
+                    point: binding.point.clone(),
+                });
+            }
+            let path = if binding.path.is_absolute() {
+                binding.path.clone()
+            } else {
+                project_root.join(&binding.path)
+            };
+            let code =
+                std::fs::read_to_string(&path).map_err(|e| BindingError::Unreadable {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+            let origin = origin_of(&path, project_root);
+            let defaults = ScriptLimits::default();
+            prepared.push((
+                binding.clone(),
+                ScriptSource {
+                    id: path.display().to_string(),
+                    origin: origin.clone(),
+                    code,
+                },
+                ScriptLimits {
+                    timeout: binding
+                        .timeout_ms
+                        .map(std::time::Duration::from_millis)
+                        .unwrap_or(defaults.timeout),
+                    calls_per_turn: binding.calls_per_turn.unwrap_or(defaults.calls_per_turn),
+                },
+                authority_for(&origin),
+            ));
+        }
+
+        let count = prepared.len();
+        for (binding, source, limits, authority) in prepared {
+            let carrier = ScriptCarrier::new(engine.clone(), source, limits);
+            registry.register_async_assembly_hook(
+                Arc::new(PromptAssemblyScript::new(carrier, &binding.entry)),
+                authority,
+            );
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::bindings::*;
+    use super::QuickJsEngine;
+    use base::interface::prompt_registry::{InMemoryPromptRegistry, PromptRegistry};
+    use base::interface::script::ScriptEngine;
+    use base::prompt::{names, PromptBlock};
+    use base::settings::ScriptBinding;
+    use std::sync::Arc;
+
+    fn ctx() -> base::interface::scene::ScenePromptContext<'static> {
+        use std::borrow::Cow;
+        base::interface::scene::ScenePromptContext {
+            cwd: Cow::Borrowed("/tmp"),
+            os: Cow::Borrowed("linux"),
+            shell: Cow::Borrowed("bash"),
+            home_dir: Cow::Borrowed("/home/user"),
+            date: Cow::Borrowed("2026-06-10"),
+            model_name: Cow::Borrowed("test-model"),
+            skills_text: None,
+            mcp_instructions: None,
+            session_memory: None,
+            is_git: false,
+            git_branch: None,
+            is_worktree: false,
+            git_status: None,
+            language: None,
+            scratchpad_dir: None,
+            output_style_content: None,
+            available_tools: None,
+            tool_results_ever_cleared: false,
+        }
+    }
+
+    fn prompt() -> Vec<PromptBlock> {
+        vec![
+            PromptBlock::system("you are an agent").named(names::SCENE_SKELETON),
+            PromptBlock::system("skills: a, b").named(names::SKILLS_CATALOG),
+            PromptBlock::system("rules: no rm -rf").named(names::RULES),
+        ]
+    }
+
+    fn binding(path: &str) -> ScriptBinding {
+        ScriptBinding {
+            path: path.into(),
+            point: "prompt.assemble".into(),
+            entry: "onAssemble".into(),
+            timeout_ms: None,
+            calls_per_turn: None,
+        }
+    }
+
+    /// The whole point of the ticket, end to end: a file on disk plus a line
+    /// of configuration changes the prompt, with nothing recompiled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_file_and_a_config_line_rewrite_the_prompt() {
+        let project = tempdir();
+        let script = project.join("prompt.js");
+        std::fs::write(
+            &script,
+            "function onAssemble(blocks) {\n\
+               return blocks.map(function (b) {\n\
+                 if (b.name === 'skills.catalog') { b.content = 'skills: (curated)'; }\n\
+                 return b;\n\
+               });\n\
+             }",
+        )
+        .unwrap();
+
+        let registry = InMemoryPromptRegistry::new();
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let n = register_all(registry.as_ref(), engine, &[binding("prompt.js")], &project)
+            .expect("the binding is valid");
+        assert_eq!(n, 1);
+
+        let out = base::interface::prompt_assembly::run_async_assembly_hooks(
+            prompt(),
+            &registry.async_assembly_hooks(),
+            &ctx(),
+        )
+        .await;
+        let skills = out
+            .iter()
+            .find(|b| b.name.as_deref() == Some(names::SKILLS_CATALOG))
+            .expect("still there");
+        assert_eq!(skills.content, "skills: (curated)");
+    }
+
+    /// A script outside the project did not come from the operator, so it may
+    /// add and no more — the same rule any downloaded extension is held to,
+    /// decided by where the file is rather than by what the binding claims.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_from_outside_the_project_may_only_add() {
+        let project = tempdir();
+        let elsewhere = tempdir();
+        let script = elsewhere.join("prompt.js");
+        std::fs::write(
+            &script,
+            "function onAssemble(blocks) {\n\
+               var kept = blocks.filter(function (b) { return b.name !== 'rules'; });\n\
+               kept.push({ name: 'outside.note', content: 'hello' });\n\
+               return kept;\n\
+             }",
+        )
+        .unwrap();
+
+        let registry = InMemoryPromptRegistry::new();
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        register_all(
+            registry.as_ref(),
+            engine,
+            &[binding(script.to_str().unwrap())],
+            &project,
+        )
+        .expect("the binding is valid");
+
+        let out = base::interface::prompt_assembly::run_async_assembly_hooks(
+            prompt(),
+            &registry.async_assembly_hooks(),
+            &ctx(),
+        )
+        .await;
+        let named: Vec<&str> = out.iter().filter_map(|b| b.name.as_deref()).collect();
+        assert!(
+            named.contains(&names::RULES),
+            "an outside script must not be able to delete a kernel block: {named:?}"
+        );
+        assert!(
+            named.contains(&"outside.note"),
+            "its addition still stands: {named:?}"
+        );
+    }
+
+    #[test]
+    fn a_binding_naming_a_point_that_does_not_exist_is_refused() {
+        let registry = InMemoryPromptRegistry::new();
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let mut b = binding("prompt.js");
+        b.point = "prompt.nonexistent".into();
+        let err = register_all(registry.as_ref(), engine, &[b], &tempdir()).unwrap_err();
+        assert_eq!(
+            err,
+            BindingError::UnknownPoint {
+                point: "prompt.nonexistent".into()
+            }
+        );
+        assert!(err.to_string().contains("extension_points.md"), "{err}");
+    }
+
+    #[test]
+    fn a_binding_to_a_point_scripts_may_not_use_says_which_they_may() {
+        let registry = InMemoryPromptRegistry::new();
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let mut b = binding("prompt.js");
+        // A real point, and one a script has no business in.
+        b.point = "event.sink".into();
+        let err = register_all(registry.as_ref(), engine, &[b], &tempdir()).unwrap_err();
+        assert!(
+            matches!(err, BindingError::UnbindablePoint { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("prompt.assemble"), "{err}");
+    }
+
+    /// All or nothing. A configuration half of which was applied is a
+    /// configuration nobody wrote.
+    #[test]
+    fn one_bad_binding_registers_none_of_them() {
+        let project = tempdir();
+        std::fs::write(project.join("good.js"), "function onAssemble(b) { return b; }").unwrap();
+
+        let registry = InMemoryPromptRegistry::new();
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let err = register_all(
+            registry.as_ref(),
+            engine,
+            &[binding("good.js"), binding("missing.js")],
+            &project,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BindingError::Unreadable { .. }), "{err:?}");
+        assert!(
+            registry.async_assembly_hooks().is_empty(),
+            "the good one must not have been registered either"
+        );
+    }
+
+    /// A fresh directory per call. The counter is load-bearing: two calls in
+    /// one test must not collide, or a test about a script living *outside*
+    /// the project silently puts it inside.
+    fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "atta-script-binding-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+}

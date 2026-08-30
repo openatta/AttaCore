@@ -169,10 +169,39 @@ pub trait PromptRegistry: Send + Sync {
     fn assembly_hooks(&self) -> Vec<(Arc<dyn AssemblyHook>, Authority)> {
         Vec::new()
     }
+
+    /// Add a pass that has to await something — a script carrier, most of
+    /// all. Kept separate from [`register_assembly_hook`](Self::register_assembly_hook)
+    /// so a Rust hook that only rearranges strings is not an async function
+    /// for the sake of the one backend that has to be.
+    fn register_async_assembly_hook(
+        &self,
+        _hook: Arc<dyn crate::interface::prompt_assembly::AsyncAssemblyHook>,
+        _authority: Authority,
+    ) -> Disposer {
+        Disposer::inert(RegistrationId::next())
+    }
+
+    /// Every registered async pass, in the order they run.
+    fn async_assembly_hooks(
+        &self,
+    ) -> Vec<(
+        Arc<dyn crate::interface::prompt_assembly::AsyncAssemblyHook>,
+        Authority,
+    )> {
+        Vec::new()
+    }
 }
 
 /// One registered assembly pass and the authority it runs under.
 type HookEntry = (RegistrationId, Arc<dyn AssemblyHook>, Authority);
+
+/// The same, for a pass that has to await something.
+type AsyncHookEntry = (
+    RegistrationId,
+    Arc<dyn crate::interface::prompt_assembly::AsyncAssemblyHook>,
+    Authority,
+);
 
 /// A registry nothing has registered with, and nothing can.
 ///
@@ -216,6 +245,7 @@ pub struct InMemoryPromptRegistry {
     blocks: Arc<Mutex<Vec<(RegistrationId, RegisteredBlock)>>>,
     variables: Arc<Mutex<Vec<(RegistrationId, String, VariableProvider)>>>,
     hooks: Arc<Mutex<Vec<HookEntry>>>,
+    async_hooks: Arc<Mutex<Vec<AsyncHookEntry>>>,
 }
 
 impl InMemoryPromptRegistry {
@@ -285,6 +315,39 @@ impl PromptRegistry for InMemoryPromptRegistry {
 
     fn assembly_hooks(&self) -> Vec<(Arc<dyn AssemblyHook>, Authority)> {
         self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, h, a)| (h.clone(), a.clone()))
+            .collect()
+    }
+
+    fn register_async_assembly_hook(
+        &self,
+        hook: Arc<dyn crate::interface::prompt_assembly::AsyncAssemblyHook>,
+        authority: Authority,
+    ) -> Disposer {
+        let id = RegistrationId::next();
+        self.async_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((id, hook, authority));
+        let hooks = self.async_hooks.clone();
+        Disposer::new(id, move |id| {
+            hooks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(entry, _, _)| *entry != id);
+        })
+    }
+
+    fn async_assembly_hooks(
+        &self,
+    ) -> Vec<(
+        Arc<dyn crate::interface::prompt_assembly::AsyncAssemblyHook>,
+        Authority,
+    )> {
+        self.async_hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()

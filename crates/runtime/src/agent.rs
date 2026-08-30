@@ -2260,6 +2260,7 @@ mod tests {
             task_models: Default::default(),
             language: None,
             feature_flags: Default::default(),
+            scripts: Vec::new(),
         }
     }
 

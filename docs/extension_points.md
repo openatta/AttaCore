@@ -366,19 +366,57 @@ honest in both directions.
 operator's code, in this process, in microseconds, between "recompile the
 engine" and "spawn a subprocess".
 
-**No interpreter ships with the engine.** Bundling one means linking a
-JavaScript runtime into every build, which is a dependency decision this
-project has not taken. A host supplies the engine; `RefusingEngine` is what
-runs when nobody has, and `FnScriptEngine` gives a host the plumbing — the
-quota, the budget, the provenance-based authority — around logic written in
-Rust.
+The engine is QuickJS, in `crates/script-host`, behind `daemon`'s `scripts`
+feature. `base` holds only the contract — it has no internal dependencies and a
+JavaScript runtime there would end up in every build of everything.
 
-A script bound to a point is subject to that point's authority rules, by
-provenance, exactly like any other extension. `ScriptCarrier` enforces the
-per-turn quota and the wall-clock budget from outside the engine, because an
-engine that enforced its own limits could choose not to; an engine
-implementation must additionally be able to interrupt a script that never
-yields, since a timeout abandons a future without stopping a busy loop.
+Bind a script by writing one in your project and naming it in `settings.json`:
+
+```jsonc
+// .atta/scripts/prompt.js
+function onAssemble(blocks) {
+  return blocks.map(b => {
+    if (b.name === "skills.catalog") b.content = curate(b.content);
+    return b;
+  });
+}
+```
+
+```jsonc
+// settings.json
+"scripts": [
+  { "path": ".atta/scripts/prompt.js", "point": "prompt.assemble", "entry": "onAssemble" }
+]
+```
+
+Optional `timeout_ms` and `calls_per_turn` narrow the budget. No recompilation
+is involved; the file and the config line are the whole of it.
+
+**Authority follows the file's location, not the configuration.** A script
+inside the project root is the operator's own and may rewrite anything; one
+anywhere else arrived from outside and may add, like any downloaded extension.
+Nothing in the binding can change that, because a declaration is exactly what
+an outside script would lie in.
+
+A binding naming a point that does not exist, or one scripts may not be bound
+to, is refused at startup and named — and one bad binding drops the whole set
+rather than applying half of it. A script that silently never runs sends its
+author looking for a bug in their JavaScript.
+
+Today the bindable points are `prompt.assemble` and nothing else. The list is
+short on purpose: every entry is a place where a script's cost is bounded and
+its authority is defined, so adding one means answering both questions rather
+than appending a string.
+
+**What a script can reach: nothing.** No filesystem, no network, no host
+bindings, and no state that survives a call — each call gets a fresh runtime,
+so one session's script cannot leave anything for another's.
+
+`ScriptCarrier` enforces the per-turn quota and the wall-clock budget from
+outside the engine, because an engine that enforced its own limits could choose
+not to. The engine additionally carries the deadline into QuickJS's interrupt
+handler, which is what actually stops `while(true){}` — a timeout abandons a
+future without stopping a busy loop.
 
 ---
 
@@ -393,8 +431,10 @@ holding:
    `CapabilityDeclaration` and asks; it does not answer.
 2. **Carriers do not call each other.** They reach each other through host
    contracts, never a direct call across memory models.
-3. **A carrier is a compile-time feature.** `cargo build -p daemon
-   --no-default-features` drops the plugin tier and everything under it.
+3. **Every carrier is a compile-time feature, independently.** A build carries
+   one, both or neither: `plugins` brings the WebAssembly tier, `scripts`
+   brings QuickJS, and `cargo build -p daemon --no-default-features` links
+   neither.
 4. **Disclosure covers every carrier.** It is about what an extension *says*,
    so it names no carrier at all.
 

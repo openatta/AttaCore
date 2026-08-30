@@ -424,6 +424,7 @@ mod tests {
             compaction: Default::default(),
             sandbox: Default::default(),
             plugins: Default::default(),
+            scripts: Vec::new(),
             instruction_file: None,
             prompt_append: None,
             prompt_override: None,

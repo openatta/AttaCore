@@ -95,7 +95,11 @@ fn no_carrier_defines_its_own_authorization() {
         );
     }
 
-    for carrier in ["crates/wasm-host/src", "crates/plugin-host/src"] {
+    for carrier in [
+        "crates/wasm-host/src",
+        "crates/plugin-host/src",
+        "crates/script-host/src",
+    ] {
         for (path, source) in read_all(&root.join(carrier)) {
             let production = without_tests(&source);
             for predicate in ["fn allows_url", "fn allows_env", "fn allows_read", "fn allows_write"] {
@@ -127,36 +131,53 @@ fn carriers_do_not_reach_for_each_other() {
         );
     }
 
-    let script = root.join("crates/core/src/interface/script.rs");
-    let production = without_tests(&std::fs::read_to_string(&script).expect("script carrier"));
-    for forbidden in ["wasm_host", "wasmtime"] {
-        assert!(
-            !production.contains(forbidden),
-            "the script carrier names `{forbidden}`; carriers talk through host \
-             contracts only"
-        );
+    for script_side in [
+        "crates/core/src/interface/script.rs",
+        "crates/script-host/src/lib.rs",
+    ] {
+        let path = root.join(script_side);
+        let production = without_tests(&std::fs::read_to_string(&path).expect("script carrier"));
+        for forbidden in ["wasm_host", "wasmtime"] {
+            assert!(
+                !production.contains(forbidden),
+                "{} names `{forbidden}`; carriers talk through host contracts only",
+                path.display()
+            );
+        }
     }
 }
 
-/// **Rule 3.** A carrier is a compile-time feature. The build that drops the
-/// plugin tier must not drag a WebAssembly runtime in with it.
+/// **Rule 3.** Every carrier is a compile-time feature, independently. A build
+/// carries one, both, or neither — dropping the plugin tier must not drag a
+/// WebAssembly runtime in, and a build with no scripts must link no JavaScript
+/// engine.
 ///
 /// `tests/scripts/locked_build.sh` asserts the same thing against a real
-/// dependency graph; this asserts the declaration that makes it possible, so
-/// a `default = ["plugins"]` slipping into `daemon` fails here rather than in
-/// whatever ships.
+/// dependency graph; this asserts the declarations that make it possible, so a
+/// carrier quietly becoming non-optional fails here rather than in whatever
+/// ships.
 #[test]
-fn the_wasm_carrier_is_optional_at_compile_time() {
+fn every_carrier_is_optional_at_compile_time() {
     let root = repo_root();
     let manifest = std::fs::read_to_string(root.join("daemon/Cargo.toml")).expect("daemon manifest");
-    assert!(
-        manifest.contains("plugin-host") && manifest.contains("optional = true"),
-        "the plugin tier must be an optional dependency of daemon"
-    );
-    assert!(
-        manifest.contains("plugins = ["),
-        "there must be a `plugins` feature to turn it off"
-    );
+
+    for (dependency, feature) in [
+        ("plugin-host", "plugins = ["),
+        ("script-host", "scripts = ["),
+    ] {
+        let declared = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with(dependency))
+            .unwrap_or_else(|| panic!("daemon must declare `{dependency}`"));
+        assert!(
+            declared.contains("optional = true"),
+            "`{dependency}` must be an optional dependency of daemon, found: {declared}"
+        );
+        assert!(
+            manifest.contains(feature),
+            "there must be a `{feature}…]` feature to turn `{dependency}` off"
+        );
+    }
 }
 
 /// **Rule 4.** Disclosure is about what an extension *says*, not about how it

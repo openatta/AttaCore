@@ -24,6 +24,7 @@ session       = { workspace = true }
 plugin        = { workspace = true, optional = true }
 plugin-host   = { workspace = true, optional = true }
 wasm-host     = { workspace = true, optional = true }
+script-host   = { workspace = true, optional = true }
 skills        = { workspace = true }
 tools         = { workspace = true }
 tokio         = { workspace = true, features = ["full"] }
@@ -60,13 +61,19 @@ hex = { workspace = true }
 zip = { workspace = true }
 
 [features]
-default = ["plugins", "plugin-compile"]
+default = ["plugins", "plugin-compile", "scripts"]
 # The plugin subsystem. Off means `plugin`/`plugin-host` (and wasmtime, once
 # the WASM host lands) are not compiled into the binary at all — see
 # `daemon::plugins`. Build the locked-down artifact with
 # `cargo build -p daemon --no-default-features`, never `--workspace`: cargo
 # unifies features across the graph, so any other member enabling it wins.
 plugins = ["dep:plugin", "dep:plugin-host", "dep:wasm-host"]
+# The script carrier. Off means no JavaScript engine is compiled into the
+# binary at all, and a `scripts` section in settings.json is refused at startup
+# rather than silently ignored — a script that quietly never runs is worse than
+# one that fails to load. Same compile-time-feature rule as `plugins`: a build
+# can carry one carrier, both, or neither.
+scripts = ["dep:script-host"]
 # Compile plugin components in-process at install. Off means the daemon links
 # no WebAssembly compiler at all and defers to `atta-plugin-compile`; a cache
 # miss at load then refuses rather than quietly compiling, which is the only

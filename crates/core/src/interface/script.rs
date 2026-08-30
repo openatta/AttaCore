@@ -10,15 +10,19 @@
 //! This is the missing tier: run a piece of the operator's own code, in this
 //! process, in microseconds.
 //!
-//! # No engine ships with the engine
+//! # The engine is a separate crate, behind a feature
 //!
-//! This module is the contract and the governance around it, not an
-//! interpreter. Bundling one is a dependency decision — a JavaScript runtime
-//! is a large amount of third-party code to link into every build — and the
-//! workspace rule is that new dependencies are approved per work order, not
-//! taken. So a host supplies the engine, [`RefusingEngine`] is what runs when
-//! nobody has, and the "no engine linked unless you asked for one" property
-//! holds today because there is no engine to link.
+//! This module is the contract and the governance around it, never an
+//! interpreter: `base` has no internal dependencies and linking a JavaScript
+//! runtime into it would put one in every build of everything. `script-host`
+//! is the carrier crate — QuickJS behind this trait — and it is an optional
+//! dependency of `daemon` under the `scripts` feature, the same way the wasm
+//! carrier sits behind `plugins`. A build can carry one carrier, both, or
+//! neither.
+//!
+//! [`RefusingEngine`] is what runs when a host wired nothing, and
+//! [`FnScriptEngine`] gives a host the governance around logic written in
+//! Rust.
 //!
 //! # Governance belongs here, not in the engine
 //!

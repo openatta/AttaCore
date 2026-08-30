@@ -31,11 +31,11 @@ export CARGO_TARGET_DIR="$LOCKED_TARGET"
 echo "==> building daemon without the plugins feature"
 cargo build -p daemon --no-default-features
 
-echo "==> asserting the plugin crates are absent from the dependency graph"
+echo "==> asserting the carrier crates are absent from the dependency graph"
 leaked=$(cargo tree -p daemon --no-default-features -e normal \
-  | grep -Eo '\b(plugin|plugin-host|wasm-host|wasmtime|cranelift-codegen) v' || true)
+  | grep -Eo '\b(plugin|plugin-host|wasm-host|wasmtime|cranelift-codegen|script-host|rquickjs|rquickjs-core|rquickjs-sys) v' || true)
 if [ -n "$leaked" ]; then
-  echo "FAIL: plugin machinery is still linked into the locked build:" >&2
+  echo "FAIL: carrier machinery is still linked into the locked build:" >&2
   echo "$leaked" >&2
   exit 1
 fi

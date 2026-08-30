@@ -28,7 +28,7 @@ use telemetry::recorder::RecorderModel;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Outcome of comparing a session's recorded `Meta.scene` (if any) against
 /// every scene this daemon currently serves (`SessionPool::active_scenes`) —
@@ -1581,6 +1581,9 @@ impl SessionPool {
         builder = builder.scene_registry(self.scene_registry());
         if let Some(host) = self.plugins.host() {
             builder = builder.plugin_host(host);
+        }
+        if let Some(registry) = build_script_registry(&settings_snapshot, &self.cwd) {
+            builder = builder.prompt_registry(registry);
         }
 
         // Give this session its own owned `McpManager` built from this
@@ -4161,6 +4164,61 @@ fn effective_permission_mode(
 /// Free function (not inlined into `create()`) specifically so this decision
 /// is unit-testable without spinning up a real session.
 #[allow(clippy::too_many_arguments)]
+/// Turn `settings.scripts` into a prompt registry, or nothing.
+///
+/// `None` when no scripts are configured, which is the overwhelming case and
+/// costs the session nothing — the builder then uses its own default and no
+/// registry is allocated.
+///
+/// A binding that cannot be honored is logged and the whole set is dropped,
+/// rather than half of it being applied. That is louder than it looks on
+/// purpose: a script that silently never runs sends its author looking for a
+/// bug in their JavaScript.
+#[cfg(feature = "scripts")]
+fn build_script_registry(
+    settings: &Arc<base::interface::settings::Settings>,
+    project_root: &std::path::Path,
+) -> Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>> {
+    if settings.scripts.is_empty() {
+        return None;
+    }
+    let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
+    let engine: Arc<dyn base::interface::script::ScriptEngine> =
+        Arc::new(script_host::QuickJsEngine::new());
+    match script_host::bindings::register_all(
+        registry.as_ref(),
+        engine,
+        &settings.scripts,
+        project_root,
+    ) {
+        Ok(n) => {
+            info!(scripts = n, "bound scripts to extension points");
+            Some(registry)
+        }
+        Err(e) => {
+            error!(error = %e, "a script binding is invalid; no scripts were bound");
+            None
+        }
+    }
+}
+
+/// Without the script carrier compiled in, a `scripts` section is refused
+/// loudly rather than ignored.
+#[cfg(not(feature = "scripts"))]
+fn build_script_registry(
+    settings: &Arc<base::interface::settings::Settings>,
+    _project_root: &std::path::Path,
+) -> Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>> {
+    if !settings.scripts.is_empty() {
+        error!(
+            count = settings.scripts.len(),
+            "settings.json configures scripts, but this build has no script engine \
+             (the `scripts` feature is off); none of them will run"
+        );
+    }
+    None
+}
+
 fn resolve_session_permission(
     bypass_instance: &Arc<dyn Permission>,
     tools: &Arc<base::tool::InMemoryToolRegistry>,

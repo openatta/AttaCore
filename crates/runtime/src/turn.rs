@@ -912,7 +912,8 @@ impl Agent {
                                 self.session.messages().to_vec(),
                                 self.settings.model.fallback_model.clone(),
                                 origin.clone(),
-                            );
+                            )
+                            .await;
                             match self.send(retry, cancel.clone()).await {
                                 Ok(s) => s,
                                 Err(e2) => {
@@ -2447,7 +2448,7 @@ or project context that should survive across sessions.
     /// PTL path had just compacted anyway. Funnelling all three call sites
     /// through one function makes the drift structurally impossible rather
     /// than merely repaired.
-    fn build_prompt_blocks(&self, effective_model: &str) -> Vec<PromptBlock> {
+    async fn build_prompt_blocks(&self, effective_model: &str) -> Vec<PromptBlock> {
         let mcp_instructions = self.build_mcp_instructions();
         let mcp_ref: Option<&str> = if mcp_instructions.is_empty() {
             None
@@ -2489,7 +2490,7 @@ or project context that should survive across sessions.
             self.tool_results_ever_cleared,
         );
         ctx.available_tools = tools_ref;
-        base::interface::prompt::assemble_prompt_with(
+        let blocks = base::interface::prompt::assemble_prompt_with(
             self.prompt_registry.as_ref(),
             self.scene.as_ref(),
             &self.settings,
@@ -2497,7 +2498,16 @@ or project context that should survive across sessions.
             &ctx,
             skills_ref, // skills_text
             mcp_ref,    // mcp_instructions
+        );
+        // Passes that have to await something — a script carrier, most of
+        // all. Kept out of `assemble_prompt_with` so assembly stays a
+        // synchronous function for every caller that registers none.
+        base::interface::prompt_assembly::run_async_assembly_hooks(
+            blocks,
+            &self.prompt_registry.async_assembly_hooks(),
+            &ctx,
         )
+        .await
     }
 
     /// Locate this turn's user message in the request that is about to go out.
@@ -2517,7 +2527,7 @@ or project context that should survive across sessions.
         &mut self,
         effective_model: &str,
     ) -> (Vec<PromptBlock>, Vec<ToolDef>, Vec<ModelMessage>) {
-        let prompt_blocks = self.build_prompt_blocks(effective_model);
+        let prompt_blocks = self.build_prompt_blocks(effective_model).await;
         let tool_defs = self.build_tool_defs().await;
         // Remember what this request costs *before* any conversation content,
         // so the next turn's compaction check can include it — see
@@ -2568,7 +2578,7 @@ or project context that should survive across sessions.
     ///
     /// Neither the overhead estimate nor the cache edits are redone — both
     /// belong to the call that failed.
-    fn prepare_retry(
+    async fn prepare_retry(
         &self,
         model: &str,
         max_tokens: u32,
@@ -2579,7 +2589,7 @@ or project context that should survive across sessions.
     ) -> ModelRequest {
         let input_map = self.resolve_input_map(&messages);
         ModelRequest {
-            prompt_blocks: self.build_prompt_blocks(model),
+            prompt_blocks: self.build_prompt_blocks(model).await,
             tool_defs,
             messages,
             params: base::interface::model::StreamParams {
@@ -2669,7 +2679,8 @@ or project context that should survive across sessions.
                 messages,
                 None,
                 origin,
-            );
+            )
+            .await;
             self.send(retry, cancel)
                 .await
                 .map_err(|e| TurnError::Model(format!("failed to stream model response: {}", e)))
@@ -5337,6 +5348,7 @@ mod tests {
             language: None,
             feature_flags: Default::default(),
             session_dir: None,
+            scripts: Vec::new(),
         };
         let session = session::session::SessionManager::in_memory(None);
         let ctx = build_prompt_context(&settings, &session, None, None, None, "test-model", false);
@@ -5614,6 +5626,7 @@ mod tests {
             language: None,
             feature_flags: Default::default(),
             session_dir: None,
+            scripts: Vec::new(),
         }
     }
 
@@ -6698,6 +6711,7 @@ mod prompt_assembly_tests {
             task_models: Default::default(),
             language: None,
             feature_flags: Default::default(),
+            scripts: Vec::new(),
         }
     }
 
@@ -6917,6 +6931,7 @@ mod prompt_assembly_tests {
 
         let joined = agent
             .build_prompt_blocks("test")
+            .await
             .iter()
             .map(|b| b.content.as_str())
             .collect::<Vec<_>>()
