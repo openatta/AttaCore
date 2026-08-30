@@ -1,0 +1,355 @@
+//! Normalization and golden-file plumbing for `turn_behavior_net`.
+//!
+//! Normalization is the load-bearing part. A raw event stream is full of
+//! things that change every run — ids, wall-clock timestamps, durations,
+//! temp-dir paths — and a snapshot that includes them fails constantly for
+//! reasons no one cares about, which is how a net gets disabled. Everything
+//! here is about keeping the *decisions* and dropping the rest.
+//!
+//! The line to walk: drop too little and the net is flaky; drop too much and
+//! it stops noticing real changes. So values are replaced with placeholders
+//! rather than deleted — `<id>` still records that there *was* an id, and a
+//! tool result that becomes empty is still a visible difference.
+
+use base::event::AgentEvent;
+use base::interface::tool::{
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
+};
+use std::sync::Arc;
+
+// ── tools ───────────────────────────────────────────────────────────────
+
+/// Echoes its `say` argument. Concurrency-safe, so a batch of them exercises
+/// the parallel dispatch path.
+#[derive(Debug)]
+struct GoldenEcho;
+
+#[async_trait::async_trait]
+impl Tool for GoldenEcho {
+    fn name(&self) -> &str {
+        "GoldenEcho"
+    }
+    fn description(&self) -> &str {
+        "Echo the `say` argument back."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"say": {"type": "string"}},
+            "required": ["say"]
+        })
+    }
+    fn is_concurrency_safe(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    fn is_read_only(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+        PermissionDecision::allow()
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        let say = input.get("say").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(ToolResult::text(format!("echo: {say}")))
+    }
+}
+
+/// Always fails. Exists so the net covers "a tool errored" as a distinct
+/// decision from "the model errored".
+#[derive(Debug)]
+struct GoldenBoom;
+
+#[async_trait::async_trait]
+impl Tool for GoldenBoom {
+    fn name(&self) -> &str {
+        "GoldenBoom"
+    }
+    fn description(&self) -> &str {
+        "Always fails."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+        PermissionDecision::allow()
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        Err(base::error::ToolError::Execution(anyhow::anyhow!(
+            "golden boom"
+        )))
+    }
+}
+
+/// Defers to the rule engine instead of self-approving, so a session running
+/// in a mode that asks will actually produce a `PermissionPrompt`.
+#[derive(Debug)]
+struct GoldenAsk;
+
+#[async_trait::async_trait]
+impl Tool for GoldenAsk {
+    fn name(&self) -> &str {
+        "GoldenAsk"
+    }
+    fn description(&self) -> &str {
+        "Requires approval."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+        PermissionDecision::Ask {
+            message: "GoldenAsk wants to run".into(),
+            decision_reason: None,
+        }
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        Ok(ToolResult::text("approved and ran"))
+    }
+}
+
+pub fn fake_tools() -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(GoldenEcho), Arc::new(GoldenBoom), Arc::new(GoldenAsk)]
+}
+
+// ── normalization ───────────────────────────────────────────────────────
+
+/// Replace run-varying substrings with stable placeholders.
+fn scrub(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.lines() {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// One line per event: the variant name plus only the fields that encode a
+/// decision. Text is kept (it is the model's scripted answer, so it is
+/// stable); ids and turn ids are not.
+pub fn normalize_events(events: &[AgentEvent]) -> String {
+    let mut out = String::new();
+    for ev in events {
+        let line = match ev {
+            AgentEvent::TextDelta { text, .. } => format!("TextDelta {text:?}"),
+            AgentEvent::ThinkingDelta { text, .. } => format!("ThinkingDelta {text:?}"),
+            AgentEvent::ToolUse { name, input, .. } => {
+                format!("ToolUse {name} {}", canonical_json(input))
+            }
+            // The content matters: without it "the hook blocked this" and
+            // "the tool ran and failed" both render as is_error=true, and the
+            // net stops distinguishing two very different outcomes.
+            AgentEvent::ToolResult {
+                name,
+                is_error,
+                content,
+                ..
+            } => format!(
+                "ToolResult {name} is_error={is_error:?} content={:?}",
+                first_line(content)
+            ),
+            AgentEvent::PermissionPrompt { message, .. } => {
+                format!("PermissionPrompt {:?}", first_line(message))
+            }
+            AgentEvent::TurnComplete { stop_reason, .. } => {
+                format!("TurnComplete stop_reason={stop_reason}")
+            }
+            AgentEvent::SystemInit { .. } => "SystemInit".to_string(),
+            AgentEvent::System { message } => format!("System {:?}", first_line(message)),
+            AgentEvent::CompactAction { strategy, .. } => format!("CompactAction {strategy}"),
+            AgentEvent::SessionChanged { .. } => "SessionChanged".to_string(),
+            AgentEvent::SessionPersisted { .. } => "SessionPersisted".to_string(),
+            AgentEvent::SkillsChanged { .. } => "SkillsChanged".to_string(),
+            AgentEvent::AgentSpawned { parent_turn, .. } => {
+                format!("AgentSpawned parent_turn={parent_turn}")
+            }
+            AgentEvent::AgentCompleted { .. } => "AgentCompleted".to_string(),
+            AgentEvent::SubagentProgress { .. } => "SubagentProgress".to_string(),
+            AgentEvent::TeamProgress { .. } => "TeamProgress".to_string(),
+            AgentEvent::Error { code, .. } => format!("Error code={code}"),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    scrub(&out)
+}
+
+/// One line per log entry: its kind, and for the entries that carry a decision
+/// (compaction, session end) the discriminating field.
+pub fn normalize_log(entries: &[history::entry::EnvelopedEntry]) -> String {
+    let mut out = String::new();
+    for e in entries {
+        let line = match &e.entry {
+            history::entry::LogEntry::Meta { .. } => "Meta".to_string(),
+            history::entry::LogEntry::User { content } => {
+                format!("User blocks={}", content.len())
+            }
+            history::entry::LogEntry::Assistant { .. } => "Assistant".to_string(),
+            history::entry::LogEntry::ToolResult { .. } => "ToolResult".to_string(),
+            history::entry::LogEntry::System { .. } => "System".to_string(),
+            history::entry::LogEntry::Compact { .. } => "Compact".to_string(),
+            history::entry::LogEntry::UsageSnapshot { .. } => "UsageSnapshot".to_string(),
+            history::entry::LogEntry::PasteRef { .. } => "PasteRef".to_string(),
+            history::entry::LogEntry::SessionEnd { state } => format!("SessionEnd {state:?}"),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or("")
+}
+
+/// Sorted-key JSON so argument ordering (a serialization detail) never shows
+/// up as a behavior change.
+fn canonical_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut keys: Vec<_> = m.keys().collect();
+            keys.sort();
+            let inner: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{k:?}:{}", canonical_json(&m[k.as_str()])))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        serde_json::Value::Array(a) => {
+            let inner: Vec<String> = a.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+// ── golden files ────────────────────────────────────────────────────────
+
+pub struct GoldenFile {
+    path: std::path::PathBuf,
+    name: String,
+}
+
+impl GoldenFile {
+    pub fn new(name: &str) -> Self {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tests/")
+            .join("fixtures")
+            .join("turn_traces");
+        Self {
+            path: dir.join(format!("{name}.txt")),
+            name: name.to_string(),
+        }
+    }
+
+    pub fn assert_eq(&self, actual: &str) {
+        if std::env::var("ATTA_UPDATE_GOLDEN").is_ok() {
+            if let Some(p) = self.path.parent() {
+                std::fs::create_dir_all(p).expect("golden dir");
+            }
+            std::fs::write(&self.path, actual).expect("write golden");
+            return;
+        }
+
+        let expected = std::fs::read_to_string(&self.path).unwrap_or_else(|_| {
+            panic!(
+                "no golden trace for `{}` at {}. If this case is new, create it with \
+                 ATTA_UPDATE_GOLDEN=1 and read what it produced before committing.\n\
+                 --- would be written ---\n{actual}",
+                self.name,
+                self.path.display()
+            )
+        });
+
+        if expected != actual {
+            panic!(
+                "turn behavior for `{}` changed.\n\n\
+                 --- expected ({}) ---\n{expected}\n\
+                 --- actual ---\n{actual}\n\
+                 If this change is intended, re-run with ATTA_UPDATE_GOLDEN=1 — after \
+                 reading the diff above.",
+                self.name,
+                self.path.display()
+            );
+        }
+    }
+}
+
+// ── scene ───────────────────────────────────────────────────────────────
+
+/// `ChatScene` with a caller-chosen compaction threshold.
+///
+/// The threshold lives on the scene, not in settings, so a case that wants to
+/// exercise compaction cannot get there by tweaking `Settings` — it needs a
+/// scene of its own. Everything else delegates, so a case differs from the
+/// plain-conversation baseline in exactly one respect.
+pub struct BudgetScene {
+    inner: scene::scene::chat::ChatScene,
+    pub compact_threshold: usize,
+}
+
+impl BudgetScene {
+    pub fn new(compact_threshold: usize) -> Self {
+        Self {
+            inner: scene::scene::chat::ChatScene,
+            compact_threshold,
+        }
+    }
+}
+
+impl base::interface::scene::AgentScene for BudgetScene {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn build_system_prompt(
+        &self,
+        ctx: &base::interface::scene::ScenePromptContext,
+    ) -> Vec<base::interface::prompt::PromptBlock> {
+        self.inner.build_system_prompt(ctx)
+    }
+    fn tools(&self) -> Vec<String> {
+        self.inner.tools()
+    }
+    fn disallowed_tools(&self) -> Vec<String> {
+        self.inner.disallowed_tools()
+    }
+    fn token_budget(&self) -> base::interface::scene::TokenBudget {
+        base::interface::scene::TokenBudget {
+            compact_threshold: self.compact_threshold,
+            compact_keep_recent: 2,
+        }
+    }
+    fn execution_params(&self) -> base::interface::scene::ExecutionParams {
+        self.inner.execution_params()
+    }
+}

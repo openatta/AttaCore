@@ -32,19 +32,19 @@ pub enum PermissionMode {
 /// with identical variant sets — a pre-existing split (see
 /// `context::config::EngineConfig::from_settings`, the first place this
 /// conversion was needed). Shared here instead of duplicated per call site.
-impl From<crate::interface::settings::PermissionMode> for PermissionMode {
-    fn from(m: crate::interface::settings::PermissionMode) -> Self {
+impl From<crate::settings::PermissionMode> for PermissionMode {
+    fn from(m: crate::settings::PermissionMode) -> Self {
         match m {
-            crate::interface::settings::PermissionMode::Default => Self::Default,
-            crate::interface::settings::PermissionMode::AcceptEdits => Self::AcceptEdits,
-            crate::interface::settings::PermissionMode::BypassPermissions => {
+            crate::settings::PermissionMode::Default => Self::Default,
+            crate::settings::PermissionMode::AcceptEdits => Self::AcceptEdits,
+            crate::settings::PermissionMode::BypassPermissions => {
                 Self::BypassPermissions
             }
-            crate::interface::settings::PermissionMode::Plan => Self::Plan,
-            crate::interface::settings::PermissionMode::Auto => Self::Auto,
-            crate::interface::settings::PermissionMode::DontAsk => Self::DontAsk,
-            crate::interface::settings::PermissionMode::Bubble => Self::Bubble,
-            crate::interface::settings::PermissionMode::Yolo => Self::Yolo,
+            crate::settings::PermissionMode::Plan => Self::Plan,
+            crate::settings::PermissionMode::Auto => Self::Auto,
+            crate::settings::PermissionMode::DontAsk => Self::DontAsk,
+            crate::settings::PermissionMode::Bubble => Self::Bubble,
+            crate::settings::PermissionMode::Yolo => Self::Yolo,
         }
     }
 }

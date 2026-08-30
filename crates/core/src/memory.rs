@@ -1013,7 +1013,7 @@ Respond with ONLY valid JSON matching this schema (no markdown, no extra text, n
     );
 
     use crate::interface::model::{MessageRole, ModelContentBlock, ModelMessage};
-    use crate::interface::settings::ThinkingMode;
+    use crate::settings::ThinkingMode;
 
     let request_messages = vec![
         ModelMessage {

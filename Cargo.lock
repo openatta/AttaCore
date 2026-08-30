@@ -3721,6 +3721,7 @@ dependencies = [
  "compaction",
  "futures",
  "hex",
+ "history",
  "hooks",
  "mcp",
  "model",

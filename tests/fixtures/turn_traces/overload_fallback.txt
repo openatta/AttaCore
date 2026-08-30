@@ -1,0 +1,13 @@
+== events ==
+SystemInit
+TextDelta "recovered"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024
+golden-fallback max_tokens=1024
+unconsumed_replies=0

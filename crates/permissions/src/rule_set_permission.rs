@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use base::context::SessionState;
 use base::interface::permission::{Permission, PermissionOutcome};
 use base::permission::{PermissionDecision as GateDecision, PermissionMode};
-use base::tool::{InMemoryToolRegistry, ToolContext};
+use base::tool::{ToolContext, ToolRegistry};
+#[cfg(test)]
+use base::tool::InMemoryToolRegistry;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -31,7 +33,7 @@ pub struct RuleSetPermission {
     /// the real one once `Builder::build()` has finished populating it. A
     /// stale registry here is not a cosmetic problem: every tool missing from
     /// it used to be waved straight through.
-    tools: RwLock<Arc<InMemoryToolRegistry>>,
+    tools: RwLock<Arc<dyn ToolRegistry>>,
     /// The session's live state, once `bind_session_state` has supplied it.
     ///
     /// `None` (embedders that never bind) falls back to a throwaway
@@ -48,7 +50,7 @@ pub struct RuleSetPermission {
 impl RuleSetPermission {
     pub fn new(
         gate: Arc<PermissionGate>,
-        tools: Arc<InMemoryToolRegistry>,
+        tools: Arc<dyn ToolRegistry>,
         permission_mode: PermissionMode,
     ) -> Self {
         Self {
@@ -77,7 +79,7 @@ impl RuleSetPermission {
     pub fn from_settings(
         settings: &base::interface::settings::Settings,
         mode: PermissionMode,
-        tools: Arc<InMemoryToolRegistry>,
+        tools: Arc<dyn ToolRegistry>,
         extra_rules: impl IntoIterator<Item = base::permission::PermissionRule>,
     ) -> Self {
         let mut rules = crate::rule::rules_from_all_tiers(settings);
@@ -91,7 +93,7 @@ impl RuleSetPermission {
 
     /// The registry currently bound — snapshot of the `Arc`, so a concurrent
     /// `bind_tool_registry` can't hold the lock across an `.await`.
-    fn tools(&self) -> Arc<InMemoryToolRegistry> {
+    fn tools(&self) -> Arc<dyn ToolRegistry> {
         self.tools.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -166,7 +168,7 @@ impl Permission for RuleSetPermission {
         }
     }
 
-    fn bind_tool_registry(&self, tools: Arc<InMemoryToolRegistry>) {
+    fn bind_tool_registry(&self, tools: Arc<dyn ToolRegistry>) {
         *self.tools.write().unwrap_or_else(|e| e.into_inner()) = tools;
     }
 

@@ -1,7 +1,7 @@
 //! `Model` trait — protocol-agnostic LLM backend interface.
 
-use crate::interface::prompt::PromptBlock;
-use crate::interface::settings::ThinkingMode;
+use crate::prompt::PromptBlock;
+use crate::settings::ThinkingMode;
 use crate::provider::ApiType;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ pub struct StreamParams {
 /// text, and it has to stay that way: splitting the sources into separate
 /// content blocks would change the bytes the model receives. So composition is
 /// expressed as coordinates over the message rather than in its structure —
-/// the same reason [`crate::interface::prompt::PromptBlock::source`] is a
+/// the same reason [`crate::prompt::PromptBlock::source`] is a
 /// field and not a delimiter inside the content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputMap {
@@ -197,7 +197,7 @@ pub struct ToolDef {
     pub input_schema: Value,
     /// Where this tool came from — `builtin`, `mcp:<server>`, `plugin:<id>`.
     ///
-    /// Annotation only, like [`crate::interface::prompt::PromptBlock::source`]:
+    /// Annotation only, like [`crate::prompt::PromptBlock::source`]:
     /// both adapters translate a `ToolDef` field by field, so this one is
     /// simply not copied and never reaches the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]

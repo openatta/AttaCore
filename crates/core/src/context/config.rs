@@ -234,6 +234,8 @@ pub struct SandboxPolicyConfig {
     /// didn't say, and the sandbox falls back to `$HOME/.atta` — which is
     /// only right when the instance happens to live there.
     pub state_root: Option<PathBuf>,
+    /// See `base::settings::SandboxConfig::require_enforcement`.
+    pub require_enforcement: bool,
 }
 
 #[derive(
@@ -312,15 +314,15 @@ impl EngineConfig {
     /// `Settings` actually carries; fields `Settings` has no equivalent for
     /// (e.g. `strong_model`, `file_limits`, `max_agent_depth`) are left at
     /// their `defaults_for()` value, same as before this existed.
-    pub fn from_settings(settings: &crate::interface::settings::Settings) -> Self {
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
         let mut c = Self::defaults_for(settings.model.model_name.clone());
         c.max_tokens = settings.model.max_tokens;
         c.fallback_model = settings.model.fallback_model.clone();
         c.thinking_mode = match settings.model.thinking_mode {
-            crate::interface::settings::ThinkingMode::Auto => ThinkingModeConfig::Auto,
-            crate::interface::settings::ThinkingMode::Off => ThinkingModeConfig::Off,
-            crate::interface::settings::ThinkingMode::On => ThinkingModeConfig::On,
-            crate::interface::settings::ThinkingMode::OnBudget(n) => {
+            crate::settings::ThinkingMode::Auto => ThinkingModeConfig::Auto,
+            crate::settings::ThinkingMode::Off => ThinkingModeConfig::Off,
+            crate::settings::ThinkingMode::On => ThinkingModeConfig::On,
+            crate::settings::ThinkingMode::OnBudget(n) => {
                 ThinkingModeConfig::OnBudget(n)
             }
         };
@@ -363,6 +365,7 @@ impl EngineConfig {
             // settings.json this session actually reads — not to whatever
             // sits under the invoking user's home.
             state_root: Some(settings.paths.global_data_dir.clone()),
+            require_enforcement: settings.sandbox.require_enforcement,
         };
         c.disable_skill_shell_execution = settings.disable_skill_shell_execution;
 
@@ -415,10 +418,10 @@ pub fn default_blocking_limit(model: &str, max_tokens: u32) -> usize {
 #[cfg(test)]
 mod sandbox_wiring_tests {
     use super::*;
-    use crate::interface::settings::Settings;
+    use crate::settings::Settings;
 
     fn settings_with_sandbox(
-        f: impl FnOnce(&mut crate::interface::settings::SandboxConfig),
+        f: impl FnOnce(&mut crate::settings::SandboxConfig),
     ) -> Settings {
         let mut s = Settings::defaults_for("test-model");
         f(&mut s.sandbox);

@@ -1,0 +1,18 @@
+== events ==
+SystemInit
+ToolUse GoldenEcho {"say":"note contents"}
+ToolResult GoldenEcho is_error=Some(false) content="echo: note contents"
+TextDelta "\n[Turn 0 used tools: GoldenEcho]\n"
+TextDelta "The note says: note contents"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024
+golden-model max_tokens=1024
+unconsumed_replies=0

@@ -2,7 +2,7 @@
 //!
 //! Scenes are code-level (compile-time), bound at Engine creation, immutable.
 
-use crate::interface::prompt::PromptBlock;
+use crate::prompt::PromptBlock;
 use std::borrow::Cow;
 
 /// Context passed to `AgentScene::build_system_prompt()`.

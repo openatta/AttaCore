@@ -65,6 +65,30 @@ pub struct SandboxedCommand {
     pub args: Vec<String>,
     /// 选定的沙盒模式（仅给 logging / 测试用）
     pub mode: SandboxMode,
+    /// Whether the policy this command was built from is actually being
+    /// enforced.
+    ///
+    /// [`mode`](Self::mode) is advisory — it names *which* backend ran and
+    /// says so in its own doc. This field is the one a caller is expected to
+    /// act on: `None` means the command below runs with no constraint at all,
+    /// whatever the policy asked for. Reporting it separately is what lets a
+    /// consumer that needs an absolute boundary refuse, instead of the
+    /// decision being made for it by a `warn!` nobody reads.
+    pub enforcement: Enforcement,
+}
+
+/// Whether a `SandboxPolicy` is being honored.
+///
+/// Deliberately two-valued today. `Partial` is the shape this will grow when
+/// a backend can honor some of a policy but not all of it (bwrap has no
+/// domain-level network filter, for instance — see [`NetworkMode`]); adding it
+/// before any backend reports it would be a distinction with no producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enforcement {
+    /// The backend delivered what the policy asked for.
+    Full,
+    /// No backend ran. The command is unconstrained.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +241,10 @@ fn plain(command: &str, mode: SandboxMode) -> SandboxedCommand {
         program: "bash".into(),
         args: vec!["-c".into(), command.into()],
         mode,
+        // Nothing wraps this command, so nothing constrains it — true whether
+        // the user asked for no sandbox or the platform could not provide one.
+        // Which of those it was is `mode`'s job to say.
+        enforcement: Enforcement::None,
     }
 }
 
@@ -224,6 +252,7 @@ fn plain(command: &str, mode: SandboxMode) -> SandboxedCommand {
 fn mac_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
     let profile = build_macos_profile(opts.cwd, opts.additional_writable, &opts.policy);
     SandboxedCommand {
+        enforcement: Enforcement::Full,
         program: "sandbox-exec".into(),
         args: vec![
             "-p".into(),
@@ -471,6 +500,7 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
     args.push(opts.command.to_string());
 
     SandboxedCommand {
+        enforcement: Enforcement::Full,
         program: "bwrap".into(),
         args,
         mode: SandboxMode::LinuxBwrap,
@@ -1118,5 +1148,54 @@ mod tests {
             "(deny file-write* (literal \"{}/.atta/settings.json\"))",
             home.display()
         )));
+    }
+}
+
+#[cfg(test)]
+mod enforcement_tests {
+    use super::*;
+
+    fn opts<'a>(cmd: &'a str, cwd: &'a std::path::Path, disable: bool) -> SandboxOptions<'a> {
+        SandboxOptions {
+            command: cmd,
+            cwd,
+            additional_writable: &[],
+            disable,
+            policy: SandboxPolicy::default(),
+        }
+    }
+
+    /// An explicit opt-out is unconstrained and says so. This is the case
+    /// where `Enforcement::None` is the honest answer *and* nothing is wrong.
+    #[test]
+    fn disabling_the_sandbox_reports_no_enforcement() {
+        let dir = std::env::temp_dir();
+        let w = wrap(opts("echo hi", &dir, true));
+        assert_eq!(w.mode, SandboxMode::Disabled);
+        assert_eq!(w.enforcement, Enforcement::None);
+    }
+
+    /// The invariant the field exists for: `enforcement` and `mode` never
+    /// disagree about whether anything is actually wrapping the command.
+    /// A backend that reported `Full` while running bare `bash` would make
+    /// every consumer's refusal check useless.
+    #[test]
+    fn enforcement_agrees_with_the_selected_backend() {
+        let dir = std::env::temp_dir();
+        let w = wrap(opts("echo hi", &dir, false));
+        match w.mode {
+            SandboxMode::Disabled | SandboxMode::Unavailable => {
+                assert_eq!(w.enforcement, Enforcement::None);
+                assert_eq!(w.program, "bash", "an unenforced command must be plain bash");
+            }
+            SandboxMode::MacOSSandboxExec => {
+                assert_eq!(w.enforcement, Enforcement::Full);
+                assert_eq!(w.program, "sandbox-exec");
+            }
+            SandboxMode::LinuxBwrap => {
+                assert_eq!(w.enforcement, Enforcement::Full);
+                assert_eq!(w.program, "bwrap");
+            }
+        }
     }
 }

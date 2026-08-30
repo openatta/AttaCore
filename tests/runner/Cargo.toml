@@ -26,6 +26,7 @@ permissions   = { workspace = true }
 skills        = { workspace = true }
 hooks         = { workspace = true }
 compaction    = { workspace = true }
+history       = { workspace = true }
 tokio         = { workspace = true, features = ["full"] }
 tokio-util    = { workspace = true }
 serde         = { workspace = true }

@@ -125,6 +125,9 @@ pub enum HookEvent {
     /// See `HookRunner::run_elicitation_result`'s doc comment: no host-side
     /// response round-trip exists in this codebase yet, so this event has no
     /// production caller today.
+    ///
+    /// Listed in [`UNWIRED_EVENTS`], which is what makes configuring a hook
+    /// for it warn instead of failing silently.
     ElicitationResult,
     /// Settings/config change.
     ///
@@ -137,10 +140,21 @@ pub enum HookEvent {
     /// session from the pool, or giving the pool a hook runner of its own
     /// with no session to attach it to.
     ///
+    /// A further wrinkle found while auditing this: the pool's own
+    /// propagation mechanism does not offer a free firing site either. A
+    /// reconfigured pool bumps `config_generation`, and a stale-but-idle
+    /// session is then *destroyed and rebuilt* before its next turn — so the
+    /// session that experienced the change no longer exists by the time
+    /// anything could observe it, and the rebuilt one already fires
+    /// `Setup`/`SessionStart`/`CwdChanged` indistinguishably from a fresh
+    /// start.
+    ///
     /// Listed here rather than deleted because the RPC surface for it exists
     /// and a hook for "the daemon was reconfigured under me" is genuinely
     /// useful; it is a wiring gap with a known shape, not a stray variant.
-    /// Configuring a hook for it parses fine and simply never runs.
+    ///
+    /// Listed in [`UNWIRED_EVENTS`], which is what makes configuring a hook
+    /// for it warn instead of failing silently.
     ConfigChange,
     /// Git worktree lifecycle.
     WorktreeCreate,
@@ -157,8 +171,98 @@ pub enum HookEvent {
     PostSampling,
 }
 
+/// Events that parse, accept hook configuration, and never fire.
+///
+/// Each one is a known wiring gap whose reason is written on the variant
+/// itself. They are kept rather than deleted for two reasons. The shape of
+/// each is right and a host that supplies the missing half has a real event
+/// to subscribe to; and deleting a variant is far more destructive than it
+/// looks — [`HooksSettings`] is a `HashMap` keyed by this enum with no
+/// `#[serde(other)]` fallback, so one unrecognized event name fails the
+/// *whole* map, and the composition root's `unwrap_or_else` then degrades to
+/// an empty runner. Removing a variant would silently disable **every** hook
+/// belonging to anyone who had configured that one.
+///
+/// The cost of keeping them is that someone configures a hook here and waits
+/// for it forever. [`HookEvent::is_wired`] exists so the composition root can
+/// say so out loud at startup instead.
+///
+/// Kept honest by `daemon/tests/hook_event_wiring.rs`, which scans the
+/// production sources for firing sites and fails if this list and the code
+/// disagree in either direction — so wiring one of these up without removing
+/// it here is a test failure, not a stale comment.
+pub const UNWIRED_EVENTS: &[HookEvent] = &[HookEvent::ElicitationResult, HookEvent::ConfigChange];
+
+impl HookEvent {
+    /// Whether anything in the engine actually fires this event.
+    ///
+    /// `false` means a configured hook for it will never run — see
+    /// [`UNWIRED_EVENTS`].
+    pub fn is_wired(self) -> bool {
+        !UNWIRED_EVENTS.contains(&self)
+    }
+}
+
 /// settings.json 的 `hooks` 字段：事件名 → 多个 hook 配置。
 pub type HooksSettings = HashMap<HookEvent, Vec<HookConfig>>;
+
+/// What a tolerant parse skipped, so a caller can say it out loud.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HooksParseReport {
+    /// Event names that are not [`HookEvent`] variants — typos, or hooks
+    /// written for a newer engine.
+    pub unknown_events: Vec<String>,
+    /// `(event, error)` for entries whose *configs* would not parse.
+    pub invalid_configs: Vec<(String, String)>,
+}
+
+impl HooksParseReport {
+    pub fn is_clean(&self) -> bool {
+        self.unknown_events.is_empty() && self.invalid_configs.is_empty()
+    }
+}
+
+/// Parse `settings.hooks_config`, keeping every entry that is well-formed.
+///
+/// Deserializing straight into [`HooksSettings`] cannot do this. It is a
+/// `HashMap` keyed by [`HookEvent`], which has no `#[serde(other)]` fallback,
+/// so serde fails the **whole map** on the first unrecognized key — and the
+/// composition root's `unwrap_or_else` then falls back to an empty runner.
+/// One typo, or one hook copied from a newer version of the engine, silently
+/// disabled *every* hook the user had configured, with a single warn line as
+/// the only evidence.
+///
+/// Going key by key confines the damage to the entry that is actually broken.
+/// Nothing is repaired or guessed at: an unrecognized name is dropped and
+/// reported, never mapped to a "closest" event.
+pub fn parse_hooks_settings(value: &serde_json::Value) -> (HooksSettings, HooksParseReport) {
+    let mut out = HooksSettings::new();
+    let mut report = HooksParseReport::default();
+
+    let Some(map) = value.as_object() else {
+        report.invalid_configs.push((
+            "<root>".into(),
+            "expected an object of event name -> array of hook configs".into(),
+        ));
+        return (out, report);
+    };
+
+    for (name, configs) in map {
+        let Ok(event) = serde_json::from_value::<HookEvent>(serde_json::Value::String(name.clone()))
+        else {
+            report.unknown_events.push(name.clone());
+            continue;
+        };
+        match serde_json::from_value::<Vec<HookConfig>>(configs.clone()) {
+            Ok(list) => {
+                out.entry(event).or_default().extend(list);
+            }
+            Err(e) => report.invalid_configs.push((name.clone(), e.to_string())),
+        }
+    }
+
+    (out, report)
+}
 
 #[cfg(test)]
 mod tests {
@@ -234,5 +338,74 @@ mod tests {
         });
         let h: HookConfig = serde_json::from_value(v).unwrap();
         assert!(matches!(h, HookConfig::Prompt { .. }));
+    }
+}
+
+#[cfg(test)]
+mod tolerant_parse_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The regression this function exists for: one bad name used to take
+    /// every other hook down with it.
+    #[test]
+    fn an_unknown_event_name_does_not_disable_the_other_hooks() {
+        let cfg = json!({
+            "PreToolUse":  [{"type": "command", "command": "echo pre"}],
+            "NoSuchEvent": [{"type": "command", "command": "echo nope"}],
+            "SessionEnd":  [{"type": "command", "command": "echo end"}],
+        });
+        let (parsed, report) = parse_hooks_settings(&cfg);
+
+        assert!(parsed.contains_key(&HookEvent::PreToolUse));
+        assert!(parsed.contains_key(&HookEvent::SessionEnd));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(report.unknown_events, vec!["NoSuchEvent".to_string()]);
+
+        // And the whole-map parse still fails on the same input — which is
+        // what makes the two behaviors different rather than the old one
+        // having been fine all along.
+        assert!(serde_json::from_value::<HooksSettings>(cfg).is_err());
+    }
+
+    /// A malformed config under a *valid* event is confined the same way.
+    #[test]
+    fn a_malformed_entry_does_not_disable_the_others() {
+        let (parsed, report) = parse_hooks_settings(&json!({
+            "PreToolUse": [{"type": "command", "command": "echo pre"}],
+            "Stop":       [{"type": "not_a_hook_kind"}],
+        }));
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains_key(&HookEvent::PreToolUse));
+        assert_eq!(report.invalid_configs.len(), 1);
+        assert_eq!(report.invalid_configs[0].0, "Stop");
+    }
+
+    /// Nothing is guessed at. A near-miss is dropped, not corrected to the
+    /// event it resembles — silently running a hook on an event the author
+    /// did not name is worse than not running it.
+    #[test]
+    fn a_near_miss_name_is_dropped_not_corrected() {
+        let (parsed, report) = parse_hooks_settings(&json!({
+            "pretooluse": [{"type": "command", "command": "echo x"}],
+        }));
+        assert!(parsed.is_empty());
+        assert_eq!(report.unknown_events, vec!["pretooluse".to_string()]);
+    }
+
+    #[test]
+    fn a_clean_config_reports_clean() {
+        let (parsed, report) = parse_hooks_settings(&json!({
+            "PreToolUse": [{"type": "command", "command": "echo pre"}],
+        }));
+        assert_eq!(parsed.len(), 1);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn a_non_object_is_reported_rather_than_panicking() {
+        let (parsed, report) = parse_hooks_settings(&json!("not-a-map"));
+        assert!(parsed.is_empty());
+        assert_eq!(report.invalid_configs.len(), 1);
     }
 }

@@ -218,11 +218,41 @@ impl Tool for BashTool {
             disable: ctx.dangerously_disable_sandbox,
             policy: to_sandbox_policy(&ctx.sandbox),
         });
-        if wrapped.mode == SandboxMode::Unavailable {
+        // A policy that cannot be enforced is the one case where "log it and
+        // carry on" is the wrong default *and* the wrong thing to change
+        // silently: refusing breaks every Linux host without bubblewrap and
+        // every Windows host, while permitting means a command the operator
+        // believes is constrained runs with nothing holding it. So the engine
+        // reports honestly and lets the host decide which it wants.
+        if wrapped.enforcement == sandbox::Enforcement::None
+            && wrapped.mode == SandboxMode::Unavailable
+        {
+            if ctx.sandbox.require_enforcement {
+                return Ok(ToolResult {
+                    content: base::tool::ToolResultContent::Text(format!(
+                        "Refused: a sandbox policy is configured but no backend on this \
+                         platform ({}) can enforce it, and `sandbox.require_enforcement` \
+                         is on. Install bubblewrap (Linux), or set \
+                         `sandbox.require_enforcement: false` to accept unsandboxed \
+                         execution, or `sandbox.dangerously_disable_sandbox: true` to \
+                         stop asking for one.",
+                        std::env::consts::OS
+                    )),
+                    is_error: true,
+                    structured_content: Some(serde_json::json!({
+                        "refused": "sandbox_unenforceable",
+                        "platform": std::env::consts::OS,
+                    })),
+                    mcp_meta: None,
+                    new_messages: Some(vec![]),
+                });
+            }
             tracing::warn!(
                 platform = std::env::consts::OS,
-                "BashTool sandbox unavailable on this platform; running unsandboxed. \
-                 Install bwrap (Linux) or use --dangerously-disable-sandbox to silence."
+                "BashTool sandbox unavailable on this platform; running UNSANDBOXED \
+                 while a policy is configured. Install bwrap (Linux), set \
+                 sandbox.require_enforcement to refuse instead, or \
+                 dangerously_disable_sandbox to stop asking."
             );
         }
 
@@ -1088,6 +1118,7 @@ mod tests {
             allowed_domains: vec!["api.example.com".to_string()],
             network_mode: base::context::config::NetworkModeConfig::Allowlist,
             state_root: None,
+            require_enforcement: false,
         };
         let policy = to_sandbox_policy(&settings);
         assert_eq!(policy.deny_read, vec![PathBuf::from("/tmp/secret")]);
@@ -1445,6 +1476,7 @@ mod allow_read_tests {
             allowed_domains: Vec::new(),
             network_mode: base::context::config::NetworkModeConfig::Unrestricted,
             state_root: None,
+            require_enforcement: false,
         };
         let policy = to_sandbox_policy(&settings);
         assert_eq!(policy.allow_read, vec![PathBuf::from("/home/u/.npmrc")]);

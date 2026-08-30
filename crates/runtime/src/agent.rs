@@ -146,7 +146,7 @@ pub(crate) type PendingPermissions = Arc<
 pub struct Agent {
     pub(crate) scene: Arc<dyn AgentScene>,
     pub(crate) model: Arc<dyn Model>,
-    pub(crate) tools: Arc<InMemoryToolRegistry>,
+    pub(crate) tools: Arc<dyn base::tool::ToolRegistry>,
     pub(crate) settings: Arc<Settings>,
     /// Real `EngineConfig` derived from `settings` via `EngineConfig::from_settings`
     /// — the tool-dispatch closure (`ToolExecCtx.config`) clones this instead of
@@ -642,8 +642,8 @@ impl Agent {
     }
 
     /// Access the tool registry (read-only).
-    pub fn tools(&self) -> &InMemoryToolRegistry {
-        &self.tools
+    pub fn tools(&self) -> &dyn base::tool::ToolRegistry {
+        self.tools.as_ref()
     }
 
     /// Access the engine settings (read-only).
@@ -875,7 +875,7 @@ pub enum EngineError {
 pub struct Builder {
     scene: Option<Arc<dyn AgentScene>>,
     model: Option<Arc<dyn Model>>,
-    tools: Option<Arc<InMemoryToolRegistry>>,
+    tools: Option<Arc<dyn base::tool::ToolRegistry>>,
     settings: Option<Arc<Settings>>,
     permission: Option<Arc<dyn Permission>>,
     memory_store: Option<Arc<MemoryStore>>,
@@ -1015,13 +1015,47 @@ fn build_hook_runner(
     plugin_host: Option<&Arc<dyn crate::plugin_host::PluginHost>>,
     session_id: Option<String>,
 ) -> Arc<HookRunner> {
+    // Key by key, not whole-map. `HooksSettings` is keyed by `HookEvent`,
+    // which has no serde fallback, so a single unrecognized event name used to
+    // fail the entire map and drop the caller into an empty runner — every
+    // hook the user configured, silently off, because of one typo.
     let parsed: hooks::HooksSettings = match &settings.hooks_config {
-        Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "settings.json `hooks` section failed to parse, ignoring");
-            Default::default()
-        }),
+        Some(v) => {
+            let (parsed, report) = hooks::parse_hooks_settings(v);
+            for name in &report.unknown_events {
+                tracing::warn!(
+                    event = %name,
+                    "settings.json `hooks` names an event this engine does not have; \
+                     that entry is ignored, the rest are unaffected"
+                );
+            }
+            for (event, err) in &report.invalid_configs {
+                tracing::warn!(
+                    event = %event,
+                    error = %err,
+                    "settings.json `hooks` entry failed to parse; that entry is ignored, \
+                     the rest are unaffected"
+                );
+            }
+            parsed
+        }
         None => Default::default(),
     };
+    // A hook configured for an event nothing fires is indistinguishable, from
+    // the outside, from a hook that runs and does nothing — the author waits
+    // for it forever. The engine knows which events those are, so it says so
+    // here rather than leaving the answer in a doc comment on the enum that
+    // whoever wrote the config is not reading.
+    for (event, configs) in &parsed {
+        if !event.is_wired() {
+            tracing::warn!(
+                event = ?event,
+                hooks = configs.len(),
+                "hook configured for an event this engine never fires — it will not run; \
+                 see `hooks::UNWIRED_EVENTS` for why"
+            );
+        }
+    }
     let hooks_search_dirs = vec![
         settings.paths.project_root().join(".atta").join("hooks"),
         settings.paths.user_data_dir.join("hooks"),
@@ -1111,7 +1145,7 @@ impl Builder {
         self.model = Some(m);
         self
     }
-    pub fn tools(mut self, t: Arc<InMemoryToolRegistry>) -> Self {
+    pub fn tools(mut self, t: Arc<dyn base::tool::ToolRegistry>) -> Self {
         self.tools = Some(t);
         self
     }
@@ -2314,7 +2348,14 @@ mod tests {
         // 500 ms sleep passes on an idle machine and fails under a loaded
         // `cargo test --workspace`, where this test competes with ~1900
         // others for the shell it needs.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // 10s was already the second attempt here (it started at a flat 500ms
+        // sleep). It still times out under a loaded `cargo test --workspace`,
+        // where this case competes with ~2300 others for the shell it needs to
+        // spawn. The wait is a *ceiling*, not a cost: the assertion below fires
+        // the moment the marker appears, so on an idle machine this test still
+        // finishes in milliseconds and only a genuine break pays the full
+        // budget.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !marker_path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -3955,6 +3996,34 @@ mod tests {
         let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None, None);
         assert!(!runner.is_empty());
         assert!(runner.has_hooks_for(hooks::HookEvent::PreToolUse));
+    }
+
+    /// The unwired-event warning must stay a *warning*. Refusing the hook, or
+    /// dropping it from the runner, would be a behavior change dressed up as
+    /// a diagnostic — and it would break anyone who has such a hook
+    /// configured today against the day the event gets wired up.
+    #[test]
+    fn build_hook_runner_keeps_hooks_for_unwired_events_and_only_warns() {
+        let mut settings = test_settings();
+        settings.hooks_config = Some(serde_json::json!({
+            "ConfigChange": [
+                { "type": "command", "command": "echo reconfigured" }
+            ],
+            "PreToolUse": [
+                { "type": "command", "command": "echo hi" }
+            ]
+        }));
+        let model: Arc<dyn Model> = Arc::new(DummyModel);
+        let runner = build_hook_runner(&settings, model, dummy_agent_tool(), None, None);
+        assert!(
+            runner.has_hooks_for(hooks::HookEvent::ConfigChange),
+            "an unwired event's hook must still be registered — the engine warns, it does \
+             not silently discard"
+        );
+        assert!(
+            runner.has_hooks_for(hooks::HookEvent::PreToolUse),
+            "an unwired event in the same config must not affect the wired ones"
+        );
     }
 
     #[test]

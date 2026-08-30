@@ -95,10 +95,24 @@ pub fn run_doctor(
 
     let (hooks_ok, hooks_error) = match &settings.hooks_config {
         None => (true, None),
-        Some(v) => match serde_json::from_value::<hooks::HooksSettings>(v.clone()) {
-            Ok(_) => (true, None),
-            Err(e) => (false, Some(format!("invalid hooks_config: {e}"))),
-        },
+        Some(v) => {
+            // Same tolerant parse the engine uses, so `doctor` reports what
+            // will actually be loaded rather than a whole-map verdict the
+            // engine no longer shares.
+            let (_, report) = hooks::parse_hooks_settings(v);
+            if report.is_clean() {
+                (true, None)
+            } else {
+                let mut parts = Vec::new();
+                if !report.unknown_events.is_empty() {
+                    parts.push(format!("unknown events: {:?}", report.unknown_events));
+                }
+                for (event, err) in &report.invalid_configs {
+                    parts.push(format!("{event}: {err}"));
+                }
+                (false, Some(parts.join("; ")))
+            }
+        }
     };
 
     serde_json::json!({

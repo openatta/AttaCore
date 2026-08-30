@@ -93,7 +93,7 @@ pub trait AgentSpawner: Send + Sync {
         cwd: PathBuf,
         cancel: CancellationToken,
         agent_type: Option<String>,
-        permission_mode: Option<crate::interface::settings::PermissionMode>,
+        permission_mode: Option<crate::settings::PermissionMode>,
     ) -> Result<String, Box<dyn std::error::Error + Send>> {
         let _ = (extra_tools, permission_mode);
         self.spawn_agent(prompt, allowed_tools, cwd, cancel, agent_type)

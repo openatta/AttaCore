@@ -1,0 +1,18 @@
+== events ==
+SystemInit
+ToolUse GoldenBoom {}
+ToolResult GoldenBoom is_error=Some(true) content="execution: golden boom"
+TextDelta "\n[Turn 0 used tools: GoldenBoom]\n"
+TextDelta "that failed"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024
+golden-model max_tokens=1024
+unconsumed_replies=0

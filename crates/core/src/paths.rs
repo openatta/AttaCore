@@ -87,10 +87,10 @@ impl ConfigPaths {
         }
     }
 
-    /// The same roots [`crate::interface::settings::Settings`] already
+    /// The same roots [`crate::settings::Settings`] already
     /// carries — for the call sites that hold `Settings` and want these
     /// accessors without re-deriving anything.
-    pub fn from_settings(paths: &crate::interface::settings::PathSettings) -> Self {
+    pub fn from_settings(paths: &crate::settings::PathSettings) -> Self {
         Self {
             user_data_dir: paths.user_data_dir.clone(),
             global_data_dir: paths.global_data_dir.clone(),
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn settings_roots_round_trip() {
         let p = paths();
-        let carried = crate::interface::settings::PathSettings {
+        let carried = crate::settings::PathSettings {
             user_data_dir: p.user_data_dir.clone(),
             global_data_dir: p.global_data_dir.clone(),
             local_data_dir: p.local_data_dir.clone(),

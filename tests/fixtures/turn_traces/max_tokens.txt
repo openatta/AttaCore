@@ -1,0 +1,15 @@
+== events ==
+SystemInit
+TextDelta "part one"
+TextDelta " and part two"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024
+golden-model max_tokens=64000
+unconsumed_replies=0

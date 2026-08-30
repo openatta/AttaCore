@@ -532,6 +532,21 @@ pub struct SandboxConfig {
     /// Default: false. Only for trusted environments.
     #[serde(default)]
     pub dangerously_disable_sandbox: bool,
+    /// Refuse to run a sandboxed command when the platform cannot actually
+    /// enforce the policy, instead of running it unconstrained.
+    ///
+    /// Off by default, which is the historical behavior: on Linux without
+    /// `bwrap`, and on platforms with no backend at all, a command whose
+    /// policy cannot be honored runs anyway with a warning. That is a silent
+    /// downgrade from "constrained" to "unconstrained" — fine for a laptop,
+    /// not fine for a host that treats the sandbox as a boundary.
+    ///
+    /// Turning it on makes such a command fail with an error naming the
+    /// missing backend. The default is `false` rather than `true` only
+    /// because flipping it would break every Linux box without bubblewrap
+    /// installed, and every Windows host, on upgrade.
+    #[serde(default)]
+    pub require_enforcement: bool,
 }
 
 /// Recorder (record/replay) configuration. `None` on [`Settings`] leaves the

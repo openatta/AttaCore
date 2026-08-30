@@ -1,9 +1,9 @@
 //! Prompt assembly — pure function that stitches together multi-source content.
 
-use crate::interface::memory::{build_memory_prompt, MemoryStore};
-use crate::interface::rules::build_rules_prompt;
+use crate::memory::{build_memory_prompt, MemoryStore};
+use crate::rules::build_rules_prompt;
 use crate::interface::scene::{AgentScene, ScenePromptContext};
-use crate::interface::settings::Settings;
+use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 
 /// Protocol-agnostic prompt block.
@@ -97,7 +97,7 @@ impl PromptBlock {
 /// 1. Scene skeleton (AgentScene::build_system_prompt)
 /// 2. Skills loaded from skills/ directories
 /// 3. Memory loaded from MemoryStore
-///    3b. Rules discovery index (filenames + first line only; see `crate::interface::rules`)
+///    3b. Rules discovery index (filenames + first line only; see `crate::rules`)
 /// 4. Runtime state (plan, todos, current turn info)
 /// 5. settings.prompt_append
 /// 6. [if set] settings.prompt_override → replaces all of the above
@@ -148,7 +148,7 @@ pub fn assemble_prompt(
     // 3b. Rules — lightweight discovery index only (filenames + first-line
     // description), not full content. Omitted entirely when no `.atta/rules/`
     // files exist anywhere, so sessions that don't use this feature pay zero
-    // extra tokens. See `crate::interface::rules` module docs.
+    // extra tokens. See `crate::rules` module docs.
     if let Some(text) = build_rules_prompt(&settings.paths) {
         blocks.push(PromptBlock::system(text).with_source(source::RULES));
     }
@@ -171,9 +171,9 @@ pub fn assemble_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interface::memory::MemoryStore;
+    use crate::memory::MemoryStore;
     use crate::interface::scene::TokenBudget;
-    use crate::interface::settings::{
+    use crate::settings::{
         ExecutionSettings, ModelSettings, PathSettings, PermissionMode, Settings, ThinkingMode,
     };
     use crate::provider::ApiType;

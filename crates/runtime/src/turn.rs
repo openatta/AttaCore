@@ -215,7 +215,7 @@ impl Agent {
                     }
                     EngineCommand::RefreshMcp => {
                         self.mcp.refresh_tools().await;
-                        register_new_mcp_adapters(&self.tools, &self.mcp);
+                        register_new_mcp_adapters(self.tools.as_ref(), &self.mcp);
                         Ok(TurnOutcome::default())
                     }
                     // `CancelTurn` is handled by the input demultiplexer, not
@@ -1260,7 +1260,7 @@ impl Agent {
                 // refresh (e.g. after a reconnect) needs to actually be
                 // callable, not just advertised — see
                 // `register_new_mcp_adapters`'s doc comment.
-                register_new_mcp_adapters(&self.tools, &self.mcp);
+                register_new_mcp_adapters(self.tools.as_ref(), &self.mcp);
                 continue;
             }
 
@@ -2805,7 +2805,7 @@ fn estimate_request_overhead(prompt_blocks: &[PromptBlock], tool_defs: &[ToolDef
 /// Context bundle for tool execution — owned to survive async closures.
 #[derive(Clone)]
 pub(crate) struct ToolExecCtx {
-    pub tools: Arc<base::tool::InMemoryToolRegistry>,
+    pub tools: Arc<dyn base::tool::ToolRegistry>,
     pub cwd: std::path::PathBuf,
     /// Where a `PermitAlways { scope: Local }` answer persists its rule.
     /// Carried from `settings.paths` rather than derived from `cwd` here —
@@ -3053,6 +3053,7 @@ fn sandbox_settings_from(config: &base::context::EngineConfig) -> base::tool::Sa
         allowed_domains: config.sandbox_policy.allowed_domains.clone(),
         network_mode: config.sandbox_policy.network_mode,
         state_root: config.sandbox_policy.state_root.clone(),
+        require_enforcement: config.sandbox_policy.require_enforcement,
     }
 }
 
@@ -3484,7 +3485,7 @@ async fn execute_tool_inner(
 /// class as the `Builder::build()`-time registration gap this mirrors.
 /// Already-registered adapters are left alone (checked by name) so this is
 /// safe to call every refresh, not just the first time.
-fn register_new_mcp_adapters(tools: &base::tool::InMemoryToolRegistry, mcp: &McpManager) {
+fn register_new_mcp_adapters(tools: &dyn base::tool::ToolRegistry, mcp: &McpManager) {
     for adapter in mcp.tool_adapters() {
         if tools.get(adapter.name()).is_none() {
             tools.register(adapter.clone());
@@ -4011,6 +4012,7 @@ mod sandbox_settings_tests {
             network_mode: NetworkModeConfig::DenyAll,
             allowed_domains: vec!["api.example.com".into()],
             state_root: None,
+            require_enforcement: false,
         };
 
         let s = sandbox_settings_from(&config);

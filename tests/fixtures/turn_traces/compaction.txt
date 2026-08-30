@@ -1,0 +1,18 @@
+== events ==
+SystemInit
+TextDelta "a fairly long first answer that fills the budget"
+TurnComplete stop_reason=end_turn
+CompactAction Snip
+TextDelta "second answer"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+Compact
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024
+golden-model max_tokens=1024
+unconsumed_replies=0

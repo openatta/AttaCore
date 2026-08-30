@@ -1,0 +1,15 @@
+== events ==
+SystemInit
+TextDelta "a first answer long enough to be worth dropping later"
+TurnComplete stop_reason=end_turn
+Error code=turn_error
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+
+== model calls ==
+golden-model max_tokens=1024
+golden-model max_tokens=1024
+unconsumed_replies=1

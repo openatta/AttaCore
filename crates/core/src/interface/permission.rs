@@ -56,7 +56,7 @@ pub trait Permission: Send + Sync {
     ///
     /// Default no-op: handlers that don't consult a registry (always-permit,
     /// bubble-to-parent, cwd-boundary) have nothing to rebind.
-    fn bind_tool_registry(&self, _tools: Arc<crate::tool::InMemoryToolRegistry>) {}
+    fn bind_tool_registry(&self, _tools: Arc<dyn crate::tool::ToolRegistry>) {}
 
     /// Bind this handler to the session's live [`SessionState`], so mode
     /// changes made *during* the session are visible to permission decisions.

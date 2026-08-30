@@ -8,7 +8,7 @@
 //! that nobody referenced from `AGENTS.md` used to be invisible to the model.
 //! Discovery still only reads each file's first line, never full content.
 
-use crate::interface::settings::PathSettings;
+use crate::settings::PathSettings;
 use std::path::{Path, PathBuf};
 
 /// One discovered rule document.
@@ -122,7 +122,7 @@ pub fn build_rules_prompt(paths: &PathSettings) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interface::settings::PathSettings;
+    use crate::settings::PathSettings;
     use tempfile::TempDir;
 
     fn write_rule(dir: &Path, filename: &str, content: &str) {

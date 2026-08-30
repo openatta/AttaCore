@@ -460,7 +460,7 @@ mod tests {
         }
         async fn stream(
             &self,
-            _prompt_blocks: Vec<crate::interface::prompt::PromptBlock>,
+            _prompt_blocks: Vec<crate::prompt::PromptBlock>,
             _tools: Vec<crate::interface::model::ToolDef>,
             _messages: Vec<crate::interface::model::ModelMessage>,
             _params: crate::interface::model::StreamParams,

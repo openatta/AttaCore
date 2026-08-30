@@ -1,0 +1,23 @@
+== events ==
+SystemInit
+ToolUse Agent {"description":"do a thing","prompt":"do a thing","subagent_type":"general-purpose"}
+AgentSpawned parent_turn=0
+SubagentProgress
+SubagentProgress
+AgentCompleted
+ToolResult Agent is_error=Some(false) content="child answer"
+TextDelta "\n[Turn 0 used tools: Agent]\n"
+TextDelta "parent wrap-up"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024
+golden-model max_tokens=1024
+golden-model max_tokens=1024
+unconsumed_replies=0
