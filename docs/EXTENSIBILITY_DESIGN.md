@@ -2,7 +2,8 @@
 
 > `EXTENSIBILITY_DESIGN.md` · 版本 v0.1 · 2026-08-29
 > 目的：把 AttaCore 从「一个可配置的 agent 引擎」变成「一个可二次开发的 agent 内核」。
-> 配套文件：**`EXTENSIBILITY_REFACTOR_TASKS.md`** —— 可执行工单。实施者从那份开始，本文档是它引用的设计依据。
+> 这份文档描述的是**目标形态与理由**。派生出的工单是迁移进度跟踪，按开发约定 §2 不入库（落在 `.local/`）；本文档不依赖它们存在。
+> 想知道**现在**能接什么，看 [extension_points.md](extension_points.md) —— 那是二开者的入口，且由代码生成、有测试保证不漂移。
 
 ---
 
