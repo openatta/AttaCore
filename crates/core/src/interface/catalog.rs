@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 25] = [
+static POINTS: [ExtensionPoint; 26] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -392,6 +392,21 @@ static POINTS: [ExtensionPoint; 25] = [
             frequency: Frequency::PerTurn,
             trust: Trust::operator_full_plugin_declares(),
             defined_in: "base::interface::memory_contracts::RetrievalHook",
+        },
+        ExtensionPoint {
+            id: "history.append_observer",
+            kind: Kind::Interception,
+            summary: "watch entries go into the session log",
+            timing: "after each append succeeds",
+            rewrites: "nothing — read-only in the types, not by agreement",
+            frequency: Frequency::PerTurn,
+            trust: Trust {
+                kernel: Access::Full,
+                config: Access::Full,
+                script: Access::Full,
+                plugin: Access::AddOnly,
+            },
+            defined_in: "history::store::AppendObserver",
         },
         ExtensionPoint {
             id: "compaction",

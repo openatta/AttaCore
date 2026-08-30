@@ -1533,6 +1533,83 @@ mod tests {
     }
 }
 
+/// Watches entries go into the log.
+///
+/// Read-only, and read-only *in the types* rather than by agreement: the entry
+/// arrives behind a shared reference and nothing is returned, so there is no
+/// expression an observer can write that changes what was appended.
+///
+/// That is not caution, it is the append-only guarantee. Every part of the
+/// engine that resumes, forks or replays a session reads position as meaning;
+/// an observer that could rewrite an entry on its way past would make the log
+/// a record of what something decided to record rather than of what happened.
+///
+/// Observers run *after* the append has succeeded, so the entry they are shown
+/// is already durable. An observer that panics still takes its caller down —
+/// it just cannot un-write anything first.
+pub trait AppendObserver: Send + Sync {
+    fn observed(&self, session: SessionId, entry: &LogEntry);
+}
+
+/// Any store, with observers on its appends.
+///
+/// A decorator rather than a method on the trait, so a backend does not have
+/// to implement — or remember to call — anything to be observable, and so the
+/// observation cannot be forgotten by whoever writes the next backend.
+pub struct ObservedHistoryStore {
+    inner: Arc<dyn HistoryStore>,
+    observers: Vec<Arc<dyn AppendObserver>>,
+}
+
+impl ObservedHistoryStore {
+    pub fn new(inner: Arc<dyn HistoryStore>, observers: Vec<Arc<dyn AppendObserver>>) -> Self {
+        Self { inner, observers }
+    }
+}
+
+#[async_trait]
+impl HistoryStore for ObservedHistoryStore {
+    async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError> {
+        // Written first. An observer sees what is on the record, not what was
+        // proposed — a failed append is not an event.
+        self.inner.append(session, entry.clone()).await?;
+        for observer in &self.observers {
+            observer.observed(session, &entry);
+        }
+        Ok(())
+    }
+
+    async fn load(&self, session: SessionId) -> Result<Vec<EnvelopedEntry>, HistoryError> {
+        self.inner.load(session).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError> {
+        self.inner.list_sessions().await
+    }
+
+    async fn delete(&self, session: SessionId) -> Result<(), HistoryError> {
+        self.inner.delete(session).await
+    }
+
+    async fn load_messages(
+        &self,
+        session: SessionId,
+    ) -> Result<Vec<base::message::Message>, HistoryError> {
+        self.inner.load_messages(session).await
+    }
+
+    async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        self.inner.session_parent(session).await
+    }
+
+    async fn child_sessions(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<SessionId>, HistoryError> {
+        self.inner.child_sessions(parent_session_id).await
+    }
+}
+
 /// The contract, exercised against every implementation.
 ///
 /// One body per property, run once per backend. A behavior asserted here is a
@@ -1723,4 +1800,125 @@ mod contract_tests {
         let messages = store.load_messages(s).await.unwrap();
         assert_eq!(messages.len(), 1, "Meta must not reach the model");
     });
+}
+
+#[cfg(test)]
+mod append_observer_tests {
+    use super::*;
+    use base::message::ContentBlock;
+
+    #[derive(Default)]
+    struct Recording {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AppendObserver for Recording {
+        fn observed(&self, _session: SessionId, entry: &LogEntry) {
+            let label = match entry {
+                LogEntry::User { content } => content
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                other => format!("{other:?}"),
+            };
+            self.seen.lock().unwrap().push(label);
+        }
+    }
+
+    fn user(text: &str) -> LogEntry {
+        LogEntry::User {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// The observer sees every append, in order — and the log is exactly what
+    /// it would have been without one. Wrapping a store must be free of
+    /// consequence to what it stores; that is the whole point of the seam
+    /// being read-only.
+    #[tokio::test]
+    async fn observing_a_log_does_not_change_it() {
+        let plain: Arc<dyn HistoryStore> = Arc::new(InMemoryHistoryStore::new());
+        let watched_inner: Arc<dyn HistoryStore> = Arc::new(InMemoryHistoryStore::new());
+        let observer = Arc::new(Recording::default());
+        let watched = ObservedHistoryStore::new(watched_inner.clone(), vec![observer.clone()]);
+
+        let a = SessionId::new();
+        for text in ["one", "two", "three"] {
+            plain.append(a, user(text)).await.unwrap();
+            watched.append(a, user(text)).await.unwrap();
+        }
+
+        let plain_entries = plain.load(a).await.unwrap();
+        let watched_entries = watched.load(a).await.unwrap();
+        assert_eq!(plain_entries.len(), watched_entries.len());
+        for (p, w) in plain_entries.iter().zip(&watched_entries) {
+            assert_eq!(
+                serde_json::to_value(&p.entry).unwrap(),
+                serde_json::to_value(&w.entry).unwrap(),
+                "an observed append must store the same bytes as an unobserved one"
+            );
+        }
+
+        assert_eq!(
+            observer.seen.lock().unwrap().as_slice(),
+            ["one", "two", "three"],
+            "the observer must see every append, in order"
+        );
+    }
+
+    /// A failed append is not an event. An observer that was told about one
+    /// would be recording something that did not happen.
+    #[tokio::test]
+    async fn an_append_that_fails_is_not_observed() {
+        struct AlwaysFails;
+
+        #[async_trait]
+        impl HistoryStore for AlwaysFails {
+            async fn append(&self, _s: SessionId, _e: LogEntry) -> Result<(), HistoryError> {
+                Err(HistoryError::Io(std::io::Error::other("disk is gone")))
+            }
+            async fn load(&self, s: SessionId) -> Result<Vec<EnvelopedEntry>, HistoryError> {
+                Err(HistoryError::SessionNotFound(s.to_string()))
+            }
+            async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError> {
+                Ok(Vec::new())
+            }
+            async fn delete(&self, _s: SessionId) -> Result<(), HistoryError> {
+                Ok(())
+            }
+        }
+
+        let observer = Arc::new(Recording::default());
+        let watched = ObservedHistoryStore::new(Arc::new(AlwaysFails), vec![observer.clone()]);
+        assert!(watched.append(SessionId::new(), user("never")).await.is_err());
+        assert!(
+            observer.seen.lock().unwrap().is_empty(),
+            "an observer must not be told about a write that did not happen"
+        );
+    }
+
+    /// Everything else passes through untouched — the decorator is about
+    /// appends and must not become a place where reads acquire behavior.
+    #[tokio::test]
+    async fn every_other_operation_is_the_inner_store() {
+        let inner: Arc<dyn HistoryStore> = Arc::new(InMemoryHistoryStore::new());
+        let watched = ObservedHistoryStore::new(inner.clone(), vec![]);
+        let s = SessionId::new();
+        watched.append(s, user("hi")).await.unwrap();
+
+        assert_eq!(watched.list_sessions().await.unwrap(), vec![s]);
+        assert_eq!(watched.load_messages(s).await.unwrap().len(), 1);
+        assert_eq!(watched.session_parent(s).await.unwrap(), None);
+        watched.delete(s).await.unwrap();
+        assert!(matches!(
+            inner.load(s).await.unwrap_err(),
+            HistoryError::SessionNotFound(_)
+        ));
+    }
 }
