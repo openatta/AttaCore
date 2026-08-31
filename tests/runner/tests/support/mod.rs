@@ -62,6 +62,48 @@ impl Tool for GoldenEcho {
     }
 }
 
+/// Returns a result far past the per-result tool-result budget.
+///
+/// Exists so the net can pin the truncation decision, which is otherwise
+/// invisible: every other tool here returns a few bytes, so the budget never
+/// fires and a change to it would go unnoticed.
+#[derive(Debug)]
+struct GoldenFlood;
+
+#[async_trait::async_trait]
+impl Tool for GoldenFlood {
+    fn name(&self) -> &str {
+        "GoldenFlood"
+    }
+    fn description(&self) -> &str {
+        "Return a very large result."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn is_concurrency_safe(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    fn is_read_only(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+        PermissionDecision::allow()
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        // Past `enforce_tool_result_budget`'s 50_000-byte per-result cap.
+        Ok(ToolResult::text("x".repeat(60_000)))
+    }
+}
+
 /// Always fails. Exists so the net covers "a tool errored" as a distinct
 /// decision from "the model errored".
 #[derive(Debug)]
@@ -132,7 +174,12 @@ impl Tool for GoldenAsk {
 }
 
 pub fn fake_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(GoldenEcho), Arc::new(GoldenBoom), Arc::new(GoldenAsk)]
+    vec![
+        Arc::new(GoldenEcho),
+        Arc::new(GoldenBoom),
+        Arc::new(GoldenAsk),
+        Arc::new(GoldenFlood),
+    ]
 }
 
 // ── normalization ───────────────────────────────────────────────────────
@@ -169,7 +216,7 @@ pub fn normalize_events(events: &[AgentEvent]) -> String {
                 ..
             } => format!(
                 "ToolResult {name} is_error={is_error:?} content={:?}",
-                first_line(content)
+                elide(content)
             ),
             AgentEvent::PermissionPrompt { message, .. } => {
                 format!("PermissionPrompt {:?}", first_line(message))
@@ -226,6 +273,38 @@ pub fn normalize_log(entries: &[history::entry::EnvelopedEntry]) -> String {
 
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
+}
+
+/// A stable, readable stand-in for content that is long on purpose.
+///
+/// Without this, a case about a 60 KB tool result writes a 60 KB golden, and
+/// a golden nobody can read is a golden nobody reviews — which is the failure
+/// mode a regression net is supposed to prevent, arriving by a different
+/// road. The length is kept because the length is the point.
+fn elide(s: &str) -> String {
+    const KEEP: usize = 80;
+    let head = first_line(s);
+    if head.len() <= KEEP && head.len() == s.len() {
+        return head.to_string();
+    }
+    format!(
+        "{}… <{} bytes total>",
+        truncate_chars(head, KEEP),
+        s.len()
+    )
+}
+
+/// Character-boundary-safe prefix. A tool result is arbitrary bytes, so a
+/// byte-index cut lands mid-character routinely.
+pub fn truncate_chars(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Sorted-key JSON so argument ordering (a serialization detail) never shows
@@ -313,6 +392,9 @@ impl GoldenFile {
 pub struct BudgetScene {
     inner: scene::scene::chat::ChatScene,
     pub compact_threshold: usize,
+    /// `None` leaves the chat scene's own ceiling. `Some` is how a case pins
+    /// the stop-on-max-turns decision without running dozens of model calls.
+    pub max_api_calls: Option<u32>,
 }
 
 impl BudgetScene {
@@ -320,7 +402,13 @@ impl BudgetScene {
         Self {
             inner: scene::scene::chat::ChatScene,
             compact_threshold,
+            max_api_calls: None,
         }
+    }
+
+    pub fn with_max_api_calls(mut self, max: u32) -> Self {
+        self.max_api_calls = Some(max);
+        self
     }
 }
 
@@ -353,6 +441,10 @@ impl base::interface::scene::AgentScene for BudgetScene {
         }
     }
     fn execution_params(&self) -> base::interface::scene::ExecutionParams {
-        self.inner.execution_params()
+        let mut params = self.inner.execution_params();
+        if let Some(max) = self.max_api_calls {
+            params.max_api_calls_per_turn = max;
+        }
+        params
     }
 }

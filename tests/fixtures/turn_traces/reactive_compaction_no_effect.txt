@@ -1,0 +1,34 @@
+== events ==
+SystemInit
+ToolUse GoldenFlood {}
+ToolResult GoldenFlood is_error=Some(false) content="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx… <60000 bytes total>"
+TextDelta "\n[Turn 0 used tools: GoldenFlood]\n"
+TextDelta "first"
+TurnComplete stop_reason=end_turn
+ToolUse GoldenFlood {}
+ToolResult GoldenFlood is_error=Some(false) content="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx… <60000 bytes total>"
+TextDelta "\n[Turn 1 used tools: GoldenFlood]\n"
+TextDelta "second"
+TurnComplete stop_reason=end_turn
+TextDelta "third"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024 messages=1 content_bytes=3 truncated_results=0
+golden-model max_tokens=1024 messages=3 content_bytes=1083 truncated_results=1
+golden-model max_tokens=1024 messages=5 content_bytes=1091 truncated_results=1
+golden-model max_tokens=1024 messages=7 content_bytes=2171 truncated_results=2
+golden-model max_tokens=1024 messages=9 content_bytes=2182 truncated_results=2
+unconsumed_replies=0

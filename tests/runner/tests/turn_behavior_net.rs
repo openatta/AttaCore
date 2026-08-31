@@ -52,6 +52,11 @@ struct Case {
     approve_prompts: Option<bool>,
     /// Raw `settings.hooks_config`, for cases about hooks.
     hooks_config: Option<serde_json::Value>,
+    /// Ceiling on model calls in one turn. `None` leaves the scene's own.
+    max_api_calls: Option<u32>,
+    /// Feature flags this case needs on. Reactive compaction is off by
+    /// default, so a case about it has to say so.
+    reactive_compact: bool,
 }
 
 impl Case {
@@ -65,6 +70,8 @@ impl Case {
             fallback_model: None,
             approve_prompts: None,
             hooks_config: None,
+            max_api_calls: None,
+            reactive_compact: false,
         }
     }
 }
@@ -92,6 +99,7 @@ async fn trace(case: Case) -> String {
     settings.memory_enabled = false;
     settings.permission_mode = case.permission_mode;
     settings.hooks_config = case.hooks_config.clone();
+    settings.feature_flags.reactive_compact = case.reactive_compact;
     let settings = Arc::new(settings);
 
     let registry = Arc::new(InMemoryToolRegistry::new());
@@ -125,7 +133,13 @@ async fn trace(case: Case) -> String {
             [],
         ));
 
-    let scene: Arc<dyn AgentScene> = Arc::new(BudgetScene::new(case.compact_threshold));
+    let scene: Arc<dyn AgentScene> = {
+        let scene = BudgetScene::new(case.compact_threshold);
+        Arc::new(match case.max_api_calls {
+            Some(max) => scene.with_max_api_calls(max),
+            None => scene,
+        })
+    };
     let (mut agent, mut event_rx, input_tx) = Builder::new()
         .scene(scene)
         .model(model)
@@ -222,8 +236,11 @@ async fn trace(case: Case) -> String {
     out.push_str("\n== session log ==\n");
     out.push_str(&normalize_log(&entries));
     out.push_str("\n== model calls ==\n");
-    for (m, max) in model_arc.calls() {
-        out.push_str(&format!("{m} max_tokens={max}\n"));
+    for c in model_arc.calls() {
+        out.push_str(&format!(
+            "{} max_tokens={} messages={} content_bytes={} truncated_results={}\n",
+            c.model, c.max_tokens, c.messages, c.content_bytes, c.truncated_results
+        ));
     }
     out.push_str(&format!("unconsumed_replies={leftover}\n"));
     out
@@ -491,4 +508,156 @@ async fn subagent_spawn() {
         ],
     ))
     .await;
+}
+
+// ── Phase 3 decisions ───────────────────────────────────────────────────
+//
+// The four decisions Phase 3's first six work orders move, each of which had
+// no case before. Written *before* the code moves, so the trace they pin is
+// the behavior as it is today rather than as it came out.
+
+/// **D2 — stop on the per-turn call ceiling.**
+///
+/// The model asks for a tool forever; the loop must stop itself. What the
+/// trace pins is both halves: which reason it stops with (`max_turns`, not
+/// `end_turn`), and how many model calls it made before deciding — a
+/// ceiling that is off by one is a real change and an invisible one.
+///
+/// The ceiling comes from `min(settings, scene)`. This case sets the scene's,
+/// which is the half that used to be ignored entirely.
+#[tokio::test]
+async fn stops_at_the_per_turn_call_ceiling() {
+    let mut case = Case::new(
+        "max_turns_ceiling",
+        vec!["keep going"],
+        vec![
+            Reply::Tool {
+                id: "c1",
+                name: "GoldenEcho",
+                input: serde_json::json!({"say": "one"}),
+            },
+            Reply::Tool {
+                id: "c2",
+                name: "GoldenEcho",
+                input: serde_json::json!({"say": "two"}),
+            },
+            Reply::Tool {
+                id: "c3",
+                name: "GoldenEcho",
+                input: serde_json::json!({"say": "three"}),
+            },
+            Reply::Text("never reached"),
+        ],
+    );
+    case.max_api_calls = Some(2);
+    check(case).await;
+}
+
+/// **D13 — the tool-result budget truncates an oversized result.**
+///
+/// `GoldenFlood` returns 60_000 bytes, past the 50_000-byte per-result cap.
+/// The decision is invisible in every other case because every other tool
+/// returns a few bytes, so this is the only thing standing between that cap
+/// and a silent change to it.
+#[tokio::test]
+async fn an_oversized_tool_result_is_truncated_by_the_budget() {
+    check(Case::new(
+        "tool_result_budget",
+        vec!["flood me"],
+        vec![
+            Reply::Tool {
+                id: "c1",
+                name: "GoldenFlood",
+                input: serde_json::json!({}),
+            },
+            Reply::Text("that was a lot"),
+        ],
+    ))
+    .await;
+}
+
+/// **D11 — an output-token target keeps the turn going.**
+///
+/// `+50k` in the user message sets a target; the loop then injects a nudge
+/// and continues rather than ending on the model's `end_turn`. Three things
+/// are pinned: that the directive is stripped from what the model is shown,
+/// that the continuation happens at all, and *when it gives up* — the
+/// diminishing-returns rule (three continuations with two deltas under 500)
+/// is three magic numbers with no configuration entry, so the trace is the
+/// only thing holding them.
+///
+/// One reply is deliberately left over. Consuming exactly as many as were
+/// scripted would prove nothing: a loop that stopped because it ran out of
+/// replies looks identical to one that decided to stop. `unconsumed_replies=1`
+/// is the difference.
+#[tokio::test]
+async fn an_output_token_target_continues_then_gives_up_on_diminishing_returns() {
+    check(Case::new(
+        "output_token_target",
+        vec!["+50k write me a long thing"],
+        vec![
+            Reply::Text("first pass"),
+            Reply::Text("second pass"),
+            Reply::Text("third pass"),
+            Reply::Text("fourth pass"),
+            Reply::Text("never reached"),
+        ],
+    ))
+    .await;
+}
+
+/// **D14 — reactive compaction, which currently does nothing.**
+///
+/// The flag is on and the trigger fires: with a 20k context limit the
+/// reactive check's hardcoded `trigger = 50_000` remaining-token threshold is
+/// satisfied on every call, so `micro_compact` runs every round.
+///
+/// Its result is then thrown away. The branch keeps the compacted history
+/// only `if compacted.len() < self.session.messages.len()`, and
+/// `micro_compact` never removes a message — it blanks tool-result *content*
+/// in place and returns the same count. So the work happens, the result is
+/// discarded, and `compaction_state.record_failure()` is called; enough of
+/// those open the circuit breaker, at which point the path stops running for
+/// the rest of the session.
+///
+/// This case therefore pins "nothing shrinks", which is the truth today and
+/// not the intent. It is here because P3-5 moves this decision behind the
+/// `Compactor` contract, and when it does, the `content_bytes` column will
+/// drop — a golden diff that has to be read and approved rather than
+/// discovered afterwards.
+///
+/// **It cannot currently fail on a change to the trigger, and that is not an
+/// oversight to fix here.** Reverse-verified: setting the reactive check's
+/// `trigger` to 0, which stops it firing at all, leaves this trace byte for
+/// byte identical — because a decision whose result is discarded has no
+/// observable consequence to regress. So D14 is *not* covered by the net
+/// until P3-5 makes the path effective, and P3-5 carries the obligation to
+/// add the coverage along with the fix.
+///
+/// (The threshold path, `compaction_triggers_and_is_logged`, is unaffected
+/// and stays out of this case: 20k is far above what these messages reach.)
+#[tokio::test]
+async fn reactive_compaction_currently_has_no_effect() {
+    let mut case = Case::new(
+        "reactive_compaction_no_effect",
+        vec!["one", "two", "three"],
+        vec![
+            Reply::Tool {
+                id: "c1",
+                name: "GoldenFlood",
+                input: serde_json::json!({}),
+            },
+            Reply::Text("first"),
+            Reply::Tool {
+                id: "c2",
+                name: "GoldenFlood",
+                input: serde_json::json!({}),
+            },
+            Reply::Text("second"),
+            Reply::Text("third"),
+        ],
+    );
+    case.reactive_compact = true;
+    case.compact_threshold = 20_000;
+    check(case).await;
 }

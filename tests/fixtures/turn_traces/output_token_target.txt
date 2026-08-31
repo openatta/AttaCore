@@ -1,0 +1,24 @@
+== events ==
+SystemInit
+TextDelta "first pass"
+TextDelta "second pass"
+TextDelta "third pass"
+TextDelta "fourth pass"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024 messages=1 content_bytes=21 truncated_results=0
+golden-model max_tokens=1024 messages=3 content_bytes=131 truncated_results=0
+golden-model max_tokens=1024 messages=5 content_bytes=242 truncated_results=0
+golden-model max_tokens=1024 messages=7 content_bytes=352 truncated_results=0
+unconsumed_replies=1

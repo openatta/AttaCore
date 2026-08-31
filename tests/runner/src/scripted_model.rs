@@ -145,10 +145,29 @@ impl Reply {
 /// loop spin and the test still pass.
 pub struct ScriptedModel {
     replies: Mutex<std::collections::VecDeque<Reply>>,
-    /// Every `(model, max_tokens)` the engine asked for, in order. The
-    /// fallback-model switch is visible only here — it changes the request,
-    /// not the response.
-    calls: Mutex<Vec<(String, u32)>>,
+    /// Every request the engine made, in order. Several decisions are visible
+    /// only here, because they change what is *sent* and nothing about what
+    /// comes back: the fallback-model switch, compaction shortening the
+    /// history, the tool-result budget truncating one of its entries, a
+    /// continuation nudge being appended.
+    calls: Mutex<Vec<Call>>,
+}
+
+/// One model request, reduced to the parts a decision can move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Call {
+    pub model: String,
+    pub max_tokens: u32,
+    /// How many messages went out. Compaction and nudges move this.
+    pub messages: usize,
+    /// Total bytes of message text. Truncation moves this and nothing else
+    /// does — an untruncated 60 KB tool result and a truncated one differ
+    /// here by three orders of magnitude.
+    pub content_bytes: usize,
+    /// Whether any content carries the tool-result budget's truncation
+    /// marker. Recorded separately from the byte count so the trace says
+    /// *which* mechanism shortened things, not just that something did.
+    pub truncated_results: usize,
 }
 
 impl ScriptedModel {
@@ -159,8 +178,8 @@ impl ScriptedModel {
         })
     }
 
-    /// The `(model_name, max_tokens)` of each call the engine made.
-    pub fn calls(&self) -> Vec<(String, u32)> {
+    /// Each request the engine made, in order.
+    pub fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -182,14 +201,39 @@ impl Model for ScriptedModel {
         &self,
         _prompt_blocks: Vec<PromptBlock>,
         _tools: Vec<ToolDef>,
-        _messages: Vec<ModelMessage>,
+        messages: Vec<ModelMessage>,
         params: StreamParams,
         _cancel: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
+        let mut content_bytes = 0usize;
+        let mut truncated_results = 0usize;
+        for m in &messages {
+            for block in &m.content {
+                let text = match block {
+                    base::interface::model::ModelContentBlock::Text { text } => Some(text.as_str()),
+                    base::interface::model::ModelContentBlock::ToolResult { content, .. } => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    content_bytes += text.len();
+                    if text.starts_with("[Tool result truncated:") {
+                        truncated_results += 1;
+                    }
+                }
+            }
+        }
         self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((params.model.clone(), params.max_tokens));
+            .push(Call {
+                model: params.model.clone(),
+                max_tokens: params.max_tokens,
+                messages: messages.len(),
+                content_bytes,
+                truncated_results,
+            });
 
         let reply = self
             .replies

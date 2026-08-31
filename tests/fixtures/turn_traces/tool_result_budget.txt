@@ -1,0 +1,18 @@
+== events ==
+SystemInit
+ToolUse GoldenFlood {}
+ToolResult GoldenFlood is_error=Some(false) content="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx… <60000 bytes total>"
+TextDelta "\n[Turn 0 used tools: GoldenFlood]\n"
+TextDelta "that was a lot"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024 messages=1 content_bytes=8 truncated_results=0
+golden-model max_tokens=1024 messages=3 content_bytes=1088 truncated_results=1
+unconsumed_replies=0
