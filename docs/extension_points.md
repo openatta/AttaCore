@@ -52,6 +52,7 @@ anything, which is why those are closed to scripts and plugins outright.
 | `token.count` | contract | every budget check | the number compaction triggers on | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.store` | contract | every append, and on resume | how and where the log persists | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.query` | contract | whenever something asks for sessions rather than for one session | which sessions come back, in what order, and how they are matched | per session (10⁰) | closed | closed | closed |
+| `history.blob` | contract | every append carrying an image or a large payload, and on load | where large content is kept and how it is addressed | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.extension_entry` | registration | any time; ordered with everything else | adds only; the kernel never reads the payload | per turn (10⁰–10¹) | full | full | add only |
 | `memory.storage` | contract | recall, and whenever a memory is written | how and where memories persist | per turn (10⁰–10¹) | closed | closed | closed |
 | `memory.retriever` | contract | once per user message, in the background | the recalled set | per turn (10⁰–10¹) | closed | closed | closed |
@@ -165,6 +166,31 @@ backend with a real index overrides this one method and takes search over
 whole; the guarantees it has to keep — newest first with a total order, at
 most the limit, and never fewer matches than a case-insensitive substring
 scan would find — are in the method's doc comment.
+
+### Large content — `history.blob`
+
+`history::blob::BlobStore`. A `User`, `Assistant` or `ToolResult` entry whose
+content is over a kilobyte, or that carries an image at any size, is written
+to the blob store and replaced in the JSONL by a `LogEntry::Blob` naming the
+store and the id. A load with that store attached puts the original entry
+back; everything above `HistoryStore` only ever sees hydrated entries.
+
+```rust
+JsonlHistoryStore::with_roots(cwd, roots).await?.with_blob_store(my_store)
+```
+
+Two implementations ship: `PasteStore` (content-addressed files under
+`<base>/pastes/`, the default) and `InMemoryBlobStore`. An implementation must
+be content-addressed, must answer `None` rather than an error for content it
+does not have, and must keep its `name` stable — the name is written into the
+log.
+
+**An unresolvable reference is inert, never an error.** Uninstall the backend,
+copy a log without its blobs, or let a cleanup run, and the session still
+loads, forks and resumes with a gap where the content was. That is the same
+rule `history.extension_entry` follows, for the same reason: refusing to open
+a conversation because part of it is unreachable trades a degraded session for
+no session.
 
 ### Memory — `memory.storage`, `memory.retriever`
 

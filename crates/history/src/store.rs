@@ -7,7 +7,8 @@
 //! and writes within a session are serialized by a mutex so two appends
 //! cannot interleave into a partial line.
 
-use crate::entry::{EnvelopedEntry, LogEntry, PasteStore};
+use crate::blob::{BlobRef, BlobStore, PasteStore};
+use crate::entry::{EnvelopedEntry, LogEntry};
 use crate::error::HistoryError;
 use crate::path::{
     canonicalize_cwd, project_dir, session_file, session_metadata_file, HistoryRoots,
@@ -16,6 +17,7 @@ use crate::project::SessionMetadata;
 use crate::query::{SessionQuery, SessionScope};
 use crate::transcript::{messages_match_query, preview_messages, project_messages};
 use async_trait::async_trait;
+use base::message::{ContentBlock, ToolResultContent};
 use base::session::SessionId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -202,9 +204,9 @@ pub struct JsonlHistoryStore {
     /// 序列化 append 调用，避免并发 partial-line 写。
     /// 不是 RwLock —— append 是写操作，读不互让有意义。
     append_lock: Arc<Mutex<()>>,
-    /// Optional external content store for deduplicating large content
-    /// in the JSONL (see `PasteStore` and `LogEntry::PasteRef`).
-    paste_store: Option<PasteStore>,
+    /// Where content too big to keep inline goes. Without one, everything
+    /// stays in the JSONL.
+    blobs: Option<Arc<dyn BlobStore>>,
 }
 
 impl JsonlHistoryStore {
@@ -217,18 +219,24 @@ impl JsonlHistoryStore {
             sessions_root: roots.sessions,
             canonical_cwd: canonical,
             append_lock: Arc::new(Mutex::new(())),
-            paste_store: None,
+            blobs: None,
         })
     }
 
-    /// Attach a [`PasteStore`] to this history store. When configured, large
-    /// User/Assistant entries (>1024 bytes of serialized content) are stored
-    /// externally and replaced with a `PasteRef` entry in the JSONL. On load,
-    /// `PasteRef` entries are transparently hydrated back to their original
-    /// variant.
-    pub fn with_paste_store(mut self, paste_store: PasteStore) -> Self {
-        self.paste_store = Some(paste_store);
+    /// Move large content and images out of the JSONL and into `blobs`.
+    ///
+    /// Written entries that qualify are replaced by a [`LogEntry::Blob`]
+    /// naming this store; a load with the same store attached puts them back.
+    /// Without a blob store nothing is externalized, and a log that has
+    /// references in it still loads — with a gap where the content was.
+    pub fn with_blob_store(mut self, blobs: Arc<dyn BlobStore>) -> Self {
+        self.blobs = Some(blobs);
         self
+    }
+
+    /// [`with_blob_store`](Self::with_blob_store) with the shipped default.
+    pub fn with_paste_store(self, paste_store: PasteStore) -> Self {
+        self.with_blob_store(Arc::new(paste_store))
     }
 
     pub fn project_dir_path(&self) -> PathBuf {
@@ -615,12 +623,9 @@ impl HistoryStore for JsonlHistoryStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        // If a paste store is configured, check if this entry has large
-        // content and store it externally as a PasteRef.
-        let entry = if let Some(ref store) = self.paste_store {
-            maybe_store_entry_content(&entry, store)?
-        } else {
-            entry
+        let entry = match &self.blobs {
+            Some(blobs) => externalize_if_bulky(entry, blobs.as_ref())?,
+            None => entry,
         };
 
         let mut f = std::fs::OpenOptions::new()
@@ -658,9 +663,8 @@ impl HistoryStore for JsonlHistoryStore {
             let mut env = serde_json::from_str::<EnvelopedEntry>(line)
                 .map_err(|error| HistoryError::Parse { line: i + 1, error })?;
 
-            // Hydrate PasteRef entries if a paste store is configured.
-            if let Some(ref store) = self.paste_store {
-                hydrate_paste_ref(&mut env, store)?;
+            if let Some(blobs) = &self.blobs {
+                hydrate(&mut env, blobs.as_ref());
             }
 
             entries.push(env);
@@ -819,65 +823,98 @@ impl HistoryStore for InMemoryHistoryStore {
 }
 
 // ---------------------------------------------------------------------------
-// Paste store helpers
+// Externalizing bulky content
 // ---------------------------------------------------------------------------
 
-/// If the entry is a `User` or `Assistant` whose serialized content exceeds
-/// 1024 bytes, store the full variant JSON in the paste store and return a
-/// `PasteRef` replacement. Otherwise return the entry unchanged.
-fn maybe_store_entry_content(
-    entry: &LogEntry,
-    paste_store: &PasteStore,
-) -> Result<LogEntry, HistoryError> {
-    if !is_content_large(entry) {
-        return Ok(entry.clone());
+/// Serialized content above this is worth a round trip to the blob store.
+const BULKY_CONTENT_BYTES: usize = 1024;
+
+/// Replace `entry` with a reference if it is one of the bulky kinds.
+///
+/// The whole entry is what gets stored, tag and auxiliary fields included, so
+/// the blob is self-describing and hydration is a plain deserialize rather
+/// than a reconstruction that has to agree with this function.
+fn externalize_if_bulky(entry: LogEntry, blobs: &dyn BlobStore) -> Result<LogEntry, HistoryError> {
+    let Some(describes) = externalizable_kind(&entry) else {
+        return Ok(entry);
+    };
+    let json = serde_json::to_string(&entry)?;
+    let id = blobs.put(json.as_bytes()).map_err(HistoryError::Io)?;
+    Ok(LogEntry::Blob {
+        blob: BlobRef {
+            store: blobs.name().to_string(),
+            id,
+            describes: describes.to_string(),
+            bytes: json.len() as u64,
+        },
+    })
+}
+
+/// The `kind` tag of an entry worth moving out, or `None` to leave it inline.
+///
+/// Images leave at any size. Their bytes are never read as text, never
+/// matched by a search and never skimmed by a person, so the threshold that
+/// exists to keep short messages readable does not apply to them.
+fn externalizable_kind(entry: &LogEntry) -> Option<&'static str> {
+    let (kind, blocks): (_, &[ContentBlock]) = match entry {
+        LogEntry::User { content } => ("user", content),
+        LogEntry::Assistant { content, .. } => ("assistant", content),
+        LogEntry::ToolResult { content, .. } => {
+            let carries_image = match content {
+                ToolResultContent::Text(_) => false,
+                ToolResultContent::Blocks(blocks) => blocks_carry_image(blocks),
+            };
+            return (carries_image || serialized_len(content) > BULKY_CONTENT_BYTES)
+                .then_some("tool_result");
+        }
+        _ => return None,
+    };
+    (blocks_carry_image(blocks) || serialized_len(blocks) > BULKY_CONTENT_BYTES).then_some(kind)
+}
+
+fn blocks_carry_image(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(|block| match block {
+        ContentBlock::Image { .. } => true,
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(nested),
+            ..
+        } => blocks_carry_image(nested),
+        _ => false,
+    })
+}
+
+/// The content's JSON size — the dominant term in the serialized line.
+fn serialized_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_string(value).map(|s| s.len()).unwrap_or(0)
+}
+
+/// Put the original entry back, if this entry is a reference and `blobs` has
+/// what it points at.
+///
+/// Every other case leaves the entry as it is, deliberately and without an
+/// error: a reference into a store nobody mounted, content that was cleaned
+/// up, or a blob that no longer deserializes are all reasons for a session to
+/// load with a gap and none of them are reasons for it not to load.
+fn hydrate(env: &mut EnvelopedEntry, blobs: &dyn BlobStore) {
+    let id = match &env.entry {
+        LogEntry::Blob { blob } if blob.store == blobs.name() => &blob.id,
+        LogEntry::PasteRef { paste_id } => paste_id,
+        _ => return,
+    };
+    let fetched = match blobs.get(id) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(blob = %id, error = %e, "blob store unreadable; leaving the reference in place");
+            return;
+        }
+    };
+    match serde_json::from_slice::<LogEntry>(&fetched) {
+        Ok(hydrated) => env.entry = hydrated,
+        Err(e) => {
+            tracing::warn!(blob = %id, error = %e, "blob does not deserialize; leaving the reference in place");
+        }
     }
-
-    // Store the full serialized variant (with kind tag, aux fields) so
-    // the paste file is self-describing for round-trip hydration.
-    let full_variant_json = serde_json::to_string(entry)?;
-    let paste_id = paste_store
-        .store(&full_variant_json)
-        .map_err(HistoryError::Io)?;
-
-    Ok(LogEntry::PasteRef { paste_id })
-}
-
-/// If `entry` is a `PasteRef`, load the paste content and replace the entry
-/// with the original variant. Otherwise do nothing.
-fn hydrate_paste_ref(
-    env: &mut EnvelopedEntry,
-    paste_store: &PasteStore,
-) -> Result<(), HistoryError> {
-    let paste_id = match &env.entry {
-        LogEntry::PasteRef { paste_id } => paste_id.clone(),
-        _ => return Ok(()),
-    };
-
-    let paste_json = paste_store
-        .load(&paste_id)
-        .map_err(HistoryError::Io)?
-        .ok_or_else(|| HistoryError::Path(format!("paste file not found: {paste_id}")))?;
-
-    let hydrated: LogEntry = serde_json::from_str(&paste_json)?;
-    env.entry = hydrated;
-    Ok(())
-}
-
-/// Check if entry is a User or Assistant with serialized content > 1024 bytes.
-fn is_content_large(entry: &LogEntry) -> bool {
-    let content = match entry {
-        LogEntry::User { content } => content,
-        LogEntry::Assistant { content, .. } => content,
-        _ => return false,
-    };
-
-    // Measure the JSON size of the content blocks (the dominant term in
-    // the serialized line). 1024 bytes is the threshold.
-    let Ok(json) = serde_json::to_string(content) else {
-        return false;
-    };
-    json.len() > 1024
 }
 
 #[cfg(test)]
@@ -1442,34 +1479,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Paste store integration tests
+    // Externalized content
     // -----------------------------------------------------------------------
 
-    async fn make_store_with_paste() -> (JsonlHistoryStore, TempDir, TempDir, TempDir) {
+    use crate::blob::{BlobStore, InMemoryBlobStore};
+    use base::message::ImageSource;
+
+    async fn make_store_with_blobs() -> (JsonlHistoryStore, TempDir, TempDir, TempDir) {
         let cwd_tmp = TempDir::new().unwrap();
         let projects_tmp = TempDir::new().unwrap();
         let paste_base = TempDir::new().unwrap();
-        let paste_store = PasteStore::new(paste_base.path());
         let store =
             JsonlHistoryStore::with_roots(cwd_tmp.path(), HistoryRoots::under(projects_tmp.path()))
                 .await
                 .unwrap()
-                .with_paste_store(paste_store);
+                .with_paste_store(PasteStore::new(paste_base.path()));
         (store, cwd_tmp, projects_tmp, paste_base)
     }
 
+    fn text_block(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }
+    }
+
+    fn image_block() -> ContentBlock {
+        ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn small_content_stored_inline_not_as_pasteref() {
-        let (store, _cwd, _proj, _paste_base) = make_store_with_paste().await;
+    async fn small_content_stays_in_the_log() {
+        let (store, _cwd, _proj, _base) = make_store_with_blobs().await;
         let s = SessionId::new();
         store
             .append(
                 s,
                 LogEntry::User {
-                    content: vec![ContentBlock::Text {
-                        text: "short".into(),
-                        cache_control: None,
-                    }],
+                    content: vec![text_block("short")],
                 },
             )
             .await
@@ -1477,7 +1529,6 @@ mod tests {
 
         let loaded = store.load(s).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        // Should be a User, not a PasteRef.
         assert!(
             matches!(loaded[0].entry, LogEntry::User { .. }),
             "expected User, got {:?}",
@@ -1486,33 +1537,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_content_stored_as_pasteref_and_hydrated() {
-        let (store, _cwd, _proj, _paste_base) = make_store_with_paste().await;
+    async fn large_content_leaves_the_log_and_comes_back_on_load() {
+        let (store, _cwd, _proj, _base) = make_store_with_blobs().await;
         let s = SessionId::new();
-
-        // Create a text block well over the 1024-byte threshold.
         let big_text = "X".repeat(1500);
         store
             .append(
                 s,
                 LogEntry::User {
-                    content: vec![ContentBlock::Text {
-                        text: big_text.clone(),
-                        cache_control: None,
-                    }],
+                    content: vec![text_block(&big_text)],
                 },
             )
             .await
             .unwrap();
 
-        // Load should transparently hydrate PasteRef back to User.
         let loaded = store.load(s).await.unwrap();
         assert_eq!(loaded.len(), 1);
         match &loaded[0].entry {
             LogEntry::User { content } => match &content[0] {
-                ContentBlock::Text { text, .. } => {
-                    assert_eq!(text, &big_text);
-                }
+                ContentBlock::Text { text, .. } => assert_eq!(text, &big_text),
                 other => panic!("expected Text block, got {other:?}"),
             },
             other => panic!("expected User, got {other:?}"),
@@ -1520,68 +1563,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_content_raw_jsonl_has_pasteref_not_content() {
-        let (store, _cwd, _proj, paste_base) = make_store_with_paste().await;
+    async fn the_jsonl_holds_a_reference_and_the_blob_holds_the_content() {
+        let (store, _cwd, _proj, base) = make_store_with_blobs().await;
         let s = SessionId::new();
-
         let big_text = "Y".repeat(1500);
         store
             .append(
                 s,
                 LogEntry::User {
-                    content: vec![ContentBlock::Text {
-                        text: big_text.clone(),
-                        cache_control: None,
-                    }],
+                    content: vec![text_block(&big_text)],
                 },
             )
             .await
             .unwrap();
 
-        // Read the raw JSONL file — it should contain "paste_ref", not the big content.
-        let path = store.session_file_path(&s);
-        let raw = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(
-            raw.contains("\"kind\":\"paste_ref\""),
-            "raw jsonl should have paste_ref: {raw}"
-        );
-        // The big text should not appear inline in the JSONL.
+        let raw = tokio::fs::read_to_string(store.session_file_path(&s))
+            .await
+            .unwrap();
+        assert!(raw.contains("\"kind\":\"blob\""), "raw jsonl: {raw}");
         assert!(
             !raw.contains(&big_text),
-            "raw jsonl should not contain the large text body"
+            "the body must not also be inline: {raw}"
         );
 
-        // Verify the paste file exists and has the content.
         let entries: Vec<EnvelopedEntry> = raw
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        let paste_id = match &entries[0].entry {
-            LogEntry::PasteRef { paste_id } => paste_id.clone(),
-            other => panic!("expected PasteRef, got {other:?}"),
+        let LogEntry::Blob { blob } = &entries[0].entry else {
+            panic!("expected a Blob reference, got {:?}", entries[0].entry);
         };
-        let paste_path = paste_base.path().join("pastes").join(&paste_id);
-        assert!(paste_path.exists(), "paste file should exist");
+        assert_eq!(blob.store, "paste");
+        assert_eq!(blob.describes, "user");
+        assert!(blob.bytes > big_text.len() as u64);
 
-        // The paste file should contain the full variant JSON with the content.
-        let paste_json = tokio::fs::read_to_string(&paste_path).await.unwrap();
-        assert!(paste_json.contains(&big_text));
+        let stored = tokio::fs::read_to_string(base.path().join("pastes").join(&blob.id))
+            .await
+            .unwrap();
+        assert!(stored.contains(&big_text));
     }
 
     #[tokio::test]
-    async fn large_assistant_content_stored_and_hydrated() {
-        let (store, _cwd, _proj, _paste_base) = make_store_with_paste().await;
+    async fn a_large_assistant_entry_keeps_every_field_across_the_round_trip() {
+        let (store, _cwd, _proj, _base) = make_store_with_blobs().await;
         let s = SessionId::new();
-
         let big_text = "Z".repeat(1500);
         store
             .append(
                 s,
                 LogEntry::Assistant {
-                    content: vec![ContentBlock::Text {
-                        text: big_text.clone(),
-                        cache_control: None,
-                    }],
+                    content: vec![text_block(&big_text)],
                     stop_reason: Some(StopReason::EndTurn),
                     usage: None,
                     model: Some("claude-sonnet-4-6".into()),
@@ -1590,9 +1621,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Load should transparently hydrate PasteRef back to Assistant with all fields.
         let loaded = store.load(s).await.unwrap();
-        assert_eq!(loaded.len(), 1);
         match &loaded[0].entry {
             LogEntry::Assistant {
                 content,
@@ -1612,25 +1641,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_messages_with_paste_hydration() {
-        let (store, _cwd, _proj, _paste_base) = make_store_with_paste().await;
+    async fn a_big_tool_result_leaves_the_log_too() {
+        let (store, _cwd, _proj, _base) = make_store_with_blobs().await;
         let s = SessionId::new();
-
-        let big_text = "A".repeat(1500);
+        let output = "line\n".repeat(400);
         store
             .append(
                 s,
-                LogEntry::User {
-                    content: vec![ContentBlock::Text {
-                        text: big_text.clone(),
-                        cache_control: None,
-                    }],
+                LogEntry::ToolResult {
+                    tool_use_id: "toolu_01".into(),
+                    content: ToolResultContent::Text(output.clone()),
+                    is_error: false,
                 },
             )
             .await
             .unwrap();
 
-        // load_messages goes through load() which hydrates.
+        let raw = tokio::fs::read_to_string(store.session_file_path(&s))
+            .await
+            .unwrap();
+        assert!(raw.contains("\"describes\":\"tool_result\""), "raw jsonl: {raw}");
+        assert!(!raw.contains(&output));
+
+        match &store.load(s).await.unwrap()[0].entry {
+            LogEntry::ToolResult { content, .. } => {
+                assert_eq!(content, &ToolResultContent::Text(output));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// An image is bytes nobody reads as text and no search matches, so it
+    /// leaves the log regardless of how small it is.
+    #[tokio::test]
+    async fn an_image_leaves_the_log_at_any_size() {
+        let (store, _cwd, _proj, _base) = make_store_with_blobs().await;
+        let s = SessionId::new();
+        store
+            .append(
+                s,
+                LogEntry::User {
+                    content: vec![text_block("look"), image_block()],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                s,
+                LogEntry::ToolResult {
+                    tool_use_id: "toolu_02".into(),
+                    content: ToolResultContent::Blocks(vec![image_block()]),
+                    is_error: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let raw = tokio::fs::read_to_string(store.session_file_path(&s))
+            .await
+            .unwrap();
+        assert_eq!(
+            raw.lines().filter(|l| l.contains("\"kind\":\"blob\"")).count(),
+            2,
+            "both the message and the tool result carry an image: {raw}"
+        );
+        assert!(!raw.contains("iVBORw0KGgo="));
+
+        let loaded = store.load(s).await.unwrap();
+        assert!(matches!(loaded[0].entry, LogEntry::User { .. }));
+        assert!(matches!(loaded[1].entry, LogEntry::ToolResult { .. }));
+    }
+
+    #[tokio::test]
+    async fn load_messages_sees_hydrated_content() {
+        let (store, _cwd, _proj, _base) = make_store_with_blobs().await;
+        let s = SessionId::new();
+        let big_text = "A".repeat(1500);
+        store
+            .append(
+                s,
+                LogEntry::User {
+                    content: vec![text_block(&big_text)],
+                },
+            )
+            .await
+            .unwrap();
+
         let messages = store.load_messages(s).await.unwrap();
         assert_eq!(messages.len(), 1);
         match &messages[0] {
@@ -1640,6 +1737,166 @@ mod tests {
             },
             other => panic!("expected User message, got {other:?}"),
         }
+    }
+
+    /// The acceptance: uninstall the blob backend and the old log still opens.
+    #[tokio::test]
+    async fn a_log_written_with_a_blob_backend_loads_without_one() {
+        let cwd = TempDir::new().unwrap();
+        let projects = TempDir::new().unwrap();
+        let paste_base = TempDir::new().unwrap();
+        let s = SessionId::new();
+
+        let roots = || HistoryRoots::under(projects.path());
+        let with_blobs = JsonlHistoryStore::with_roots(cwd.path(), roots())
+            .await
+            .unwrap()
+            .with_paste_store(PasteStore::new(paste_base.path()));
+        with_blobs
+            .append(
+                s,
+                LogEntry::System {
+                    subkind: crate::entry::SystemSubkind::Notice,
+                    text: "before".into(),
+                },
+            )
+            .await
+            .unwrap();
+        with_blobs
+            .append(
+                s,
+                LogEntry::User {
+                    content: vec![text_block(&"B".repeat(1500))],
+                },
+            )
+            .await
+            .unwrap();
+        with_blobs
+            .append(
+                s,
+                LogEntry::User {
+                    content: vec![text_block("after")],
+                },
+            )
+            .await
+            .unwrap();
+
+        for (label, store) in [
+            (
+                "nothing mounted",
+                JsonlHistoryStore::with_roots(cwd.path(), roots()).await.unwrap(),
+            ),
+            (
+                "a different store mounted",
+                JsonlHistoryStore::with_roots(cwd.path(), roots())
+                    .await
+                    .unwrap()
+                    .with_blob_store(Arc::new(InMemoryBlobStore::new())),
+            ),
+            (
+                "the right store, emptied",
+                JsonlHistoryStore::with_roots(cwd.path(), roots())
+                    .await
+                    .unwrap()
+                    .with_paste_store(PasteStore::new(TempDir::new().unwrap().path())),
+            ),
+        ] {
+            let loaded = store
+                .load(s)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: a session must still load: {e:?}"));
+            assert_eq!(loaded.len(), 3, "{label}: an unreachable entry is still an entry");
+            assert!(
+                matches!(loaded[1].entry, LogEntry::Blob { .. }),
+                "{label}: expected the reference left in place, got {:?}",
+                loaded[1].entry
+            );
+            assert_eq!(
+                store.load_messages(s).await.unwrap().len(),
+                1,
+                "{label}: an unresolved reference is not something the model sees"
+            );
+        }
+    }
+
+    /// A reference names its store, and a store that is not the one named
+    /// does not get to answer for it — even when it happens to hold that id,
+    /// which content addressing makes likely rather than exotic. Resolving a
+    /// foreign id is how a backend with its own id space hands back the wrong
+    /// content.
+    #[tokio::test]
+    async fn a_reference_is_only_resolved_by_the_store_it_names() {
+        let cwd = TempDir::new().unwrap();
+        let projects = TempDir::new().unwrap();
+        let paste_base = TempDir::new().unwrap();
+        let s = SessionId::new();
+        let entry = LogEntry::User {
+            content: vec![text_block(&"C".repeat(1500))],
+        };
+
+        let written = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+            .await
+            .unwrap()
+            .with_paste_store(PasteStore::new(paste_base.path()));
+        written.append(s, entry.clone()).await.unwrap();
+
+        let impostor = InMemoryBlobStore::new();
+        impostor
+            .put(serde_json::to_string(&entry).unwrap().as_bytes())
+            .unwrap();
+        let reader = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+            .await
+            .unwrap()
+            .with_blob_store(Arc::new(impostor));
+
+        assert!(
+            matches!(reader.load(s).await.unwrap()[0].entry, LogEntry::Blob { .. }),
+            "a store that was not named must leave the reference alone"
+        );
+    }
+
+    /// The pre-`Blob` form is still read, and a missing paste no longer takes
+    /// the session down with it.
+    #[tokio::test]
+    async fn an_old_paste_ref_line_still_hydrates_and_survives_its_paste_going_missing() {
+        let cwd = TempDir::new().unwrap();
+        let projects = TempDir::new().unwrap();
+        let paste_base = TempDir::new().unwrap();
+        let pastes = PasteStore::new(paste_base.path());
+        let s = SessionId::new();
+
+        let original = LogEntry::User {
+            content: vec![text_block("what the paste held")],
+        };
+        let paste_id = pastes.store(&serde_json::to_string(&original).unwrap()).unwrap();
+        let store = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+            .await
+            .unwrap()
+            .with_paste_store(pastes);
+        store
+            .append(
+                s,
+                LogEntry::PasteRef {
+                    paste_id: paste_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        match &store.load(s).await.unwrap()[0].entry {
+            LogEntry::User { content } => match &content[0] {
+                ContentBlock::Text { text, .. } => assert_eq!(text, "what the paste held"),
+                other => panic!("expected Text block, got {other:?}"),
+            },
+            other => panic!("expected the hydrated User entry, got {other:?}"),
+        }
+
+        std::fs::remove_file(paste_base.path().join("pastes").join(&paste_id)).unwrap();
+        let loaded = store
+            .load(s)
+            .await
+            .expect("a missing paste is a gap, not a broken session");
+        assert!(matches!(loaded[0].entry, LogEntry::PasteRef { .. }));
     }
 }
 

@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 27] = [
+static POINTS: [ExtensionPoint; 28] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -362,6 +362,16 @@ static POINTS: [ExtensionPoint; 27] = [
             frequency: Frequency::PerSession,
             trust: Trust::host_only(),
             defined_in: "history::store::HistoryStore::find_sessions",
+        },
+        ExtensionPoint {
+            id: "history.blob",
+            kind: Kind::Contract,
+            summary: "where content too big to keep in the log lives",
+            timing: "every append carrying an image or a large payload, and on load",
+            rewrites: "where large content is kept and how it is addressed",
+            frequency: Frequency::PerTurn,
+            trust: Trust::host_only(),
+            defined_in: "history::blob::BlobStore",
         },
         ExtensionPoint {
             id: "history.extension_entry",

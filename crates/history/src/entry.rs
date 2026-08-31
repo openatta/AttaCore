@@ -2,12 +2,11 @@
 //!
 //! `EnvelopedEntry` = 顶层字段（v / id / ts / session_id）+ flatten 进 `LogEntry`。
 
+use crate::blob::BlobRef;
 use base::id::Id;
 use base::message::{ContentBlock, Message, StopReason, ToolResultContent};
 use base::session::SessionId;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 /// 当前 schema 版本。旧历史文件无 `v` 字段 → 反序列化时按 0 解读
@@ -186,11 +185,31 @@ pub enum LogEntry {
         total_cost_usd: f64,
     },
 
-    /// Content stored externally in the paste store (SHA-256 hex, first 16
-    /// chars). Written when the serialized content exceeds 1024 bytes, to
-    /// avoid bloating the conversation JSONL. Transparently hydrated back to
-    /// the original variant by [`JsonlHistoryStore::load`].
+    /// The pre-`Blob` externalization form: a paste id and nothing else.
+    ///
+    /// Still read, never written. Without a store name there is no way to ask
+    /// whether the backend holding it is even mounted, which is why the shape
+    /// changed; a load resolves it against whatever store is mounted and
+    /// leaves it alone if that store does not have it.
     PasteRef { paste_id: String },
+
+    /// Content kept outside the log, with a pointer to where.
+    ///
+    /// Written in place of a `User`, `Assistant` or `ToolResult` entry whose
+    /// content is large or carries an image — things that cost a lot to keep
+    /// inline and that nobody reads as text. A load with the naming store
+    /// mounted puts the original entry back, and nothing above the store ever
+    /// sees this variant.
+    ///
+    /// # An unresolvable reference is inert, never an error
+    ///
+    /// The blob may be in a store this process did not mount, or cleaned up,
+    /// or left behind when a backend was uninstalled. In every one of those
+    /// cases the session still loads, still forks and still resumes — with a
+    /// gap where the content was. Refusing to open a conversation because
+    /// part of it is unreachable trades a degraded session for no session,
+    /// which is the trade [`Extension`](Self::Extension) already refuses.
+    Blob { blob: BlobRef },
 
     /// Marks a sidechain session as having run its one-shot task to
     /// conclusion. Only written for sub-agent sessions that returned from
@@ -267,84 +286,6 @@ pub struct UsageRecord {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
-}
-
-/// External content store for deduplicating large content in the JSONL.
-///
-/// Files are stored under `<base>/pastes/` keyed by the first 16 hex
-/// characters of the SHA-256 hash of the content. Content is deduplicated:
-/// identical content produces the same paste ID and is written once.
-#[derive(Debug, Clone)]
-pub struct PasteStore {
-    dir: PathBuf,
-}
-
-impl PasteStore {
-    /// Create a new paste store rooted at `base` (e.g. `~/.atta/<scope>`).
-    /// The actual paste files live in `<base>/pastes/`.
-    pub fn new(base: &Path) -> Self {
-        Self {
-            dir: base.join("pastes"),
-        }
-    }
-
-    /// Store `content` and return the paste ID (SHA-256 hex, first 16 chars).
-    /// If the same content was previously stored, the existing paste ID is
-    /// returned and no additional file is written (deduplication).
-    pub fn store(&self, content: &str) -> Result<String, std::io::Error> {
-        let hash = Sha256::digest(content.as_bytes());
-        let hex_str = hex::encode(hash);
-        let paste_id = hex_str[..16].to_string();
-
-        std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(&paste_id);
-        if !path.exists() {
-            std::fs::write(&path, content)?;
-        }
-        Ok(paste_id)
-    }
-
-    /// Load content by `paste_id`. Returns `None` if the paste file does not
-    /// exist (e.g. if it was cleaned up or never written).
-    pub fn load(&self, paste_id: &str) -> Result<Option<String>, std::io::Error> {
-        let path = self.dir.join(paste_id);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Remove paste files whose last modification time is older than 7 days.
-    /// Returns the number of files removed.
-    pub fn cleanup(&self) -> Result<usize, std::io::Error> {
-        let now = std::time::SystemTime::now();
-        let max_age = std::time::Duration::from_secs(7 * 24 * 3600);
-        let mut removed = 0;
-
-        if !self.dir.exists() {
-            return Ok(0);
-        }
-
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            if !meta.is_file() {
-                continue;
-            }
-            if let Ok(modified) = meta.modified() {
-                if now
-                    .duration_since(modified)
-                    .unwrap_or(std::time::Duration::ZERO)
-                    > max_age
-                {
-                    std::fs::remove_file(entry.path())?;
-                    removed += 1;
-                }
-            }
-        }
-        Ok(removed)
-    }
 }
 
 #[cfg(test)]
@@ -587,61 +528,5 @@ mod tests {
             }
             _ => panic!(),
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // PasteStore tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn paste_store_store_and_load_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = PasteStore::new(dir.path());
-        let content = "hello paste store";
-
-        let id = store.store(content).unwrap();
-        // ID is first 16 hex chars of SHA-256
-        assert_eq!(id.len(), 16);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-
-        let loaded = store.load(&id).unwrap().expect("should find paste file");
-        assert_eq!(loaded, content);
-    }
-
-    #[test]
-    fn paste_store_dedup_returns_same_id() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = PasteStore::new(dir.path());
-        let content = "this content should have a stable hash";
-
-        let id1 = store.store(content).unwrap();
-        let id2 = store.store(content).unwrap();
-        assert_eq!(id1, id2);
-    }
-
-    #[test]
-    fn paste_store_load_missing_returns_none() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = PasteStore::new(dir.path());
-        let result = store.load("nonexistentpasteid").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn paste_store_cleanup_skips_fresh_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = PasteStore::new(dir.path());
-        store.store("fresh content").unwrap();
-        // No files should be cleaned up — they were just written.
-        let removed = store.cleanup().unwrap();
-        assert_eq!(removed, 0);
-    }
-
-    #[test]
-    fn paste_store_cleanup_handles_empty_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = PasteStore::new(dir.path());
-        let removed = store.cleanup().unwrap();
-        assert_eq!(removed, 0);
     }
 }

@@ -309,6 +309,7 @@ pub fn normalize_log(entries: &[history::entry::EnvelopedEntry]) -> String {
             history::entry::LogEntry::Compact { .. } => "Compact".to_string(),
             history::entry::LogEntry::UsageSnapshot { .. } => "UsageSnapshot".to_string(),
             history::entry::LogEntry::PasteRef { .. } => "PasteRef".to_string(),
+            history::entry::LogEntry::Blob { blob } => format!("Blob {}", blob.describes),
             history::entry::LogEntry::SessionEnd { state } => format!("SessionEnd {state:?}"),
             history::entry::LogEntry::Extension { ns, event, .. } => {
                 format!("Extension {ns}/{event}")

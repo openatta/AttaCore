@@ -187,6 +187,7 @@ pub fn latest_projected_message_entry_id(entries: &[EnvelopedEntry]) -> Option<I
         | LogEntry::Compact { .. }
         | LogEntry::UsageSnapshot { .. }
         | LogEntry::PasteRef { .. }
+        | LogEntry::Blob { .. }
         | LogEntry::Extension { .. }
         | LogEntry::SessionEnd { .. } => None,
     })
@@ -198,7 +199,8 @@ fn apply_entry_to_messages(entry: &LogEntry, messages: &mut Vec<Message>) {
         | LogEntry::System { .. }
         | LogEntry::UsageSnapshot { .. }
         | LogEntry::PasteRef { .. }
-        | LogEntry::SessionEnd { .. } => {} // PasteRef hydrated by store::load()
+        | LogEntry::Blob { .. }
+        | LogEntry::SessionEnd { .. } => {} // externalized content is hydrated by store::load()
         // An extension's state is not model-visible. Whether it could be —
         // and what would have to be true for it to be reconstructible from
         // the log if it were — is the projection question, not this one.
