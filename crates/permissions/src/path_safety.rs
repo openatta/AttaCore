@@ -563,11 +563,13 @@ mod tests {
     fn symlink_resolution_detects_escape() {
         use std::fs;
         use std::os::unix;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        static SYMLINK_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let stamp = SYMLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("attacore_symlink_test_{}", stamp));
+        // A `TempDir` rather than a name built from a counter: the counter
+        // restarts at zero in every process, and $TMPDIR is shared, so two
+        // test binaries running at once picked the same directory and the
+        // second one failed to create a symlink that already existed.
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let inside = dir.join("workdir");
         let outside = dir.join("outside");
 
@@ -594,9 +596,6 @@ mod tests {
             matches!(err, PathSafetyError::SymlinkEscape { .. }),
             "expected SymlinkEscape, got {err:?}"
         );
-
-        // Cleanup
-        fs::remove_dir_all(&dir).ok();
     }
 
     // ── Unicode normalization attack detection ─────────────────────────
