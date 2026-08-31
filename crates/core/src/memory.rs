@@ -8,6 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::interface::environment::{Environment, SystemEnvironment};
 
 /// A single durable memory entry — stored as a .md file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,14 +48,17 @@ impl DurableMemory {
     /// Memories older than 30 days get a ≥0.5 penalty; memories updated within
     /// 7 days get no penalty. `recall_count` slows decay (well-established
     /// memories age more gracefully).
-    pub fn staleness_penalty(&self) -> f64 {
+    ///
+    /// `now` is passed in rather than read: this score decides which memories
+    /// reach the model, so it belongs to the kept category
+    /// [`Environment`](crate::interface::environment::Environment) exists for.
+    pub fn staleness_penalty(&self, now: time::OffsetDateTime) -> f64 {
         let last = time::OffsetDateTime::parse(
             &self.last_seen,
             &time::format_description::well_known::Iso8601::DEFAULT,
         )
         .ok();
         let Some(last) = last else { return 1.0 };
-        let now = time::OffsetDateTime::now_utc();
         let age_days = (now - last).whole_days().max(0) as f64;
 
         if age_days <= 7.0 {
@@ -68,8 +74,8 @@ impl DurableMemory {
     }
 
     /// Effective confidence after applying staleness penalty.
-    pub fn effective_confidence(&self) -> f64 {
-        (self.confidence * (1.0 - self.staleness_penalty())).max(0.0)
+    pub fn effective_confidence(&self, now: time::OffsetDateTime) -> f64 {
+        (self.confidence * (1.0 - self.staleness_penalty(now))).max(0.0)
     }
 }
 
@@ -140,6 +146,7 @@ pub enum MemoryScope {
 pub struct MemoryStore {
     user_dir: PathBuf,
     local_dir: PathBuf,
+    environment: Arc<dyn Environment>,
 }
 
 /// File name for the index.
@@ -150,7 +157,14 @@ impl MemoryStore {
         Self {
             user_dir,
             local_dir,
+            environment: Arc::new(SystemEnvironment),
         }
+    }
+
+    /// Score ageing against `environment` instead of the machine's clock.
+    pub fn with_environment(mut self, environment: Arc<dyn Environment>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// The distinct directories this store owns, most specific first.
@@ -357,8 +371,12 @@ impl MemoryStore {
         // carries `confidence`, `last_seen`, `source_session_id` and
         // `recall_count` — so the filter can do what it says.
         let mut doomed: Vec<(PathBuf, String)> = Vec::new();
+        // One instant for the whole pass. Reading the clock per entry would
+        // let two memories of the same age score differently by where they
+        // happen to sit in the list.
+        let now = self.environment.now();
         all.retain(|(dir, m)| {
-            let keep = m.effective_confidence() >= 0.3;
+            let keep = m.effective_confidence(now) >= 0.3;
             if !keep {
                 doomed.push((dir.clone(), m.name.clone()));
             }
@@ -1364,11 +1382,16 @@ This memory was written before the flat-format fix."#;
 
         let back = MemoryStore::load_from_dir(&user_dir);
         let b = &back[0];
-        assert_eq!(b.staleness_penalty(), 0.0, "a just-written memory is fresh");
+        let now = time::OffsetDateTime::now_utc();
+        assert_eq!(
+            b.staleness_penalty(now),
+            0.0,
+            "a just-written memory is fresh"
+        );
         assert!(
-            b.effective_confidence() > 0.8,
+            b.effective_confidence(now) > 0.8,
             "effective confidence collapsed to {} — staleness scoring is inert again",
-            b.effective_confidence()
+            b.effective_confidence(now)
         );
     }
 
@@ -1638,5 +1661,73 @@ This memory was written before the flat-format fix."#;
         // The global dir was untouched — files and index both intact.
         assert!(user.join("global-fact.md").exists());
         assert!(index_of(&user).contains("global-fact"));
+    }
+
+    /// 2020-01-01, far enough in the past that a memory dated a day before it
+    /// is ancient by the machine's clock and fresh by this one.
+    fn fixed_instant() -> time::OffsetDateTime {
+        time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(18_262)
+    }
+
+    fn iso(t: time::OffsetDateTime) -> String {
+        t.format(&time::format_description::well_known::Iso8601::DEFAULT)
+            .unwrap()
+    }
+
+    fn store_at(dir: &Path, clock: time::OffsetDateTime, step: time::Duration) -> MemoryStore {
+        MemoryStore::new(dir.to_path_buf(), dir.join("local")).with_environment(Arc::new(
+            crate::interface::environment::FixedEnvironment::new(clock, step),
+        ))
+    }
+
+    /// Which memories survive to be offered to the model is decided against
+    /// the environment's clock. Under a fixed one the answer is the same
+    /// whenever the test runs — which it would not be if the score still read
+    /// the machine, since both entries are years old by that measure.
+    #[test]
+    fn ageing_is_scored_against_the_environment_not_the_machine() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("memory");
+        let clock = fixed_instant();
+        let store = store_at(&dir, clock, time::Duration::ZERO);
+
+        let mut recent = mem("recent");
+        recent.last_seen = iso(clock - time::Duration::days(1));
+        let mut ancient = mem("ancient");
+        ancient.last_seen = iso(clock - time::Duration::days(200));
+        store.persist_batch(vec![recent, ancient]).unwrap();
+
+        assert_eq!(store.compact(10).unwrap(), 1);
+        assert!(
+            dir.join("recent.md").exists(),
+            "a memory a day old under the fixed clock must not age out"
+        );
+        assert!(
+            !dir.join("ancient.md").exists(),
+            "the formula still decays — 200 days is past the cap"
+        );
+    }
+
+    /// Every entry in one compaction is scored against one instant. A clock
+    /// read per entry would make a memory's fate depend on its position in the
+    /// list, which is the ordering instability this contract is for.
+    #[test]
+    fn a_compaction_scores_every_entry_against_the_same_instant() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("memory");
+        let clock = fixed_instant();
+        let store = store_at(&dir, clock, time::Duration::days(30));
+
+        for name in ["a-fact", "b-fact", "c-fact"] {
+            let mut m = mem(name);
+            m.last_seen = iso(clock - time::Duration::days(8));
+            store.persist_batch(vec![m]).unwrap();
+        }
+
+        assert_eq!(
+            store.compact(10).unwrap(),
+            0,
+            "three memories of equal age must share one verdict"
+        );
     }
 }

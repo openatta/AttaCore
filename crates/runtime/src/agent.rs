@@ -1800,13 +1800,20 @@ impl Builder {
                 )
             }
         };
+        let environment = self
+            .environment
+            .clone()
+            .unwrap_or_else(|| Arc::new(base::interface::environment::SystemEnvironment));
         let memory_store = self.memory_store.unwrap_or_else(|| {
             let p = &settings.paths;
             // memory 不分 scene，只分全局/项目——见 base::paths 模块文档。
-            Arc::new(MemoryStore::new(
-                p.global_data_dir.join("memory"),
-                p.local_data_dir.join("memory"),
-            ))
+            Arc::new(
+                MemoryStore::new(
+                    p.global_data_dir.join("memory"),
+                    p.local_data_dir.join("memory"),
+                )
+                .with_environment(environment.clone()),
+            )
         });
         // Session: `self.history_store` (set via `Builder::history_store(...)`)
         // makes this incrementally persisted to disk once per turn; `None`
@@ -2406,9 +2413,7 @@ impl Builder {
                 health: Arc::new(base::interface::health::HealthChecks::from_vec(
                     self.health_checks,
                 )),
-                environment: self
-                    .environment
-                    .unwrap_or_else(|| Arc::new(base::interface::environment::SystemEnvironment)),
+                environment,
                 recovery_policy,
                 model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self

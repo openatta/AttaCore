@@ -393,6 +393,11 @@ Two places, because the log's half is written by the store and the
 model-visible half by the agent. Configure both, or a replay differs in the
 half you forgot.
 
+The builder hands the same environment to the memory store it creates, so
+durable memories age against it too — that is what decides which of them are
+offered to the model. A store supplied with `Builder::memory_store` is
+configured by whoever built it: `MemoryStore::new(user, local).with_environment(env)`.
+
 ### Where skills come from — `skill.source`
 
 `base::interface::skill_provider::SkillProvider`. Three implementations ship
