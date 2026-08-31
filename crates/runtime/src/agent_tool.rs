@@ -3385,6 +3385,21 @@ mod catalog_tests {
     use super::*;
     use std::io::Write;
 
+    /// A directory of agent-type `.md` files that outlives the assertions
+    /// reading them.
+    ///
+    /// An `AgentTool` built over a directory keeps a `notify` watcher on it,
+    /// and a `.md` file disappearing re-runs the merge with that agent type
+    /// gone. Deleting the directory partway through a test therefore races the
+    /// watcher against itself: the unlink of the file is dispatched, removing
+    /// the directory tears the watch down, and whichever lands first decides
+    /// whether the catalog under assertion still holds anything. A `TempDir`
+    /// is cleaned up when the test ends, once nothing is going to read it
+    /// again.
+    fn agent_type_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir for agent-type files")
+    }
+
     fn write_agent_md(dir: &Path, filename: &str, content: &str) {
         std::fs::create_dir_all(dir).unwrap();
         let mut f = std::fs::File::create(dir.join(filename)).unwrap();
@@ -3856,16 +3871,10 @@ mod catalog_tests {
 
     #[test]
     fn resolve_tools_mcp_servers_grants_matching_server_tools_only() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-mcp-servers-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = agent_type_dir();
+        let dir = tmp.path();
         write_agent_md(
-            &dir,
+            dir,
             "github-agent.md",
             "---\ndescription: Uses only the github MCP server\nmcp_servers: github\n---\nbody",
         );
@@ -3873,8 +3882,7 @@ mod catalog_tests {
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
         let agent_tool =
-            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[&dir], &[]);
-        let _ = std::fs::remove_dir_all(&dir);
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[dir], &[]);
 
         // Two servers' worth of MCP tools attached to the parent — only
         // "github"'s should make it into the resolved registry.
@@ -3913,16 +3921,10 @@ mod catalog_tests {
 
     #[test]
     fn resolve_tools_disallowed_tools_removes_from_full_access_pool() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-disallowed-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = agent_type_dir();
+        let dir = tmp.path();
         write_agent_md(
-            &dir,
+            dir,
             "no-writes.md",
             "---\ndescription: Inherits every tool except file writes\ndisallowed_tools: Write, Edit\n---\nbody",
         );
@@ -3934,8 +3936,7 @@ mod catalog_tests {
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
         let agent_tool =
-            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[&dir], &[]);
-        let _ = std::fs::remove_dir_all(&dir);
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[dir], &[]);
 
         let resolved = agent_tool.resolve_tools(Some("no-writes"));
         let names: Vec<String> = resolved
@@ -3953,18 +3954,12 @@ mod catalog_tests {
 
     #[test]
     fn resolve_tools_disallowed_tools_applied_before_allowed_tools() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-disallowed-allowed-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = agent_type_dir();
+        let dir = tmp.path();
         // A tool listed in both allowed_tools and disallowed_tools must end
         // up removed either way.
         write_agent_md(
-            &dir,
+            dir,
             "conflicting.md",
             "---\ndescription: Lists Bash in both allow and deny\nallowed_tools: Read, Bash\ndisallowed_tools: Bash\n---\nbody",
         );
@@ -3975,8 +3970,7 @@ mod catalog_tests {
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
         let agent_tool =
-            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[&dir], &[]);
-        let _ = std::fs::remove_dir_all(&dir);
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[dir], &[]);
 
         let resolved = agent_tool.resolve_tools(Some("conflicting"));
         let names: Vec<String> = resolved
@@ -3990,16 +3984,10 @@ mod catalog_tests {
 
     #[test]
     fn custom_agent_type_model_override_is_applied_to_sub_settings() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-model-override-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = agent_type_dir();
+        let dir = tmp.path();
         write_agent_md(
-            &dir,
+            dir,
             "opus-reviewer.md",
             "---\ndescription: Reviewer pinned to a specific model\nmodel: claude-opus-4-8\n---\nbody",
         );
@@ -4007,8 +3995,7 @@ mod catalog_tests {
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
         let agent_tool =
-            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[&dir], &[]);
-        let _ = std::fs::remove_dir_all(&dir);
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[dir], &[]);
 
         // Same lookup `run_sub`/`run_sub_inner` perform: resolve the type's
         // `model` override, then thread it into `sub_settings()`.
@@ -4180,16 +4167,10 @@ mod catalog_tests {
 
     #[test]
     fn run_sub_applies_permission_mode_and_max_turns_override_end_to_end() {
-        let dir = std::env::temp_dir().join(format!(
-            "atta-agent-permmode-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = agent_type_dir();
+        let dir = tmp.path();
         write_agent_md(
-            &dir,
+            dir,
             "cautious.md",
             "---\ndescription: A cautious read-only researcher\npermission_mode: plan\nmax_turns: 3\n---\nbody",
         );
@@ -4197,8 +4178,7 @@ mod catalog_tests {
         let model: Arc<dyn Model> = Arc::new(DummyModel);
         let config = Arc::new(EngineConfig::defaults_for("parent-default-model"));
         let agent_tool =
-            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[&dir], &[]);
-        let _ = std::fs::remove_dir_all(&dir);
+            AgentTool::with_parent_tools(model, config, tools.clone(), tools, &[dir], &[]);
 
         let def = agent_tool.inner.agent_type_def("cautious").unwrap();
         let mut settings = agent_tool.sub_settings(None, std::path::PathBuf::from("/tmp/cwd"));
