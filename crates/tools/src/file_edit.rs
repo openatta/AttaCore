@@ -6,6 +6,7 @@
 use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{ExecError, FileSystem};
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -226,6 +227,7 @@ impl Tool for FileEditTool {
                 ctx.cwd.join(parsed.file_path)
             };
             let path = crate::security::normalize_path_lexically(&path);
+            let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
             let policy = crate::security::WritePolicy::new(ctx.cwd.clone())
                 .with_additional_roots(ctx.additional_writable_dirs.clone());
             match crate::security::check_write(&path, &policy) {
@@ -270,8 +272,11 @@ impl Tool for FileEditTool {
             snapshot.record(&path, "Edit");
         }
 
-        let outcome =
-            run_with_cancel(&ctx.cancel, perform_edits_structured(&path, &edits)).await??;
+        let outcome = run_with_cancel(
+            &ctx.cancel,
+            perform_edits_structured(&*ctx.exec.filesystem, &path, &edits),
+        )
+        .await??;
 
         // **S1-a **: emit structured diff payload alongside text. TUI
         // parses `structured_content.kind == "diff"` and renders inline; CLI
@@ -336,18 +341,20 @@ struct PerformOutcome {
 /// non-unique without replace_all), the file is **not** written and an
 /// error is returned describing which edit failed and why.
 async fn perform_edits_structured(
+    fs: &dyn FileSystem,
     path: &Path,
     edits: &[SingleEdit],
 ) -> Result<PerformOutcome, ToolError> {
-    let metadata = tokio::fs::metadata(path)
+    let metadata = fs
+        .metadata_following_symlinks(path)
         .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
+        .map_err(|e| match e {
+            ExecError::Failed(_) => {
                 ToolError::Validation(format!("file not found: {}", path.display()))
             }
-            _ => ToolError::exec(e.to_string()),
+            other => other.into(),
         })?;
-    if metadata.is_dir() {
+    if metadata.is_dir {
         return Err(ToolError::Validation(format!(
             "path is a directory, not a file: {}",
             path.display()
@@ -356,25 +363,16 @@ async fn perform_edits_structured(
 
     // File size limit (1 GiB).
     const MAX_EDIT_BYTES: u64 = 1024 * 1024 * 1024;
-    let meta = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| ToolError::exec(format!("stat: {e}")))?;
-    if meta.len() > MAX_EDIT_BYTES {
+    if metadata.len > MAX_EDIT_BYTES {
         return Err(ToolError::Validation(format!(
             "file is {} bytes; max edit size is {} bytes",
-            meta.len(),
-            MAX_EDIT_BYTES
+            metadata.len, MAX_EDIT_BYTES
         )));
     }
 
-    let original = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::InvalidData => {
-                ToolError::Validation(format!("file is not valid UTF-8: {}", path.display()))
-            }
-            _ => ToolError::exec(e.to_string()),
-        })?;
+    let original = String::from_utf8(fs.read(path).await?).map_err(|_| {
+        ToolError::Validation(format!("file is not valid UTF-8: {}", path.display()))
+    })?;
 
     let mut current = original.clone();
     let mut total_replacements: usize = 0;
@@ -403,7 +401,7 @@ async fn perform_edits_structured(
         total_replacements += if replace_all { count } else { 1 };
     }
 
-    tokio::fs::write(path, &current).await?;
+    fs.write_str(path, &current).await?;
 
     let path_str = path.display().to_string();
     let (diff_text, diff_payload) = render_diff(&original, &current, &path_str);
@@ -529,8 +527,11 @@ fn parse_pair(s: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::interface::exec::local::LocalFileSystem;
+    use base::interface::exec::{DirEntry, Metadata};
     use base::tool::ToolResultContent;
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn ctx_in(cwd: &Path) -> ToolContext {
@@ -963,5 +964,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Cancelled));
+    }
+
+    /// Serves one body for every read and collects every write, so what the
+    /// edit worked on and where the result went can only be the provider.
+    struct Interposed {
+        body: &'static str,
+        written: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    #[async_trait]
+    impl FileSystem for Interposed {
+        async fn read(&self, _: &Path) -> Result<Vec<u8>, ExecError> {
+            Ok(self.body.as_bytes().to_vec())
+        }
+        async fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), ExecError> {
+            self.written.lock().unwrap().push((
+                path.to_path_buf(),
+                String::from_utf8_lossy(bytes).into_owned(),
+            ));
+            Ok(())
+        }
+        async fn create_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+            LocalFileSystem.create_dir_all(path).await
+        }
+        async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ExecError> {
+            LocalFileSystem.read_dir(path).await
+        }
+        async fn remove_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+            LocalFileSystem.remove_dir_all(path).await
+        }
+        async fn metadata(&self, _: &Path) -> Result<Metadata, ExecError> {
+            Ok(Metadata {
+                is_dir: false,
+                is_file: true,
+                is_symlink: false,
+                len: self.body.len() as u64,
+            })
+        }
+        async fn canonicalize(&self, path: &Path) -> Result<PathBuf, ExecError> {
+            Ok(path.to_path_buf())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_edit_reads_and_writes_through_the_provider() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("code.rs");
+        tokio::fs::write(&p, "on the disk\n").await.unwrap();
+
+        let provider = Arc::new(Interposed {
+            body: "in the provider\n",
+            written: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut ctx = ctx_in(dir.path());
+        ctx.exec.filesystem = provider.clone();
+
+        FileEditTool
+            .call(
+                json!({
+                    "file_path": p.to_string_lossy(),
+                    "old_string": "in the provider",
+                    "new_string": "edited",
+                }),
+                ctx,
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("the old_string only exists in the provider's copy");
+
+        let written = provider.written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, p);
+        assert_eq!(written[0].1, "edited\n");
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "on the disk\n",
+            "the disk must not have been touched"
+        );
     }
 }

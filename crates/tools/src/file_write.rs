@@ -7,6 +7,7 @@
 use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::FileSystem;
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -136,6 +137,7 @@ impl Tool for FileWriteTool {
                 false => ctx.cwd.join(parsed.file_path),
             };
             let path = crate::security::normalize_path_lexically(&path);
+            let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
             let policy = crate::security::WritePolicy::new(ctx.cwd.clone())
                 .with_additional_roots(ctx.additional_writable_dirs.clone());
             match crate::security::check_write(&path, &policy) {
@@ -180,7 +182,11 @@ impl Tool for FileWriteTool {
             snapshot.record(&path, "Write");
         }
 
-        let result = run_with_cancel(&ctx.cancel, write_file(&path, &input.content)).await?;
+        let result = run_with_cancel(
+            &ctx.cancel,
+            write_file(&*ctx.exec.filesystem, &path, &input.content),
+        )
+        .await?;
 
         result.map(|bytes| {
             ToolResult::text(format!(
@@ -202,23 +208,26 @@ fn resolve_path(s: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-async fn write_file(path: &Path, content: &str) -> Result<usize, ToolError> {
+async fn write_file(fs: &dyn FileSystem, path: &Path, content: &str) -> Result<usize, ToolError> {
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            tokio::fs::create_dir_all(parent)
+        if !parent.as_os_str().is_empty() && fs.metadata_following_symlinks(parent).await.is_err() {
+            fs.create_dir_all(parent)
                 .await
                 .map_err(|e| ToolError::Validation(format!("cannot create parent dir: {e}")))?;
         }
     }
-    tokio::fs::write(path, content.as_bytes()).await?;
+    fs.write_str(path, content).await?;
     Ok(content.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::interface::exec::local::LocalFileSystem;
+    use base::interface::exec::{DirEntry, ExecError, Metadata};
     use base::tool::ToolResultContent;
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn ctx_in(cwd: &Path) -> ToolContext {
@@ -386,6 +395,141 @@ mod tests {
         assert!(tool.is_destructive(&Value::Null));
         assert!(!tool.is_concurrency_safe(&Value::Null));
         assert_eq!(tool.name(), "Write");
+    }
+
+    /// A filesystem that reports one path as living somewhere else, the way a
+    /// remote provider would report its own symlinks.
+    struct ResolvesElsewhere {
+        from: PathBuf,
+        to: PathBuf,
+    }
+
+    #[async_trait]
+    impl FileSystem for ResolvesElsewhere {
+        async fn read(&self, path: &Path) -> Result<Vec<u8>, ExecError> {
+            LocalFileSystem.read(path).await
+        }
+        async fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), ExecError> {
+            LocalFileSystem.write(path, bytes).await
+        }
+        async fn create_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+            LocalFileSystem.create_dir_all(path).await
+        }
+        async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ExecError> {
+            LocalFileSystem.read_dir(path).await
+        }
+        async fn remove_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+            LocalFileSystem.remove_dir_all(path).await
+        }
+        async fn metadata(&self, path: &Path) -> Result<Metadata, ExecError> {
+            LocalFileSystem.metadata(path).await
+        }
+        async fn canonicalize(&self, path: &Path) -> Result<PathBuf, ExecError> {
+            if path == self.from {
+                Ok(self.to.clone())
+            } else {
+                LocalFileSystem.canonicalize(path).await
+            }
+        }
+    }
+
+    /// The write policy has to judge the path the *provider* says the write
+    /// will land on. A tool that resolved the path against this machine's disk
+    /// instead would allow the write here: nothing on this disk links
+    /// `inside/note.txt` anywhere, and lexically it sits in the project.
+    #[tokio::test]
+    async fn the_policy_judges_the_path_the_provider_resolves_to() {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("project");
+        let elsewhere = dir.path().join("elsewhere");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::create_dir_all(&elsewhere).await.unwrap();
+
+        let target = project.join("note.txt");
+        let mut ctx = ctx_in(&project);
+        ctx.exec.filesystem = Arc::new(ResolvesElsewhere {
+            from: target.clone(),
+            to: elsewhere.join("note.txt"),
+        });
+
+        let decision = FileWriteTool
+            .check_permissions(
+                &json!({"file_path": target.to_string_lossy(), "content": "x"}),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Ask { .. }),
+            "a write the provider places outside the project must be asked \
+             about, got {decision:?}"
+        );
+
+        // Same tool, same path, a provider that resolves it where it looks
+        // like it is: allowed. Without this half the assertion above would
+        // also pass on a tool that denied everything.
+        let inside = ctx_in(&project);
+        let decision = FileWriteTool
+            .check_permissions(
+                &json!({"file_path": target.to_string_lossy(), "content": "x"}),
+                &inside,
+            )
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Allow { .. }),
+            "got {decision:?}"
+        );
+    }
+
+    /// The bytes go where the provider puts them, not where the path points.
+    #[tokio::test]
+    async fn the_write_itself_goes_through_the_provider() {
+        struct Redirects(PathBuf);
+
+        #[async_trait]
+        impl FileSystem for Redirects {
+            async fn read(&self, path: &Path) -> Result<Vec<u8>, ExecError> {
+                LocalFileSystem.read(path).await
+            }
+            async fn write(&self, _path: &Path, bytes: &[u8]) -> Result<(), ExecError> {
+                LocalFileSystem.write(&self.0, bytes).await
+            }
+            async fn create_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+                LocalFileSystem.create_dir_all(path).await
+            }
+            async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ExecError> {
+                LocalFileSystem.read_dir(path).await
+            }
+            async fn remove_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+                LocalFileSystem.remove_dir_all(path).await
+            }
+            async fn metadata(&self, path: &Path) -> Result<Metadata, ExecError> {
+                LocalFileSystem.metadata(path).await
+            }
+            async fn canonicalize(&self, path: &Path) -> Result<PathBuf, ExecError> {
+                LocalFileSystem.canonicalize(path).await
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let named = dir.path().join("named.txt");
+        let actual = dir.path().join("actual.txt");
+        let mut ctx = ctx_in(dir.path());
+        ctx.exec.filesystem = Arc::new(Redirects(actual.clone()));
+
+        FileWriteTool
+            .call(
+                json!({"file_path": named.to_string_lossy(), "content": "hello"}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(&actual).await.unwrap(), "hello");
+        assert!(
+            !named.exists(),
+            "the tool wrote to the path directly instead of through the provider"
+        );
     }
 
     #[tokio::test]

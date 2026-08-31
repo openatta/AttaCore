@@ -331,29 +331,28 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
     Ok(())
 }
 
-/// Like `check_write`, but also resolves symlinks and validates the real path.
+/// Like `check_write`, but also validates the path symlinks resolve to.
 ///
-/// This should be called when the target path is known to exist (e.g., editing
-/// an existing file). It first runs all lexical checks, then resolves symlinks
-/// and verifies the real (canonicalized) path satisfies the same constraints.
+/// `resolved` is what the filesystem the write will land on says `target`
+/// really is, or `None` when it could not say — a file that does not exist
+/// yet, which leaves the lexical checks as the whole answer.
 ///
-/// If the file does not exist yet, this falls back to the lexical check only.
-///
-/// Note: this function performs filesystem I/O via `std::fs::canonicalize`.
+/// Resolution is the caller's to perform, and deliberately so: the symlink
+/// graph belongs to the filesystem being written to, so resolving a path here
+/// would answer about this machine's disk even when the write is going
+/// somewhere else. See `docs/EXECUTION_LAYER_DESIGN.md` §2.2.
 pub fn check_write_resolve_symlinks(
     target: &Path,
+    resolved: Option<&Path>,
     policy: &WritePolicy,
 ) -> Result<(), PathSafetyError> {
-    // Run all lexical checks first
     check_write(target, policy)?;
 
-    // Resolve symlinks and check the real path
-    match std::fs::canonicalize(target) {
-        Ok(real_path) if real_path != target => {
-            // The path was a symlink — verify the real target too
-            check_write(&real_path, policy).map_err(|_| PathSafetyError::SymlinkEscape {
+    match resolved {
+        Some(real_path) if real_path != target => {
+            check_write(real_path, policy).map_err(|_| PathSafetyError::SymlinkEscape {
                 symlink_path: target.to_path_buf(),
-                real_path: real_path.clone(),
+                real_path: real_path.to_path_buf(),
                 primary: policy.primary_root.clone(),
             })
         }
@@ -591,11 +590,16 @@ mod tests {
         );
 
         // Symlink-resolved check should catch the escape
-        let err = check_write_resolve_symlinks(&link_path, &p).unwrap_err();
+        let resolved = fs::canonicalize(&link_path).unwrap();
+        let err = check_write_resolve_symlinks(&link_path, Some(&resolved), &p).unwrap_err();
         assert!(
             matches!(err, PathSafetyError::SymlinkEscape { .. }),
             "expected SymlinkEscape, got {err:?}"
         );
+
+        // A caller whose filesystem cannot resolve the path — because it does
+        // not exist there — gets the lexical answer and nothing more.
+        assert!(check_write_resolve_symlinks(&link_path, None, &p).is_ok());
     }
 
     // ── Unicode normalization attack detection ─────────────────────────

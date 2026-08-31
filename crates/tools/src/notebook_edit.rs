@@ -112,6 +112,7 @@ impl Tool for NotebookEditTool {
             };
             crate::security::normalize_path_lexically(&resolved)
         };
+        let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
         let policy = crate::security::WritePolicy::new(ctx.cwd.clone())
             .with_additional_roots(ctx.additional_writable_dirs.clone());
         match crate::security::check_write(&path, &policy) {
@@ -143,7 +144,10 @@ impl Tool for NotebookEditTool {
         }
 
         // 读 + 解析
-        let content = tokio::fs::read_to_string(path)
+        let content = ctx
+            .exec
+            .filesystem
+            .read_to_string(path)
             .await
             .map_err(|e| ToolError::exec(format!("read {}: {e}", input.file_path)))?;
         let mut nb: Value = serde_json::from_str(&content)
@@ -205,7 +209,9 @@ impl Tool for NotebookEditTool {
         // 写回（pretty-print 让 git diff 可读）
         let new_content = serde_json::to_string_pretty(&nb)
             .map_err(|e| ToolError::exec(format!("serialize: {e}")))?;
-        tokio::fs::write(path, &new_content)
+        ctx.exec
+            .filesystem
+            .write_str(path, &new_content)
             .await
             .map_err(|e| ToolError::exec(format!("write: {e}")))?;
 
@@ -268,6 +274,10 @@ fn source_to_lines(source: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::interface::exec::local::LocalFileSystem;
+    use base::interface::exec::{DirEntry, ExecError, FileSystem, Metadata};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn empty_notebook_json() -> String {
@@ -422,5 +432,74 @@ mod tests {
         let v = source_to_lines("a\nb\nc");
         let arr: Vec<String> = serde_json::from_value(v).unwrap();
         assert_eq!(arr, vec!["a\n".to_string(), "b\n".into(), "c".into()]);
+    }
+
+    /// The notebook the tool edits is the one the provider hands it, and the
+    /// result goes back through the provider.
+    #[tokio::test]
+    async fn the_notebook_is_read_and_written_through_the_provider() {
+        struct Interposed {
+            body: String,
+            written: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl FileSystem for Interposed {
+            async fn read(&self, _: &Path) -> Result<Vec<u8>, ExecError> {
+                Ok(self.body.as_bytes().to_vec())
+            }
+            async fn write(&self, _: &Path, bytes: &[u8]) -> Result<(), ExecError> {
+                self.written
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(bytes).into_owned());
+                Ok(())
+            }
+            async fn create_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+                LocalFileSystem.create_dir_all(path).await
+            }
+            async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ExecError> {
+                LocalFileSystem.read_dir(path).await
+            }
+            async fn remove_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+                LocalFileSystem.remove_dir_all(path).await
+            }
+            async fn metadata(&self, path: &Path) -> Result<Metadata, ExecError> {
+                LocalFileSystem.metadata(path).await
+            }
+            async fn canonicalize(&self, path: &Path) -> Result<PathBuf, ExecError> {
+                Ok(path.to_path_buf())
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("nb.ipynb");
+        tokio::fs::write(&p, "not a notebook at all").await.unwrap();
+
+        let provider = Arc::new(Interposed {
+            body: one_code_cell_json(),
+            written: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut ctx = ToolContext::for_test(dir.path().to_path_buf());
+        ctx.exec.filesystem = provider.clone();
+
+        NotebookEditTool
+            .call(
+                json!({"file_path": p.to_string_lossy(), "cell_index": 0,
+                       "mode": "edit", "new_source": "print(2)"}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("the disk holds no parsable notebook; the provider does");
+
+        let written = provider.written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1);
+        assert!(written[0].contains("print(2)"));
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "not a notebook at all",
+            "the disk must not have been touched"
+        );
     }
 }

@@ -59,4 +59,34 @@ pub trait FileSystem: Send + Sync {
     async fn write_str(&self, path: &Path, text: &str) -> Result<(), ExecError> {
         self.write(path, text.as_bytes()).await
     }
+
+    /// Metadata of what `path` points at rather than of `path` itself.
+    ///
+    /// [`metadata`](Self::metadata) reports on the link — that is what its
+    /// `is_symlink` field is for — so a caller asking "how big is this, is it
+    /// a directory" has to resolve first or a symlink to a directory answers
+    /// as a small ordinary file.
+    async fn metadata_following_symlinks(&self, path: &Path) -> Result<Metadata, ExecError> {
+        let resolved = self.canonicalize(path).await?;
+        self.metadata(&resolved).await
+    }
+
+    /// The resolved form of a path that may not exist yet.
+    ///
+    /// A write policy has to be checked against a path that has already had
+    /// its symlinks resolved, but the file being created has no symlinks to
+    /// resolve. Falling back to the resolved parent plus the final component
+    /// answers the question the policy actually asks — "where would this land"
+    /// — for both cases.
+    async fn canonicalize_best_effort(&self, path: &Path) -> PathBuf {
+        if let Ok(resolved) = self.canonicalize(path).await {
+            return resolved;
+        }
+        if let Some(parent) = path.parent() {
+            if let Ok(resolved_parent) = self.canonicalize(parent).await {
+                return resolved_parent.join(path.file_name().unwrap_or_default());
+            }
+        }
+        path.to_path_buf()
+    }
 }

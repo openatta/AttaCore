@@ -120,20 +120,6 @@ pub enum ExecError {
     Failed(String),
 }
 
-impl From<ExecError> for crate::error::ToolError {
-    /// The three sentences survive the trip to the model.
-    ///
-    /// `Denied` keeps its own variant because "a policy refused" is something
-    /// the model can work around, and flattening it into a generic execution
-    /// failure is how a model ends up retrying the same refused thing.
-    fn from(e: ExecError) -> Self {
-        match e {
-            ExecError::Denied(m) => Self::Denied(m),
-            other => Self::Execution(anyhow::anyhow!(other.to_string())),
-        }
-    }
-}
-
 impl ExecError {
     pub fn unavailable(m: impl std::fmt::Display) -> Self {
         Self::Unavailable(m.to_string())
@@ -143,5 +129,23 @@ impl ExecError {
     }
     pub fn failed(m: impl std::fmt::Display) -> Self {
         Self::Failed(m.to_string())
+    }
+}
+
+/// The three sentences of [`ExecError`], said in the vocabulary a tool result
+/// speaks.
+///
+/// Collapsing them would cost the host the one case it can act on: a
+/// `Denied` is the model's to work around, a `Failed` is the target's own
+/// words, and an `Unavailable` is neither — it keeps its own prefix so that a
+/// deployment whose execution environment is down reads as a broken
+/// environment rather than as a tool the model used wrongly.
+impl From<ExecError> for crate::error::ToolError {
+    fn from(e: ExecError) -> Self {
+        match e {
+            ExecError::Unavailable(_) => Self::exec(e.to_string()),
+            ExecError::Denied(m) => Self::Denied(m),
+            ExecError::Failed(m) => Self::exec(m),
+        }
     }
 }

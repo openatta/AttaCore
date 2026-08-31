@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{ExecError, FileSystem, Metadata};
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ToolResultBlock, ToolResultContent, ValidationResult,
@@ -151,10 +152,9 @@ impl Tool for FileReadTool {
         biased;
         _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
         r = read_file_to_text(
+            &*ctx.exec.filesystem,
             &path,
-            input.offset,
-            input.limit,
-            input.pages.as_deref(),
+            &input,
             max_bytes as u64,
             2000,  // default_read_lines
             2000,  // max_line_chars
@@ -186,26 +186,24 @@ fn resolve_path(s: &str, cwd: &Path) -> PathBuf {
 }
 
 async fn read_file_to_text(
+    fs: &dyn FileSystem,
     path: &Path,
-    offset: Option<usize>,
-    limit: Option<usize>,
-    pages: Option<&str>,
+    input: &FileReadInput,
     max_bytes: u64,
     default_lines: usize,
     max_line_chars: usize,
 ) -> Result<ToolResult, ToolError> {
-    let metadata = match tokio::fs::metadata(path).await {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolError::exec(format!(
-                "file not found: {}",
-                path.display()
-            )));
-        }
-        Err(e) => return Err(ToolError::exec(e.to_string())),
-    };
+    // Resolution doubles as the existence probe: a model naming a file that
+    // is not there is the one failure this tool answers with prose.
+    let metadata = fs
+        .metadata_following_symlinks(path)
+        .await
+        .map_err(|e| match e {
+            ExecError::Failed(_) => ToolError::exec(format!("file not found: {}", path.display())),
+            other => other.into(),
+        })?;
 
-    if metadata.is_dir() {
+    if metadata.is_dir {
         return Err(ToolError::Validation(format!(
             "path is a directory, not a file: {}",
             path.display()
@@ -224,45 +222,45 @@ async fn read_file_to_text(
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
     ) {
-        return read_image(path, &metadata, max_bytes).await;
+        return read_image(fs, path, &metadata, max_bytes).await;
     }
 
     // PDF handling
     if ext == "pdf" {
-        return read_pdf_text(path, &metadata, max_bytes, pages)
+        return read_pdf_text(fs, path, &metadata, max_bytes, input.pages.as_deref())
             .await
             .map(ToolResult::text);
     }
 
     // Jupyter notebook handling
     if ext == "ipynb" {
-        return read_notebook(path, offset, limit, default_lines, max_line_chars)
-            .await
-            .map(ToolResult::text);
+        return read_notebook(
+            fs,
+            path,
+            input.offset,
+            input.limit,
+            default_lines,
+            max_line_chars,
+        )
+        .await
+        .map(ToolResult::text);
     }
 
-    if metadata.len() > max_bytes {
+    if metadata.len > max_bytes {
         return Err(ToolError::Validation(format!(
             "file too large ({} bytes); cap is {} bytes. Use Grep / Glob or pass a smaller window.",
-            metadata.len(),
-            max_bytes
+            metadata.len, max_bytes
         )));
     }
 
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::InvalidData => {
-                // If UTF-8 fails but it might be binary, give a better hint
-                ToolError::Validation(format!(
-                    "file is not valid UTF-8 (possible binary file): {}. \
-                     Use Bash with `file {}` to inspect the type.",
-                    path.display(),
-                    path.display()
-                ))
-            }
-            _ => ToolError::exec(e.to_string()),
-        })?;
+    let content = String::from_utf8(fs.read(path).await?).map_err(|_| {
+        ToolError::Validation(format!(
+            "file is not valid UTF-8 (possible binary file): {}. \
+             Use Bash with `file {}` to inspect the type.",
+            path.display(),
+            path.display()
+        ))
+    })?;
 
     // Empty file warning.
     if content.trim().is_empty() {
@@ -273,8 +271,8 @@ async fn read_file_to_text(
 
     Ok(ToolResult::text(format_with_line_numbers(
         &content,
-        offset.unwrap_or(1).max(1),
-        limit.unwrap_or(default_lines),
+        input.offset.unwrap_or(1).max(1),
+        input.limit.unwrap_or(default_lines),
         max_line_chars,
     )))
 }
@@ -297,20 +295,18 @@ async fn read_file_to_text(
 /// text block: name/mime/size/dimensions are genuinely useful to the model and
 /// cost a handful of tokens.
 async fn read_image(
+    fs: &dyn FileSystem,
     path: &Path,
-    metadata: &std::fs::Metadata,
+    metadata: &Metadata,
     max_bytes: u64,
 ) -> Result<ToolResult, ToolError> {
-    if metadata.len() > max_bytes {
+    if metadata.len > max_bytes {
         return Err(ToolError::Validation(format!(
             "image too large ({} bytes); cap is {} bytes",
-            metadata.len(),
-            max_bytes
+            metadata.len, max_bytes
         )));
     }
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| ToolError::exec(e.to_string()))?;
+    let bytes = fs.read(path).await?;
     let mime = mime_from_ext(path);
     let b64 = base64_encode(&bytes);
     let dims = estimate_image_dimensions(&bytes);
@@ -342,15 +338,16 @@ async fn read_image(
 
 /// Read a PDF file — returns basic text extraction via the `pdftotext` CLI tool.
 async fn read_pdf_text(
+    fs: &dyn FileSystem,
     path: &Path,
-    metadata: &std::fs::Metadata,
+    metadata: &Metadata,
     max_bytes: u64,
     pages: Option<&str>,
 ) -> Result<String, ToolError> {
-    if metadata.len() > max_bytes.max(50 * 1024 * 1024) {
+    if metadata.len > max_bytes.max(50 * 1024 * 1024) {
         return Err(ToolError::Validation(format!(
             "PDF too large ({} bytes); cap is {} bytes",
-            metadata.len(),
+            metadata.len,
             max_bytes.max(50 * 1024 * 1024)
         )));
     }
@@ -386,25 +383,20 @@ async fn read_pdf_text(
                 path.file_name()
                     .map(|n| n.to_string_lossy())
                     .unwrap_or_default(),
-                metadata.len(),
+                metadata.len,
             ))
         }
         _ => {
-            // pdftotext not available — return raw binary header for inspection
-            let mut f = tokio::fs::File::open(path)
-                .await
-                .map_err(|e| ToolError::exec(e.to_string()))?;
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 1024.min(metadata.len() as usize)];
-            f.read_exact(&mut buf)
-                .await
-                .map_err(|e| ToolError::exec(e.to_string()))?;
+            // The bytes are discarded: without pdftotext there is nothing to
+            // extract, and the read is here so that a file we cannot actually
+            // open reports that instead of a cheerful "install poppler".
+            fs.read(path).await?;
             Ok(format!(
                 "[PDF: {} — {} bytes. Install pdftotext (poppler-utils) for text extraction.]",
                 path.file_name()
                     .map(|n| n.to_string_lossy())
                     .unwrap_or_default(),
-                metadata.len(),
+                metadata.len,
             ))
         }
     }
@@ -412,15 +404,14 @@ async fn read_pdf_text(
 
 /// Read a Jupyter notebook and format cells as readable text.
 async fn read_notebook(
+    fs: &dyn FileSystem,
     path: &Path,
     offset: Option<usize>,
     limit: Option<usize>,
     default_lines: usize,
     max_line_chars: usize,
 ) -> Result<String, ToolError> {
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| ToolError::exec(e.to_string()))?;
+    let content = fs.read_to_string(path).await?;
     let notebook: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| ToolError::Validation(format!("invalid notebook JSON: {e}")))?;
 
@@ -586,9 +577,11 @@ fn format_with_line_numbers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::interface::exec::DirEntry;
     use base::tool::ToolResultContent;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn ctx_in(cwd: &Path) -> ToolContext {
@@ -1059,6 +1052,115 @@ mod tests {
         assert!(
             text.contains("doc.pdf"),
             "expected the PDF header line, got: {text}"
+        );
+    }
+
+    /// A filesystem holding exactly one file and nothing else, so that what
+    /// `Read` reports can only have come from it.
+    struct OneFile {
+        path: PathBuf,
+        body: &'static str,
+    }
+
+    #[async_trait]
+    impl base::interface::exec::FileSystem for OneFile {
+        async fn read(&self, path: &Path) -> Result<Vec<u8>, ExecError> {
+            if path == self.path {
+                Ok(self.body.as_bytes().to_vec())
+            } else {
+                Err(ExecError::failed(format!(
+                    "{}: no such file",
+                    path.display()
+                )))
+            }
+        }
+        async fn write(&self, _: &Path, _: &[u8]) -> Result<(), ExecError> {
+            Err(ExecError::denied("read-only"))
+        }
+        async fn create_dir_all(&self, _: &Path) -> Result<(), ExecError> {
+            Err(ExecError::denied("read-only"))
+        }
+        async fn read_dir(&self, _: &Path) -> Result<Vec<DirEntry>, ExecError> {
+            Ok(Vec::new())
+        }
+        async fn remove_dir_all(&self, _: &Path) -> Result<(), ExecError> {
+            Err(ExecError::denied("read-only"))
+        }
+        async fn metadata(&self, path: &Path) -> Result<Metadata, ExecError> {
+            if path == self.path {
+                Ok(Metadata {
+                    is_dir: false,
+                    is_file: true,
+                    is_symlink: false,
+                    len: self.body.len() as u64,
+                })
+            } else {
+                Err(ExecError::failed(format!(
+                    "{}: no such file",
+                    path.display()
+                )))
+            }
+        }
+        async fn canonicalize(&self, path: &Path) -> Result<PathBuf, ExecError> {
+            if path == self.path {
+                Ok(self.path.clone())
+            } else {
+                Err(ExecError::failed(format!(
+                    "{}: no such file",
+                    path.display()
+                )))
+            }
+        }
+    }
+
+    /// Both halves matter: the provider's file is readable although the disk
+    /// has never heard of it, and the disk's file is missing although it is
+    /// right there. A tool still reading the disk fails one or the other.
+    #[tokio::test]
+    async fn read_sees_the_providers_files_and_only_those() {
+        let dir = TempDir::new().unwrap();
+        let only_on_disk = dir.path().join("on_disk.txt");
+        let only_in_provider = dir.path().join("in_provider.txt");
+        tokio::fs::write(&only_on_disk, "from the disk\n")
+            .await
+            .unwrap();
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.exec.filesystem = Arc::new(OneFile {
+            path: only_in_provider.clone(),
+            body: "from the provider\n",
+        });
+
+        let r = FileReadTool
+            .call(
+                json!({"file_path": only_in_provider.to_string_lossy()}),
+                ctx.clone(),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
+        let ToolResultContent::Text(text) = r.content else {
+            panic!("text read");
+        };
+        assert!(
+            text.contains("from the provider"),
+            "expected the provider's bytes, got: {text}"
+        );
+
+        let r = FileReadTool
+            .call(
+                json!({"file_path": only_on_disk.to_string_lossy()}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
+        let ToolResultContent::Text(text) = r.content else {
+            panic!("text read");
+        };
+        assert!(
+            text.contains("(no such file)"),
+            "a file the provider does not have is not there, got: {text}"
         );
     }
 }

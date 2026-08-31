@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::FileSystem;
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -166,6 +167,10 @@ impl Tool for GrepTool {
         let pattern_arc = Arc::new(re);
         let glob_arc = Arc::new(glob_matcher);
         let root_owned = root.clone();
+        let filesystem = ctx.exec.filesystem.clone();
+        // The walk runs on `ignore`'s own threads, which are outside any
+        // runtime, so blocking on them cannot stall a reactor.
+        let runtime = tokio::runtime::Handle::current();
 
         // 检查 cancel 后再进 blocking walk
         if cancel.is_cancelled() {
@@ -183,6 +188,8 @@ impl Tool for GrepTool {
                 let lines = lines.clone();
                 let pat = pattern_arc.clone();
                 let glob = glob_arc.clone();
+                let filesystem: Arc<dyn FileSystem> = filesystem.clone();
+                let runtime = runtime.clone();
                 Box::new(move |entry| {
                     let entry = match entry {
                         Ok(e) => e,
@@ -201,7 +208,7 @@ impl Tool for GrepTool {
                         }
                     }
                     // 读 + 跳大文件 / 二进制
-                    let bytes = match std::fs::read(path) {
+                    let bytes = match runtime.block_on(filesystem.read(path)) {
                         Ok(b) => b,
                         Err(_) => return WalkState::Continue,
                     };
@@ -326,6 +333,8 @@ fn resolve_path(s: &str, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::interface::exec::local::LocalFileSystem;
+    use base::interface::exec::{DirEntry, ExecError, Metadata};
     use base::tool::ToolResultContent;
     use serde_json::json;
     use tempfile::TempDir;
@@ -541,5 +550,61 @@ mod tests {
             Err(ToolError::Cancelled) => {} // cancel worked
             Err(e) => panic!("unexpected error: {e:?}"),
         }
+    }
+
+    /// The walk stays on this machine — it is not part of the contract — but
+    /// the bytes that decide a match come from the provider.
+    #[tokio::test]
+    async fn what_grep_matches_on_is_the_providers_bytes() {
+        struct SameBodyEverywhere;
+
+        #[async_trait]
+        impl FileSystem for SameBodyEverywhere {
+            async fn read(&self, _: &Path) -> Result<Vec<u8>, ExecError> {
+                Ok(b"needle\n".to_vec())
+            }
+            async fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), ExecError> {
+                LocalFileSystem.write(path, bytes).await
+            }
+            async fn create_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+                LocalFileSystem.create_dir_all(path).await
+            }
+            async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ExecError> {
+                LocalFileSystem.read_dir(path).await
+            }
+            async fn remove_dir_all(&self, path: &Path) -> Result<(), ExecError> {
+                LocalFileSystem.remove_dir_all(path).await
+            }
+            async fn metadata(&self, path: &Path) -> Result<Metadata, ExecError> {
+                LocalFileSystem.metadata(path).await
+            }
+            async fn canonicalize(&self, path: &Path) -> Result<PathBuf, ExecError> {
+                LocalFileSystem.canonicalize(path).await
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), "haystack only\n")
+            .await
+            .unwrap();
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.exec.filesystem = Arc::new(SameBodyEverywhere);
+
+        let r = GrepTool
+            .call(
+                json!({"pattern": "needle", "path": dir.path().to_string_lossy()}),
+                ctx,
+                ProgressSender::noop("t"),
+            )
+            .await
+            .unwrap();
+        let ToolResultContent::Text(text) = r.content else {
+            panic!("text result");
+        };
+        assert!(
+            text.contains("a.txt"),
+            "the file matches only through the provider's bytes, got: {text}"
+        );
     }
 }
