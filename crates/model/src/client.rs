@@ -7,6 +7,9 @@ use crate::error::AnthropicError;
 use crate::parser::parse_sse;
 use crate::stream::StreamEvent;
 use crate::types::MessagesRequest;
+use base::interface::backoff::{
+    Backoff, BackoffPolicy, FailedAttempt, LadderBackoff, RequestFailure,
+};
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,11 +20,6 @@ use url::Url;
 
 /// Anthropic API base URL.
 pub const ANTHROPIC_API_BASE_URL: &str = "https://api.anthropic.com/";
-
-/// 默认重试退避序列（毫秒）：6 步指数退避，覆盖 ~1 分钟。
-const DEFAULT_BACKOFF_MS: &[u64] = &[1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
-/// jitter 比例：±25%
-const JITTER_RATIO: f32 = 0.25;
 
 /// SSE 流两个事件之间允许的最大静默时间。响应头拿到之后（`send_with_retry` 已经
 /// 成功返回），流本身**没有任何超时保护**——如果底层连接在中途静默卡死（代理/
@@ -87,6 +85,22 @@ async fn classify_response(resp: reqwest::Response) -> Result<reqwest::Response,
     })
 }
 
+/// A base URL pointing at this machine.
+///
+/// The ambient `HTTP(S)_PROXY` means "reach the internet through this egress",
+/// not "also proxy calls to my own machine" — but reqwest applies it to
+/// loopback targets too unless `NO_PROXY` carves them out, and a local relay,
+/// vLLM or Ollama endpoint is a configuration people really run. Same carve-out
+/// `tools::web_fetch` makes, for the same reason.
+pub(crate) fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let v = headers.get("retry-after")?.to_str().ok()?;
     // RFC 7231 retry-after：要么数字秒数，要么 HTTP 时间。我们只支持数字秒数。
@@ -143,35 +157,50 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
     }
 }
 
-/// 在首字节前重试：429 / 503 / 529 / 网络错按指数退避（含 jitter）；
-/// 429 优先尊重 retry-after 头。最多 6 次（覆盖 ~1 分钟）。
+/// 把 `AnthropicError` 翻译成退避策略的词汇。这里就是"哪些错误还值得再发一次"
+/// 的唯一答案——落进 `Other` 的策略一律不重试。
+fn failure_kind(e: &AnthropicError) -> RequestFailure {
+    match e {
+        AnthropicError::Transport(_) => RequestFailure::Transport,
+        AnthropicError::RateLimited { .. } => RequestFailure::RateLimited,
+        AnthropicError::Overloaded { .. } => RequestFailure::Overloaded,
+        _ => RequestFailure::Other,
+    }
+}
+
+/// 在首字节前重试：等多久、还试不试由 `BackoffPolicy` 决定；
+/// `retry-after` 头的解析留在本协议这一侧，作为提示交给策略。
 async fn send_with_retry(
     inner: &HttpInner,
     req: &MessagesRequest,
 ) -> Result<reqwest::Response, AnthropicError> {
-    let backoff = inner.backoff_ms.as_slice();
-    let mut attempt = 0usize;
+    let mut attempt = 0u32;
     loop {
         // `send_one` 的 `.send().await` 只有 TCP connect_timeout（30s）——连上之后
         // 服务端/代理如果吃掉请求、永远不回任何字节，这一步会无限期挂着，跟
         // `STREAM_IDLE_TIMEOUT` 保护的"连上了但流中途卡死"是同一类问题的另一半
-        // （见该常量的文档）。用同样的超时把它转成一个可重试的 `StreamInterrupted`。
+        // （见该常量的文档）。用同样的超时把它转成一个明确的错误。
         let attempt_result =
             match tokio::time::timeout(STREAM_IDLE_TIMEOUT, send_one(inner, req)).await {
                 Ok(result) => result,
                 Err(_elapsed) => Err(AnthropicError::StreamInterrupted),
             };
-        match attempt_result {
+        let e = match attempt_result {
             Ok(resp) => return Ok(resp),
-            Err(e) if e.is_retryable() && attempt < backoff.len() => {
-                let base = match &e {
-                    AnthropicError::RateLimited {
-                        retry_after: Some(d),
-                        ..
-                    } => d.as_millis() as u64,
-                    _ => backoff[attempt],
-                };
-                let delay = jittered_delay(base);
+            Err(e) => e,
+        };
+        let server_hint = match &e {
+            AnthropicError::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        };
+        let verdict = inner.backoff.after_failure(&FailedAttempt {
+            index: attempt,
+            failure: failure_kind(&e),
+            server_hint,
+        });
+        match verdict {
+            Backoff::GiveUp => return Err(e),
+            Backoff::WaitThenRetry(delay) => {
                 tracing::warn!(
                     attempt = attempt + 1,
                     delay_ms = delay.as_millis() as u64,
@@ -181,24 +210,8 @@ async fn send_with_retry(
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e),
         }
     }
-}
-
-/// 给定的 base 退避基础上加 ±25% jitter。
-fn jittered_delay(base_ms: u64) -> Duration {
-    use std::time::SystemTime;
-    // 用 nanos 当随机源，足够散；不上 rand 依赖
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let unit = (nanos % 1_000_000) as f32 / 1_000_000.0; // [0, 1)
-    let signed = (unit - 0.5) * 2.0; // [-1, 1)
-    let delta_ms = (base_ms as f32 * JITTER_RATIO * signed) as i64;
-    let final_ms = (base_ms as i64 + delta_ms).max(0) as u64;
-    Duration::from_millis(final_ms)
 }
 
 pub type EventStream =
@@ -254,8 +267,7 @@ struct HttpInner {
     base: Url,
     auth: AuthMode,
     anthropic_version: &'static str,
-    /// 退避序列（毫秒）；测试用 with_backoff 覆盖以缩短测试时间
-    backoff_ms: Vec<u64>,
+    backoff: Arc<dyn BackoffPolicy>,
 }
 
 impl HttpAnthropicClient {
@@ -266,12 +278,16 @@ impl HttpAnthropicClient {
 
     /// 自定义 base URL（用于本地 mock server / Bedrock relay 等）。
     pub fn with_base(auth: AuthMode, base: Url) -> Result<Self, AnthropicError> {
-        let http = reqwest::Client::builder()
+        // **重要**：不使用 ClientBuilder::timeout()，因为它会包装整个响应体流，
+        // 对于 SSE 流式场景会导致连接在 300s 后断开。流式超时由引擎层 CancellationToken 负责。
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
             // 连接超时：30s 内连不上就放弃
-            .connect_timeout(Duration::from_secs(30))
-            // **重要**：不使用 ClientBuilder::timeout()，因为它会包装整个响应体流，
-            // 对于 SSE 流式场景会导致连接在 300s 后断开。流式超时由引擎层 CancellationToken 负责。
+            .connect_timeout(Duration::from_secs(30));
+        if is_loopback(&base) {
+            builder = builder.no_proxy();
+        }
+        let http = builder
             .build()
             .map_err(|e| AnthropicError::Transport(anyhow::Error::new(e)))?;
         Ok(Self {
@@ -280,28 +296,32 @@ impl HttpAnthropicClient {
                 base,
                 auth,
                 anthropic_version: "2023-06-01",
-                backoff_ms: DEFAULT_BACKOFF_MS.to_vec(),
+                backoff: Arc::new(LadderBackoff::new()),
             }),
         })
     }
 
     /// 自定义退避序列（毫秒）。测试用——缩短重试间隔避免拖长 CI。
-    pub fn with_backoff(mut self, backoff_ms: Vec<u64>) -> Self {
-        // 不能 mutate Arc<HttpInner>；重建一遍
-        let inner = (*self.inner).clone_with_backoff(backoff_ms);
+    pub fn with_backoff(self, backoff_ms: Vec<u64>) -> Self {
+        self.with_backoff_policy(Arc::new(LadderBackoff::from_millis(backoff_ms)))
+    }
+
+    /// 换掉整条退避策略。宿主自己实现 `ModelFactory` 时的接入点。
+    pub fn with_backoff_policy(mut self, backoff: Arc<dyn BackoffPolicy>) -> Self {
+        let inner = (*self.inner).clone_with_backoff(backoff);
         self.inner = Arc::new(inner);
         self
     }
 }
 
 impl HttpInner {
-    fn clone_with_backoff(&self, backoff_ms: Vec<u64>) -> Self {
+    fn clone_with_backoff(&self, backoff: Arc<dyn BackoffPolicy>) -> Self {
         Self {
             http: self.http.clone(),
             base: self.base.clone(),
             auth: self.auth.clone(),
             anthropic_version: self.anthropic_version,
-            backoff_ms,
+            backoff,
         }
     }
 }
@@ -338,6 +358,20 @@ impl AnthropicClient for HttpAnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_url_on_this_machine_is_recognised_as_loopback() {
+        for local in [
+            "http://127.0.0.1:8080/",
+            "http://localhost:11434/",
+            "http://[::1]:8080/",
+        ] {
+            assert!(is_loopback(&Url::parse(local).unwrap()), "{local}");
+        }
+        for remote in ["https://api.anthropic.com/", "https://gw.internal/v1/"] {
+            assert!(!is_loopback(&Url::parse(remote).unwrap()), "{remote}");
+        }
+    }
 
     /// trait object 可以装 —— 这是给 Engine 用的方式。
     #[test]
@@ -379,6 +413,40 @@ mod tests {
             second.is_none(),
             "stream ended normally, expected None, got: {second:?}"
         );
+    }
+
+    /// 哪些错误还值得再发一次，用共享策略读得懂的词汇表达。`Other` 是默认策略
+    /// 一律不重试的那一类——注意 `StreamInterrupted` 在这一类里：首字节前的静默
+    /// 超时不重试，因为分不清服务端是没收到请求还是已经在算了。
+    #[test]
+    fn only_pre_stream_failures_classify_as_retryable_kinds() {
+        assert_eq!(
+            failure_kind(&AnthropicError::Transport(anyhow::anyhow!("reset"))),
+            RequestFailure::Transport
+        );
+        assert_eq!(
+            failure_kind(&AnthropicError::RateLimited {
+                retry_after: None,
+                headers: HashMap::new(),
+            }),
+            RequestFailure::RateLimited
+        );
+        assert_eq!(
+            failure_kind(&AnthropicError::Overloaded { status: 529 }),
+            RequestFailure::Overloaded
+        );
+        for fatal in [
+            AnthropicError::Server {
+                status: 500,
+                body: String::new(),
+            },
+            AnthropicError::Auth("bad key".into()),
+            AnthropicError::StreamInterrupted,
+            AnthropicError::Refused,
+            AnthropicError::Cancelled,
+        ] {
+            assert_eq!(failure_kind(&fatal), RequestFailure::Other, "{fatal}");
+        }
     }
 
     /// 没有 ANTHROPIC_API_KEY / 没有网络也不能 panic。仅检查 URL 拼写 +

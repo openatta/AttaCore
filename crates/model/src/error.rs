@@ -54,14 +54,6 @@ pub enum AnthropicError {
 }
 
 impl AnthropicError {
-    /// 是否值得在**首字节前**重试。已开始的流不重试（避免重复计费）。
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Transport(_) | Self::RateLimited { .. } | Self::Overloaded { .. }
-        )
-    }
-
     /// 是否像“上下文过长 / prompt too long / 413”这类可通过压缩缓解的错误。
     pub fn is_context_limit_error(&self) -> bool {
         match self {

@@ -29,6 +29,7 @@
 //! | [`turn_policy::TurnPolicy`] | when a turn has gone on long enough |
 //! | [`recovery_policy::RecoveryPolicy`] | what to do when a call goes wrong |
 //! | [`budget_policy::BudgetPolicy`] | what a turn may spend and how much it may carry |
+//! | [`backoff::BackoffPolicy`] | whether a failed request is sent again, and when |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
 //! | [`import_callback::ImportCallback`] | the host's answer to an import prompt |
@@ -57,6 +58,7 @@
 //! index, not this directory.
 
 pub mod agent_spawner;
+pub mod backoff;
 pub mod capabilities;
 pub mod catalog;
 pub mod credentials;

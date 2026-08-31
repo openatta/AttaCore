@@ -29,6 +29,9 @@ pub mod request;
 pub mod stream;
 
 use async_trait::async_trait;
+use base::interface::backoff::{
+    Backoff, BackoffPolicy, FailedAttempt, LadderBackoff, RequestFailure,
+};
 use base::interface::model::{Model, ModelError, ModelMessage, ModelStream, StreamParams, ToolDef};
 use base::interface::prompt::PromptBlock;
 use base::provider::ApiType;
@@ -39,11 +42,6 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use self::request::ChatCompletionsRequest;
-
-/// Backoff before the first byte, matching `crate::client`'s ladder: six steps
-/// covering roughly a minute. Retrying only pre-stream is deliberate — once
-/// tokens have been billed, a retry double-charges them.
-const DEFAULT_BACKOFF_MS: &[u64] = &[1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
 
 /// Maximum silence between two SSE events before the stream is declared dead.
 /// See [`stream::events_from_bytes`]; same value and same reasoning as
@@ -68,7 +66,12 @@ struct Inner {
     /// Used when [`StreamParams::model`] is empty — the `default_model` from
     /// the provider's config.
     default_model: String,
-    backoff_ms: Vec<u64>,
+    /// Shared with `crate::client` — see
+    /// [`BackoffPolicy`](base::interface::backoff::BackoffPolicy). Retrying
+    /// only before the first byte is deliberate and stays here: once tokens
+    /// have been billed, a retry double-charges them, and that is a fact about
+    /// this protocol rather than a thing a policy gets to decide.
+    backoff: Arc<dyn BackoffPolicy>,
 }
 
 impl OpenAICompatibleModel {
@@ -83,24 +86,29 @@ impl OpenAICompatibleModel {
         api_key: impl Into<String>,
         model_default: impl Into<String>,
     ) -> Result<Self, ModelError> {
-        let http = reqwest::Client::builder()
+        let endpoint = chat_completions_url(base_url)?;
+        // No `ClientBuilder::timeout()`: it bounds the whole response body,
+        // which for SSE means the connection is torn down mid-stream after the
+        // timeout. Streaming lifetime is the engine's `CancellationToken` to
+        // manage. (Same trap as `crate::client`.)
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            // No `ClientBuilder::timeout()`: it bounds the whole response body,
-            // which for SSE means the connection is torn down mid-stream after
-            // the timeout. Streaming lifetime is the engine's
-            // `CancellationToken` to manage. (Same trap as `crate::client`.)
+            .connect_timeout(Duration::from_secs(30));
+        if crate::client::is_loopback(&endpoint) {
+            builder = builder.no_proxy();
+        }
+        let http = builder
             .build()
             .map_err(|e| ModelError::Network(e.to_string()))?;
 
         Ok(Self {
             inner: Arc::new(Inner {
                 http,
-                endpoint: chat_completions_url(base_url)?,
+                endpoint,
                 api_key: api_key.into(),
                 extra_headers: Vec::new(),
                 default_model: model_default.into(),
-                backoff_ms: DEFAULT_BACKOFF_MS.to_vec(),
+                backoff: Arc::new(LadderBackoff::new()),
             }),
         })
     }
@@ -113,9 +121,15 @@ impl OpenAICompatibleModel {
     }
 
     /// Shorten the retry ladder. Tests only — the default covers ~1 minute.
-    pub fn with_backoff(mut self, backoff_ms: Vec<u64>) -> Self {
+    pub fn with_backoff(self, backoff_ms: Vec<u64>) -> Self {
+        self.with_backoff_policy(Arc::new(LadderBackoff::from_millis(backoff_ms)))
+    }
+
+    /// Replace the backoff policy outright. Where a host writing its own
+    /// `ModelFactory` plugs in.
+    pub fn with_backoff_policy(mut self, backoff: Arc<dyn BackoffPolicy>) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
-        inner.backoff_ms = backoff_ms;
+        inner.backoff = backoff;
         self
     }
 
@@ -136,7 +150,7 @@ impl Clone for Inner {
             api_key: self.api_key.clone(),
             extra_headers: self.extra_headers.clone(),
             default_model: self.default_model.clone(),
-            backoff_ms: self.backoff_ms.clone(),
+            backoff: self.backoff.clone(),
         }
     }
 }
@@ -209,21 +223,25 @@ async fn send_once(
     })
 }
 
-/// Retryable *before the first byte only*. A stream that has started has
-/// already billed input tokens; replaying it bills them twice.
-fn is_retryable(e: &ModelError) -> bool {
-    matches!(
-        e,
-        ModelError::Network(_) | ModelError::RateLimited | ModelError::Overloaded
-    )
+/// Translate a [`ModelError`] into the backoff policy's vocabulary.
+///
+/// Chat Completions carries no `retry-after` the way the Messages API does, so
+/// this side never supplies a server hint — the policy that reads one is the
+/// same policy either way.
+fn failure_kind(e: &ModelError) -> RequestFailure {
+    match e {
+        ModelError::Network(_) => RequestFailure::Transport,
+        ModelError::RateLimited => RequestFailure::RateLimited,
+        ModelError::Overloaded => RequestFailure::Overloaded,
+        _ => RequestFailure::Other,
+    }
 }
 
 async fn send_with_retry(
     inner: &Inner,
     req: &ChatCompletionsRequest,
 ) -> Result<reqwest::Response, ModelError> {
-    let backoff = inner.backoff_ms.as_slice();
-    let mut attempt = 0usize;
+    let mut attempt = 0u32;
     loop {
         // A server that accepts the connection and then never responds would
         // otherwise hang here indefinitely — the connect timeout does not
@@ -234,10 +252,18 @@ async fn send_with_retry(
                 "no response headers within the idle window".into(),
             )),
         };
-        match result {
+        let e = match result {
             Ok(resp) => return Ok(resp),
-            Err(e) if is_retryable(&e) && attempt < backoff.len() => {
-                let delay = Duration::from_millis(backoff[attempt]);
+            Err(e) => e,
+        };
+        let verdict = inner.backoff.after_failure(&FailedAttempt {
+            index: attempt,
+            failure: failure_kind(&e),
+            server_hint: None,
+        });
+        match verdict {
+            Backoff::GiveUp => return Err(e),
+            Backoff::WaitThenRetry(delay) => {
                 tracing::warn!(
                     attempt = attempt + 1,
                     delay_ms = delay.as_millis() as u64,
@@ -247,7 +273,6 @@ async fn send_with_retry(
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -403,17 +428,32 @@ mod tests {
         );
     }
 
-    /// Only pre-first-byte failures retry; an API-level 400 is the caller's
-    /// problem and replaying it just burns time.
+    /// Which failures are worth another attempt, in the vocabulary the shared
+    /// policy reads. An API-level 400 is the caller's problem and replaying it
+    /// just burns time; `Other` is what the default policy refuses outright.
     #[test]
-    fn only_pre_stream_failures_are_retryable() {
-        assert!(is_retryable(&ModelError::RateLimited));
-        assert!(is_retryable(&ModelError::Overloaded));
-        assert!(is_retryable(&ModelError::Network("reset".into())));
-        assert!(!is_retryable(&ModelError::Auth("bad key".into())));
-        assert!(!is_retryable(&ModelError::Api {
-            status: 400,
-            message: "bad request".into()
-        }));
+    fn only_pre_stream_failures_classify_as_retryable_kinds() {
+        assert_eq!(
+            failure_kind(&ModelError::RateLimited),
+            RequestFailure::RateLimited
+        );
+        assert_eq!(
+            failure_kind(&ModelError::Overloaded),
+            RequestFailure::Overloaded
+        );
+        assert_eq!(
+            failure_kind(&ModelError::Network("reset".into())),
+            RequestFailure::Transport
+        );
+        for fatal in [
+            ModelError::Auth("bad key".into()),
+            ModelError::Api {
+                status: 400,
+                message: "bad request".into(),
+            },
+            ModelError::Internal("boom".into()),
+        ] {
+            assert_eq!(failure_kind(&fatal), RequestFailure::Other, "{fatal:?}");
+        }
     }
 }
