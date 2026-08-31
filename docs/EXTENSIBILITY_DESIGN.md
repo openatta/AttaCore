@@ -334,6 +334,10 @@ pub trait TurnPolicy: Send + Sync {
 
 ### 4.5 执行层（X1–X5）
 
+> **本节是草案，已被 `EXECUTION_LAYER_DESIGN.md` 取代。** 那份文档是阶段 4 的实施蓝图，
+> 与下面的草案有两处刻意的偏离（`Shell` 并入 `Process`；补上草案漏掉的 `Network`/X7），
+> 各自写了理由。实施照那一份。
+
 四个 trait 一组，一起换才有意义（换了子进程不换文件系统，等于半个远端）：
 
 ```rust
@@ -568,7 +572,11 @@ DSH（DeepSeek Harness，Node + Cordis）是目前插件化做得最彻底的 ag
 
 **这一步是「换一个 provider，把 Bash、PTY、文件、LSP 整体搬到容器或远端」的前提**，也是这个内核在商业上最有价值的一条能力。但它要动全部内建工具，必须单独立项，不要和阶段 1–3 混做。
 
-**验收**：存在至少两个执行层 provider（本地 + 一个远端或容器），切换只改配置。
+**验收**：存在至少两个执行层 provider，切换只改配置。
+
+实施蓝图见 `EXECUTION_LAYER_DESIGN.md`。第二个 provider 定为**进程内**实现而非容器
+——它的真实用途是工具层的确定性测试，与 `InMemoryBlobStore`、`FixedEnvironment` 同一形状。
+这个选择降低了今天的代价，也降低了对契约形状的验证强度，取舍写在那份文档的 §3.1。
 
 ### 迁移期的兼容策略
 
