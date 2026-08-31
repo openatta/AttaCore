@@ -9,8 +9,10 @@
 //! - Cancellation via context cancel token
 //! - Line-by-line streaming via ProgressSender
 
+use crate::exec_capture::tool_error;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{OutputStream, ProcessSpec};
 use base::tool::{
     InterruptBehavior, PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext,
     ToolResult, ValidationResult,
@@ -19,7 +21,6 @@ use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::process::Stdio;
 use std::time::Duration;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
@@ -130,20 +131,27 @@ impl Tool for MonitorTool {
         );
 
         // Spawn the child process via bash -c
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.args(["-c", &input.command]);
-        cmd.current_dir(&ctx.cwd);
-        cmd.stdout(Stdio::piped())
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        cmd.kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(|e| ToolError::exec(e.to_string()))?;
-        let stdout = child.stdout.take().expect("stdout piped");
+        let spec =
+            ProcessSpec::new("bash", &ctx.cwd).args(["-c".to_string(), input.command.clone()]);
+        let mut child = ctx
+            .exec
+            .process
+            .spawn(spec, ctx.cancel.clone())
+            .await
+            .map_err(tool_error)?;
+        let chunks = child.output().expect("the first call owns the pipes");
 
         // Spawn a background task to drain stdout lines and send them as progress events.
         let progress_clone = progress.clone();
         let drain_handle = tokio::spawn(async move {
+            let stdout = tokio_util::io::StreamReader::new(chunks.map(|chunk| match chunk {
+                // Only stdout becomes a notification. The stderr chunks are
+                // read and thrown away rather than left unread: a provider
+                // pipes both, and a pipe nobody drains stalls the child.
+                Ok(c) if c.stream == OutputStream::Stdout => Ok(std::io::Cursor::new(c.bytes)),
+                Ok(_) => Ok(std::io::Cursor::new(Vec::new())),
+                Err(e) => Err(std::io::Error::other(e.to_string())),
+            }));
             let mut framed =
                 FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
             let mut line_count: u64 = 0;
@@ -165,7 +173,7 @@ impl Tool for MonitorTool {
             tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => {
-                    let _ = child.kill().await;
+                    child.kill().await;
                     return Err(ToolError::Cancelled);
                 }
                 r = child.wait() => r,
@@ -175,34 +183,34 @@ impl Tool for MonitorTool {
             tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => {
-                    let _ = child.kill().await;
+                    child.kill().await;
                     return Err(ToolError::Cancelled);
                 }
                 _ = tokio::time::sleep(timeout) => {
-                    let _ = child.kill().await;
+                    child.kill().await;
                     return Err(ToolError::Timeout(timeout));
                 }
                 r = child.wait() => r,
             }
         };
 
-        let status = wait_result.map_err(|e| ToolError::exec(e.to_string()))?;
+        let status = wait_result.map_err(tool_error)?;
         let line_count = drain_handle.await.unwrap_or(0);
 
-        let summary = if status.success() {
+        let summary = if status.success {
             format!(
                 "Command completed successfully (exit code 0). {} lines streamed.",
                 line_count
             )
         } else {
-            let code = status.code().unwrap_or(-1);
+            let code = status.code.unwrap_or(-1);
             format!(
                 "Command exited with code {}. {} lines streamed.",
                 code, line_count
             )
         };
 
-        if status.success() {
+        if status.success {
             Ok(ToolResult::text(summary))
         } else {
             Ok(ToolResult::error_text(summary))
@@ -332,6 +340,44 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error, "successful exit should not be error");
+    }
+
+    /// stderr used to go to `/dev/null`; the contract pipes both streams. It
+    /// has to be read — an undrained pipe stops the child at the kernel's
+    /// buffer — and then dropped, because only stdout is a notification.
+    #[tokio::test]
+    async fn a_flood_of_stderr_is_swallowed_without_wedging_the_child() {
+        let dir = TempDir::new().unwrap();
+        let tool = MonitorTool;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback = base::tool::ProgressSender::with_callback(
+            "test",
+            std::sync::Arc::new(collector::Collector(captured.clone())),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            tool.call(
+                json!({
+                    "command": "head -c 400000 /dev/zero | tr '\\0' 'e' >&2; echo done",
+                    "description": "stderr flood",
+                    "timeout_ms": 15000
+                }),
+                ctx_in(dir.path()),
+                callback,
+            ),
+        )
+        .await
+        .expect("an unread stderr pipe would wedge the child here")
+        .unwrap();
+        assert!(!result.is_error, "the command exits zero: {result:?}");
+
+        let lines = captured.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec!["done\n".to_string()],
+            "stderr must not become notifications"
+        );
     }
 
     #[tokio::test]

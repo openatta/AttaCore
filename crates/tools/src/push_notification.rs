@@ -3,8 +3,10 @@
 //! 向用户发送桌面通知。在 macOS 上通过 osascript 的 `display notification` 实
 //! 现；其他平台回退到 stderr 输出。如果 Remote Control 连接，也推送到手机。
 
+use crate::exec_capture::capture;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::ProcessSpec;
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -12,7 +14,6 @@ use base::tool::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::process::Command;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PushNotificationInput {
@@ -75,7 +76,7 @@ impl Tool for PushNotificationTool {
     async fn call(
         &self,
         input: Value,
-        _ctx: ToolContext,
+        ctx: ToolContext,
         _progress: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: PushNotificationInput = serde_json::from_value(input)?;
@@ -90,22 +91,20 @@ impl Tool for PushNotificationTool {
         #[cfg(target_os = "macos")]
         {
             let escaped = msg.replace('"', "\\\"");
-            let result = Command::new("osascript")
-                .arg("-e")
-                .arg(format!(
-                    "display notification \"{escaped}\" with title \"AttaCode\""
-                ))
-                .output();
+            let spec = ProcessSpec::new("osascript", &ctx.cwd).args([
+                "-e".to_string(),
+                format!(r#"display notification "{escaped}" with title "AttaCode""#),
+            ]);
 
-            match result {
-                Ok(output) if output.status.success() => {
+            match capture(&ctx.exec, spec, ctx.cancel.clone()).await {
+                Ok(output) if output.status.success => {
                     let suffix = if is_proactive { " (proactive)" } else { "" };
                     Ok(ToolResult::text(format!(
                         "Notification sent: {msg}{suffix}"
                     )))
                 }
                 Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr = output.stderr_lossy();
                     eprintln!("osascript failed: {stderr}");
                     Ok(ToolResult::error_text(format!(
                         "Failed to send notification: {stderr}"
@@ -122,6 +121,7 @@ impl Tool for PushNotificationTool {
 
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = ctx;
             eprintln!("[PushNotification] {msg}");
             let suffix = if is_proactive { " (proactive)" } else { "" };
             Ok(ToolResult::text(format!(

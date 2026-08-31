@@ -11,8 +11,10 @@
 //!
 //! Only registered when `ATTACODE_VERIFY_PLAN=true` is set.
 
+use crate::exec_capture::capture;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{ExecError, ExecProviders, ProcessSpec};
 use base::tool::{
     PermissionDecision, ProgressSender, Tool, ToolContext, ToolResult, ValidationResult,
 };
@@ -90,7 +92,7 @@ impl Tool for VerifyPlanExecutionTool {
         })?;
 
         // 2. Run `git diff` in the session cwd to get working-tree changes.
-        let diff_output = run_git_diff(&ctx.cwd).await;
+        let diff_output = run_git_diff(&ctx.exec, &ctx.cwd, ctx.cancel.clone()).await;
 
         // 3. Build verification report.
         let focus_note = input
@@ -116,16 +118,16 @@ impl Tool for VerifyPlanExecutionTool {
     }
 }
 
-async fn run_git_diff(cwd: &std::path::Path) -> String {
-    let output = tokio::process::Command::new("git")
-        .args(["diff", "--no-color"])
-        .current_dir(cwd)
-        .output()
-        .await;
+async fn run_git_diff(
+    exec: &ExecProviders,
+    cwd: &std::path::Path,
+    cancel: tokio_util::sync::CancellationToken,
+) -> String {
+    let spec = ProcessSpec::new("git", cwd).args(["diff", "--no-color"]);
 
-    match output {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+    match capture(exec, spec, cancel).await {
+        Ok(o) if o.status.success => {
+            let stdout = o.stdout_lossy().into_owned();
             if stdout.trim().is_empty() {
                 "(no unstaged changes). ".to_string()
             } else {
@@ -143,10 +145,18 @@ async fn run_git_diff(cwd: &std::path::Path) -> String {
             }
         }
         Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            format!("(git diff failed: {stderr})")
+            format!("(git diff failed: {})", o.stderr_lossy())
         }
-        Err(e) => {
+        // The three classes stay apart: telling the model "git is not
+        // available" when the execution environment is the thing that is down
+        // sends it looking for the wrong problem.
+        Err(ExecError::Unavailable(e)) => {
+            format!("(execution environment unavailable: {e})")
+        }
+        Err(ExecError::Denied(e)) => {
+            format!("(git diff refused by policy: {e})")
+        }
+        Err(ExecError::Failed(e)) => {
             format!("(git not available: {e})")
         }
     }

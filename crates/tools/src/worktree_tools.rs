@@ -14,9 +14,11 @@
 //! 创建 worktree + 把 path 注入 SessionState；ExitWorktree 调 cleanup 并从
 //! activated 移除。
 
+use crate::exec_capture::capture;
 use crate::worktree::WorktreeHandle;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{ExecProviders, ProcessSpec};
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -131,7 +133,7 @@ impl Tool for EnterWorktreeTool {
                 new_messages: Some(vec![]),
             });
         }
-        match crate::worktree::create_worktree(&ctx.cwd, &input.slug).await {
+        match crate::worktree::create_worktree(&ctx.exec, &ctx.cwd, &input.slug).await {
             Ok(handle) => {
                 let path = handle.path().to_path_buf();
                 let branch = handle.branch().to_string();
@@ -214,7 +216,7 @@ impl Tool for ExitWorktreeTool {
     async fn call(
         &self,
         input: Value,
-        _ctx: ToolContext,
+        ctx: ToolContext,
         _: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let inp: ExitWorktreeInput = serde_json::from_value(input).unwrap_or_default();
@@ -253,17 +255,16 @@ impl Tool for ExitWorktreeTool {
 
         // "remove" or unknown — handle is owned, lock is dropped, safe to await
         {
-            if !discard {
-                if let Ok(true) = has_uncommitted_changes(&path).await {
-                    return Ok(ToolResult {
-                            content: base::tool::ToolResultContent::Text(
-                                "Worktree has uncommitted changes. Use discard_changes: true to force removal.".into(),
-                            ),
-                            is_error: true,
-                            structured_content: None,
-                            mcp_meta: None,
-                            new_messages: Some(vec![])});
-                }
+            if !discard && has_uncommitted_changes(&ctx.exec, &path, ctx.cancel.clone()).await {
+                return Ok(ToolResult {
+                    content: base::tool::ToolResultContent::Text(
+                        "Worktree has uncommitted changes. Use discard_changes: true to force removal.".into(),
+                    ),
+                    is_error: true,
+                    structured_content: None,
+                    mcp_meta: None,
+                    new_messages: Some(vec![]),
+                });
             }
             handle.cleanup().await;
             let slug = branch
@@ -289,16 +290,20 @@ impl Tool for ExitWorktreeTool {
 }
 
 /// Check if a git worktree has uncommitted changes.
-async fn has_uncommitted_changes(path: &std::path::Path) -> Result<bool, std::io::Error> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        std::process::Command::new("git")
-            .args(["-C", &path.display().to_string(), "status", "--porcelain"])
-            .output()
-            .map(|o| !o.stdout.is_empty())
-    })
-    .await
-    .unwrap_or(Ok(false))
+///
+/// A `git` that could not be run at all answers "no changes", because the
+/// caller's only use for the answer is whether to refuse a removal the user
+/// asked for, and refusing on an unanswerable question strands the worktree.
+async fn has_uncommitted_changes(
+    exec: &ExecProviders,
+    path: &std::path::Path,
+    cancel: tokio_util::sync::CancellationToken,
+) -> bool {
+    let spec = ProcessSpec::new("git", path).args(["status", "--porcelain"]);
+    capture(exec, spec, cancel)
+        .await
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

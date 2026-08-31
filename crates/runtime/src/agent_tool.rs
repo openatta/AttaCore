@@ -2394,7 +2394,7 @@ impl AgentTool {
         let tid = bg_task_id();
         let task = ctx.session.register_running_task(tid.clone());
         let mut worktree_handle = match &input.worktree {
-            Some(s) => match create_worktree(&ctx.session.cwd, s).await {
+            Some(s) => match create_worktree(&ctx.exec, &ctx.session.cwd, s).await {
                 Ok(h) => Some(h),
                 Err(e) => {
                     *task.status.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -3326,7 +3326,7 @@ impl base::tool::Tool for AgentTool {
 
         // Sync
         let mut worktree_handle = match &inp.worktree {
-            Some(s) => match create_worktree(&ctx.session.cwd, s).await {
+            Some(s) => match create_worktree(&ctx.exec, &ctx.session.cwd, s).await {
                 Ok(h) => Some(h),
                 Err(e) => return Err(base::error::ToolError::Execution(anyhow!("worktree: {e}"))),
             },

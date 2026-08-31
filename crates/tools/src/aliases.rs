@@ -21,8 +21,10 @@
 //!   over a JSON snapshot that had to be injected at construction time (and
 //!   never was — nothing ever called `ConfigTool::new`).
 
+use crate::exec_capture::capture;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{ExecError, ProcessSpec};
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -211,18 +213,21 @@ impl Tool for PowerShellTool {
             ))
         })?;
 
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(&input.command);
-        cmd.current_dir(&ctx.cwd);
-        let out = tokio::time::timeout(timeout, cmd.output())
+        let spec = ProcessSpec::new(&program, &ctx.cwd).args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &input.command,
+        ]);
+        let out = tokio::time::timeout(timeout, capture(&ctx.exec, spec, ctx.cancel.clone()))
             .await
             .map_err(|_| ToolError::exec(format!("{program} timed out after {timeout:?}")))?
-            .map_err(|e| ToolError::exec(format!("{program} spawn: {e}")))?;
-        let stdout = truncate_output(&String::from_utf8_lossy(&out.stdout));
-        let stderr = truncate_output(&String::from_utf8_lossy(&out.stderr));
+            .map_err(|e| match e {
+                ExecError::Denied(m) => ToolError::Denied(format!("{program}: {m}")),
+                other => ToolError::exec(format!("{program} spawn: {other}")),
+            })?;
+        let stdout = truncate_output(&out.stdout_lossy());
+        let stderr = truncate_output(&out.stderr_lossy());
         let body = if !stderr.is_empty() {
             format!("{stdout}\n--- stderr ---\n{stderr}")
         } else {
@@ -230,10 +235,10 @@ impl Tool for PowerShellTool {
         };
         Ok(ToolResult {
             content: base::tool::ToolResultContent::Text(body),
-            is_error: !out.status.success(),
+            is_error: !out.status.success,
             structured_content: Some(json!({
                 "program": program,
-                "exit_code": out.status.code()})),
+                "exit_code": out.status.code})),
             mcp_meta: None,
             new_messages: Some(vec![]),
         })
@@ -370,22 +375,18 @@ impl Tool for ReplTool {
             ReplLanguage::Node => ("node", vec!["-e", &input.code]),
             ReplLanguage::Ruby => ("ruby", vec!["-e", &input.code]),
         };
-        let mut cmd = tokio::process::Command::new(program);
-        for a in &args {
-            cmd.arg(a);
-        }
-        cmd.current_dir(&ctx.cwd);
-        let out = tokio::time::timeout(timeout, cmd.output())
+        let spec = ProcessSpec::new(program, &ctx.cwd).args(args.iter().copied());
+        let out = tokio::time::timeout(timeout, capture(&ctx.exec, spec, ctx.cancel.clone()))
             .await
             .map_err(|_| ToolError::exec(format!("REPL ({program}) timed out")))?
-            .map_err(|e| {
-                #[allow(clippy::useless_format)]
-                ToolError::exec(format!(
-                    "REPL spawn ({program}): {e}; ensure {program} is installed"
-                ))
+            .map_err(|e| match e {
+                ExecError::Denied(m) => ToolError::Denied(format!("REPL ({program}): {m}")),
+                other => ToolError::exec(format!(
+                    "REPL spawn ({program}): {other}; ensure {program} is installed"
+                )),
             })?;
-        let stdout = truncate_output(&String::from_utf8_lossy(&out.stdout));
-        let stderr = truncate_output(&String::from_utf8_lossy(&out.stderr));
+        let stdout = truncate_output(&out.stdout_lossy());
+        let stderr = truncate_output(&out.stderr_lossy());
         let body = if !stderr.is_empty() {
             format!("{stdout}\n--- stderr ---\n{stderr}")
         } else {
@@ -393,9 +394,9 @@ impl Tool for ReplTool {
         };
         Ok(ToolResult {
             content: base::tool::ToolResultContent::Text(body),
-            is_error: !out.status.success(),
+            is_error: !out.status.success,
             structured_content: Some(
-                json!({"language": input.language, "exit_code": out.status.code()}),
+                json!({"language": input.language, "exit_code": out.status.code}),
             ),
             mcp_meta: None,
             new_messages: Some(vec![]),
