@@ -276,6 +276,25 @@ pub enum LogEntry {
     },
 }
 
+impl LogEntry {
+    /// The line's `kind` tag — the same string the JSON carries.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Meta { .. } => "meta",
+            Self::User { .. } => "user",
+            Self::Assistant { .. } => "assistant",
+            Self::ToolResult { .. } => "tool_result",
+            Self::System { .. } => "system",
+            Self::Compact { .. } => "compact",
+            Self::UsageSnapshot { .. } => "usage_snapshot",
+            Self::PasteRef { .. } => "paste_ref",
+            Self::Blob { .. } => "blob",
+            Self::SessionEnd { .. } => "session_end",
+            Self::Extension { .. } => "extension",
+        }
+    }
+}
+
 /// Outcome recorded by [`LogEntry::SessionEnd`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -309,6 +328,52 @@ pub struct UsageRecord {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `kind()` is only worth having if it is the tag readers already know.
+    #[test]
+    fn the_kind_label_is_the_serde_tag() {
+        let entries = [
+            LogEntry::User { content: vec![] },
+            LogEntry::Assistant {
+                content: vec![],
+                stop_reason: None,
+                usage: None,
+                model: None,
+            },
+            LogEntry::ToolResult {
+                tool_use_id: "t".into(),
+                content: ToolResultContent::Text(String::new()),
+                is_error: false,
+            },
+            LogEntry::System {
+                subkind: SystemSubkind::Notice,
+                text: String::new(),
+            },
+            LogEntry::UsageSnapshot {
+                total_input: 0,
+                total_output: 0,
+                total_cache_creation: 0,
+                total_cache_read: 0,
+                total_cost_usd: 0.0,
+            },
+            LogEntry::PasteRef {
+                paste_id: "p".into(),
+            },
+            LogEntry::SessionEnd {
+                state: SessionEndState::Completed,
+            },
+            LogEntry::Extension {
+                ns: "n".into(),
+                event: "e".into(),
+                payload: json!({}),
+            },
+        ];
+        for entry in entries {
+            let label = entry.kind();
+            let tag = serde_json::to_value(&entry).unwrap();
+            assert_eq!(tag["kind"], label, "{label} disagrees with what is written");
+        }
+    }
 
     #[test]
     fn user_entry_roundtrip() {

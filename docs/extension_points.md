@@ -654,6 +654,12 @@ Read-only in the types, not by agreement: the entry arrives behind a shared
 reference and nothing is returned. Observers run after the append succeeded, so
 a failed write is never observed.
 
+`history::observers::AppendCounts` ships as one: a running tally of how many
+entries, of which kind, have gone into each session. The question it answers
+— how big has this session got — otherwise costs a read and a parse of the
+whole log, per asking. Hold the same `Arc` the store holds, and call `forget`
+when a session is done with, or the map grows for the life of the process.
+
 ### Lifecycle hooks — `hooks`
 
 Thirty named events, five backends (command, prompt, HTTP, agent, wasm),
