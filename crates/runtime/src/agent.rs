@@ -190,6 +190,9 @@ pub struct Agent {
     /// When this session's turns have gone on long enough — see
     /// [`Builder::turn_policy`].
     pub(crate) turn_policy: Arc<dyn base::interface::turn_policy::TurnPolicy>,
+    /// What this session's turns may spend, and how much context they may
+    /// carry — see [`Builder::budget_policy`].
+    pub(crate) budget_policy: Arc<dyn base::interface::budget_policy::BudgetPolicy>,
     /// What to do when a model call goes wrong — see
     /// [`Builder::recovery_policy`].
     pub(crate) recovery_policy: Arc<dyn base::interface::recovery_policy::RecoveryPolicy>,
@@ -977,6 +980,8 @@ pub struct Builder {
     result_transformers: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
     /// Turn stop conditions — see [`Builder::turn_policy`].
     turn_policy: Option<Arc<dyn base::interface::turn_policy::TurnPolicy>>,
+    /// Spend and context ceilings — see [`Builder::budget_policy`].
+    budget_policy: Option<Arc<dyn base::interface::budget_policy::BudgetPolicy>>,
     /// Model-failure recovery — see [`Builder::recovery_policy`].
     recovery_policy: Option<Arc<dyn base::interface::recovery_policy::RecoveryPolicy>>,
     /// Model request/response interception — see [`Builder::model_interceptor`].
@@ -1179,6 +1184,7 @@ impl Builder {
             tool_middleware: Vec::new(),
             result_transformers: Vec::new(),
             turn_policy: None,
+            budget_policy: None,
             recovery_policy: None,
             model_interceptors: Vec::new(),
             memory_retriever: None,
@@ -1309,6 +1315,25 @@ impl Builder {
         p: Arc<dyn base::interface::turn_policy::TurnPolicy>,
     ) -> Self {
         self.turn_policy = Some(p);
+        self
+    }
+
+    /// Decide what this session's turns may spend, and how large a request
+    /// may get.
+    ///
+    /// The default carries the engine's numbers: the cumulative token ceiling
+    /// from settings, the output-volume rules, and the scene's compaction
+    /// threshold with no ceiling above it. `Capped` adds the ceiling — a
+    /// deployment that must never send a request past some size wraps its
+    /// policy in it, and a turn that cannot be compacted under the cap ends
+    /// instead of sending the request.
+    ///
+    /// [`BudgetPolicy`]: base::interface::budget_policy::BudgetPolicy
+    pub fn budget_policy(
+        mut self,
+        p: Arc<dyn base::interface::budget_policy::BudgetPolicy>,
+    ) -> Self {
+        self.budget_policy = Some(p);
         self
     }
 
@@ -2177,6 +2202,13 @@ impl Builder {
                 ))
             });
 
+        let budget_policy: Arc<dyn base::interface::budget_policy::BudgetPolicy> =
+            self.budget_policy.clone().unwrap_or_else(|| {
+                Arc::new(base::interface::budget_policy::EngineBudget::new(
+                    settings.execution.max_budget_tokens,
+                ))
+            });
+
         agent_tool_arc.set_event_sender(event_tx.clone());
         agent_tool_arc.set_hooks(hooks.clone());
         agent_tool_arc.set_parent_permission(permission.clone());
@@ -2225,6 +2257,7 @@ impl Builder {
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
                 turn_policy,
+                budget_policy,
                 recovery_policy,
                 model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self
@@ -4864,6 +4897,63 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
+
+    /// P3-6's acceptance: a deployment configures a ceiling on request size
+    /// and the engine honours it. There was no such configuration before —
+    /// `TokenBudget` said when to start compacting and nothing said how large
+    /// was too large.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_context_hard_cap_ends_a_turn_the_scene_would_have_allowed() {
+        use base::interface::budget_policy::{Capped, EngineBudget};
+
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Probe",
+        });
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(ProbeTool));
+
+        // Zero: the system prompt alone is over it, so the first request is
+        // one this deployment has said must never be sent.
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(tools)
+            .budget_policy(Arc::new(Capped {
+                inner: EngineBudget::new(None),
+                context_hard_cap: 0,
+            }))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "go".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { stop_reason, .. }) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the cap should have ended the turn");
+
+        assert_eq!(stop, "context_exceeded");
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
 
     /// P3-3's acceptance: a policy turns an overload from "switch to the
     /// fallback" into "fail", without the loop knowing anything about it.

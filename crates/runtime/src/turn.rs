@@ -394,7 +394,6 @@ impl Agent {
         // could declare any limit it liked and nothing enforced it. Lower of
         // the two wins; that rule now lives in `LimitsPolicy::new`, which is
         // built once per session — see `Builder::turn_policy`.
-        let max_budget_tokens = self.settings.execution.max_budget_tokens;
         let mut total_tokens_used: u64 = 0;
         let start = std::time::Instant::now();
 
@@ -834,6 +833,24 @@ impl Agent {
             // 1. Compact if token budget exceeded
             self.compact_if_needed().await;
 
+            // A ceiling compaction was unable to get under. Ending the turn is
+            // the only honest answer left: the request that would go out next
+            // is one the deployment said must never be sent.
+            if let Some(cap) = self.context_budget().hard_cap {
+                let carried = self.context_tokens();
+                if carried > cap {
+                    tracing::warn!(carried, cap, "context above the hard cap after compaction");
+                    self.last_had_tool_uses = had_tool_uses_this_turn;
+                    self.emit_turn_complete("context_exceeded", api_calls, tool_calls, start);
+                    return Ok(TurnOutcome {
+                        stop_reason: "context_exceeded".into(),
+                        api_calls,
+                        tool_calls,
+                        usage: Usage::default(),
+                    });
+                }
+            }
+
             // 2. Assemble the request
             let step = api_calls;
             api_calls += 1;
@@ -894,8 +911,9 @@ impl Agent {
                 {
                     let msg = e.to_string();
                     tracing::warn!("recovering by compacting, then retrying");
-                    let threshold = self.scene.token_budget().compact_threshold.max(50000);
-                    let keep = self.scene.token_budget().compact_keep_recent.min(5);
+                    let budget = self.context_budget();
+                    let threshold = budget.compact_threshold.max(50000);
+                    let keep = budget.compact_keep_recent.min(5);
                     let messages_before = self.session.messages.len();
                     if let Ok((compacted, result)) =
                         self.compactor.compact(messages, threshold, keep).await
@@ -1143,35 +1161,17 @@ impl Agent {
             // no estimate. At 90% inject a warning; at 100% abort.
             {
                 total_tokens_used += usage.input_tokens as u64 + usage.output_tokens as u64;
-                if let Some(budget) = max_budget_tokens {
-                    if total_tokens_used >= budget {
-                        tracing::warn!(total_tokens_used, budget, "token budget exceeded");
-                        let _ = self.telemetry_handle.record(
-                            telemetry::TelemetryEvent::budget_enforced(
-                                &self.session.session_id,
-                                self.session.turn_count,
-                                Some(self.current_turn_id.clone()),
-                                telemetry::BudgetEnforcedPayload {
-                                    action: telemetry::BudgetEnforcedAction::TurnStopped,
-                                    total_tokens_used,
-                                    budget,
-                                },
-                            ),
-                        );
-                        self.last_had_tool_uses = had_tool_uses_this_turn;
-                        self.emit_turn_complete("budget_exceeded", api_calls, tool_calls, start);
-                        return Ok(TurnOutcome {
-                            stop_reason: "budget_exceeded".into(),
-                            api_calls,
-                            tool_calls,
-                            usage: Usage::default(),
-                        });
-                    }
-                    if total_tokens_used >= budget * 9 / 10 {
-                        // Inject a reminder so the model wraps up before hitting the hard cap.
+                match self
+                    .budget_policy
+                    .on_usage(&base::interface::budget_policy::Spend {
+                        total_tokens: total_tokens_used,
+                    })
+                {
+                    base::interface::budget_policy::Spending::WithinBudget => {}
+                    base::interface::budget_policy::Spending::Warn { reminder, limit } => {
                         tracing::warn!(
                             total_tokens_used,
-                            budget,
+                            budget = limit,
                             "approaching token budget limit; injecting continue reminder"
                         );
                         let _ = self.telemetry_handle.record(
@@ -1182,15 +1182,36 @@ impl Agent {
                                 telemetry::BudgetEnforcedPayload {
                                     action: telemetry::BudgetEnforcedAction::WarningInjected,
                                     total_tokens_used,
-                                    budget,
+                                    budget: limit,
                                 },
                             ),
                         );
                         self.session.push_message(ModelMessage {
                             role: MessageRole::User,
-                            content: vec![ModelContentBlock::Text {
-                                text: "<system-reminder>\nOutput token budget nearly exhausted. Keep your response concise and wrap up.\n</system-reminder>".into(),
-                            }],
+                            content: vec![ModelContentBlock::Text { text: reminder }],
+                        });
+                    }
+                    base::interface::budget_policy::Spending::Exhausted { limit } => {
+                        tracing::warn!(total_tokens_used, budget = limit, "token budget exceeded");
+                        let _ = self.telemetry_handle.record(
+                            telemetry::TelemetryEvent::budget_enforced(
+                                &self.session.session_id,
+                                self.session.turn_count,
+                                Some(self.current_turn_id.clone()),
+                                telemetry::BudgetEnforcedPayload {
+                                    action: telemetry::BudgetEnforcedAction::TurnStopped,
+                                    total_tokens_used,
+                                    budget: limit,
+                                },
+                            ),
+                        );
+                        self.last_had_tool_uses = had_tool_uses_this_turn;
+                        self.emit_turn_complete("budget_exceeded", api_calls, tool_calls, start);
+                        return Ok(TurnOutcome {
+                            stop_reason: "budget_exceeded".into(),
+                            api_calls,
+                            tool_calls,
+                            usage: Usage::default(),
                         });
                     }
                 }
@@ -1389,25 +1410,18 @@ impl Agent {
                     .saturating_add(usage.output_tokens as u64);
 
                 let this_delta = usage.output_tokens as u64;
-                if should_continue_token_budget(
-                    self.accumulated_output_tokens,
-                    target,
-                    self.token_budget_continuation_count,
-                    this_delta,
-                    self.last_delta_tokens,
-                ) {
+                if let base::interface::budget_policy::OutputTarget::KeepGoing { nudge } = self
+                    .budget_policy
+                    .on_output_target(&base::interface::budget_policy::OutputProgress {
+                        accumulated: self.accumulated_output_tokens,
+                        target,
+                        continuations: self.token_budget_continuation_count,
+                        this_delta,
+                        last_delta: self.last_delta_tokens,
+                    })
+                {
                     self.token_budget_continuation_count += 1;
                     self.last_delta_tokens = this_delta;
-                    let remaining = target.saturating_sub(self.accumulated_output_tokens);
-                    let nudge = format!(
-                        "\
-<system-reminder>
-Continue working. Used {accumulated}/{target} output tokens ({remaining} remaining).
-</system-reminder>",
-                        accumulated = self.accumulated_output_tokens,
-                        target = target,
-                        remaining = remaining,
-                    );
                     self.session.push_message(ModelMessage {
                         role: MessageRole::User,
                         content: vec![ModelContentBlock::Text { text: nudge }],
@@ -1908,7 +1922,7 @@ or project context that should survive across sessions.
             tracing::debug!(modified = budget_modified, "tool result budget enforced");
         }
 
-        let budget = self.scene.token_budget();
+        let budget = self.context_budget();
         let context_tokens = self.context_tokens();
         match compactor.reactive(
             &mut self.session.messages,
@@ -1997,7 +2011,7 @@ or project context that should survive across sessions.
                 }
             }
 
-            let keep = self.scene.token_budget().compact_keep_recent;
+            let keep = budget.compact_keep_recent;
             let messages_before = self.session.messages.len();
             // Snapshot the conversation *before* compaction. Two things below
             // need it: the LLM summarizer (which must see what is about to be
@@ -2309,7 +2323,7 @@ or project context that should survive across sessions.
 
         // Budget-aware skill listing: 1% of context window tokens * 4
         // chars/token, fallback 8000 chars.
-        let context_window = self.scene.token_budget().compact_threshold;
+        let context_window = self.context_budget().compact_threshold;
         let budget_chars = if context_window > 0 {
             ((context_window as f64 * 0.01) * 4.0) as usize
         } else {
@@ -2650,6 +2664,12 @@ or project context that should survive across sessions.
         self.session.token_count() + self.request_overhead_tokens
     }
 
+    /// What the scene asked for, after the deployment's budget policy has had
+    /// its say.
+    fn context_budget(&self) -> base::interface::budget_policy::ContextBudget {
+        self.budget_policy.context_budget(&self.scene.token_budget())
+    }
+
     /// Handle model Overloaded error by switching to fallback model and retrying.
     /// Put a model error to the recovery policy.
     ///
@@ -2757,20 +2777,6 @@ or project context that should survive across sessions.
     }
 }
 
-/// Pure continuation decision. Continue while accumulated output < 90% of
-/// target AND not diminishing. Diminishing: ≥3 continuations with both this
-/// and the previous delta under 500 tokens. No hard cap on continuation count.
-fn should_continue_token_budget(
-    accumulated: u64,
-    target: u64,
-    count: u32,
-    this_delta: u64,
-    last_delta: u64,
-) -> bool {
-    let threshold = (target as f64 * 0.9) as u64;
-    let is_diminishing = count >= 3 && this_delta < 500 && last_delta < 500;
-    !is_diminishing && accumulated < threshold
-}
 
 /// Tokens a request spends before any conversation content: the assembled
 /// system prompt plus every tool definition's name, description and JSON
@@ -5101,32 +5107,6 @@ mod tests {
     fn turn_outcome_default() {
         let outcome = TurnOutcome::default();
         assert_eq!(outcome.api_calls, 0);
-    }
-
-    // ── Token budget continuation decision tests ──
-
-    #[test]
-    fn token_budget_continuation_stops_at_90pct() {
-        // 89% of target → continue
-        assert!(should_continue_token_budget(89_000, 100_000, 0, 1_000, 0));
-        // 90% of target → stop
-        assert!(!should_continue_token_budget(90_000, 100_000, 0, 1_000, 0));
-        // High continuation count alone does NOT stop (no hard cap; was 10).
-        assert!(should_continue_token_budget(
-            10_000, 100_000, 20, 1_000, 1_000
-        ));
-    }
-
-    #[test]
-    fn token_budget_diminishing_returns_stops() {
-        // ≥3 continuations, both deltas <500 → stop even below 90%
-        assert!(!should_continue_token_budget(10_000, 100_000, 3, 400, 400));
-        // ≥3 but large delta → continue
-        assert!(should_continue_token_budget(
-            10_000, 100_000, 3, 1_000, 1_000
-        ));
-        // <3 continuations, small deltas → still continue
-        assert!(should_continue_token_budget(10_000, 100_000, 2, 400, 400));
     }
 
     // ── Token budget directive parsing tests ──

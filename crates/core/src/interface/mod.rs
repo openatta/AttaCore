@@ -28,6 +28,7 @@
 //! | [`scene::AgentScene`] | system prompt, tool surface, budgets |
 //! | [`turn_policy::TurnPolicy`] | when a turn has gone on long enough |
 //! | [`recovery_policy::RecoveryPolicy`] | what to do when a call goes wrong |
+//! | [`budget_policy::BudgetPolicy`] | what a turn may spend and how much it may carry |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
 //! | [`import_callback::ImportCallback`] | the host's answer to an import prompt |
@@ -74,6 +75,7 @@ pub mod model_interceptor;
 pub mod permission;
 pub mod prompt_assembly;
 pub mod prompt_registry;
+pub mod budget_policy;
 pub mod recovery_policy;
 #[deprecated(note = "moved to `base::prompt` — prompt data types and the assembler function")]
 pub use crate::prompt;
