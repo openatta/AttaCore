@@ -636,12 +636,13 @@ impl Agent {
             // 2. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
             async move {
                 if !base_url.is_empty() {
-                    if let Ok(client) = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5))
-                        .build()
-                    {
-                        let _ = client.get(&base_url).send().await;
-                    }
+                    let net = base::interface::exec::local::LocalNetwork::default();
+                    let warming = base::interface::exec::Network::send(
+                        &net,
+                        base::interface::exec::HttpRequest::get(&base_url),
+                        base::interface::exec::Origin::Operator,
+                    );
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), warming).await;
                 }
             },
             // 3. Create the session-memory sidecar file if this session has

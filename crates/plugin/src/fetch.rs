@@ -3,7 +3,8 @@
 //! placeholder (just `mkdir`, no actual download).
 //!
 //! Supports two `download_url` schemes:
-//! - `https://`/`http://` — fetched via `reqwest`. A `checksum` is
+//! - `https://`/`http://` — fetched through the execution layer's
+//!   `Network`, like every other outbound request. A `checksum` is
 //!   **required** for network sources — installing unverified bytes from
 //!   the network is exactly the supply-chain risk `homograph.rs` already
 //!   guards the *name* side of; this guards the *content* side.
@@ -55,21 +56,23 @@ async fn fetch_bytes(download_url: &str) -> Result<Vec<u8>, PluginError> {
     if let Some(path) = download_url.strip_prefix("file://") {
         return std::fs::read(path).map_err(PluginError::Io);
     }
-    let resp = reqwest::get(download_url)
-        .await
-        .map_err(|e| PluginError::Io(std::io::Error::other(format!("download failed: {e}"))))?;
-    if !resp.status().is_success() {
+    // `Origin::Operator`: a plugin archive comes from a marketplace an
+    // operator configured, not from a url the model named.
+    let net = base::interface::exec::local::LocalNetwork::default();
+    let resp = base::interface::exec::Network::send(
+        &net,
+        base::interface::exec::HttpRequest::get(download_url),
+        base::interface::exec::Origin::Operator,
+    )
+    .await
+    .map_err(|e| PluginError::Io(std::io::Error::other(format!("download failed: {e}"))))?;
+    if !(200..300).contains(&resp.status) {
         return Err(PluginError::Schema(format!(
             "download failed: HTTP {} from {download_url}",
-            resp.status()
+            resp.status
         )));
     }
-    let bytes = resp.bytes().await.map_err(|e| {
-        PluginError::Io(std::io::Error::other(format!(
-            "download body read failed: {e}"
-        )))
-    })?;
-    Ok(bytes.to_vec())
+    Ok(resp.body)
 }
 
 fn verify_checksum(bytes: &[u8], expected_hex: &str) -> Result<(), PluginError> {

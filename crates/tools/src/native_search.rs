@@ -115,7 +115,7 @@ impl NativeSearchProvider {
                 if !url.ends_with('/') {
                     url.push('/');
                 }
-                let parsed = reqwest::Url::parse(&url).ok()?;
+                let parsed = url::Url::parse(&url).ok()?;
                 HttpAnthropicClient::with_base(auth, parsed).ok()?
             }
             None => HttpAnthropicClient::new(auth).ok()?,

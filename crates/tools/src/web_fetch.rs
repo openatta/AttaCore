@@ -1,12 +1,13 @@
 //! WebFetchTool —— "WebFetch"。
 //!
-//! reqwest 抓 URL；如果 content-type 含 html 用 html2text 渲染纯文本；
-//! 其它（json / text / binary）按 utf-8 解码或标识 binary。
+//! 通过执行层的 `Network` 抓 URL；如果 content-type 含 html 用 html2text
+//! 渲染纯文本；其它（json / text / binary）按 utf-8 解码或标识 binary。
 //! 5 MB 上限、~50_000 char 上限、15s 超时。
 
 use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{HttpRequest, Network, Origin};
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, SecondaryLlm, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -121,7 +122,11 @@ impl Tool for WebFetchTool {
         _progress: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let input: WebFetchInput = serde_json::from_value(input)?;
-        let result = run_with_cancel(&ctx.cancel, fetch(&input.url)).await?;
+        let fetching = tokio::time::timeout(TIMEOUT, fetch(&*ctx.exec.network, &input.url));
+        let result = match run_with_cancel(&ctx.cancel, fetching).await? {
+            Ok(result) => result,
+            Err(_elapsed) => return Err(ToolError::Timeout(TIMEOUT)),
+        };
         match result {
             Ok((status, text)) => {
                 // **Q1 **: if a secondary LLM is wired AND the user
@@ -164,17 +169,13 @@ impl Tool for WebFetchTool {
                 "HTTP {status}\n{}",
                 truncate_chars(&body, 4000)
             ))),
-            Err(FetchError::TooLarge { size }) => Err(ToolError::Validation(format!(
-                "response is {size} bytes; cap is {MAX_BYTES} bytes"
-            ))),
             Err(FetchError::Redirect(location)) => {
                 // Cross-host redirect — return to model for re-fetch.
                 Ok(ToolResult::text(format!(
                     "Redirected to: {location}\n\nRe-fetch this URL to continue."
                 )))
             }
-            Err(FetchError::Timeout) => Err(ToolError::Timeout(TIMEOUT)),
-            Err(FetchError::Other(e)) => Err(ToolError::exec(e.to_string())),
+            Err(FetchError::Egress(e)) => Err(e.into()),
         }
     }
 }
@@ -201,83 +202,51 @@ fn truncate_for_secondary(text: &str) -> String {
 enum FetchError {
     #[error("HTTP {status}")]
     HttpStatus { status: u16, body: String },
-    #[error("response too large: {size} bytes")]
-    TooLarge { size: u64 },
-    #[error("timeout")]
-    Timeout,
     #[error("redirect: {0}")]
     Redirect(String),
     #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    Egress(#[from] base::interface::exec::ExecError),
 }
 
-async fn fetch(url: &str) -> Result<(u16, String), FetchError> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none()); // Don't follow redirects.
-                                                      // A loopback target should never go through the ambient HTTP(S)_PROXY —
-                                                      // that env var means "reach the real internet through this egress proxy,"
-                                                      // not "also proxy calls to my own machine." Left unhandled, a dev/CI
-                                                      // environment with HTTP_PROXY set (and no NO_PROXY carve-out) silently
-                                                      // routes even `http://127.0.0.1:*` through the proxy, which can't reach
-                                                      // back into the local port — this is exactly what broke this tool's own
-                                                      // local-server tests. Genuine external fetches still respect the system
-                                                      // proxy as before; only loopback targets bypass it.
-    if crate::security::is_loopback_url(url) {
-        builder = builder.no_proxy();
-    }
-    let client = builder
-        .build()
-        .map_err(|e| FetchError::Other(anyhow::Error::new(e)))?;
+/// One model-directed request, through the deployment's egress.
+///
+/// Redirects are not followed: which URL to fetch next is the model's call,
+/// and a provider that chased the chain itself would be reaching hosts the
+/// model never named.
+async fn fetch(net: &dyn Network, url: &str) -> Result<(u16, String), FetchError> {
+    let resp = net
+        .send(
+            HttpRequest::get(url).max_bytes(MAX_BYTES).max_redirects(0),
+            Origin::Agent,
+        )
+        .await?;
 
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) if e.is_timeout() => return Err(FetchError::Timeout),
-        Err(e) => return Err(FetchError::Other(anyhow::Error::new(e))),
-    };
-
-    let status = resp.status().as_u16();
-    // Handle cross-host redirects by returning the Location to the model
+    let status = resp.status;
     if (300..400).contains(&status) {
-        if let Some(location) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
-            return Err(FetchError::Redirect(location.to_string()));
-        }
-    }
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BYTES {
-            return Err(FetchError::TooLarge { size: len });
+        if let Some(location) = resp.headers.get("location") {
+            return Err(FetchError::Redirect(location.clone()));
         }
     }
 
     let content_type = resp
-        .headers()
+        .headers
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchError::Other(anyhow::Error::new(e)))?;
-    if body_bytes.len() as u64 > MAX_BYTES {
-        return Err(FetchError::TooLarge {
-            size: body_bytes.len() as u64,
-        });
-    }
+        .cloned()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
 
     if !(200..300).contains(&status) {
         // 把 body（截断）作为 error message
-        let body = String::from_utf8_lossy(&body_bytes).into_owned();
-        return Err(FetchError::HttpStatus { status, body });
+        return Err(FetchError::HttpStatus {
+            status,
+            body: resp.body_text(),
+        });
     }
 
     let text = if content_type.contains("html") {
-        html2text::from_read(&body_bytes[..], 100)
+        html2text::from_read(&resp.body[..], 100)
     } else {
         // 其它 content type（json / text / xml / md / 二进制）按 utf-8 lossy
-        String::from_utf8_lossy(&body_bytes).into_owned()
+        resp.body_text()
     };
 
     Ok((status, text))
@@ -409,6 +378,89 @@ connection: close\r\n\
             }
             _ => panic!(),
         }
+    }
+
+    /// A server that answers 200 to everything and counts what it was asked.
+    async fn a_server_that_would_answer() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
+content-type: text/plain\r\n\
+content-length: 5\r\n\
+connection: close\r\n\
+\r\n\
+hello";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                let _ = sock.write_all(RESPONSE).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (port, seen)
+    }
+
+    fn ctx_under(cwd: &Path, domains: &[&str]) -> ToolContext {
+        use base::context::config::NetworkModeConfig;
+        let mut ctx = ctx_in(cwd);
+        ctx.exec = base::interface::exec::ExecProviders::local().with_network(Arc::new(
+            base::interface::exec::local::LocalNetwork::for_agent_policy(
+                NetworkModeConfig::Allowlist,
+                domains.iter().map(|d| d.to_string()).collect(),
+            ),
+        ));
+        ctx
+    }
+
+    /// `settings.sandbox.allowed_domains` binds what the model may reach, and
+    /// a url the model chose to fetch is exactly that.
+    #[tokio::test]
+    async fn the_allowed_domains_setting_reaches_this_tool() {
+        use std::sync::atomic::Ordering;
+
+        let (port, seen) = a_server_that_would_answer().await;
+        let url = format!("http://127.0.0.1:{port}/");
+        let tool = WebFetchTool::new();
+
+        let refused = tool
+            .call(
+                json!({ "url": url }),
+                ctx_under(Path::new("/tmp"), &["allowed.test"]),
+                ProgressSender::noop("t"),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(ToolError::Denied(_))),
+            "a host off the allowlist must be refused, got: {refused:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "the refusal has to happen before the connection, or the policy is              only a filter on what comes back"
+        );
+
+        let allowed = tool
+            .call(
+                json!({ "url": url }),
+                ctx_under(Path::new("/tmp"), &["127.0.0.1"]),
+                ProgressSender::noop("t"),
+            )
+            .await
+            .expect("the same url, with its host on the list");
+        assert!(!allowed.is_error);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the allowed fetch really went out"
+        );
     }
 
     #[tokio::test]

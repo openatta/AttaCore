@@ -73,6 +73,9 @@ pub struct PluginState {
     pub caps: Arc<ResolvedCapabilities>,
     pub kv: Arc<KvNamespace>,
     pub progress: Option<Arc<dyn ProgressSink>>,
+    /// Where this plugin's HTTP goes out. Declared hosts are checked against
+    /// `caps` first; this is the egress that carries what survives.
+    pub net: Arc<dyn base::interface::exec::Network>,
 }
 
 impl PluginState {
@@ -127,7 +130,14 @@ impl PluginState {
             caps,
             kv,
             progress,
+            net: Arc::new(base::interface::exec::local::LocalNetwork::default()),
         })
+    }
+
+    /// Send this plugin's HTTP out through a given egress.
+    pub fn with_network(mut self, net: Arc<dyn base::interface::exec::Network>) -> Self {
+        self.net = net;
+        self
     }
 
     pub fn limiter(&mut self) -> &mut dyn ResourceLimiter {

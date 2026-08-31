@@ -56,19 +56,24 @@ impl Host for PluginState {
                 "network access to `{refused}` is not in this plugin's declared `net` capability"
             ));
         }
-        let client = reqwest::Client::new();
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|_| format!("`{method}` is not an HTTP method"))?;
-        let mut request = client.request(method, &url);
+        let mut request = base::interface::exec::HttpRequest::new(&method, &url);
         for (k, v) in headers {
             request = request.header(k, v);
         }
         if let Some(body) = body {
             request = request.body(body);
         }
-        let response = request.send().await.map_err(|e| e.to_string())?;
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        Ok(bytes.to_vec())
+        // `Origin::Operator`: the hosts a plugin may reach are the ones its
+        // own manifest declares and an operator accepted at install time, and
+        // `allows_url` above is what enforces that.
+        let response = base::interface::exec::Network::send(
+            &*self.net,
+            request,
+            base::interface::exec::Origin::Operator,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(response.body)
     }
 
     async fn secret(&mut self, key: String) -> Option<String> {

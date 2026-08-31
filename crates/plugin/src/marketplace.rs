@@ -4,7 +4,10 @@
 
 use crate::manifest::PluginError;
 use async_trait::async_trait;
+use base::interface::exec::local::LocalNetwork;
+use base::interface::exec::{HttpRequest, Network, Origin};
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// A resolved plugin source — where to download the plugin from.
 #[derive(Debug, Clone)]
@@ -47,15 +50,22 @@ pub trait PluginResolver: Send + Sync {
 /// - `{registry_url}/{name}/{version}/plugin.toml` — plugin manifest
 pub struct RegistryResolver {
     registry_url: String,
-    client: reqwest::Client,
+    net: Arc<dyn Network>,
 }
 
 impl RegistryResolver {
     pub fn new(registry_url: String) -> Self {
         Self {
             registry_url: registry_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            net: Arc::new(LocalNetwork::default()),
         }
+    }
+
+    /// Fetch through a given egress, so a deployment that has gone offline
+    /// takes the marketplace with it.
+    pub fn with_network(mut self, net: Arc<dyn Network>) -> Self {
+        self.net = net;
+        self
     }
 }
 
@@ -63,15 +73,13 @@ impl RegistryResolver {
 impl PluginResolver for RegistryResolver {
     async fn fetch_index(&self) -> Result<Vec<RegistryEntry>, PluginError> {
         let url = format!("{}/index.json", self.registry_url);
+        // `Origin::Operator`: a marketplace URL comes from configuration.
         let resp = self
-            .client
-            .get(&url)
-            .send()
+            .net
+            .send(HttpRequest::get(&url), Origin::Operator)
             .await
             .map_err(|e| PluginError::Io(std::io::Error::other(e.to_string())))?;
-        let entries: Vec<RegistryEntry> = resp
-            .json()
-            .await
+        let entries: Vec<RegistryEntry> = serde_json::from_slice(&resp.body)
             .map_err(|e| PluginError::Schema(format!("invalid index: {e}")))?;
         Ok(entries)
     }

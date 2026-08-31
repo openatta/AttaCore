@@ -11,9 +11,6 @@ description  = "AttaCore — telemetry, usage stats, LLM call recording, perf"
 base          = { workspace = true }
 tokio         = { workspace = true }
 tokio-util    = { workspace = true }
-# Only used by feature_flags.rs to pull flag *definitions* — unrelated to
-# sending telemetry data, which this crate never does on its own (see lib.rs).
-reqwest       = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }

@@ -182,10 +182,23 @@ pub enum Origin {
 #[async_trait]
 pub trait Network: Send + Sync {
     async fn send(&self, req: HttpRequest, origin: Origin) -> Result<HttpResponse, ExecError>;
+    /// 响应头到了、body 还没读。默认实现 = `send` 之后当作一整块。
+    async fn open(&self, req: HttpRequest, origin: Origin) -> Result<HttpStream, ExecError>;
     /// 预检，给不发请求也要判断的调用点（Ping、沙箱 profile 生成）。
     fn permits(&self, host: &str, origin: Origin) -> bool;
 }
 ```
+
+**`open` 是硬要求**，理由和 §2.1 的流式一样：Messages API 是一条挂着整个回答的
+SSE 流，一个只会交出完整 body 的出口承载不了引擎发得最多的那个请求；而且退避策略
+是在第一个 body 字节存在之前、按状态码和响应头分类的。
+
+`HttpRequest` 上另有两个字段，都是**策略正确性**而非便利：
+
+- `max_redirects` —— provider 自己跟重定向时**每一跳都要重新过策略**，否则一个
+  被允许的主机可以把模型交给一个不被允许的主机，allowlist 只对链条的第一跳成立。
+  `WebFetch` 要 0：下一个 URL 抓不抓是模型的决定，不是出口的。
+- `max_bytes` —— 工具不再自建 client 之后，`WebFetch` 的 5 MB 上限没别处可放。
 
 **`allowed_domains` 只作用于 `Origin::Agent`。** 这是本设计里最容易搞错的一条，
 所以写在这里：把它作用到模型 API 上会让 agent 连自己的大脑都够不着。
@@ -195,9 +208,15 @@ pub trait Network: Send + Sync {
 `Origin::Operator` 仍然走同一个契约，因为可审计、可限速、可离线这三件事对它同样成立
 （一次离线运行要能把遥测和市场也断掉），只是不受 `allowed_domains` 约束。
 
-**跨 crate 的代价要说清楚**：10 个客户端构造点分布在 8 个 crate 里，其中
+**超时不进 `HttpRequest`。** 按 §0.1 它属于 `tool.around`，而且 provider 给流
+加一个整体超时就等于把 SSE 回答拦腰截断。各调用点保留自己原有的超时。
+
+**跨 crate 的代价要说清楚**：11 个客户端构造点分布在 9 个 crate 里，其中
 `crates/model` 与 `crates/auth` 在依赖图上低于 `tools`。契约因此必须放
 `crates/core`，且这两个 crate 会因此依赖它。这是 X7 无法回避的耦合。
+
+**留在外面的一处**：MCP 的 streamable-HTTP 传输由 `rmcp` 自己持有，撬开它不属于
+这一层的工作。
 
 ### 2.4 `Sandbox`
 

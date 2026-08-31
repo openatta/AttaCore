@@ -2,8 +2,11 @@
 
 use crate::pkce::PkceVerifier;
 use crate::provider::ProviderConfig;
+use base::interface::exec::local::LocalNetwork;
+use base::interface::exec::{ExecError, HttpRequest, Network, Origin};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
 use url::Url;
@@ -11,7 +14,7 @@ use url::Url;
 #[derive(Debug, Error)]
 pub enum OAuthError {
     #[error("network: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(#[from] ExecError),
     #[error("token endpoint returned status {0}: {1}")]
     Status(u16, String),
     #[error("provider returned malformed token JSON: {0}")]
@@ -36,7 +39,7 @@ pub struct TokenResponse {
 
 pub struct OAuth2Client<'a> {
     pub provider: &'a ProviderConfig,
-    pub http: reqwest::Client,
+    pub net: Arc<dyn Network>,
 }
 
 impl<'a> OAuth2Client<'a> {
@@ -44,13 +47,13 @@ impl<'a> OAuth2Client<'a> {
     pub fn new(provider: &'a ProviderConfig) -> Self {
         Self {
             provider,
-            http: reqwest::Client::new(),
+            net: Arc::new(LocalNetwork::default()),
         }
     }
 
-    /// Builder: set client.
-    pub fn with_client(provider: &'a ProviderConfig, http: reqwest::Client) -> Self {
-        Self { provider, http }
+    /// Builder: set the egress this client's token requests go out through.
+    pub fn with_network(provider: &'a ProviderConfig, net: Arc<dyn Network>) -> Self {
+        Self { provider, net }
     }
 
     /// Build the URL the user's browser visits to start auth. Returns the URL
@@ -113,19 +116,29 @@ impl<'a> OAuth2Client<'a> {
     }
 
     async fn post_token(&self, form: &HashMap<&str, &str>) -> Result<TokenResponse, OAuthError> {
-        let mut req = self
-            .http
-            .post(&self.provider.token_url)
-            .form(form)
-            .header("Accept", "application/json");
+        let body = form
+            .iter()
+            .fold(
+                url::form_urlencoded::Serializer::new(String::new()),
+                |mut acc, (k, v)| {
+                    acc.append_pair(k, v);
+                    acc
+                },
+            )
+            .finish();
+        let mut req = HttpRequest::post(&self.provider.token_url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .body(body);
         for (k, v) in &self.provider.token_request_headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            return Err(OAuthError::Status(status.as_u16(), body));
+        // `Origin::Operator`: the token endpoint belongs to a provider the
+        // operator configured, not to a destination the model picked.
+        let resp = self.net.send(req, Origin::Operator).await?;
+        let body = resp.body_text();
+        if !(200..300).contains(&resp.status) {
+            return Err(OAuthError::Status(resp.status, body));
         }
         let parsed: TokenResponse = serde_json::from_str(&body)?;
         Ok(parsed)

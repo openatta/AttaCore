@@ -151,8 +151,8 @@ pub struct HookRunner {
     /// P1-10: Agent hook 执行器；None 时 Agent hook 报"no executor"
     agent_executor: Option<Arc<dyn AgentHookExecutor>>,
     wasm_executor: Option<Arc<dyn WasmHookExecutor>>,
-    /// HTTP client；按需 lazy 初始化（绝大多数 session 不用 http hook）
-    http_client: std::sync::OnceLock<reqwest::Client>,
+    /// HTTP hook 的出口；按需 lazy 初始化（绝大多数 session 不用 http hook）
+    net: std::sync::OnceLock<std::sync::Arc<dyn base::interface::exec::Network>>,
     /// Track executed `once` hooks: set of (HookEvent, config_index) that have
     /// already fired and must not fire again in this session.
     once_executed: std::sync::Mutex<std::collections::HashSet<(HookEvent, usize)>>,
@@ -184,7 +184,7 @@ impl HookRunner {
             prompt_executor: None,
             agent_executor: None,
             wasm_executor: None,
-            http_client: std::sync::OnceLock::new(),
+            net: std::sync::OnceLock::new(),
             once_executed: std::sync::Mutex::new(std::collections::HashSet::new()),
             file_watcher: std::sync::Mutex::new(None),
             pending_rewakes: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -291,12 +291,15 @@ impl HookRunner {
         Ok(())
     }
 
-    fn http(&self) -> &reqwest::Client {
-        self.http_client.get_or_init(|| {
-            reqwest::Client::builder()
-                .build()
-                .expect("default reqwest client")
+    fn net(&self) -> &dyn base::interface::exec::Network {
+        &**self.net.get_or_init(|| {
+            std::sync::Arc::new(base::interface::exec::local::LocalNetwork::default())
         })
+    }
+
+    /// Send this runner's HTTP hooks out through a given egress.
+    pub fn set_network(&self, net: std::sync::Arc<dyn base::interface::exec::Network>) {
+        let _ = self.net.set(net);
     }
 
     /// True if hooks for event are present.

@@ -32,10 +32,12 @@ use async_trait::async_trait;
 use base::interface::backoff::{
     Backoff, BackoffPolicy, FailedAttempt, LadderBackoff, RequestFailure,
 };
+use base::interface::exec::local::LocalNetwork;
+use base::interface::exec::{HttpRequest, HttpStream, Network, Origin};
 use base::interface::model::{Model, ModelError, ModelMessage, ModelStream, StreamParams, ToolDef};
 use base::interface::prompt::PromptBlock;
 use base::provider::ApiType;
-use futures::stream::TryStreamExt;
+use futures::stream::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +57,7 @@ pub struct OpenAICompatibleModel {
 }
 
 struct Inner {
-    http: reqwest::Client,
+    net: Arc<dyn Network>,
     /// Fully resolved `.../chat/completions` endpoint (see
     /// [`chat_completions_url`]).
     endpoint: Url,
@@ -87,23 +89,10 @@ impl OpenAICompatibleModel {
         model_default: impl Into<String>,
     ) -> Result<Self, ModelError> {
         let endpoint = chat_completions_url(base_url)?;
-        // No `ClientBuilder::timeout()`: it bounds the whole response body,
-        // which for SSE means the connection is torn down mid-stream after the
-        // timeout. Streaming lifetime is the engine's `CancellationToken` to
-        // manage. (Same trap as `crate::client`.)
-        let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30));
-        if crate::client::is_loopback(&endpoint) {
-            builder = builder.no_proxy();
-        }
-        let http = builder
-            .build()
-            .map_err(|e| ModelError::Network(e.to_string()))?;
 
         Ok(Self {
             inner: Arc::new(Inner {
-                http,
+                net: Arc::new(LocalNetwork::default()),
                 endpoint,
                 api_key: api_key.into(),
                 extra_headers: Vec::new(),
@@ -138,14 +127,22 @@ impl OpenAICompatibleModel {
     pub fn endpoint(&self) -> &Url {
         &self.inner.endpoint
     }
+
+    /// Replace the egress. Same reason as on the Anthropic side: a deployment
+    /// that audits or goes offline has to be able to reach this one too.
+    pub fn with_network(mut self, net: Arc<dyn Network>) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.net = net;
+        self
+    }
 }
 
-// `Arc::make_mut` needs `Clone`; `reqwest::Client` is itself an `Arc` handle,
-// so this clones a handful of pointers, not a connection pool.
+// `Arc::make_mut` needs `Clone`; everything here is either a handle or a
+// short string, so this clones a handful of pointers.
 impl Clone for Inner {
     fn clone(&self) -> Self {
         Self {
-            http: self.http.clone(),
+            net: self.net.clone(),
             endpoint: self.endpoint.clone(),
             api_key: self.api_key.clone(),
             extra_headers: self.extra_headers.clone(),
@@ -181,34 +178,31 @@ fn chat_completions_url(base_url: &str) -> Result<Url, ModelError> {
 }
 
 /// One HTTP attempt, with the response classified into [`ModelError`].
-async fn send_once(
-    inner: &Inner,
-    req: &ChatCompletionsRequest,
-) -> Result<reqwest::Response, ModelError> {
-    let mut builder = inner
-        .http
-        .post(inner.endpoint.clone())
+async fn send_once(inner: &Inner, req: &ChatCompletionsRequest) -> Result<HttpStream, ModelError> {
+    let body = serde_json::to_vec(req)
+        .map_err(|e| ModelError::Internal(format!("serializing the request: {e}")))?;
+    let mut builder = HttpRequest::post(inner.endpoint.as_str())
         .header("content-type", "application/json")
-        .bearer_auth(&inner.api_key);
+        .header("authorization", format!("Bearer {}", inner.api_key));
     for (k, v) in &inner.extra_headers {
         builder = builder.header(k, v);
     }
 
-    let resp = builder
-        .json(req)
-        .send()
+    // `Origin::Operator`: see the same call on the Anthropic side.
+    let resp = inner
+        .net
+        .open(builder.body(body), Origin::Operator)
         .await
-        .map_err(|e| ModelError::Network(e.to_string()))?;
+        .map_err(exec_error)?;
 
-    let status = resp.status();
-    if status.is_success() {
+    let code = resp.status;
+    if (200..300).contains(&code) {
         return Ok(resp);
     }
-    let code = status.as_u16();
     // Truncate: an error body can be an entire HTML error page.
-    let body = resp.text().await.unwrap_or_default();
+    let body = drain_to_string(resp.body).await;
     let body = if body.len() > 4096 {
-        body[..4096].to_string()
+        body.chars().take(4096).collect()
     } else {
         body
     };
@@ -237,10 +231,39 @@ fn failure_kind(e: &ModelError) -> RequestFailure {
     }
 }
 
+/// The execution layer's three sentences in this protocol's vocabulary.
+///
+/// A policy refusal becomes `Internal`, not `Network`: `Network` is the class
+/// the backoff policy retries, and a second request meets the same policy.
+fn exec_error(e: base::interface::exec::ExecError) -> ModelError {
+    match e {
+        base::interface::exec::ExecError::Denied(m) => {
+            ModelError::Internal(format!("refused by egress policy: {m}"))
+        }
+        other => ModelError::Network(other.to_string()),
+    }
+}
+
+async fn drain_to_string(
+    mut body: futures::stream::BoxStream<
+        'static,
+        Result<Vec<u8>, base::interface::exec::ExecError>,
+    >,
+) -> String {
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(c) => buf.extend_from_slice(&c),
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 async fn send_with_retry(
     inner: &Inner,
     req: &ChatCompletionsRequest,
-) -> Result<reqwest::Response, ModelError> {
+) -> Result<HttpStream, ModelError> {
     let mut attempt = 0u32;
     loop {
         // A server that accepts the connection and then never responds would
@@ -326,8 +349,8 @@ impl Model for OpenAICompatibleModel {
                 }
             };
             let bytes = resp
-                .bytes_stream()
-                .map_err(|e| ModelError::Network(e.to_string()));
+                .body
+                .map(|c| c.map(bytes::Bytes::from).map_err(exec_error));
 
             let mut events = Box::pin(stream::events_from_bytes(bytes, STREAM_IDLE_TIMEOUT));
             while let Some(event) = futures::StreamExt::next(&mut events).await {

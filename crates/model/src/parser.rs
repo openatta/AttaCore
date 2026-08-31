@@ -14,7 +14,7 @@ use std::pin::Pin;
 pub type ParsedStream =
     Pin<Box<dyn Stream<Item = Result<StreamEvent, AnthropicError>> + Send + 'static>>;
 
-/// 输入：字节流（典型来自 `reqwest::Response::bytes_stream()` 或测试 fixture）
+/// 输入：字节流（典型来自 `Network::open` 的响应体或测试 fixture）
 /// 输出：StreamEvent 流（已 Box::pin，调用方直接 `.next()`）
 ///
 /// 错误处理：

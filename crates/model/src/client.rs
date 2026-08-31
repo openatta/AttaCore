@@ -1,4 +1,4 @@
-//! AnthropicClient trait + HttpAnthropicClient（reqwest 实现）。
+//! AnthropicClient trait + HttpAnthropicClient（走执行层 `Network` 的实现）。
 //!
 //! 重试 / beta header / 多 provider 都在 HttpAnthropicClient 内部；
 //! Engine 只看 trait。
@@ -10,8 +10,10 @@ use crate::types::MessagesRequest;
 use base::interface::backoff::{
     Backoff, BackoffPolicy, FailedAttempt, LadderBackoff, RequestFailure,
 };
-use futures::stream::{Stream, StreamExt, TryStreamExt};
-use std::collections::HashMap;
+use base::interface::exec::local::LocalNetwork;
+use base::interface::exec::{HttpRequest, HttpStream, Network, Origin};
+use futures::stream::{Stream, StreamExt};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,29 +50,25 @@ where
     }
 }
 
-/// 把 reqwest::Response 按状态码分流为 Ok(continue) / Err(分类后的 AnthropicError)。
+/// 把响应按状态码分流为 Ok(continue) / Err(分类后的 AnthropicError)。
 /// 抽到独立 fn：try_stream! 宏内的 ? 不能让借用检查器看出"err 分支总返回"。
-async fn classify_response(resp: reqwest::Response) -> Result<reqwest::Response, AnthropicError> {
-    let status = resp.status();
-    if status.is_success() {
+async fn classify_response(resp: HttpStream) -> Result<HttpStream, AnthropicError> {
+    let code = resp.status;
+    if (200..300).contains(&code) {
         return Ok(resp);
     }
-    let code = status.as_u16();
-    // 提前抓 retry-after / anthropic-ratelimit-* 头（resp.text() 后 headers 不可用了）
-    let retry_after = parse_retry_after(resp.headers());
+    let retry_after = parse_retry_after(&resp.headers);
     let mut anthropic_headers = HashMap::new();
-    for (name, value) in resp.headers() {
-        let n = name.as_str().to_lowercase();
+    for (name, value) in &resp.headers {
+        let n = name.to_ascii_lowercase();
         if n.starts_with("anthropic-ratelimit-") || n == "retry-after" {
-            if let Ok(v) = value.to_str() {
-                anthropic_headers.insert(n, v.to_string());
-            }
+            anthropic_headers.insert(n, value.clone());
         }
     }
     // 截掉超长 body 防止日志爆炸
-    let body = resp.text().await.unwrap_or_default();
+    let body = drain_to_string(resp.body).await;
     let body = if body.len() > 4096 {
-        body[..4096].to_string()
+        body.chars().take(4096).collect()
     } else {
         body
     };
@@ -85,33 +83,32 @@ async fn classify_response(resp: reqwest::Response) -> Result<reqwest::Response,
     })
 }
 
-/// A base URL pointing at this machine.
-///
-/// The ambient `HTTP(S)_PROXY` means "reach the internet through this egress",
-/// not "also proxy calls to my own machine" — but reqwest applies it to
-/// loopback targets too unless `NO_PROXY` carves them out, and a local relay,
-/// vLLM or Ollama endpoint is a configuration people really run. Same carve-out
-/// `tools::web_fetch` makes, for the same reason.
-pub(crate) fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        None => false,
+/// 把一个还没读的响应体读成字符串。错误当作提前结束——这里只用于错误 body，
+/// 读到多少算多少比再报一个覆盖掉状态码的错更有用。
+async fn drain_to_string(
+    mut body: futures::stream::BoxStream<
+        'static,
+        Result<Vec<u8>, base::interface::exec::ExecError>,
+    >,
+) -> String {
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(c) => buf.extend_from_slice(&c),
+            Err(_) => break,
+        }
     }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let v = headers.get("retry-after")?.to_str().ok()?;
+fn parse_retry_after(headers: &BTreeMap<String, String>) -> Option<Duration> {
+    let v = headers.get("retry-after")?;
     // RFC 7231 retry-after：要么数字秒数，要么 HTTP 时间。我们只支持数字秒数。
     v.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 /// 一次 HTTP send + classify。失败时按 AnthropicError 分类返回。
-async fn send_one(
-    inner: &HttpInner,
-    req: &MessagesRequest,
-) -> Result<reqwest::Response, AnthropicError> {
+async fn send_one(inner: &HttpInner, req: &MessagesRequest) -> Result<HttpStream, AnthropicError> {
     let url = inner
         .base
         .join("v1/messages")
@@ -119,9 +116,7 @@ async fn send_one(
 
     let body = serde_json::to_vec(req)?;
 
-    let mut builder = inner
-        .http
-        .post(url)
+    let mut builder = HttpRequest::post(url.as_str())
         .header("anthropic-version", inner.anthropic_version)
         .header("content-type", "application/json");
 
@@ -133,12 +128,12 @@ async fn send_one(
     match &inner.auth {
         AuthMode::ApiKey(k) => builder = builder.header("x-api-key", k),
         AuthMode::OauthToken(t) => {
-            builder = builder.bearer_auth(t);
+            builder = builder.header("authorization", format!("Bearer {t}"));
             push_unique(&mut betas, "oauth-2025-04-20");
         }
         AuthMode::OauthRefreshing(provider) => {
             let token = provider.current_bearer_token().await?;
-            builder = builder.bearer_auth(&token);
+            builder = builder.header("authorization", format!("Bearer {token}"));
             push_unique(&mut betas, "oauth-2025-04-20");
         }
     }
@@ -147,7 +142,10 @@ async fn send_one(
         builder = builder.header("anthropic-beta", betas.join(","));
     }
 
-    let resp = builder.body(body).send().await?;
+    // `Origin::Operator`: this endpoint is the deployment's own configuration.
+    // Binding it to `allowed_domains` would take the agent's model away from
+    // it the moment anyone wrote a domain list.
+    let resp = inner.net.open(builder.body(body), Origin::Operator).await?;
     classify_response(resp).await
 }
 
@@ -173,7 +171,7 @@ fn failure_kind(e: &AnthropicError) -> RequestFailure {
 async fn send_with_retry(
     inner: &HttpInner,
     req: &MessagesRequest,
-) -> Result<reqwest::Response, AnthropicError> {
+) -> Result<HttpStream, AnthropicError> {
     let mut attempt = 0u32;
     loop {
         // `send_one` 的 `.send().await` 只有 TCP connect_timeout（30s）——连上之后
@@ -263,7 +261,7 @@ pub struct HttpAnthropicClient {
 }
 
 struct HttpInner {
-    http: reqwest::Client,
+    net: Arc<dyn Network>,
     base: Url,
     auth: AuthMode,
     anthropic_version: &'static str,
@@ -278,27 +276,23 @@ impl HttpAnthropicClient {
 
     /// 自定义 base URL（用于本地 mock server / Bedrock relay 等）。
     pub fn with_base(auth: AuthMode, base: Url) -> Result<Self, AnthropicError> {
-        // **重要**：不使用 ClientBuilder::timeout()，因为它会包装整个响应体流，
-        // 对于 SSE 流式场景会导致连接在 300s 后断开。流式超时由引擎层 CancellationToken 负责。
-        let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-            // 连接超时：30s 内连不上就放弃
-            .connect_timeout(Duration::from_secs(30));
-        if is_loopback(&base) {
-            builder = builder.no_proxy();
-        }
-        let http = builder
-            .build()
-            .map_err(|e| AnthropicError::Transport(anyhow::Error::new(e)))?;
         Ok(Self {
             inner: Arc::new(HttpInner {
-                http,
+                net: Arc::new(LocalNetwork::default()),
                 base,
                 auth,
                 anthropic_version: "2023-06-01",
                 backoff: Arc::new(LadderBackoff::new()),
             }),
         })
+    }
+
+    /// 换掉出口。宿主要审计、限速或整体离线时，模型 API 也要走它那一条。
+    pub fn with_network(mut self, net: Arc<dyn Network>) -> Self {
+        let mut inner = (*self.inner).clone_with_backoff(self.inner.backoff.clone());
+        inner.net = net;
+        self.inner = Arc::new(inner);
+        self
     }
 
     /// 自定义退避序列（毫秒）。测试用——缩短重试间隔避免拖长 CI。
@@ -317,7 +311,7 @@ impl HttpAnthropicClient {
 impl HttpInner {
     fn clone_with_backoff(&self, backoff: Arc<dyn BackoffPolicy>) -> Self {
         Self {
-            http: self.http.clone(),
+            net: self.net.clone(),
             base: self.base.clone(),
             auth: self.auth.clone(),
             anthropic_version: self.anthropic_version,
@@ -335,10 +329,9 @@ impl AnthropicClient for HttpAnthropicClient {
             // 流中错（或服务端 error 事件）不重试 —— 避免重复计 token。
             let resp = send_with_retry(&inner, &req).await?;
 
-            // bytes_stream 的 Err 是 reqwest::Error，转成 AnthropicError 才能喂 parse_sse
             let byte_stream = resp
-                .bytes_stream()
-                .map_err(|e| AnthropicError::Transport(anyhow::Error::new(e)));
+                .body
+                .map(|c| c.map(bytes::Bytes::from).map_err(AnthropicError::from));
 
             let mut events = parse_sse(byte_stream);
             while let Some(ev) = next_with_idle_timeout(&mut events, STREAM_IDLE_TIMEOUT).await {
@@ -358,20 +351,6 @@ impl AnthropicClient for HttpAnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_base_url_on_this_machine_is_recognised_as_loopback() {
-        for local in [
-            "http://127.0.0.1:8080/",
-            "http://localhost:11434/",
-            "http://[::1]:8080/",
-        ] {
-            assert!(is_loopback(&Url::parse(local).unwrap()), "{local}");
-        }
-        for remote in ["https://api.anthropic.com/", "https://gw.internal/v1/"] {
-            assert!(!is_loopback(&Url::parse(remote).unwrap()), "{remote}");
-        }
-    }
 
     /// trait object 可以装 —— 这是给 Engine 用的方式。
     #[test]

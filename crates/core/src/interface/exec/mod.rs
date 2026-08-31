@@ -27,7 +27,7 @@ pub mod process;
 pub mod sandbox;
 
 pub use filesystem::{DirEntry, FileSystem, Metadata};
-pub use network::{HttpRequest, HttpResponse, Network, Origin};
+pub use network::{HttpRequest, HttpResponse, HttpStream, Network, Origin, DEFAULT_MAX_REDIRECTS};
 pub use process::{ExitStatus, OutputChunk, OutputStream, Process, ProcessHandle, ProcessSpec};
 pub use sandbox::{
     default_deny_read, Confined, Enforcement, NetworkMode, Sandbox, SandboxMode, SandboxPolicy,

@@ -42,7 +42,7 @@ impl ModelFactory for AnthropicFactory {
                 if !url.ends_with('/') {
                     url.push('/');
                 }
-                let base = reqwest::Url::parse(&url).map_err(|e| {
+                let base = url::Url::parse(&url).map_err(|e| {
                     format!("provider '{provider_id}': invalid base_url '{url}': {e}")
                 })?;
                 Arc::new(

@@ -1,7 +1,12 @@
 //! GrowthBook-style feature flag client.
 //!
 //! Remote evaluation with cache-first access, disk persistence,
-#![allow(clippy::match_like_matches_macro, clippy::if_same_then_else, clippy::manual_strip, clippy::question_mark)]
+#![allow(
+    clippy::match_like_matches_macro,
+    clippy::if_same_then_else,
+    clippy::manual_strip,
+    clippy::question_mark
+)]
 //! A/B experiment logging, and killswitch support.
 //!
 //! Killswitch convention: flags with the `tengu_frond_boric` prefix or
@@ -330,33 +335,7 @@ impl FeatureFlagClient {
             return Err(FeatureFlagError::NotConfigured);
         }
 
-        let url = format!("{}/api/flags", self.endpoint.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| FeatureFlagError::Http(e.to_string()))?;
-
-        let resp = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                FeatureFlagError::Http(format!("request failed: {e}"))
-            })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(FeatureFlagError::Http(format!(
-                "status {status}: {body}"
-            )));
-        }
-
-        let body: RemoteFlagsResponse = resp.json().await.map_err(|e| {
-            FeatureFlagError::Parse(format!("failed to parse response: {e}"))
-        })?;
+        let body = fetch_remote_flags(&self.endpoint, &self.api_key).await?;
 
         self.apply_flags(body);
         self.cache_timestamp = Instant::now();
@@ -375,11 +354,11 @@ impl FeatureFlagClient {
             return Err(FeatureFlagError::NotConfigured);
         };
 
-        let data = std::fs::read_to_string(path)
-            .map_err(|e| FeatureFlagError::Io(e.to_string()))?;
+        let data =
+            std::fs::read_to_string(path).map_err(|e| FeatureFlagError::Io(e.to_string()))?;
 
-        let body: RemoteFlagsResponse = serde_json::from_str(&data)
-            .map_err(|e| FeatureFlagError::Parse(e.to_string()))?;
+        let body: RemoteFlagsResponse =
+            serde_json::from_str(&data).map_err(|e| FeatureFlagError::Parse(e.to_string()))?;
 
         self.apply_flags(body);
         self.cache_timestamp = Instant::now();
@@ -442,10 +421,7 @@ impl FeatureFlagClient {
 
     /// Check whether a killswitch is active for the given flag.
     fn is_killswitched(&self, flag_name: &str) -> bool {
-        self.killswitches
-            .get(flag_name)
-            .copied()
-            .unwrap_or(false)
+        self.killswitches.get(flag_name).copied().unwrap_or(false)
     }
 
     /// Apply raw flag definitions to internal state, re-evaluating all flags.
@@ -573,7 +549,9 @@ impl FeatureFlagClient {
         }
 
         // "userId == <value>"
-        if let Some(val) = cond.strip_prefix("userId ==").or_else(|| cond.strip_prefix("userId=="))
+        if let Some(val) = cond
+            .strip_prefix("userId ==")
+            .or_else(|| cond.strip_prefix("userId=="))
         {
             let val = val.trim().trim_matches('"').trim_matches('\'');
             return context.user_id.as_deref() == Some(val);
@@ -601,8 +579,7 @@ impl FeatureFlagClient {
     /// Match a condition without user context (for no-context evaluation).
     fn condition_matches_no_context(&self, condition: &str) -> bool {
         let cond = condition.trim();
-        cond.eq_ignore_ascii_case("all")
-            || cond.starts_with("percentRollout(")
+        cond.eq_ignore_ascii_case("all") || cond.starts_with("percentRollout(")
     }
 
     /// Stable rollout check using a hash of the flag key.
@@ -628,8 +605,7 @@ impl FeatureFlagClient {
         };
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| FeatureFlagError::Io(e.to_string()))?;
+            std::fs::create_dir_all(parent).map_err(|e| FeatureFlagError::Io(e.to_string()))?;
         }
 
         let wrapper = RemoteFlagsResponse {
@@ -642,10 +618,8 @@ impl FeatureFlagClient {
 
         // Atomic write: write to temp then rename
         let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &data)
-            .map_err(|e| FeatureFlagError::Io(e.to_string()))?;
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| FeatureFlagError::Io(e.to_string()))?;
+        std::fs::write(&tmp_path, &data).map_err(|e| FeatureFlagError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| FeatureFlagError::Io(e.to_string()))?;
 
         Ok(())
     }
@@ -796,6 +770,8 @@ pub fn spawn_refresh_task(
     })
 }
 
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Fetch flags from the remote endpoint (no lock held).
 async fn fetch_remote_flags(
     endpoint: &str,
@@ -806,27 +782,34 @@ async fn fetch_remote_flags(
     }
 
     let url = format!("{}/api/flags", endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| FeatureFlagError::Http(e.to_string()))?;
+    let net = base::interface::exec::local::LocalNetwork::default();
+    // `Origin::Operator`: the flag endpoint is deployment configuration.
+    let req = base::interface::exec::HttpRequest::get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Accept", "application/json");
+    let sending =
+        base::interface::exec::Network::send(&net, req, base::interface::exec::Origin::Operator);
 
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| FeatureFlagError::Http(format!("request failed: {e}")))?;
+    let resp = match tokio::time::timeout(FETCH_TIMEOUT, sending).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(FeatureFlagError::Http(format!("request failed: {e}"))),
+        Err(_elapsed) => {
+            return Err(FeatureFlagError::Http(format!(
+                "request failed: no response within {}s",
+                FETCH_TIMEOUT.as_secs()
+            )))
+        }
+    };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(FeatureFlagError::Http(format!("status {status}: {body}")));
+    if !(200..300).contains(&resp.status) {
+        return Err(FeatureFlagError::Http(format!(
+            "status {}: {}",
+            resp.status,
+            resp.body_text()
+        )));
     }
 
-    resp.json()
-        .await
+    serde_json::from_slice(&resp.body)
         .map_err(|e| FeatureFlagError::Parse(format!("failed to parse response: {e}")))
 }
 
@@ -871,17 +854,19 @@ mod tests {
     #[test]
     fn is_enabled_checks_cache() {
         let mut client = FeatureFlagClient::new("".into(), "".into());
-        client.cache.insert("test_flag".into(), FlagValue::Bool(true));
+        client
+            .cache
+            .insert("test_flag".into(), FlagValue::Bool(true));
         assert!(client.is_enabled("test_flag"));
     }
 
     #[test]
     fn is_enabled_returns_false_for_killswitched_flag() {
         let mut client = FeatureFlagClient::new("".into(), "".into());
-        client.cache.insert("test_flag".into(), FlagValue::Bool(true));
         client
-            .killswitches
-            .insert("test_flag".into(), true);
+            .cache
+            .insert("test_flag".into(), FlagValue::Bool(true));
+        client.killswitches.insert("test_flag".into(), true);
         assert!(!client.is_enabled("test_flag"));
     }
 
@@ -891,9 +876,7 @@ mod tests {
         client
             .cache
             .insert("test_flag".into(), FlagValue::String("hello".into()));
-        client
-            .killswitches
-            .insert("test_flag".into(), true);
+        client.killswitches.insert("test_flag".into(), true);
         assert!(client.get_value("test_flag").is_none());
     }
 

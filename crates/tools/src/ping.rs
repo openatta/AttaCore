@@ -1,12 +1,13 @@
 //! PingTool —— "Ping"。
 //!
-//! 对给定 URL 发起一个 HTTP HEAD 请求，返回延迟（latency_ms）和 HTTP 状态码。
-//! 不下载响应体，仅验证可达性与响应速度。
+//! 通过执行层的 `Network` 对给定 URL 发起一个 HTTP HEAD 请求，返回延迟
+//! （latency_ms）和 HTTP 状态码。不下载响应体，仅验证可达性与响应速度。
 //! 超时 10s，重定向跟随但不计跳转时间差异。
 
 use crate::cancel::run_with_cancel;
 use async_trait::async_trait;
 use base::error::ToolError;
+use base::interface::exec::{HttpRequest, Origin};
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
     ValidationResult,
@@ -17,6 +18,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REDIRECTS: u8 = 3;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PingInput {
@@ -90,27 +92,14 @@ impl Tool for PingTool {
     ) -> Result<ToolResult, ToolError> {
         let input: PingInput = serde_json::from_value(input)?;
 
-        let mut builder = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .user_agent(concat!("attacode/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::limited(3));
-        // See `crate::security::is_loopback_url`'s doc comment — a loopback
-        // ping target should never go through the ambient HTTP(S)_PROXY.
-        if crate::security::is_loopback_url(&input.url) {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| ToolError::exec(format!("{e}")))?;
-
+        let req = HttpRequest::new("HEAD", &input.url).max_redirects(MAX_REDIRECTS);
         let start = Instant::now();
-        let resp = run_with_cancel(&ctx.cancel, client.head(&input.url).send()).await?;
+        let sending = tokio::time::timeout(TIMEOUT, ctx.exec.network.send(req, Origin::Agent));
 
-        match resp {
-            Ok(resp) => {
-                let elapsed = start.elapsed();
-                let latency_ms = elapsed.as_millis();
-                let status = resp.status().as_u16();
+        match run_with_cancel(&ctx.cancel, sending).await? {
+            Ok(Ok(resp)) => {
+                let latency_ms = start.elapsed().as_millis();
+                let status = resp.status;
 
                 let msg = if let Some(ref label) = input.label {
                     format!("[latency: {latency_ms} ms | HTTP {status} | label: {label}]")
@@ -119,12 +108,8 @@ impl Tool for PingTool {
                 };
                 Ok(ToolResult::text(msg))
             }
-            Err(e) if e.is_timeout() => Err(ToolError::Timeout(TIMEOUT)),
-            Err(e) if e.is_connect() => Err(ToolError::exec(format!(
-                "connection refused for {}: {e}",
-                input.url
-            ))),
-            Err(e) => Err(ToolError::exec(format!("ping failed: {e}"))),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_elapsed) => Err(ToolError::Timeout(TIMEOUT)),
         }
     }
 }

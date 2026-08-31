@@ -15,7 +15,6 @@ plugin   = { workspace = true }
 anyhow   = { workspace = true }
 hex      = { workspace = true }
 sha2     = { workspace = true }
-reqwest  = { workspace = true }
 tokio    = { workspace = true }
 tokio-util = { workspace = true }
 tracing  = { workspace = true }

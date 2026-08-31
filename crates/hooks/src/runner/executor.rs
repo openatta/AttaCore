@@ -72,20 +72,34 @@ impl HookRunner {
         let timeout_dur = timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(self.default_timeout);
-        let mut req = self.http().post(url).timeout(timeout_dur).json(input);
+        let payload = match serde_json::to_vec(input) {
+            Ok(p) => p,
+            Err(e) => return HookOutcome::Error(format!("http hook payload: {e}")),
+        };
+        let mut req = base::interface::exec::HttpRequest::post(url)
+            .header("content-type", "application/json")
+            .body(payload);
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => return HookOutcome::Error(format!("http hook send: {e}")),
+        // `Origin::Operator`: an HTTP hook endpoint is written in settings.json
+        // by whoever runs this engine, not chosen by the model.
+        let sending = self
+            .net()
+            .send(req, base::interface::exec::Origin::Operator);
+        let resp = match tokio::time::timeout(timeout_dur, sending).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return HookOutcome::Error(format!("http hook send: {e}")),
+            Err(_elapsed) => {
+                return HookOutcome::Error(format!(
+                    "http hook send: no response within {}ms",
+                    timeout_dur.as_millis()
+                ))
+            }
         };
-        let status = resp.status();
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => return HookOutcome::Error(format!("http hook body: {e}")),
-        };
-        if !status.is_success() {
+        let status = resp.status;
+        let body = resp.body_text();
+        if !(200..300).contains(&status) {
             return HookOutcome::Error(format!("http hook {status}: {}", truncate(&body, 500)));
         }
         let response = parse_hook_response_lenient(&body);

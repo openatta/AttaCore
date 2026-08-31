@@ -51,6 +51,13 @@ pub enum AnthropicError {
     /// 解析错误（意外类型 / 格式）
     #[error("parse error: {0}")]
     ParseError(String),
+
+    /// 出口策略拒绝了这次连接（离线运行、宿主自己的限制）。
+    ///
+    /// 独立成一类，是因为它**不该重试**——再发一次撞的是同一条策略——
+    /// 而 `Transport` 会被退避策略当成值得再试一次的那一类。
+    #[error("refused by egress policy: {0}")]
+    Denied(String),
 }
 
 impl AnthropicError {
@@ -76,8 +83,11 @@ impl AnthropicError {
     }
 }
 
-impl From<reqwest::Error> for AnthropicError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Transport(anyhow::Error::new(e))
+impl From<base::interface::exec::ExecError> for AnthropicError {
+    fn from(e: base::interface::exec::ExecError) -> Self {
+        match e {
+            base::interface::exec::ExecError::Denied(m) => Self::Denied(m),
+            other => Self::Transport(anyhow::Error::new(other)),
+        }
     }
 }

@@ -10,7 +10,6 @@ description  = "AttaCore — OAuth 2.0 PKCE client"
 [dependencies]
 base          = { workspace = true }
 tokio         = { workspace = true }
-reqwest       = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }
