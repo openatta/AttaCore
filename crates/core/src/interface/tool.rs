@@ -21,6 +21,10 @@ pub struct SandboxSettings {
     pub deny_read: Vec<PathBuf>,
     pub allowed_domains: Vec<String>,
     pub network_mode: NetworkModeConfig,
+    /// See `base::settings::SandboxConfig::deny_write`.
+    pub deny_write: Vec<String>,
+    /// See `base::settings::SandboxConfig::allow_write`.
+    pub allow_write: Vec<PathBuf>,
     /// See `base::context::config::SandboxPolicyConfig::state_root`.
     pub state_root: Option<PathBuf>,
     /// See `base::settings::SandboxConfig::require_enforcement`.

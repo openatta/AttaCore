@@ -73,61 +73,35 @@ pub fn canonicalize_best_effort(p: &Path) -> PathBuf {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cwd_path_is_allowed() {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-        let target = cwd.join("test.txt");
-        assert!(validate_path_within_bounds(&target, &cwd, &[]).is_ok());
+/// The write policy for this call, with every root resolved by the same
+/// filesystem the target is resolved by.
+///
+/// Both sides have to be resolved or neither. `/tmp` is a symlink to
+/// `/private/tmp` on macOS, and a project reached through any symlink has the
+/// same shape: resolve the target only, and it looks like it sits outside a
+/// root it is actually inside, so the write is refused for being somewhere it
+/// is not.
+pub async fn write_policy(ctx: &base::tool::ToolContext) -> permissions::path_safety::WritePolicy {
+    let fs = &*ctx.exec.filesystem;
+    let root = fs.canonicalize_best_effort(&ctx.cwd).await;
+    let mut additional = Vec::with_capacity(ctx.additional_writable_dirs.len());
+    for dir in &ctx.additional_writable_dirs {
+        additional.push(fs.canonicalize_best_effort(dir).await);
     }
-
-    #[test]
-    fn detects_traversal() {
-        assert!(contains_path_traversal(Path::new("../etc/passwd")));
-        assert!(!contains_path_traversal(Path::new("foo/bar.txt")));
+    let mut allowed = Vec::with_capacity(ctx.sandbox.allow_write.len());
+    for path in &ctx.sandbox.allow_write {
+        allowed.push(fs.canonicalize_best_effort(path).await);
     }
+    permissions::path_safety::WritePolicy::new(root)
+        .with_additional_roots(additional)
+        .with_extra_blacklist(ctx.sandbox.deny_write.clone())
+        .with_allowed(allowed)
 }
+
+
 
 // ── Write policy types ──
 
-#[derive(Debug, Clone)]
-pub enum PathSafetyError {
-    OutsideAllowedRoots {
-        path: PathBuf,
-        allowed: Vec<PathBuf>,
-    },
-    Other(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct WritePolicy {
-    roots: Vec<PathBuf>,
-}
-impl WritePolicy {
-    pub fn new(cwd: PathBuf) -> Self {
-        Self { roots: vec![cwd] }
-    }
-    pub fn with_additional_roots(mut self, roots: Vec<PathBuf>) -> Self {
-        self.roots.extend(roots);
-        self
-    }
-}
-
-pub fn check_write(path: &Path, policy: &WritePolicy) -> Result<(), PathSafetyError> {
-    let resolved = canonicalize_best_effort(path);
-    for root in &policy.roots {
-        if resolved.starts_with(canonicalize_best_effort(root)) {
-            return Ok(());
-        }
-    }
-    Err(PathSafetyError::OutsideAllowedRoots {
-        path: path.to_path_buf(),
-        allowed: policy.roots.clone(),
-    })
-}
 
 pub fn is_path_within_root(path: &Path, root: &Path) -> bool {
     canonicalize_best_effort(path).starts_with(canonicalize_best_effort(root))
@@ -147,4 +121,22 @@ pub fn normalize_path_lexically(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cwd_path_is_allowed() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let target = cwd.join("test.txt");
+        assert!(validate_path_within_bounds(&target, &cwd, &[]).is_ok());
+    }
+
+    #[test]
+    fn detects_traversal() {
+        assert!(contains_path_traversal(Path::new("../etc/passwd")));
+        assert!(!contains_path_traversal(Path::new("foo/bar.txt")));
+    }
 }

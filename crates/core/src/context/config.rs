@@ -229,6 +229,12 @@ pub struct SandboxPolicyConfig {
     pub deny_read: Option<Vec<PathBuf>>,
     pub network_mode: NetworkModeConfig,
     pub allowed_domains: Vec<String>,
+    /// Extra filename segments no tool may write. See
+    /// `base::settings::SandboxConfig::deny_write`.
+    pub deny_write: Vec<String>,
+    /// Paths exempt from the write deny rules. See
+    /// `base::settings::SandboxConfig::allow_write`.
+    pub allow_write: Vec<PathBuf>,
     /// This instance's global state root, so the profile can protect the
     /// settings.json files that actually govern it. `None` means the caller
     /// didn't say, and the sandbox falls back to `$HOME/.atta` — which is
@@ -351,6 +357,8 @@ impl EngineConfig {
         // own documented Option semantics.
         c.sandbox_policy = SandboxPolicyConfig {
             allow_read: settings.sandbox.allow_read.clone(),
+            deny_write: settings.sandbox.deny_write.clone(),
+            allow_write: settings.sandbox.allow_write.clone(),
             deny_read: if settings.sandbox.deny_read.is_empty() {
                 None
             } else {

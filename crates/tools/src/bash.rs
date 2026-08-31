@@ -1288,6 +1288,8 @@ mod tests {
             network_mode: base::context::config::NetworkModeConfig::Allowlist,
             state_root: None,
             require_enforcement: false,
+            deny_write: Vec::new(),
+            allow_write: Vec::new(),
         };
         let policy = to_sandbox_policy(&settings);
         assert_eq!(policy.deny_read, vec![PathBuf::from("/tmp/secret")]);
@@ -1646,6 +1648,8 @@ mod allow_read_tests {
             network_mode: base::context::config::NetworkModeConfig::Unrestricted,
             state_root: None,
             require_enforcement: false,
+            deny_write: Vec::new(),
+            allow_write: Vec::new(),
         };
         let policy = to_sandbox_policy(&settings);
         assert_eq!(policy.allow_read, vec![PathBuf::from("/home/u/.npmrc")]);

@@ -3134,6 +3134,8 @@ fn sandbox_settings_from(config: &base::context::EngineConfig) -> base::tool::Sa
         deny_read: config.sandbox_policy.deny_read.clone().unwrap_or_default(),
         allowed_domains: config.sandbox_policy.allowed_domains.clone(),
         network_mode: config.sandbox_policy.network_mode,
+        deny_write: config.sandbox_policy.deny_write.clone(),
+        allow_write: config.sandbox_policy.allow_write.clone(),
         state_root: config.sandbox_policy.state_root.clone(),
         require_enforcement: config.sandbox_policy.require_enforcement,
     }
@@ -4168,6 +4170,8 @@ mod sandbox_settings_tests {
             allowed_domains: vec!["api.example.com".into()],
             state_root: None,
             require_enforcement: false,
+            deny_write: Vec::new(),
+            allow_write: Vec::new(),
         };
 
         let s = sandbox_settings_from(&config);

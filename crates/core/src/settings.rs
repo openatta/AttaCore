@@ -511,6 +511,27 @@ pub struct SandboxConfig {
     /// Without this there was no way to say "yes, that one is fine here".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_read: Vec<PathBuf>,
+    /// Extra filename segments a tool may never write, on top of the built-in
+    /// credential defaults (`.env`, `id_rsa`, `.ssh`, `.atta`, ...). A path is
+    /// refused if *any* of its components matches one, or begins with one
+    /// followed by a dot — so `.env` also covers `.env.production`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_write: Vec<String>,
+    /// Paths to re-allow writing, on top of the built-in deny defaults. Most
+    /// specific wins.
+    ///
+    /// The write-side counterpart of [`allow_read`](Self::allow_read), and it
+    /// exists for the same reason: the defaults sit on real workflows. A
+    /// project that keeps a checked-in `.env.example`, or a deployment whose
+    /// agent is meant to maintain a private-registry `.npmrc`, has to be able
+    /// to say "that one is fine here".
+    ///
+    /// This exempts a path from the *deny* rules only. Where a tool may write
+    /// at all is a different question, answered by `additional_directories` —
+    /// keeping them apart is what stops one setting quietly widening the
+    /// project boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_write: Vec<PathBuf>,
     pub allowed_domains: Vec<String>,
     /// Outbound network policy for sandboxed `Bash` commands.
     #[serde(default)]

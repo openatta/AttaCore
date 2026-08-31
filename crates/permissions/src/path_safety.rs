@@ -21,6 +21,24 @@ const DEFAULT_FILENAME_BLACKLIST: &[&str] = &[
     ".pgpass",
 ];
 
+/// Not secrets — files a tool should not casually rewrite.
+///
+/// `.atta` and `.claude` hold the settings a tool is judged by, so a tool that
+/// can rewrite them can rewrite its own rules. The lockfiles and `.gitignore`
+/// are here because they are generated or curated, and a model editing one
+/// directly is nearly always doing it the wrong way round.
+///
+/// Denied like the credential list, and exempted the same way — a deployment
+/// whose agent is supposed to maintain a `.gitignore` says so in
+/// `sandbox.allow_write`.
+const GUARDED_FILENAMES: &[&str] = &[
+    ".atta",
+    ".claude",
+    ".gitignore",
+    "package-lock.json",
+    "Cargo.lock",
+];
+
 /// 不论 cwd 在哪，下面这些系统目录都拒写。
 const ABSOLUTE_DENY_PREFIXES: &[&str] = &[
     "/etc",
@@ -43,6 +61,14 @@ pub struct WritePolicy {
     pub additional_roots: Vec<PathBuf>,
     /// 路径里任意 component 命中就拒（除默认黑名单外的扩展项）
     pub extra_blacklist: Vec<String>,
+    /// Paths exempt from the deny rules — the filename blacklist and the
+    /// system-directory list, not the root containment check.
+    ///
+    /// Without this the defaults are a wall rather than a policy: a project
+    /// with a checked-in `.env.example` had no way to say so, and the only
+    /// available answer was to not run the check at all. Which is what
+    /// happened.
+    pub allow: Vec<PathBuf>,
 }
 
 impl WritePolicy {
@@ -52,7 +78,14 @@ impl WritePolicy {
             primary_root,
             additional_roots: Vec::new(),
             extra_blacklist: Vec::new(),
+            allow: Vec::new(),
         }
+    }
+
+    /// Builder: paths the deny rules do not apply to.
+    pub fn with_allowed(mut self, paths: Vec<PathBuf>) -> Self {
+        self.allow = paths;
+        self
     }
 
     /// Builder: set additional roots.
@@ -238,30 +271,31 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
         }
     }
 
-    // 6. 系统目录硬黑名单
-    for prefix in ABSOLUTE_DENY_PREFIXES {
-        if target.starts_with(prefix) {
-            return Err(PathSafetyError::SystemPathDenied(target.to_path_buf()));
-        }
-    }
-
-    // 7. 文件名黑名单（任意 component 命中即拒）
-    for c in target.components() {
-        if let Component::Normal(name) = c {
-            let s = name.to_string_lossy();
-            for &b in DEFAULT_FILENAME_BLACKLIST {
-                if s == b || s.starts_with(&format!("{b}.")) {
-                    return Err(PathSafetyError::BlacklistedFilename {
-                        path: target.to_path_buf(),
-                        matched: b.to_string(),
-                    });
-                }
+    // Steps 6 and 7 are the ones a deployment can carve exceptions out of.
+    // Root containment below is not: an exception says "this sensitive name
+    // is fine here", never "this path may be outside the project".
+    if !policy.allow.iter().any(|a| starts_within(target, a)) {
+        // 6. 系统目录硬黑名单
+        for prefix in ABSOLUTE_DENY_PREFIXES {
+            if target.starts_with(prefix) {
+                return Err(PathSafetyError::SystemPathDenied(target.to_path_buf()));
             }
-            for b in &policy.extra_blacklist {
-                if s == *b || s.starts_with(&format!("{b}.")) {
+        }
+
+        // 7. 文件名黑名单（任意 component 命中即拒）
+        for c in target.components() {
+            if let Component::Normal(name) = c {
+                let s = name.to_string_lossy();
+                let hit = DEFAULT_FILENAME_BLACKLIST
+                    .iter()
+                    .chain(GUARDED_FILENAMES.iter())
+                    .map(|b| b.to_string())
+                    .chain(policy.extra_blacklist.iter().cloned())
+                    .find(|b| s == *b || s.starts_with(&format!("{b}.")));
+                if let Some(matched) = hit {
                     return Err(PathSafetyError::BlacklistedFilename {
                         path: target.to_path_buf(),
-                        matched: b.clone(),
+                        matched,
                     });
                 }
             }
@@ -509,8 +543,53 @@ mod tests {
     fn allows_normal_dotfiles() {
         let p = policy("/tmp/work");
         // 黑名单只匹配特定文件名，不是所有 dotfile
-        assert!(check_write(Path::new("/tmp/work/.gitignore"), &p).is_ok());
         assert!(check_write(Path::new("/tmp/work/.editorconfig"), &p).is_ok());
+        assert!(check_write(Path::new("/tmp/work/.prettierrc"), &p).is_ok());
+    }
+
+    /// The guarded list is not about secrets: these are generated or curated
+    /// files a model editing directly is usually doing the wrong way round.
+    /// They were denied by a list inside `FileWrite`; they are denied here
+    /// now, which is the same answer from somewhere a deployment can reach.
+    #[test]
+    fn guarded_files_are_denied_but_a_deployment_can_say_otherwise() {
+        let p = policy("/tmp/work");
+        for name in [".gitignore", "Cargo.lock", "package-lock.json"] {
+            let path = PathBuf::from("/tmp/work").join(name);
+            assert!(
+                matches!(
+                    check_write(&path, &p),
+                    Err(PathSafetyError::BlacklistedFilename { .. })
+                ),
+                "{name} should be guarded"
+            );
+        }
+
+        let permitted = policy("/tmp/work").with_allowed(vec![PathBuf::from("/tmp/work/.gitignore")]);
+        assert!(
+            check_write(Path::new("/tmp/work/.gitignore"), &permitted).is_ok(),
+            "an exemption is what makes the default a policy rather than a wall"
+        );
+        assert!(
+            matches!(
+                check_write(Path::new("/tmp/work/Cargo.lock"), &permitted),
+                Err(PathSafetyError::BlacklistedFilename { .. })
+            ),
+            "and it exempts what it names, not everything"
+        );
+    }
+
+    /// An exemption lifts the deny rules, never the project boundary.
+    #[test]
+    fn an_exemption_does_not_let_a_write_leave_the_project() {
+        let p = policy("/tmp/work").with_allowed(vec![PathBuf::from("/etc")]);
+        assert!(
+            matches!(
+                check_write(Path::new("/etc/passwd"), &p),
+                Err(PathSafetyError::OutsideAllowedRoots { .. })
+            ),
+            "otherwise one setting would quietly widen where a tool may write"
+        );
     }
 
     #[test]

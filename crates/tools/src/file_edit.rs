@@ -199,28 +199,6 @@ impl Tool for FileEditTool {
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
         // 1. 路径安全（与 Write 同款）
         if let Ok(parsed) = serde_json::from_value::<FileEditInput>(input.clone()) {
-            // Deny sensitive paths by filename pattern
-            let file_name = std::path::Path::new(&parsed.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let path_str = &parsed.file_path;
-            if file_name.starts_with(".env")
-                || file_name == ".gitignore"
-                || file_name == "package-lock.json"
-                || file_name == "Cargo.lock"
-                || path_str.contains("/.claude/")
-                || path_str.starts_with(".claude/")
-                || path_str.starts_with("./.claude/")
-                || path_str.contains("/.atta/")
-                || path_str.starts_with(".atta/")
-                || path_str.starts_with("./.atta/")
-            {
-                return PermissionDecision::Deny {
-                    reason: Some(format!("Edit of sensitive file '{file_name}' is denied")),
-                    decision_reason: Some("path_safety".into()),
-                };
-            }
             let path = if PathBuf::from(&parsed.file_path).is_absolute() {
                 PathBuf::from(parsed.file_path)
             } else {
@@ -228,15 +206,14 @@ impl Tool for FileEditTool {
             };
             let path = crate::security::normalize_path_lexically(&path);
             let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
-            let policy = crate::security::WritePolicy::new(ctx.cwd.clone())
-                .with_additional_roots(ctx.additional_writable_dirs.clone());
-            match crate::security::check_write(&path, &policy) {
+            let policy = crate::security::write_policy(ctx).await;
+            match permissions::path_safety::check_write(&path, &policy) {
                 Ok(()) => {
                     return PermissionDecision::Allow {
                         decision_reason: Some("project_write".into()),
                     };
                 }
-                Err(crate::security::PathSafetyError::OutsideAllowedRoots { .. }) => {
+                Err(permissions::path_safety::PathSafetyError::OutsideAllowedRoots { .. }) => {
                     return PermissionDecision::Ask {
                         message: "Edit outside the project requires confirmation".into(),
                         decision_reason: None,

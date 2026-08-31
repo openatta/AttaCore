@@ -79,14 +79,30 @@ pub trait FileSystem: Send + Sync {
     /// answers the question the policy actually asks — "where would this land"
     /// — for both cases.
     async fn canonicalize_best_effort(&self, path: &Path) -> PathBuf {
-        if let Ok(resolved) = self.canonicalize(path).await {
-            return resolved;
-        }
-        if let Some(parent) = path.parent() {
-            if let Ok(resolved_parent) = self.canonicalize(parent).await {
-                return resolved_parent.join(path.file_name().unwrap_or_default());
+        // Walk up to the deepest ancestor that exists, resolve that, and put
+        // the rest back on. Stopping at the immediate parent is not enough for
+        // the case this mostly serves — a file about to be created, often in a
+        // directory about to be created with it — and the difference matters
+        // when an ancestor is a symlink: an unresolved target compared against
+        // a resolved root looks like it is somewhere it is not.
+        let mut unresolved: Vec<std::ffi::OsString> = Vec::new();
+        let mut cursor = path;
+        loop {
+            if let Ok(resolved) = self.canonicalize(cursor).await {
+                let mut out = resolved;
+                for part in unresolved.iter().rev() {
+                    out.push(part);
+                }
+                return out;
+            }
+            let Some(name) = cursor.file_name() else {
+                return path.to_path_buf();
+            };
+            unresolved.push(name.to_os_string());
+            match cursor.parent() {
+                Some(p) if !p.as_os_str().is_empty() => cursor = p,
+                _ => return path.to_path_buf(),
             }
         }
-        path.to_path_buf()
     }
 }

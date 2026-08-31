@@ -113,11 +113,10 @@ impl Tool for NotebookEditTool {
             crate::security::normalize_path_lexically(&resolved)
         };
         let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
-        let policy = crate::security::WritePolicy::new(ctx.cwd.clone())
-            .with_additional_roots(ctx.additional_writable_dirs.clone());
-        match crate::security::check_write(&path, &policy) {
+        let policy = crate::security::write_policy(ctx).await;
+        match permissions::path_safety::check_write(&path, &policy) {
             Ok(_) => PermissionDecision::allow(),
-            Err(crate::security::PathSafetyError::OutsideAllowedRoots { .. }) => {
+            Err(permissions::path_safety::PathSafetyError::OutsideAllowedRoots { .. }) => {
                 PermissionDecision::Ask {
                     message: "NotebookEdit outside the project requires confirmation".into(),
                     decision_reason: None,
