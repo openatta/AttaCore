@@ -356,7 +356,6 @@ impl JsonlHistoryStore {
             .await
     }
 
-    /// Skips sessions that lack metadata or whose jsonl store is corrupt.
     async fn recent_summaries(&self, max: usize) -> Result<Vec<SessionSummary>, HistoryError> {
         let files = self.session_files_by_mtime(max).await?;
         let mut out = Vec::new();
@@ -465,6 +464,10 @@ impl JsonlHistoryStore {
         Ok(out)
     }
 
+    /// `None` for a session whose log cannot be read back. A half-written or
+    /// hand-edited transcript is a property of that one session; letting it
+    /// fail the call would hide every other session in the directory behind
+    /// it.
     async fn session_summary(
         &self,
         session_id: SessionId,
@@ -472,7 +475,9 @@ impl JsonlHistoryStore {
     ) -> Result<Option<SessionSummary>, HistoryError> {
         let entries = match self.load(session_id).await {
             Ok(entries) => entries,
-            Err(HistoryError::SessionNotFound(_)) => return Ok(None),
+            Err(HistoryError::SessionNotFound(_)) | Err(HistoryError::Parse { .. }) => {
+                return Ok(None)
+            }
             Err(e) => return Err(e),
         };
         let messages = project_messages_with(&entries, self.projection());
@@ -1150,6 +1155,38 @@ mod tests {
         assert_eq!(summaries[0].entry_count, 2);
         assert_eq!(summaries[0].message_count, 2);
         assert!(summaries[0].preview.contains("useful answer"));
+    }
+
+    #[tokio::test]
+    async fn a_transcript_that_will_not_parse_hides_only_itself() {
+        let (store, _cwd, _proj) = make_store().await;
+        let good = SessionId::new();
+        store
+            .append(
+                good,
+                LogEntry::User {
+                    content: vec![ContentBlock::Text {
+                        text: "readable".into(),
+                        cache_control: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let corrupt = SessionId::new();
+        tokio::fs::write(store.session_file_path(&corrupt), "{not json at all\n")
+            .await
+            .unwrap();
+
+        let summaries = store
+            .find_sessions(&SessionQuery::recent(10))
+            .await
+            .expect("one unreadable log must not fail the listing");
+        assert_eq!(
+            summaries.iter().map(|s| s.session_id).collect::<Vec<_>>(),
+            vec![good]
+        );
     }
 
     #[tokio::test]

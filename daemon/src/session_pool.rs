@@ -2593,7 +2593,15 @@ impl SessionPool {
         Ok(detail)
     }
 
-    /// 列出所有 session（活跃的 + 磁盘上历史的），合并去重。
+    /// 列出所有 session（活跃的 + 历史的），合并去重。
+    ///
+    /// The historical half is a `HistoryStore::find_sessions` answer rather
+    /// than a directory walk of the pool's own, so a store that keeps an
+    /// index over its sessions answers this RPC from the index. Only the ids
+    /// and their order are taken from it: the fields a summary could fill in
+    /// (`preview`, `message_count`, timestamps) are what `session.list` has
+    /// always reported empty for an inactive session, and filling them here
+    /// would change the RPC.
     ///
     /// `include_children == false` (the default) hides sidechain sessions —
     /// they're sub-agent/team-member transcripts, not something a user
@@ -2645,7 +2653,7 @@ impl SessionPool {
 
         // Snapshot active sessions and release the lock before the disk
         // reads below (`session_kind_and_parent` per session, plus
-        // `store.list_sessions()`) — holding `self.sessions` across that
+        // `store.find_sessions()`) — holding `self.sessions` across that
         // much I/O would block every other pool operation for the duration.
         let active_snapshot: Vec<(String, Option<String>, Instant, Instant)> = {
             let sessions = self.sessions.lock().await;
@@ -2686,11 +2694,12 @@ impl SessionPool {
             });
         }
 
-        // 从 HistoryStore 查磁盘历史（inactive sessions）
+        // 从 HistoryStore 查历史（inactive sessions）
         if let Some(ref store) = self.history_store {
-            if let Ok(sids) = store.list_sessions().await {
-                for sid in sids {
-                    let sid_str = sid.to_string();
+            let query = history::query::SessionQuery::recent(usize::MAX);
+            if let Ok(summaries) = store.find_sessions(&query).await {
+                for summary in summaries {
+                    let sid_str = summary.session_id.to_string();
                     if seen.contains(&sid_str) {
                         continue;
                     }
@@ -4735,6 +4744,12 @@ mod mcp_for_project_tests {
     /// these tests need: they're about the *cache* around the connect, not
     /// the connect itself (that's `mcp_toy_server_smoke.rs`'s job).
     pub(super) async fn test_pool() -> (SessionPool, tempfile::TempDir) {
+        test_pool_with_store(None).await
+    }
+
+    pub(super) async fn test_pool_with_store(
+        history_store: Option<Arc<dyn history::store::HistoryStore>>,
+    ) -> (SessionPool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -4758,7 +4773,7 @@ mod mcp_for_project_tests {
             permission,
             memory_store,
             cwd,
-            None,
+            history_store,
             paths,
             None,
         );
@@ -5072,6 +5087,174 @@ mod with_session_lock_tests {
         assert!(
             pool.session_locks.lock().await.is_empty(),
             "a lock nothing else references must not linger in the registry forever"
+        );
+    }
+}
+
+/// `session.list`'s historical half is a `HistoryStore` query, not a walk the
+/// pool does itself.
+#[cfg(test)]
+mod session_listing_tests {
+    use super::mcp_for_project_tests::test_pool_with_store;
+    use super::*;
+    use history::entry::{EnvelopedEntry, LogEntry};
+    use history::error::HistoryError;
+    use history::query::SessionQuery;
+    use history::store::{HistoryStore, InMemoryHistoryStore, SessionSummary};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A store that answers "which sessions are there" from an index it keeps
+    /// as entries arrive, and counts every fall-through to the enumeration
+    /// the default would use.
+    struct IndexedStore {
+        inner: InMemoryHistoryStore,
+        index: std::sync::Mutex<Vec<base::session::SessionId>>,
+        enumerations: AtomicUsize,
+    }
+
+    impl IndexedStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryHistoryStore::new(),
+                index: std::sync::Mutex::new(Vec::new()),
+                enumerations: AtomicUsize::new(0),
+            }
+        }
+
+        fn indexed_order(&self) -> Vec<base::session::SessionId> {
+            self.index.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HistoryStore for IndexedStore {
+        async fn append(
+            &self,
+            session: base::session::SessionId,
+            entry: LogEntry,
+        ) -> Result<(), HistoryError> {
+            {
+                let mut index = self.index.lock().unwrap();
+                index.retain(|s| *s != session);
+                index.insert(0, session);
+            }
+            self.inner.append(session, entry).await
+        }
+
+        async fn load(
+            &self,
+            session: base::session::SessionId,
+        ) -> Result<Vec<EnvelopedEntry>, HistoryError> {
+            self.inner.load(session).await
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<base::session::SessionId>, HistoryError> {
+            self.enumerations.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_sessions().await
+        }
+
+        async fn delete(&self, session: base::session::SessionId) -> Result<(), HistoryError> {
+            self.inner.delete(session).await
+        }
+
+        async fn find_sessions(
+            &self,
+            query: &SessionQuery,
+        ) -> Result<Vec<SessionSummary>, HistoryError> {
+            Ok(self
+                .indexed_order()
+                .into_iter()
+                .take(query.limit)
+                .map(|session_id| SessionSummary {
+                    session_id,
+                    last_modified: "1970-01-01T00:00:00Z".into(),
+                    entry_count: 0,
+                    message_count: 0,
+                    preview: String::new(),
+                    canonical_cwd: None,
+                    title: None,
+                    total_input_tokens: None,
+                    total_output_tokens: None,
+                    compact_count: 0,
+                })
+                .collect())
+        }
+    }
+
+    async fn seed(store: &IndexedStore, count: usize) -> Vec<base::session::SessionId> {
+        let mut ids = Vec::new();
+        for i in 0..count {
+            let sid = base::session::SessionId::new();
+            store
+                .append(
+                    sid,
+                    LogEntry::User {
+                        content: vec![base::message::ContentBlock::Text {
+                            text: format!("session {i}"),
+                            cache_control: None,
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            ids.push(sid);
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_store_with_an_index_answers_session_list_without_being_enumerated() {
+        let store = Arc::new(IndexedStore::new());
+        seed(&store, 3).await;
+        let expected: Vec<String> = store
+            .indexed_order()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let (pool, _dir) = test_pool_with_store(Some(store.clone())).await;
+        let listed: Vec<String> = pool
+            .list_all(false, None)
+            .await
+            .into_iter()
+            .map(|info| info.session_id)
+            .collect();
+
+        assert_eq!(
+            listed, expected,
+            "the index's answer, in the index's order, is what the RPC reports"
+        );
+        assert_eq!(
+            store.enumerations.load(Ordering::SeqCst),
+            0,
+            "a backend that answered `find_sessions` must not also be walked session by session"
+        );
+    }
+
+    /// The fields a `SessionSummary` could fill in stay empty for a session
+    /// that is only on disk — clients have always read them that way.
+    #[tokio::test]
+    async fn an_inactive_session_reports_the_same_empty_summary_it_always_has() {
+        let store = Arc::new(IndexedStore::new());
+        let ids = seed(&store, 1).await;
+
+        let (pool, _dir) = test_pool_with_store(Some(store.clone())).await;
+        let listed = pool.list_all(false, None).await;
+        assert_eq!(listed.len(), 1);
+
+        assert_eq!(
+            serde_json::to_value(&listed[0]).unwrap(),
+            serde_json::json!({
+                "session_id": ids[0].to_string(),
+                "name": null,
+                "preview": null,
+                "message_count": 0,
+                "created_at": "",
+                "last_active": "",
+                "status": "inactive",
+                "session_kind": "primary",
+                "resumable": true,
+            })
         );
     }
 }
