@@ -3037,7 +3037,10 @@ impl SessionPool {
         limit: usize,
     ) -> Result<serde_json::Value, RpcError> {
         let entries = self.load_entries(session_id).await?;
-        let messages = history::transcript::project_messages(&entries);
+        let messages = history::transcript::project_messages_with(
+            &entries,
+            self.require_history_store()?.projection(),
+        );
         let total = messages.len();
         let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
@@ -3093,7 +3096,7 @@ impl SessionPool {
         let entries = self.load_entries(session_id).await?;
         let store = self.require_history_store()?;
 
-        let lengths = history::transcript::projected_lengths(&entries);
+        let lengths = history::transcript::projected_lengths_with(&entries, store.projection());
         let total_messages = lengths.last().copied().unwrap_or(0);
         let target = at_message.unwrap_or(total_messages).min(total_messages);
         // Shortest prefix already holding `target` messages. `target == 0`
@@ -3190,7 +3193,8 @@ impl SessionPool {
             copied += 1;
         }
 
-        let message_count = history::transcript::project_messages(&entries[..cut]).len();
+        let message_count =
+            history::transcript::project_messages_with(&entries[..cut], store.projection()).len();
         info!(
             source = %session_id,
             fork = %new_sid,
@@ -3718,12 +3722,12 @@ impl SessionPool {
     /// on disk — all three mean the same thing to `session.resume`'s caller
     /// ("no prior conversation"), so they don't need distinguishing here.
     async fn history_counts(&self, session_id: &str) -> (usize, usize) {
-        match self.load_entries(session_id).await {
-            Ok(entries) => (
-                history::transcript::project_messages(&entries).len(),
+        match (self.load_entries(session_id).await, self.history_store.as_ref()) {
+            (Ok(entries), Some(store)) => (
+                history::transcript::project_messages_with(&entries, store.projection()).len(),
                 entries.len(),
             ),
-            Err(_) => (0, 0),
+            _ => (0, 0),
         }
     }
 

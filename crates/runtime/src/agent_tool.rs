@@ -2895,8 +2895,9 @@ impl AgentTool {
                 "no entries found for session {session_id}"
             )));
         }
-        let projected = history::transcript::project_messages(&entries);
-        let report = history::transcript::resume_projection_report(&entries);
+        let projection = history_store.projection();
+        let projected = history::transcript::project_messages_with(&entries, projection);
+        let report = history::transcript::resume_projection_report_with(&entries, projection);
 
         // 2. Convert projected history messages to ModelMessages
         let mut model_messages: Vec<ModelMessage> = Vec::with_capacity(projected.len());

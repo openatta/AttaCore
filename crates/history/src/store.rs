@@ -15,7 +15,10 @@ use crate::path::{
 };
 use crate::project::SessionMetadata;
 use crate::query::{SessionQuery, SessionScope};
-use crate::transcript::{messages_match_query, preview_messages, project_messages};
+use crate::transcript::{
+    messages_match_query, preview_messages, project_messages_with, DefaultProjection,
+    TranscriptProjection,
+};
 use async_trait::async_trait;
 use base::message::{ContentBlock, ToolResultContent};
 use base::session::SessionId;
@@ -78,7 +81,17 @@ pub trait HistoryStore: Send + Sync {
         session: SessionId,
     ) -> Result<Vec<base::message::Message>, HistoryError> {
         let entries = self.load(session).await?;
-        Ok(project_messages(&entries))
+        Ok(project_messages_with(&entries, self.projection()))
+    }
+
+    /// The rules this store's logs are read under.
+    ///
+    /// On the store rather than the engine because a log and the rules for
+    /// reading it travel together: forking, resuming and searching a
+    /// transcript must all see the same conversation, and they reach it
+    /// through here.
+    fn projection(&self) -> &dyn TranscriptProjection {
+        &DefaultProjection
     }
 
     /// Which session spawned this one, if any.
@@ -160,7 +173,7 @@ pub trait HistoryStore: Send + Sync {
                 Err(HistoryError::SessionNotFound(_)) => continue,
                 Err(e) => return Err(e),
             };
-            let messages = project_messages(&entries);
+            let messages = project_messages_with(&entries, self.projection());
             if let Some(needle) = needle {
                 if !session_id.to_string().contains(needle)
                     && !messages_match_query(&messages, needle)
@@ -207,6 +220,8 @@ pub struct JsonlHistoryStore {
     /// Where content too big to keep inline goes. Without one, everything
     /// stays in the JSONL.
     blobs: Option<Arc<dyn BlobStore>>,
+    /// How this store's logs become messages. `None` is the engine's rules.
+    projection: Option<Arc<dyn TranscriptProjection>>,
 }
 
 impl JsonlHistoryStore {
@@ -220,6 +235,7 @@ impl JsonlHistoryStore {
             canonical_cwd: canonical,
             append_lock: Arc::new(Mutex::new(())),
             blobs: None,
+            projection: None,
         })
     }
 
@@ -231,6 +247,17 @@ impl JsonlHistoryStore {
     /// references in it still loads — with a gap where the content was.
     pub fn with_blob_store(mut self, blobs: Arc<dyn BlobStore>) -> Self {
         self.blobs = Some(blobs);
+        self
+    }
+
+    /// Read this store's logs under someone else's rules.
+    ///
+    /// The rules must be reconstructible from the log alone — see
+    /// [`crate::transcript::model_visible_content_is_reconstructible`]. A
+    /// projection that reads anything else produces a session that cannot be
+    /// reopened.
+    pub fn with_projection(mut self, projection: Arc<dyn TranscriptProjection>) -> Self {
+        self.projection = Some(projection);
         self
     }
 
@@ -333,7 +360,7 @@ impl JsonlHistoryStore {
                 Err(HistoryError::SessionNotFound(_)) => continue,
                 Err(e) => return Err(e),
             };
-            let messages = project_messages(&entries);
+            let messages = project_messages_with(&entries, self.projection());
             if session_id.to_string().contains(needle) || messages_match_query(&messages, needle) {
                 let metadata = load_session_metadata(&self.sessions_root, session_id).await;
                 out.push(self.summary_from_parts(
@@ -386,7 +413,7 @@ impl JsonlHistoryStore {
             if !filter.matches(metadata.as_ref()) {
                 continue;
             }
-            let messages = project_messages(&entries);
+            let messages = project_messages_with(&entries, self.projection());
             let haystack = format!(
                 "{}\n{}\n{}\n{}",
                 session_id,
@@ -427,7 +454,7 @@ impl JsonlHistoryStore {
             Err(HistoryError::SessionNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let messages = project_messages(&entries);
+        let messages = project_messages_with(&entries, self.projection());
         let metadata = load_session_metadata(&self.sessions_root, session_id).await;
         Ok(Some(self.summary_from_parts(
             session_id,
@@ -615,6 +642,13 @@ async fn load_session_metadata(
 
 #[async_trait]
 impl HistoryStore for JsonlHistoryStore {
+    fn projection(&self) -> &dyn TranscriptProjection {
+        match &self.projection {
+            Some(p) => &**p,
+            None => &DefaultProjection,
+        }
+    }
+
     async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError> {
         let _guard = self.append_lock.lock().await;
         let path = self.session_file_path(&session);
@@ -1969,6 +2003,10 @@ impl HistoryStore for ObservedHistoryStore {
         self.inner.session_parent(session).await
     }
 
+    fn projection(&self) -> &dyn TranscriptProjection {
+        self.inner.projection()
+    }
+
     async fn child_sessions(
         &self,
         parent_session_id: &str,
@@ -2246,6 +2284,57 @@ mod append_observer_tests {
         );
     }
 
+    /// P3-8's acceptance: a store mounted with a different projection hands
+    /// back a different conversation, and every reader of that store — resume,
+    /// fork, search — sees the same one, because they all come through here.
+    #[tokio::test]
+    async fn a_store_projection_decides_what_the_model_reads_back() {
+        let cwd = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let s = SessionId::new();
+
+        let entries = [
+            LogEntry::User {
+                content: vec![base::message::ContentBlock::Text {
+                    text: "ship it".into(),
+                    cache_control: None,
+                }],
+            },
+            LogEntry::Extension {
+                ns: "com.acme.deploy".into(),
+                event: "finished".into(),
+                payload: serde_json::json!({"version": "1.4.0"}),
+            },
+        ];
+
+        let engine_rules =
+            JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap();
+        for e in entries.iter().cloned() {
+            engine_rules.append(s, e).await.unwrap();
+        }
+        assert_eq!(
+            engine_rules.load_messages(s).await.unwrap().len(),
+            1,
+            "the engine's rules keep an extension's state out of the conversation"
+        );
+
+        let host_rules =
+            JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap()
+                .with_projection(Arc::new(crate::transcript::ExtensionsAreVisible {
+                    namespaces: vec!["com.acme.deploy".into()],
+                }));
+        let messages = host_rules.load_messages(s).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            crate::transcript::render_search_text(&messages).contains("1.4.0"),
+            "and the same log now carries the deploy into the conversation"
+        );
+    }
+
     /// A failed append is not an event. An observer that was told about one
     /// would be recording something that did not happen.
     #[tokio::test]
@@ -2348,7 +2437,7 @@ mod query_contract_tests {
         async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError> {
             self.inner.append(session, entry).await?;
             let entries = self.inner.load(session).await?;
-            let messages = project_messages(&entries);
+            let messages = project_messages_with(&entries, self.projection());
             let row = IndexRow {
                 modified: entries.iter().map(|env| env.ts).max(),
                 id: session.to_string(),

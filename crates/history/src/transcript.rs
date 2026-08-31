@@ -27,20 +27,154 @@ pub enum ResumeProjectionWarning {
     EmptyCompactBoundary,
 }
 
-/// Project raw history entries into the message view the model should see.
+/// How a log becomes the messages the model is given.
 ///
-/// Rules:
-/// - `Meta`, `System`, `UsageSnapshot` are metadata-only and do not enter API
-/// - `User`, `Assistant`, `ToolResult` materialize as messages
-/// - `Compact` acts as a replay boundary: the view is reset to the compact
-///   summary payload, then subsequent turns are appended on top
+/// The rules were a free function, which made "what does the model see" a
+/// fact about this file rather than a question anyone could answer
+/// differently. It matters most for the one entry kind the kernel does not
+/// understand: an extension writes its state into the log, and whether that
+/// state can become something the model reads had nowhere to be decided.
+/// Here is where.
+///
+/// # The invariant that comes with saying yes
+///
+/// Model-visible content must be reconstructible from the log alone. A
+/// projection that renders an extension entry by asking the live extension
+/// what it means produces a conversation that cannot be resumed: reload the
+/// same log with the plugin uninstalled and the model sees something else, or
+/// nothing. `model_visible_content_is_reconstructible` is that invariant made
+/// checkable — it round-trips the entries through their serialized form, the
+/// way a load does, and requires the projection to come out the same.
+pub trait TranscriptProjection: Send + Sync {
+    /// Fold one entry into the view being built.
+    fn apply(&self, entry: &LogEntry, messages: &mut Vec<Message>);
+
+    /// Whether this entry contributes content of its own.
+    ///
+    /// Cannot be derived from `apply` and must agree with it: a compaction
+    /// boundary rewrites the whole view without being a message, so "the
+    /// message list changed" and "this entry is a message" are different
+    /// questions.
+    fn is_model_visible(&self, entry: &LogEntry) -> bool;
+}
+
+/// The engine's rules.
+///
+/// - `Meta`, `System`, `UsageSnapshot`, `SessionEnd` are metadata and never
+///   reach the model;
+/// - `PasteRef` and `Blob` are references the store hydrates before this ever
+///   runs;
+/// - `Extension` is skipped, which is what makes an entry from an uninstalled
+///   plugin inert rather than fatal;
+/// - `User`, `Assistant`, `ToolResult` materialize as messages;
+/// - `Compact` is a replay boundary: the view resets to the compaction's
+///   payload and later turns stack on top.
+pub struct DefaultProjection;
+
+impl TranscriptProjection for DefaultProjection {
+    fn apply(&self, entry: &LogEntry, messages: &mut Vec<Message>) {
+        apply_entry_to_messages(entry, messages)
+    }
+
+    fn is_model_visible(&self, entry: &LogEntry) -> bool {
+        matches!(
+            entry,
+            LogEntry::User { .. } | LogEntry::Assistant { .. } | LogEntry::ToolResult { .. }
+        )
+    }
+}
+
+/// The engine's rules, plus: an extension's entries become text the model
+/// reads.
+///
+/// The second answer to the question this contract exists to make askable. A
+/// host whose plugin records things the conversation should know about — a
+/// ticket closing, a deploy landing, a review returning — wants them in the
+/// transcript in the order they happened, not re-injected as a reminder every
+/// turn.
+///
+/// Rendered from the entry and nothing else, which is what keeps a session
+/// built this way reopenable after the plugin that wrote the entries is gone.
+pub struct ExtensionsAreVisible {
+    /// Which namespaces to surface. Empty means all of them.
+    pub namespaces: Vec<String>,
+}
+
+impl ExtensionsAreVisible {
+    pub fn all() -> Self {
+        Self {
+            namespaces: Vec::new(),
+        }
+    }
+
+    fn covers(&self, ns: &str) -> bool {
+        self.namespaces.is_empty() || self.namespaces.iter().any(|n| n == ns)
+    }
+}
+
+impl TranscriptProjection for ExtensionsAreVisible {
+    fn apply(&self, entry: &LogEntry, messages: &mut Vec<Message>) {
+        let LogEntry::Extension { ns, event, payload } = entry else {
+            return DefaultProjection.apply(entry, messages);
+        };
+        if !self.covers(ns) {
+            return;
+        }
+        messages.push(Message::User {
+            content: vec![ContentBlock::Text {
+                text: format!("<{ns}:{event}>\n{payload}\n</{ns}:{event}>"),
+                cache_control: None,
+            }],
+        });
+    }
+
+    fn is_model_visible(&self, entry: &LogEntry) -> bool {
+        match entry {
+            LogEntry::Extension { ns, .. } => self.covers(ns),
+            other => DefaultProjection.is_model_visible(other),
+        }
+    }
+}
+
+/// Whether a projection's output survives the trip through the log.
+///
+/// Serializes every entry and reads it back — which is all a resume does —
+/// and re-projects. A projection that reads only its entries comes out
+/// identical. One that consults anything else does not, and a conversation
+/// built on it cannot be reopened.
+pub fn model_visible_content_is_reconstructible(
+    projection: &dyn TranscriptProjection,
+    entries: &[EnvelopedEntry],
+) -> bool {
+    let Ok(round_tripped) = entries
+        .iter()
+        .map(|env| {
+            serde_json::to_string(env).and_then(|line| serde_json::from_str::<EnvelopedEntry>(&line))
+        })
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    project_messages_with(entries, projection) == project_messages_with(&round_tripped, projection)
+}
+
+/// Project raw history entries into the message view the model should see,
+/// under the engine's own rules.
 pub fn project_messages(entries: &[EnvelopedEntry]) -> Vec<Message> {
+    project_messages_with(entries, &DefaultProjection)
+}
+
+/// Project under someone else's rules.
+pub fn project_messages_with(
+    entries: &[EnvelopedEntry],
+    projection: &dyn TranscriptProjection,
+) -> Vec<Message> {
     let mut out = Vec::new();
     for env in entries {
         if env.is_sidechain {
             continue;
         }
-        apply_entry_to_messages(&env.entry, &mut out);
+        projection.apply(&env.entry, &mut out);
     }
     out
 }
@@ -61,11 +195,18 @@ pub fn project_messages(entries: &[EnvelopedEntry]) -> Vec<Message> {
 /// looking for "first prefix with at least N messages" must therefore scan
 /// this vector rather than assume it's monotonic.
 pub fn projected_lengths(entries: &[EnvelopedEntry]) -> Vec<usize> {
+    projected_lengths_with(entries, &DefaultProjection)
+}
+
+pub fn projected_lengths_with(
+    entries: &[EnvelopedEntry],
+    projection: &dyn TranscriptProjection,
+) -> Vec<usize> {
     let mut out = Vec::with_capacity(entries.len());
     let mut messages = Vec::new();
     for env in entries {
         if !env.is_sidechain {
-            apply_entry_to_messages(&env.entry, &mut messages);
+            projection.apply(&env.entry, &mut messages);
         }
         out.push(messages.len());
     }
@@ -73,6 +214,13 @@ pub fn projected_lengths(entries: &[EnvelopedEntry]) -> Vec<usize> {
 }
 
 pub fn resume_projection_report(entries: &[EnvelopedEntry]) -> ResumeProjectionReport {
+    resume_projection_report_with(entries, &DefaultProjection)
+}
+
+pub fn resume_projection_report_with(
+    entries: &[EnvelopedEntry],
+    projection: &dyn TranscriptProjection,
+) -> ResumeProjectionReport {
     let mut report = ResumeProjectionReport {
         entry_count: entries.len(),
         projected_message_count: 0,
@@ -114,9 +262,9 @@ pub fn resume_projection_report(entries: &[EnvelopedEntry]) -> ResumeProjectionR
                 } else {
                     saw_empty_compact = true;
                 }
-                apply_entry_to_messages(&env.entry, &mut messages);
+                projection.apply(&env.entry, &mut messages);
             }
-            _ => apply_entry_to_messages(&env.entry, &mut messages),
+            _ => projection.apply(&env.entry, &mut messages),
         }
     }
     report.projected_message_count = messages.len();
@@ -164,10 +312,18 @@ pub fn projected_message_count_through_entry_id(
     entries: &[EnvelopedEntry],
     target_id: Id,
 ) -> Option<usize> {
+    projected_message_count_through_entry_id_with(entries, target_id, &DefaultProjection)
+}
+
+pub fn projected_message_count_through_entry_id_with(
+    entries: &[EnvelopedEntry],
+    target_id: Id,
+    projection: &dyn TranscriptProjection,
+) -> Option<usize> {
     let mut messages: Vec<Message> = Vec::new();
     for env in entries {
         if !env.is_sidechain {
-            apply_entry_to_messages(&env.entry, &mut messages);
+            projection.apply(&env.entry, &mut messages);
         }
         if env.id == target_id {
             return Some(messages.len());
@@ -177,20 +333,18 @@ pub fn projected_message_count_through_entry_id(
 }
 
 pub fn latest_projected_message_entry_id(entries: &[EnvelopedEntry]) -> Option<Id> {
-    entries.iter().rev().find_map(|env| match env.entry {
-        _ if env.is_sidechain => None,
-        LogEntry::User { .. } | LogEntry::Assistant { .. } | LogEntry::ToolResult { .. } => {
-            Some(env.id)
-        }
-        LogEntry::Meta { .. }
-        | LogEntry::System { .. }
-        | LogEntry::Compact { .. }
-        | LogEntry::UsageSnapshot { .. }
-        | LogEntry::PasteRef { .. }
-        | LogEntry::Blob { .. }
-        | LogEntry::Extension { .. }
-        | LogEntry::SessionEnd { .. } => None,
-    })
+    latest_projected_message_entry_id_with(entries, &DefaultProjection)
+}
+
+pub fn latest_projected_message_entry_id_with(
+    entries: &[EnvelopedEntry],
+    projection: &dyn TranscriptProjection,
+) -> Option<Id> {
+    entries
+        .iter()
+        .rev()
+        .find(|env| !env.is_sidechain && projection.is_model_visible(&env.entry))
+        .map(|env| env.id)
 }
 
 fn apply_entry_to_messages(entry: &LogEntry, messages: &mut Vec<Message>) {
@@ -832,6 +986,128 @@ mod extension_entry_tests {
                 .map(|e| e.id),
             "the last model-visible entry must not become an extension's"
         );
+    }
+
+
+    /// P3-8's acceptance: whether an extension's state reaches the model is
+    /// now a question with somewhere to be answered, and both answers work.
+    #[test]
+    fn an_extension_entry_can_be_projected_as_something_the_model_reads() {
+        let s = SessionId::new();
+        // The extension goes last, so the last-model-visible cursor has a
+        // different answer under each projection rather than the same one by
+        // coincidence.
+        let entries: Vec<EnvelopedEntry> = [text("one"), text("two"), ext("com.acme.deploy")]
+            .into_iter()
+            .map(|e| EnvelopedEntry::new(s, e))
+            .collect();
+
+        assert_eq!(project_messages(&entries).len(), 2, "the engine's answer");
+        assert_eq!(
+            latest_projected_message_entry_id(&entries),
+            Some(entries[1].id)
+        );
+
+        let visible = ExtensionsAreVisible::all();
+        let projected = project_messages_with(&entries, &visible);
+        assert_eq!(projected.len(), 3);
+        let Message::User { content } = &projected[2] else {
+            panic!("expected the extension's entry as a user message");
+        };
+        let ContentBlock::Text { text, .. } = &content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("com.acme.deploy:checkpoint"));
+        assert!(text.contains("\"step\":3"), "the payload, not just the name");
+
+        assert_eq!(
+            latest_projected_message_entry_id_with(&entries, &visible),
+            Some(entries[2].id),
+            "and the last-message cursor follows the same rules"
+        );
+    }
+
+    /// Only the namespaces asked for. A host opening its own plugin's entries
+    /// has not opened every other plugin's.
+    #[test]
+    fn a_namespace_that_was_not_asked_for_stays_invisible() {
+        let s = SessionId::new();
+        let entries: Vec<EnvelopedEntry> = [ext("com.acme.deploy"), ext("com.other.thing")]
+            .into_iter()
+            .map(|e| EnvelopedEntry::new(s, e))
+            .collect();
+        let only_mine = ExtensionsAreVisible {
+            namespaces: vec!["com.acme.deploy".into()],
+        };
+        assert_eq!(project_messages_with(&entries, &only_mine).len(), 1);
+    }
+
+    /// The invariant P1-5 left open: model-visible content must be
+    /// reconstructible from the log alone.
+    #[test]
+    fn both_shipped_projections_survive_the_trip_through_the_log() {
+        let s = SessionId::new();
+        let entries: Vec<EnvelopedEntry> = [
+            text("one"),
+            ext("com.acme.deploy"),
+            LogEntry::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "ok".into(),
+                    cache_control: None,
+                }],
+                stop_reason: None,
+                model: Some("m".into()),
+                usage: None,
+            },
+        ]
+        .into_iter()
+        .map(|e| EnvelopedEntry::new(s, e))
+        .collect();
+
+        assert!(model_visible_content_is_reconstructible(
+            &DefaultProjection,
+            &entries
+        ));
+        assert!(model_visible_content_is_reconstructible(
+            &ExtensionsAreVisible::all(),
+            &entries
+        ));
+    }
+
+    /// And the check has teeth: a projection that renders from anything other
+    /// than the entry produces a conversation that reads differently the
+    /// second time it is opened.
+    #[test]
+    fn a_projection_reading_state_outside_the_log_fails_the_invariant() {
+        struct FromSomewhereElse(std::sync::atomic::AtomicUsize);
+        impl TranscriptProjection for FromSomewhereElse {
+            fn apply(&self, entry: &LogEntry, messages: &mut Vec<Message>) {
+                DefaultProjection.apply(entry, messages);
+                if matches!(entry, LogEntry::Extension { .. }) {
+                    let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    messages.push(Message::User {
+                        content: vec![ContentBlock::Text {
+                            text: format!("seen {n} times"),
+                            cache_control: None,
+                        }],
+                    });
+                }
+            }
+            fn is_model_visible(&self, entry: &LogEntry) -> bool {
+                DefaultProjection.is_model_visible(entry)
+                    || matches!(entry, LogEntry::Extension { .. })
+            }
+        }
+
+        let s = SessionId::new();
+        let entries: Vec<EnvelopedEntry> = [text("one"), ext("com.acme.deploy")]
+            .into_iter()
+            .map(|e| EnvelopedEntry::new(s, e))
+            .collect();
+        assert!(!model_visible_content_is_reconstructible(
+            &FromSomewhereElse(std::sync::atomic::AtomicUsize::new(0)),
+            &entries
+        ));
     }
 
     /// Fork copies entries forward by cloning and re-appending them; an entry

@@ -284,7 +284,7 @@ impl SessionManager {
             }
         }
 
-        let projected = history::transcript::project_messages(&entries);
+        let projected = history::transcript::project_messages_with(&entries, store.projection());
         self.messages = projected
             .iter()
             .filter_map(message_to_model_message)
