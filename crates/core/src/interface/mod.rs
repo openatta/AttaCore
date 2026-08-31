@@ -30,6 +30,7 @@
 //! | [`turn_policy::TurnPolicy`] | when a turn has gone on long enough |
 //! | [`recovery_policy::RecoveryPolicy`] | what to do when a call goes wrong |
 //! | [`budget_policy::BudgetPolicy`] | what a turn may spend and how much it may carry |
+//! | [`environment::Environment`] | kept time and kept identifiers |
 //! | [`backoff::BackoffPolicy`] | whether a failed request is sent again, and when |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
@@ -88,6 +89,7 @@ pub mod prompt_assembler;
 pub mod prompt_assembly;
 pub mod prompt_registry;
 pub mod budget_policy;
+pub mod environment;
 pub mod recovery_policy;
 #[deprecated(note = "moved to `base::prompt` — prompt data types and the assembler function")]
 pub use crate::prompt;

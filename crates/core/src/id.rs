@@ -23,6 +23,13 @@ impl Id {
         Self(*uuid::Uuid::new_v4().as_bytes())
     }
 
+    /// The same sixteen bytes an id is made of, from somewhere other than the
+    /// system's randomness — see
+    /// [`Environment`](crate::interface::environment::Environment).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
     /// 从外部字符串解码并验证 16 字节。
     pub fn parse(s: &str) -> Result<Self, IdError> {
         let v = bs58::decode(s).into_vec()?;

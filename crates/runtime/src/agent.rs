@@ -199,6 +199,8 @@ pub struct Agent {
     /// Whether this session's subsystems are working — see
     /// [`Builder::health_check`] and [`Agent::health`].
     pub(crate) health: Arc<base::interface::health::HealthChecks>,
+    /// Kept time and kept identifiers — see [`Builder::environment`].
+    pub(crate) environment: Arc<dyn base::interface::environment::Environment>,
     /// What to do when a model call goes wrong — see
     /// [`Builder::recovery_policy`].
     pub(crate) recovery_policy: Arc<dyn base::interface::recovery_policy::RecoveryPolicy>,
@@ -630,7 +632,7 @@ impl Agent {
 
         let (frozen, _, _) = tokio::join!(
             // 1. Pre-compute the frozen environment snapshot (git status, branch, platform, etc.)
-            base::frozen::FrozenContext::collect(cwd.clone(), &paths),
+            base::frozen::FrozenContext::collect(cwd.clone(), &paths, &*self.environment),
             // 2. Fire-and-forget pre-connect GET to the API base URL (warms TCP/TLS)
             async move {
                 if !base_url.is_empty() {
@@ -1012,6 +1014,8 @@ pub struct Builder {
     budget_policy: Option<Arc<dyn base::interface::budget_policy::BudgetPolicy>>,
     /// Diagnostics — see [`Builder::health_check`].
     health_checks: Vec<Arc<dyn base::interface::health::HealthCheck>>,
+    /// Kept time and ids — see [`Builder::environment`].
+    environment: Option<Arc<dyn base::interface::environment::Environment>>,
     /// Model-failure recovery — see [`Builder::recovery_policy`].
     recovery_policy: Option<Arc<dyn base::interface::recovery_policy::RecoveryPolicy>>,
     /// Model request/response interception — see [`Builder::model_interceptor`].
@@ -1223,6 +1227,7 @@ impl Builder {
             turn_policy: None,
             budget_policy: None,
             health_checks: Vec::new(),
+            environment: None,
             recovery_policy: None,
             model_interceptors: Vec::new(),
             memory_retriever: None,
@@ -1391,6 +1396,24 @@ impl Builder {
         p: Arc<dyn base::interface::budget_policy::BudgetPolicy>,
     ) -> Self {
         self.budget_policy = Some(p);
+        self
+    }
+
+    /// Take kept time and kept identifiers from somewhere other than the
+    /// machine.
+    ///
+    /// Only the answers that get *kept* come from here — a timestamp written
+    /// into the log, an id naming an entry, the date the prompt tells the
+    /// model. Measurement is not on the contract and does not change.
+    ///
+    /// A history store carries its own; configure both to replay a session.
+    ///
+    /// [`Environment`]: base::interface::environment::Environment
+    pub fn environment(
+        mut self,
+        e: Arc<dyn base::interface::environment::Environment>,
+    ) -> Self {
+        self.environment = Some(e);
         self
     }
 
@@ -2383,6 +2406,9 @@ impl Builder {
                 health: Arc::new(base::interface::health::HealthChecks::from_vec(
                     self.health_checks,
                 )),
+                environment: self
+                    .environment
+                    .unwrap_or_else(|| Arc::new(base::interface::environment::SystemEnvironment)),
                 recovery_policy,
                 model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self

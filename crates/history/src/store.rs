@@ -84,6 +84,15 @@ pub trait HistoryStore: Send + Sync {
         Ok(project_messages_with(&entries, self.projection()))
     }
 
+    /// Where this store's kept time and kept identifiers come from.
+    ///
+    /// On the store for the same reason the projection is: an entry's id and
+    /// timestamp are written here and nowhere else, so this is the only place
+    /// that has to be told.
+    fn environment(&self) -> &dyn base::interface::environment::Environment {
+        &base::interface::environment::SystemEnvironment
+    }
+
     /// The rules this store's logs are read under.
     ///
     /// On the store rather than the engine because a log and the rules for
@@ -222,6 +231,8 @@ pub struct JsonlHistoryStore {
     blobs: Option<Arc<dyn BlobStore>>,
     /// How this store's logs become messages. `None` is the engine's rules.
     projection: Option<Arc<dyn TranscriptProjection>>,
+    /// Where entry ids and timestamps come from. `None` is the machine's.
+    environment: Option<Arc<dyn base::interface::environment::Environment>>,
 }
 
 impl JsonlHistoryStore {
@@ -236,6 +247,7 @@ impl JsonlHistoryStore {
             append_lock: Arc::new(Mutex::new(())),
             blobs: None,
             projection: None,
+            environment: None,
         })
     }
 
@@ -258,6 +270,15 @@ impl JsonlHistoryStore {
     /// reopened.
     pub fn with_projection(mut self, projection: Arc<dyn TranscriptProjection>) -> Self {
         self.projection = Some(projection);
+        self
+    }
+
+    /// Take entry ids and timestamps from somewhere other than the machine.
+    pub fn with_environment(
+        mut self,
+        environment: Arc<dyn base::interface::environment::Environment>,
+    ) -> Self {
+        self.environment = Some(environment);
         self
     }
 
@@ -649,6 +670,13 @@ impl HistoryStore for JsonlHistoryStore {
         }
     }
 
+    fn environment(&self) -> &dyn base::interface::environment::Environment {
+        match &self.environment {
+            Some(e) => &**e,
+            None => &base::interface::environment::SystemEnvironment,
+        }
+    }
+
     async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError> {
         let _guard = self.append_lock.lock().await;
         let path = self.session_file_path(&session);
@@ -667,7 +695,7 @@ impl HistoryStore for JsonlHistoryStore {
             .create(true)
             .open(&path)?;
 
-        let enveloped = EnvelopedEntry::new(session, entry);
+        let enveloped = EnvelopedEntry::new_in(self.environment(), session, entry);
         let line = serde_json::to_string(&enveloped)?;
 
         // 一次 write_all 把 line + '\n' 一起出，减少 partial line 风险。
@@ -822,7 +850,7 @@ impl HistoryStore for InMemoryHistoryStore {
             .unwrap_or_else(|e| e.into_inner())
             .entry(session)
             .or_default()
-            .push(EnvelopedEntry::new(session, entry));
+            .push(EnvelopedEntry::new_in(self.environment(), session, entry));
         Ok(())
     }
 
@@ -2005,6 +2033,10 @@ impl HistoryStore for ObservedHistoryStore {
 
     fn projection(&self) -> &dyn TranscriptProjection {
         self.inner.projection()
+    }
+
+    fn environment(&self) -> &dyn base::interface::environment::Environment {
+        self.inner.environment()
     }
 
     async fn child_sessions(

@@ -1753,7 +1753,7 @@ impl SessionPool {
                                 .display()
                                 .to_string()
                         }),
-                        started_at: time::OffsetDateTime::now_utc(),
+                        started_at: store.environment().now(),
                         model: settings_snapshot.model.model_name.clone(),
                         permission_mode: serde_json::to_value(settings_snapshot.permission_mode)
                             .ok()
@@ -3151,7 +3151,7 @@ impl SessionPool {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| settings.paths.global_data_dir.display().to_string()),
-            started_at: time::OffsetDateTime::now_utc(),
+            started_at: store.environment().now(),
             model: settings.model.model_name.clone(),
             permission_mode: serde_json::to_value(settings.permission_mode)
                 .ok()

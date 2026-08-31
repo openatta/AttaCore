@@ -461,7 +461,8 @@ impl Agent {
         if collected_this_turn {
             let cwd = self.settings.paths.project_root();
             let paths = base::paths::ConfigPaths::from_settings(&self.settings.paths);
-            self.frozen = Some(base::frozen::FrozenContext::collect(cwd, &paths).await);
+            self.frozen =
+                Some(base::frozen::FrozenContext::collect(cwd, &paths, &*self.environment).await);
         }
 
         // A-2: `FrozenContext` is a session snapshot on purpose — but the
@@ -483,7 +484,7 @@ impl Agent {
         if !self.claude_md_injected {
             let instructions = self.build_instruction_context();
             if !instructions.is_empty() {
-                let today = chrono_now();
+                let today = chrono_now(&*self.environment);
                 self.session.push_message(ModelMessage {
                     role: MessageRole::User,
                     content: vec![ModelContentBlock::Text {
@@ -1517,6 +1518,7 @@ impl Agent {
                     None => (self.model.clone(), DEFAULT_MEMORY_MODEL.to_string()),
                 };
                 let prompt_intro = self.scene.memory_extraction_prompt();
+                let environment = self.environment.clone();
                 tokio::spawn(async move {
                     extract_memories_after_turn(
                         &store,
@@ -1524,6 +1526,7 @@ impl Agent {
                         model.as_ref(),
                         &model_name,
                         prompt_intro.as_deref(),
+                        &*environment,
                     )
                     .await;
                 });
@@ -2492,12 +2495,12 @@ or project context that should survive across sessions.
         };
         let mut ctx = build_prompt_context(
             &self.settings,
-            &self.session,
             self.frozen.as_ref(),
             mcp_ref,
             skills_ref,
             effective_model,
             self.tool_results_ever_cleared,
+            &*self.environment,
         );
         ctx.available_tools = tools_ref;
         let blocks = self
@@ -3631,12 +3634,12 @@ fn register_new_mcp_adapters(tools: &dyn base::tool::ToolRegistry, mcp: &McpMana
 
 fn build_prompt_context<'a>(
     settings: &'a base::interface::settings::Settings,
-    _session: &'a session::session::SessionManager,
     frozen: Option<&'a base::frozen::FrozenContext>,
     mcp_instructions: Option<&'a str>,
     skills_text: Option<&'a str>,
     effective_model: &str,
     tool_results_ever_cleared: bool,
+    env: &dyn base::interface::environment::Environment,
 ) -> ScenePromptContext<'a> {
     let (is_git, git_branch, is_worktree, git_status, memory_index, output_style, shell, home_dir) =
         if let Some(f) = frozen {
@@ -3663,7 +3666,7 @@ fn build_prompt_context<'a>(
         // From the environment snapshot, same as `shell` — a fact about the
         // machine, collected once where a test can replace it.
         home_dir: Cow::Owned(home_dir.unwrap_or_else(|| "/home/user".to_string())),
-        date: Cow::Owned(chrono_now()),
+        date: Cow::Owned(chrono_now(env)),
         // The model actually being called this turn, not the configured
         // default — after an overloaded-fallback switch these diverge, and
         // the prompt should describe reality (knowledge cutoff, model
@@ -3692,9 +3695,8 @@ fn build_prompt_context<'a>(
     }
 }
 
-fn chrono_now() -> String {
-    use time::OffsetDateTime;
-    let now = OffsetDateTime::now_utc();
+fn chrono_now(env: &dyn base::interface::environment::Environment) -> String {
+    let now = env.now();
     format!(
         "{:04}-{:02}-{:02}",
         now.year(),
@@ -5350,8 +5352,15 @@ mod tests {
             session_dir: None,
             scripts: Vec::new(),
         };
-        let session = session::session::SessionManager::in_memory(None);
-        let ctx = build_prompt_context(&settings, &session, None, None, None, "test-model", false);
+        let ctx = build_prompt_context(
+            &settings,
+            None,
+            None,
+            None,
+            "test-model",
+            false,
+            &base::interface::environment::SystemEnvironment,
+        );
         assert_eq!(ctx.os, std::env::consts::OS);
 
         // Regression: `ctx.shell` used to be hardcoded to "/bin/bash"
@@ -5366,12 +5375,12 @@ mod tests {
         };
         let ctx_with_frozen = build_prompt_context(
             &settings,
-            &session,
             Some(&frozen),
             None,
             None,
             "fallback-model",
             false,
+            &base::interface::environment::SystemEnvironment,
         );
         assert_eq!(ctx_with_frozen.shell, "/usr/bin/zsh");
         assert_eq!(ctx_with_frozen.model_name, "fallback-model");
@@ -5859,6 +5868,7 @@ pub(crate) async fn extract_memories_after_turn(
     model: &dyn base::interface::model::Model,
     model_name: &str,
     prompt_intro: Option<&str>,
+    environment: &dyn base::interface::environment::Environment,
 ) {
     // Only extract if there are messages worth analyzing
     if messages.len() < 2 {
@@ -5972,7 +5982,8 @@ Return only a JSON array of memories. If nothing is worth saving, return []."
                     if name.is_empty() || confidence < 0.3 {
                         return None;
                     }
-                    let timestamp = time::OffsetDateTime::now_utc()
+                    let timestamp = environment
+                        .now()
                         .format(&time::format_description::well_known::Iso8601::DEFAULT)
                         .unwrap_or_else(|_| "2026-01-01T00:00:00Z".to_string());
                     Some(DurableMemory {
@@ -6195,7 +6206,7 @@ mod extract_memories_tests {
         let messages = vec![user_msg("hello"), user_msg("world")];
         let model = CapturingModel::new();
 
-        extract_memories_after_turn(&store, &messages, &model, "custom-vendor-model", None).await;
+        extract_memories_after_turn(&store, &messages, &model, "custom-vendor-model", None, &base::interface::environment::SystemEnvironment).await;
 
         let (params, _) = model
             .captured
@@ -6212,7 +6223,7 @@ mod extract_memories_tests {
         let messages = vec![user_msg("hello"), user_msg("world")];
         let model = CapturingModel::new();
 
-        extract_memories_after_turn(&store, &messages, &model, "m", None).await;
+        extract_memories_after_turn(&store, &messages, &model, "m", None, &base::interface::environment::SystemEnvironment).await;
 
         let (_, prompt_text) = model
             .captured
@@ -6235,6 +6246,7 @@ mod extract_memories_tests {
             &model,
             "m",
             Some("Extract facts about the user's chat preferences."),
+            &base::interface::environment::SystemEnvironment,
         )
         .await;
 
@@ -6291,7 +6303,15 @@ mod extract_memories_tests {
         let store = MemoryStore::new(user_dir.clone(), local_dir.clone());
         let messages = vec![user_msg("hello"), user_msg("world")];
 
-        extract_memories_after_turn(&store, &messages, &ExtractingModel, "m", None).await;
+        extract_memories_after_turn(
+            &store,
+            &messages,
+            &ExtractingModel,
+            "m",
+            None,
+            &base::interface::environment::SystemEnvironment,
+        )
+        .await;
 
         assert!(
             local_dir.join("release-freeze.md").exists(),
@@ -6845,6 +6865,7 @@ mod prompt_assembly_tests {
         let frozen = base::frozen::FrozenContext::collect(
             child.clone(),
             &base::paths::ConfigPaths::new(child.join(".state"), child.join(".atta"), "code"),
+            &base::interface::environment::SystemEnvironment,
         )
         .await;
         let mut settings = test_settings(dir.path());
@@ -6892,6 +6913,7 @@ mod prompt_assembly_tests {
         let frozen = base::frozen::FrozenContext::collect(
             root.clone(),
             &base::paths::ConfigPaths::new(root.join(".state"), root.join(".atta"), "code"),
+            &base::interface::environment::SystemEnvironment,
         )
         .await;
         let mut settings = test_settings(dir.path());

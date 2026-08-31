@@ -50,10 +50,27 @@ impl EnvelopedEntry {
     /// ID, and the current timestamp. No parent linkage or sidechain marker
     /// is set by default — use [`with_parent`] / [`as_sidechain`] for that.
     pub fn new(session_id: SessionId, entry: LogEntry) -> Self {
+        Self::new_in(
+            &base::interface::environment::SystemEnvironment,
+            session_id,
+            entry,
+        )
+    }
+
+    /// The same, with the id and the timestamp coming from `env`.
+    ///
+    /// These two fields are the whole reason the contract exists: they are
+    /// written once and kept forever, so a log replayed under a fixed
+    /// environment is the same log rather than a similar one.
+    pub fn new_in(
+        env: &dyn base::interface::environment::Environment,
+        session_id: SessionId,
+        entry: LogEntry,
+    ) -> Self {
         Self {
             v: CURRENT_SCHEMA_VERSION,
-            id: Id::new(),
-            ts: OffsetDateTime::now_utc(),
+            id: env.new_id(),
+            ts: env.now(),
             session_id,
             parent_id: None,
             is_sidechain: false,

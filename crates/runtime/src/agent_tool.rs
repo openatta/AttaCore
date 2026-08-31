@@ -611,7 +611,7 @@ async fn write_sidechain_meta(
     };
     let meta = history::entry::LogEntry::Meta {
         cwd: cwd.display().to_string(),
-        started_at: time::OffsetDateTime::now_utc(),
+        started_at: store.environment().now(),
         model: settings.model.model_name.clone(),
         permission_mode: serde_json::to_value(settings.permission_mode)
             .ok()
