@@ -545,21 +545,49 @@ transcript 里,用 `session.history` 取——追赶靠的是历史,不是重放
 ```
 
 #### `daemon.doctor`
-返回按场景/项目分组的自检报告。
+只读自检:三份 settings.json 各自的状态、provider 路由的解析结果、hooks 配置,
+外加这个进程的几项装配事实。不做任何修复,也不发起任何网络探测 ——
+`HealthCheck` 契约要求每项检查从已经握着的状态立刻回答。
+
+下面是一个全新装配、三份 settings.json 都还不存在时的完整响应,逐字段为真
+(`path` 因机器而异,其余是字面值):
 
 ```jsonc
-{ "ok": false,
-  "checks": [
-    { "scope":"global", "name":"settings_readable", "ok":true },
-    { "scope":"scene:research", "name":"provider_reachable", "ok":false,
-      "detail":"connect timeout" },
-    { "scope":"project:/Users/x/repo-a", "name":"teams_dir_writable", "ok":true } ],
-  "orphan_sidechains": ["…"] }
+{ "scene": "coding",
+  "health": {
+    "status": "ok",                   // ok | degraded | failing,取所有检查里最差的一项
+    "checks": [                       // 每项的 details 与下面同名的顶层字段是同一份数据
+      { "name":"settings.tiers",     "status":"ok", "summary":"every settings.json present parses" },
+      { "name":"settings.providers", "status":"ok", "summary":"provider routing resolves" },
+      { "name":"settings.hooks",     "status":"ok", "summary":"hooks configuration parses" } ] },
+  "settings_tiers": [
+    { "tier":"global",  "path":"…/settings.json",       "exists":false, "parses":true, "error":null },
+    { "tier":"scene",   "path":"…/settings.json",       "exists":false, "parses":true, "error":null },
+    { "tier":"project", "path":"…/.atta/settings.json", "exists":false, "parses":true, "error":null } ],
+  "providers": { "ok":true, "default_provider":null, "configured":[], "task_models":[],
+                 "warnings":[], "error":null },
+  "hooks": { "configured":false, "ok":true, "error":null },
+  "session_persistence": { "history_store_wired":true },
+  "plugins": { "status":"enabled" },
+  "permission_rules_count": 0,
+  "model": { "model_name":"claude-sonnet-4-6", "api_type":"Anthropic" } }
 ```
 
-`orphan_sidechains` 列出磁盘上遗留的侧链(正常关闭会清掉侧链,所以启动后仍存在的
-按定义就是上次非正常退出留下的)。供人工检查;自动清理由启动 GC 按
-`settings.execution.sidechain_orphan_retention_days`(默认 30)执行。
+`health` 是 `HealthCheck` 契约(`docs/extension_points.md`)的报告:宿主注册的检查
+与引擎自带的三项并排出现在同一个 `checks` 里,插件的失效记录也从这里出来。状态是
+三值而不是布尔 —— `degraded`("还能用,但有人该知道":某一层 settings.json 读不了、
+某个 provider 回退了)与 `failing`("这块不能指望了")是要分开报的两件事。
+
+`settings_tiers` / `providers` / `hooks` 是 `health.checks` 里同名检查 `details`
+的副本,放在顶层是因为现有客户端读的是它们。
+
+`providers` 的 `ok` 只说明配置**形状**解析得通(每个 `task_models` 条目都指向一个
+存在的 provider),不说明真能建出客户端 —— `api_type: openai_compatible` 之类
+schema 收但运行时没有实现的配置,这里仍然是 `ok: true`。
+
+`plugins.status` 是这个二进制**能不能加载插件**:`enabled`、
+`disabled-by-policy`(编进来了但配置关掉了)、`compiled-out`(根本没编进来)。
+锁死的部署要能从运行中的进程验证这件事,而不是靠 release notes。
 
 #### `daemon.subscribeEvents`
 把当前连接标记为异步通知订阅者,此后推送 §7 的 `daemon.event` 帧。

@@ -464,3 +464,160 @@ mod tests {
         assert_eq!(report["health"]["status"], "degraded");
     }
 }
+
+/// The `daemon.doctor` example in `docs/daemon_rpc_protocol.md`, checked
+/// against a report this process actually produces.
+///
+/// A protocol example is what a client gets written against, and nothing
+/// compiles it — it can describe a response no version of the daemon ever
+/// returned and stay that way indefinitely. So it is read back out of the file
+/// and compared to a real report field by field.
+#[cfg(test)]
+mod documented_shape_tests {
+    use super::*;
+    use crate::config::StaticDaemonPaths;
+
+    /// The doc's example is written for a fresh install with no settings.json
+    /// anywhere; `run_doctor` has to be called under exactly that to compare.
+    fn report_the_example_describes(dir: &Path) -> serde_json::Value {
+        run_doctor(
+            &StaticDaemonPaths::new(dir.to_path_buf()),
+            "coding",
+            Arc::new(Settings::defaults_for("claude-sonnet-4-6")),
+            true,
+            crate::plugins::PluginStatus::Enabled,
+            &HealthChecks::new(),
+        )
+    }
+
+    fn protocol_doc() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("daemon crate has a parent")
+            .join("docs")
+            .join("daemon_rpc_protocol.md");
+        std::fs::read_to_string(&path).expect("protocol doc is readable")
+    }
+
+    /// The first fenced block under `#### \`daemon.doctor\``, with its `//`
+    /// annotations removed. Quote-aware, because a `//` inside a string would
+    /// otherwise take the rest of the line with it.
+    fn documented_doctor_example(doc: &str) -> serde_json::Value {
+        let section = doc
+            .split_once("#### `daemon.doctor`")
+            .expect("the doc still documents daemon.doctor")
+            .1;
+        let fenced = section
+            .split_once("```jsonc\n")
+            .expect("the section still carries a jsonc example")
+            .1
+            .split_once("\n```")
+            .expect("the example is fenced")
+            .0;
+
+        let mut json = String::new();
+        for line in fenced.lines() {
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut cut = line.len();
+            let bytes: Vec<char> = line.chars().collect();
+            for (i, c) in bytes.iter().enumerate() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' if in_string => escaped = true,
+                    '"' => in_string = !in_string,
+                    '/' if !in_string && bytes.get(i + 1) == Some(&'/') => {
+                        cut = line
+                            .char_indices()
+                            .nth(i)
+                            .map(|(byte, _)| byte)
+                            .unwrap_or(line.len());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            json.push_str(&line[..cut]);
+            json.push('\n');
+        }
+        serde_json::from_str(&json).expect("the example parses as JSON once comments are stripped")
+    }
+
+    /// A documented string containing `…` stands for something that varies by
+    /// machine; only its presence and type are claimed.
+    fn is_placeholder(v: &serde_json::Value) -> bool {
+        v.as_str().is_some_and(|s| s.contains('…'))
+    }
+
+    /// Every field the example writes must be in `actual` at the same path,
+    /// with the same value. The example may say less than the response — it
+    /// may not say anything different.
+    fn assert_documented(path: &str, documented: &serde_json::Value, actual: &serde_json::Value) {
+        match documented {
+            serde_json::Value::Object(fields) => {
+                let actual = actual
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{path}: documented as an object, response is not"));
+                for (key, value) in fields {
+                    let found = actual.get(key).unwrap_or_else(|| {
+                        panic!("{path}.{key}: documented, absent from response")
+                    });
+                    assert_documented(&format!("{path}.{key}"), value, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let actual = actual
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{path}: documented as an array, response is not"));
+                assert!(
+                    actual.len() >= items.len(),
+                    "{path}: {} entries documented, {} in the response",
+                    items.len(),
+                    actual.len()
+                );
+                for (i, item) in items.iter().enumerate() {
+                    assert_documented(&format!("{path}[{i}]"), item, &actual[i]);
+                }
+            }
+            scalar if is_placeholder(scalar) => {
+                assert!(
+                    actual.is_string(),
+                    "{path}: documented as a string placeholder, response has {actual}"
+                );
+            }
+            scalar => assert_eq!(scalar, actual, "{path}"),
+        }
+    }
+
+    #[test]
+    fn the_documented_example_is_a_real_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual = report_the_example_describes(dir.path());
+        let documented = documented_doctor_example(&protocol_doc());
+        assert_documented("doctor", &documented, &actual);
+    }
+
+    /// A field in the response that the example never mentions is the drift
+    /// this test exists to catch, so the top level is checked both ways.
+    #[test]
+    fn the_example_accounts_for_every_top_level_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual = report_the_example_describes(dir.path());
+        let documented = documented_doctor_example(&protocol_doc());
+
+        let mut undocumented: Vec<&String> = actual
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| documented.get(*k).is_none())
+            .collect();
+        undocumented.sort();
+        assert!(
+            undocumented.is_empty(),
+            "daemon.doctor returns keys the protocol doc does not mention: {undocumented:?}"
+        );
+    }
+}
