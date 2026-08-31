@@ -1865,41 +1865,39 @@ or project context that should survive across sessions.
 
     /// Compact session messages if token budget is exceeded.
     async fn compact_if_needed(&mut self) {
-        // Time-based micro-compact — clear old tool results before budget check.
-        // Runs even if token budget not exceeded.
-        {
-            let config = self.time_based_mc_config.clone();
-            if config.max_age.is_some() {
-                let ages = self.session.message_ages();
-                let mc_result = compaction::time_based_mc::apply_time_based_mc(
-                    &mut self.session.messages,
-                    &config,
-                    &ages,
-                );
-                if mc_result.cleared > 0 {
-                    self.tool_results_ever_cleared = true;
-                    tracing::info!(
-                        cleared = mc_result.cleared,
-                        skipped = mc_result.skipped,
-                        "time-based micro-compact applied"
-                    );
-                }
-            }
+        // Every judgement below belongs to the compactor: what has gone stale,
+        // whether to compact early, when to warn, and when the budget forces
+        // it. The order they are asked in is the loop's.
+        let compactor = self.compactor.clone();
+        let cached_due = self.cached_mc.should_run();
+        let cached_keep_recent = self.cached_mc.keep_recent();
+        let ages = self.session.message_ages();
+        let time_based = self.time_based_mc_config.clone();
+        let aging = compactor.age(
+            &mut self.session.messages,
+            &compaction::compact::AgingInput {
+                message_ages: &ages,
+                time_based: &time_based,
+                cached_due,
+                cached_keep_recent,
+            },
+        );
+        if aging.cleared() > 0 {
+            self.tool_results_ever_cleared = true;
         }
-
-        // Cached micro-compact: time-driven cache edit generation.
-        // When enabled, clears old tool results and records tool_use_ids as
-        // cache_edits for the next API request. Gated by the `cached_microcompact`
-        // feature flag.
-        if self.cached_mc.should_run() {
-            let cleared = self.cached_mc.run(&mut self.session.messages);
-            if cleared > 0 {
-                self.tool_results_ever_cleared = true;
-                tracing::info!(
-                    cleared,
-                    "cached micro-compact applied — pending cache_edits generated"
-                );
-            }
+        if aging.time_based.cleared > 0 {
+            tracing::info!(
+                cleared = aging.time_based.cleared,
+                skipped = aging.time_based.skipped,
+                "time-based micro-compact applied"
+            );
+        }
+        if let Some(ids) = aging.cache_edits {
+            tracing::info!(
+                cleared = aging.cached_cleared,
+                "cached micro-compact applied — pending cache_edits generated"
+            );
+            self.cached_mc.record_pass(ids);
         }
 
         // Enforce per-message tool result budget BEFORE compaction.
@@ -1910,79 +1908,56 @@ or project context that should survive across sessions.
             tracing::debug!(modified = budget_modified, "tool result budget enforced");
         }
 
-        // Feature 2 (#29): Reactive compact — proactive compaction before budget exhausted.
-        // Uses token usage velocity to predict when compaction is needed and triggers early.
-        // v2: Circuit breaker — skips compaction if consecutive failures exceeded limit.
-        if self.settings.feature_flags.reactive_compact {
-            let context_limit = self.scene.token_budget().compact_threshold;
-            if context_limit > 0 {
-                let current = self.context_tokens();
-                let velocity =
-                    compaction::reactive::estimate_token_velocity(&self.session.messages);
-                // Check circuit breaker before attempting compaction
-                if self.compaction_state.circuit_open {
-                    tracing::warn!(
-                        failures = self.compaction_state.consecutive_failures,
-                        "compaction circuit breaker open — skipping reactive compact"
-                    );
-                } else if compaction::reactive::should_compact_with_state(
-                    current,
-                    context_limit,
-                    velocity,
-                    &self.compaction_state,
-                ) {
-                    tracing::info!(
-                        current_tokens = current,
-                        context_limit = context_limit,
-                        "reactive compact triggered — proactively clearing old tool results"
-                    );
-                    let keep = self.scene.token_budget().compact_keep_recent.max(5);
-                    let (compacted, _strategy) = compaction::compact::DefaultCompactor
-                        .micro_compact(self.session.messages().to_vec(), keep);
-                    if compacted.len() < self.session.messages.len() {
-                        self.session.messages = compacted;
-                        self.session
-                            .message_timestamps
-                            .truncate(self.session.messages.len());
-                        self.tool_results_ever_cleared = true;
-                        self.compaction_state.record_success();
-                        // Run post-compact cleanup callbacks (cache clearing, etc.)
-                        compaction::cleanup::run_cleanup_callbacks();
-                        tracing::info!("reactive micro-compact completed");
-                    } else {
-                        self.compaction_state.record_failure();
-                        tracing::warn!("reactive micro-compact had no effect");
-                    }
-                }
+        let budget = self.scene.token_budget();
+        let context_tokens = self.context_tokens();
+        match compactor.reactive(
+            &mut self.session.messages,
+            &compaction::compact::ReactiveInput {
+                context_tokens,
+                context_limit: budget.compact_threshold,
+                keep_recent: budget.compact_keep_recent,
+                enabled: self.settings.feature_flags.reactive_compact,
+                circuit_open: self.compaction_state.circuit_open,
+            },
+        ) {
+            compaction::compact::ReactiveOutcome::Compacted => {
+                self.session
+                    .message_timestamps
+                    .truncate(self.session.messages.len());
+                self.tool_results_ever_cleared = true;
+                self.compaction_state.record_success();
+                tracing::info!(context_tokens, "reactive micro-compact completed");
             }
+            compaction::compact::ReactiveOutcome::NoEffect => {
+                self.compaction_state.record_failure();
+                tracing::warn!(
+                    failures = self.compaction_state.consecutive_failures,
+                    "reactive micro-compact had no effect"
+                );
+            }
+            compaction::compact::ReactiveOutcome::NotTriggered => {}
         }
 
-        let threshold = self.scene.token_budget().compact_threshold;
-        // Compact warning — inject system-reminder when approaching threshold.
-        // Warns at 80% of compact threshold so the user is not surprised by
-        // a sudden compaction boundary.
-        if threshold > 0 {
-            let current = self.context_tokens();
-            let warn_at = (threshold as f64 * 0.8) as usize;
-            if current > warn_at && current <= threshold && !self.compact_warning_issued {
-                let warn_msg = format!(
-                    "<system-reminder>\n\
-                     ⚠️ Context is at {:.0}% of the token budget ({}/{} tokens). \
-                     The conversation will be compacted soon to make room. \
-                     If you have pending work, wrap it up or ask the user what to preserve.\n\
-                     </system-reminder>",
-                    (current as f64 / threshold as f64 * 100.0).min(99.0),
-                    current,
-                    threshold,
-                );
-                self.session.push_message(ModelMessage {
-                    role: MessageRole::User,
-                    content: vec![ModelContentBlock::Text { text: warn_msg }],
-                });
-                self.compact_warning_issued = true;
-            }
+        let threshold = budget.compact_threshold;
+        if let Some(reminder) = compactor.context_warning(&compaction::compact::BudgetState {
+            context_tokens: self.context_tokens(),
+            threshold,
+            warned_already: self.compact_warning_issued,
+        }) {
+            self.session.push_message(ModelMessage {
+                role: MessageRole::User,
+                content: vec![ModelContentBlock::Text { text: reminder }],
+            });
+            self.compact_warning_issued = true;
         }
-        if threshold > 0 && self.context_tokens() > threshold {
+        // Asked again after the reminder, not before it: the reminder is
+        // itself context, and a conversation one message short of the
+        // threshold crosses it here rather than a turn later.
+        if compactor.should_compact(&compaction::compact::BudgetState {
+            context_tokens: self.context_tokens(),
+            threshold,
+            warned_already: self.compact_warning_issued,
+        }) {
             // Fire PreCompact hook.
             if self
                 .hooks
@@ -2047,9 +2022,7 @@ or project context that should survive across sessions.
             // turn — it can only fail to help.
             let compact_start = std::time::Instant::now();
             let llm_outcome = match self.compaction_summarizer() {
-                Some(summarizer)
-                    if compaction::llm_summary::should_summarize(&pre_compact, threshold, keep) =>
-                {
+                Some(summarizer) if compactor.wants_llm_summary(&pre_compact, threshold, keep) => {
                     match compaction::llm_summary::full_compact(
                         &summarizer,
                         pre_compact.clone(),

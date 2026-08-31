@@ -34,7 +34,9 @@ use test_runner::scripted_model::{Reply, ScriptedModel};
 use tokio_util::sync::CancellationToken;
 
 mod support;
-use support::{fake_tools, normalize_events, normalize_log, BudgetScene, GoldenFile};
+use support::{
+    compactable_tool, fake_tools, normalize_events, normalize_log, BudgetScene, GoldenFile,
+};
 
 /// How a case is configured. Defaults are the boring ones; a case overrides
 /// only what it is about.
@@ -57,6 +59,9 @@ struct Case {
     /// Feature flags this case needs on. Reactive compaction is off by
     /// default, so a case about it has to say so.
     reactive_compact: bool,
+    /// Tools registered only for this case. The default set is shared, so a
+    /// tool added there changes the schemas every other case sends.
+    extra_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl Case {
@@ -72,6 +77,7 @@ impl Case {
             hooks_config: None,
             max_api_calls: None,
             reactive_compact: false,
+            extra_tools: Vec::new(),
         }
     }
 }
@@ -105,6 +111,9 @@ async fn trace(case: Case) -> String {
     let registry = Arc::new(InMemoryToolRegistry::new());
     for t in fake_tools() {
         registry.register(t as Arc<dyn Tool>);
+    }
+    for t in &case.extra_tools {
+        registry.register(t.clone());
     }
 
     // A history store is what makes the session log observable at all — the
@@ -606,38 +615,23 @@ async fn an_output_token_target_continues_then_gives_up_on_diminishing_returns()
     .await;
 }
 
-/// **D14 — reactive compaction, which currently does nothing.**
+/// **D14 — reactive compaction that fires and clears nothing.**
 ///
 /// The flag is on and the trigger fires: with a 20k context limit the
-/// reactive check's hardcoded `trigger = 50_000` remaining-token threshold is
-/// satisfied on every call, so `micro_compact` runs every round.
+/// reactive check's `trigger = 50_000` remaining-token threshold is satisfied
+/// on every call, so the pass runs every round. It still changes nothing,
+/// because `micro_compact` clears results only for a fixed whitelist of tool
+/// names and `GoldenFlood` is not on it.
 ///
-/// Its result is then thrown away. The branch keeps the compacted history
-/// only `if compacted.len() < self.session.messages.len()`, and
-/// `micro_compact` never removes a message — it blanks tool-result *content*
-/// in place and returns the same count. So the work happens, the result is
-/// discarded, and `compaction_state.record_failure()` is called; enough of
-/// those open the circuit breaker, at which point the path stops running for
-/// the rest of the session.
-///
-/// This case therefore pins "nothing shrinks", which is the truth today and
-/// not the intent. It is here because P3-5 moves this decision behind the
-/// `Compactor` contract, and when it does, the `content_bytes` column will
-/// drop — a golden diff that has to be read and approved rather than
-/// discovered afterwards.
-///
-/// **It cannot currently fail on a change to the trigger, and that is not an
-/// oversight to fix here.** Reverse-verified: setting the reactive check's
-/// `trigger` to 0, which stops it firing at all, leaves this trace byte for
-/// byte identical — because a decision whose result is discarded has no
-/// observable consequence to regress. So D14 is *not* covered by the net
-/// until P3-5 makes the path effective, and P3-5 carries the obligation to
-/// add the coverage along with the fix.
+/// That is the case's subject: firing is not the same as helping, and the
+/// circuit breaker is fed by the difference. `reactive_compaction_clears_old_tool_results`
+/// is the other half — the same trigger with a whitelisted tool, where the
+/// request does shrink.
 ///
 /// (The threshold path, `compaction_triggers_and_is_logged`, is unaffected
 /// and stays out of this case: 20k is far above what these messages reach.)
 #[tokio::test]
-async fn reactive_compaction_currently_has_no_effect() {
+async fn reactive_compaction_fires_but_clears_nothing() {
     let mut case = Case::new(
         "reactive_compaction_no_effect",
         vec!["one", "two", "three"],
@@ -659,5 +653,50 @@ async fn reactive_compaction_currently_has_no_effect() {
     );
     case.reactive_compact = true;
     case.compact_threshold = 20_000;
+    check(case).await;
+}
+
+/// **D14 — reactive compaction with a consequence.**
+///
+/// Seven `Read` rounds in one turn, well under the 20k threshold, so the
+/// budget never forces anything: everything this case shows is the predictive
+/// pass. `Read` is on the micro-compact whitelist and `compact_keep_recent`
+/// is 2 (floored to 5 rounds by the pass), so from the sixth round on the
+/// oldest results are blanked and `content_bytes` in the model-call column
+/// stops climbing.
+///
+/// The pass used to be unobservable — it adopted its result only when the
+/// message *count* dropped, and blanking a body in place never drops the
+/// count, so the work was done and thrown away on every round. This case
+/// exists because that is now fixed, and it is what would notice if it broke
+/// again. Reverse-verified two ways: turning the feature flag off for this
+/// case, and putting the message-count criterion back, each leave
+/// `content_bytes` climbing and fail here.
+#[tokio::test]
+async fn reactive_compaction_clears_old_tool_results() {
+    fn read(id: &'static str) -> Reply {
+        Reply::Tool {
+            id,
+            name: "Read",
+            input: serde_json::json!({}),
+        }
+    }
+    let mut case = Case::new(
+        "reactive_compaction_clears",
+        vec!["walk the tree"],
+        vec![
+            read("r1"),
+            read("r2"),
+            read("r3"),
+            read("r4"),
+            read("r5"),
+            read("r6"),
+            read("r7"),
+            Reply::Text("done"),
+        ],
+    );
+    case.reactive_compact = true;
+    case.compact_threshold = 20_000;
+    case.extra_tools = vec![compactable_tool()];
     check(case).await;
 }

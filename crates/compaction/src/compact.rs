@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use base::interface::model::{MessageRole, ModelContentBlock, ModelMessage};
 use base::text::truncate_at_char_boundary;
 
+use std::time::Instant;
+
 use crate::grouping::{estimate_tokens, group_by_api_round, ApiRound};
+use crate::time_based_mc::{TimeBasedMcConfig, TimeBasedMcResult};
 
 // ── Strategy types ──
 
@@ -86,6 +89,83 @@ pub enum CompactError {
 
 // ── Compactor trait ──
 
+/// What the aging passes may look at.
+///
+/// Neither pass is about the token budget: one clears tool results that have
+/// simply grown old, the other keeps the server-side cache from carrying
+/// results nobody will read again. They run before anything consults the
+/// budget, which is why they get their own input.
+pub struct AgingInput<'a> {
+    /// `(message index, when it was pushed)` for every message.
+    pub message_ages: &'a [(usize, Instant)],
+    pub time_based: &'a TimeBasedMcConfig,
+    /// Whether the cached pass's interval has elapsed. The interval and the
+    /// clock stay with the caller, which owns the pass's pending cache edits.
+    pub cached_due: bool,
+    pub cached_keep_recent: usize,
+}
+
+/// What one aging pass did.
+#[derive(Debug, Default)]
+pub struct Aging {
+    pub time_based: TimeBasedMcResult,
+    pub cached_cleared: usize,
+    /// `Some` when the cached pass ran: the `tool_use_id`s whose results it
+    /// blanked, which the next request sends as `cache_edits`.
+    pub cache_edits: Option<Vec<String>>,
+}
+
+impl Aging {
+    pub fn cleared(&self) -> usize {
+        self.time_based.cleared + self.cached_cleared
+    }
+}
+
+/// What the predictive pass may look at.
+pub struct ReactiveInput {
+    pub context_tokens: usize,
+    /// The effective context window. `0` disables the pass.
+    pub context_limit: usize,
+    pub keep_recent: usize,
+    pub enabled: bool,
+    /// Set once the caller has seen enough consecutive no-effect passes to
+    /// stop paying for them.
+    pub circuit_open: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactiveOutcome {
+    /// The pass is off, the circuit is open, or the prediction said there is
+    /// still room.
+    NotTriggered,
+    /// It ran and the history is cheaper for it.
+    Compacted,
+    /// It ran and bought nothing.
+    NoEffect,
+}
+
+/// How close the conversation is to the budget that forces compaction.
+pub struct BudgetState {
+    pub context_tokens: usize,
+    /// `0` disables both the warning and the threshold.
+    pub threshold: usize,
+    /// Whether this session has already been warned. The warning is worth
+    /// saying once.
+    pub warned_already: bool,
+}
+
+/// Compaction: when it happens, and what it does.
+///
+/// `compact` is the transformation. The four methods around it are the
+/// judgements about *when* — two aging passes that run before the budget is
+/// consulted, a predictive pass that fires before the budget is reached, and
+/// the threshold that forces the transformation. All four were inline in the
+/// turn loop, which meant swapping the compactor changed how history was
+/// rewritten but not when, and three of the four paths never reached the
+/// compactor at all.
+///
+/// Every judgement has a default that is the engine's own, so an implementor
+/// who only cares about the transformation writes `compact` and nothing else.
 #[async_trait]
 pub trait Compactor: Send + Sync {
     /// Compact messages to fit within `max_tokens`, keeping at least `keep_rounds` recent rounds.
@@ -96,6 +176,145 @@ pub trait Compactor: Send + Sync {
         max_tokens: usize,
         keep_rounds: usize,
     ) -> Result<(Vec<ModelMessage>, CompactResult), CompactError>;
+
+    /// Clear what has gone stale, before anyone looks at the budget.
+    fn age(&self, messages: &mut [ModelMessage], input: &AgingInput<'_>) -> Aging {
+        let mut out = Aging::default();
+        if input.time_based.max_age.is_some() {
+            out.time_based = crate::time_based_mc::apply_time_based_mc(
+                messages,
+                input.time_based,
+                input.message_ages,
+            );
+        }
+        if input.cached_due {
+            let (cleared, ids) =
+                crate::cached::clear_stale_tool_results(messages, input.cached_keep_recent);
+            out.cached_cleared = cleared;
+            out.cache_edits = Some(ids);
+        }
+        out
+    }
+
+    /// Compact early, before the budget forces a bigger one.
+    ///
+    /// Adopts the result only if it made the history cheaper. The obvious
+    /// criterion — fewer messages — is the wrong one here: `micro_compact`
+    /// blanks tool-result bodies in place and never drops a message, so
+    /// counting messages meant the result was discarded every time and this
+    /// whole path had no consequence.
+    fn reactive(
+        &self,
+        messages: &mut Vec<ModelMessage>,
+        input: &ReactiveInput,
+    ) -> ReactiveOutcome {
+        if !input.enabled || input.context_limit == 0 || input.circuit_open {
+            return ReactiveOutcome::NotTriggered;
+        }
+        let velocity = crate::reactive::estimate_token_velocity(messages);
+        if !crate::reactive::should_compact_reactively(
+            input.context_tokens,
+            input.context_limit,
+            velocity,
+        ) {
+            return ReactiveOutcome::NotTriggered;
+        }
+        let keep = input.keep_recent.max(5);
+        if group_by_api_round(messages).len() <= keep {
+            // Nothing has aged out of the keep window yet. Not a failure: the
+            // circuit breaker is there to stop paying for a pass that keeps
+            // not helping, and a session with nothing old enough to clear is
+            // not that. Counting it as one opens the circuit within the first
+            // few rounds of every session and the pass never runs again.
+            return ReactiveOutcome::NotTriggered;
+        }
+        let before = estimate_tokens(messages);
+        let (compacted, _) = DefaultCompactor.micro_compact(messages.clone(), keep);
+        if estimate_tokens(&compacted) >= before {
+            return ReactiveOutcome::NoEffect;
+        }
+        *messages = compacted;
+        crate::cleanup::run_cleanup_callbacks();
+        ReactiveOutcome::Compacted
+    }
+
+    /// Tell the user compaction is coming, while there is still room to react
+    /// to it. `None` once it has been said.
+    fn context_warning(&self, state: &BudgetState) -> Option<String> {
+        if state.threshold == 0 || state.warned_already {
+            return None;
+        }
+        let warn_at = (state.threshold as f64 * 0.8) as usize;
+        if state.context_tokens <= warn_at || state.context_tokens > state.threshold {
+            return None;
+        }
+        Some(format!(
+            "<system-reminder>\n\
+             ⚠️ Context is at {:.0}% of the token budget ({}/{} tokens). \
+             The conversation will be compacted soon to make room. \
+             If you have pending work, wrap it up or ask the user what to preserve.\n\
+             </system-reminder>",
+            (state.context_tokens as f64 / state.threshold as f64 * 100.0).min(99.0),
+            state.context_tokens,
+            state.threshold,
+        ))
+    }
+
+    /// Whether the budget now forces a compaction.
+    fn should_compact(&self, state: &BudgetState) -> bool {
+        state.threshold > 0 && state.context_tokens > state.threshold
+    }
+
+    /// Whether it is worth an API call to summarize before anything is
+    /// dropped.
+    ///
+    /// Only the choice is here. Producing the summary needs a model, and
+    /// which model that is — a cheap one the task router picked, or the
+    /// conversation's own — is the loop's to know.
+    fn wants_llm_summary(
+        &self,
+        messages: &[ModelMessage],
+        max_tokens: usize,
+        keep_rounds: usize,
+    ) -> bool {
+        crate::llm_summary::should_summarize(messages, max_tokens, keep_rounds)
+    }
+}
+
+/// Compaction only when the budget forces it.
+///
+/// A deployment that wants its transcript left alone until it genuinely has
+/// to be rewritten: no aging passes, no early compaction, no warning. Wraps
+/// any compactor rather than replacing it, so "stop touching my history
+/// early" does not also mean "reimplement compaction".
+pub struct OnlyAtThreshold<C>(pub C);
+
+#[async_trait]
+impl<C: Compactor> Compactor for OnlyAtThreshold<C> {
+    async fn compact(
+        &self,
+        messages: Vec<ModelMessage>,
+        max_tokens: usize,
+        keep_rounds: usize,
+    ) -> Result<(Vec<ModelMessage>, CompactResult), CompactError> {
+        self.0.compact(messages, max_tokens, keep_rounds).await
+    }
+
+    fn age(&self, _messages: &mut [ModelMessage], _input: &AgingInput<'_>) -> Aging {
+        Aging::default()
+    }
+
+    fn reactive(
+        &self,
+        _messages: &mut Vec<ModelMessage>,
+        _input: &ReactiveInput,
+    ) -> ReactiveOutcome {
+        ReactiveOutcome::NotTriggered
+    }
+
+    fn context_warning(&self, _state: &BudgetState) -> Option<String> {
+        None
+    }
 }
 
 // ── DefaultCompactor: Snip + MicroCompact + CollapseContext ──
@@ -937,6 +1156,195 @@ mod tests {
             msgs.push(assistant_text(&format!("response {i}")));
         }
         msgs
+    }
+
+    // ── the trigger judgements ──
+
+    /// `rounds` rounds of "the model called Read, here is a kilobyte back".
+    fn read_rounds(rounds: usize) -> Vec<ModelMessage> {
+        let mut msgs = Vec::new();
+        for i in 0..rounds {
+            msgs.push(tool_use(&format!("t{i}"), "Read", "{}"));
+            msgs.push(tool_result(&format!("t{i}"), &"r".repeat(1_000)));
+        }
+        msgs
+    }
+
+    fn result_bodies(msgs: &[ModelMessage]) -> Vec<String> {
+        msgs.iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ModelContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reactive_input() -> ReactiveInput {
+        ReactiveInput {
+            context_tokens: 1_000,
+            context_limit: 20_000,
+            keep_recent: 2,
+            enabled: true,
+            circuit_open: false,
+        }
+    }
+
+    #[test]
+    fn the_reactive_pass_adopts_a_rewrite_that_never_drops_a_message() {
+        let mut messages = read_rounds(8);
+        let before = estimate_tokens(&messages);
+        let outcome = DefaultCompactor.reactive(&mut messages, &reactive_input());
+        assert_eq!(outcome, ReactiveOutcome::Compacted);
+        assert_eq!(
+            messages.len(),
+            16,
+            "micro-compact blanks bodies in place; a criterion based on the \
+             message count can only ever see nothing happen"
+        );
+        assert!(estimate_tokens(&messages) < before);
+    }
+
+    /// The distinction the circuit breaker depends on. Every session starts
+    /// with nothing old enough to clear; if that counted as a failure the
+    /// breaker would open in the first few rounds and the pass would never
+    /// run again.
+    #[test]
+    fn having_nothing_old_enough_to_clear_is_not_a_failed_pass() {
+        let mut messages = read_rounds(3);
+        assert_eq!(
+            DefaultCompactor.reactive(&mut messages, &reactive_input()),
+            ReactiveOutcome::NotTriggered
+        );
+    }
+
+    #[test]
+    fn a_pass_that_buys_nothing_is_reported_as_such() {
+        // `Bash` is on the whitelist, `GoldenFlood` is not — nothing here can
+        // be cleared, so the pass runs and comes back empty-handed.
+        let mut messages = Vec::new();
+        for i in 0..8 {
+            messages.push(tool_use(&format!("t{i}"), "NotOnTheWhitelist", "{}"));
+            messages.push(tool_result(&format!("t{i}"), &"r".repeat(1_000)));
+        }
+        assert_eq!(
+            DefaultCompactor.reactive(&mut messages, &reactive_input()),
+            ReactiveOutcome::NoEffect
+        );
+    }
+
+    #[test]
+    fn an_open_circuit_stops_the_pass_running_at_all() {
+        let mut messages = read_rounds(8);
+        let input = ReactiveInput {
+            circuit_open: true,
+            ..reactive_input()
+        };
+        assert_eq!(
+            DefaultCompactor.reactive(&mut messages, &input),
+            ReactiveOutcome::NotTriggered
+        );
+        assert_eq!(
+            result_bodies(&messages),
+            result_bodies(&read_rounds(8)),
+            "and leaves the history alone"
+        );
+    }
+
+    #[test]
+    fn the_warning_is_said_once_and_only_in_the_last_fifth() {
+        let state = |tokens, warned| BudgetState {
+            context_tokens: tokens,
+            threshold: 10_000,
+            warned_already: warned,
+        };
+        assert!(DefaultCompactor.context_warning(&state(7_999, false)).is_none());
+        assert!(DefaultCompactor.context_warning(&state(8_001, false)).is_some());
+        assert!(
+            DefaultCompactor.context_warning(&state(8_001, true)).is_none(),
+            "already said"
+        );
+        assert!(
+            DefaultCompactor.context_warning(&state(10_001, false)).is_none(),
+            "past the threshold there is nothing to warn about — it is compacting"
+        );
+    }
+
+    #[test]
+    fn a_threshold_of_zero_disables_the_budget_entirely() {
+        let state = BudgetState {
+            context_tokens: usize::MAX,
+            threshold: 0,
+            warned_already: false,
+        };
+        assert!(!DefaultCompactor.should_compact(&state));
+        assert!(DefaultCompactor.context_warning(&state).is_none());
+    }
+
+    /// The second implementation, and the one a host would actually reach
+    /// for: leave my transcript alone until the budget forces a rewrite.
+    #[tokio::test]
+    async fn only_at_threshold_declines_everything_the_budget_did_not_force() {
+        let c = OnlyAtThreshold(DefaultCompactor);
+        let mut messages = read_rounds(8);
+        let untouched = messages.clone();
+
+        assert_eq!(
+            c.reactive(&mut messages, &reactive_input()),
+            ReactiveOutcome::NotTriggered
+        );
+        let aging = c.age(
+            &mut messages,
+            &AgingInput {
+                message_ages: &[],
+                time_based: &TimeBasedMcConfig::default(),
+                cached_due: true,
+                cached_keep_recent: 0,
+            },
+        );
+        assert_eq!(aging.cleared(), 0);
+        assert!(aging.cache_edits.is_none());
+        assert_eq!(result_bodies(&messages), result_bodies(&untouched));
+        assert!(c
+            .context_warning(&BudgetState {
+                context_tokens: 9_000,
+                threshold: 10_000,
+                warned_already: false,
+            })
+            .is_none());
+
+        // What it does not decline: the budget itself.
+        let state = BudgetState {
+            context_tokens: 10_001,
+            threshold: 10_000,
+            warned_already: false,
+        };
+        assert!(c.should_compact(&state));
+        let (out, result) = c.compact(messages, 500, 2).await.expect("compacts");
+        assert_ne!(result.strategy, CompactStrategy::NoOp);
+        assert!(estimate_tokens(&out) < estimate_tokens(&untouched));
+    }
+
+    /// Both aging passes run, and the cached one hands back the ids the next
+    /// request needs.
+    #[test]
+    fn the_cached_pass_reports_what_it_blanked() {
+        let mut messages = read_rounds(4);
+        let aging = DefaultCompactor.age(
+            &mut messages,
+            &AgingInput {
+                message_ages: &[],
+                time_based: &TimeBasedMcConfig::disabled(),
+                cached_due: true,
+                cached_keep_recent: 1,
+            },
+        );
+        assert_eq!(aging.cached_cleared, 3);
+        assert_eq!(
+            aging.cache_edits.as_deref(),
+            Some(["t2", "t1", "t0"].map(String::from).as_slice()),
+            "newest first, and only the ones that were blanked"
+        );
     }
 
     // ── UTF-8 safety regressions ──

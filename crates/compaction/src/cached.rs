@@ -70,47 +70,21 @@ impl CachedMicroCompact {
         if !self.config.enabled {
             return 0;
         }
+        let (cleared, ids) = clear_stale_tool_results(messages, self.config.keep_recent);
+        self.record_pass(ids);
+        cleared
+    }
 
-        // Collect indices of tool result blocks (from newest to oldest),
-        // also tracking tool_use_ids for cache_edits.
-        let mut result_positions: Vec<(usize, usize)> = Vec::new(); // (msg_idx, block_idx)
-        let mut cleared_ids: Vec<String> = Vec::new();
-
-        for (i, msg) in messages.iter().enumerate().rev() {
-            if msg.role == MessageRole::User {
-                for (j, block) in msg.content.iter().enumerate() {
-                    if matches!(block, ModelContentBlock::ToolResult { .. }) {
-                        result_positions.push((i, j));
-                    }
-                }
-            }
-        }
-
-        let to_keep = self.config.keep_recent.min(result_positions.len());
-        let to_clear = result_positions.len().saturating_sub(to_keep);
-
-        for &(msg_idx, block_idx) in &result_positions[to_keep..] {
-            if let Some(msg) = messages.get_mut(msg_idx) {
-                if let Some(block) = msg.content.get_mut(block_idx) {
-                    // Capture tool_use_id before clearing
-                    if let ModelContentBlock::ToolResult { tool_use_id, .. } = &block {
-                        if !tool_use_id.is_empty() {
-                            cleared_ids.push(tool_use_id.clone());
-                        }
-                    }
-                    *block = ModelContentBlock::ToolResult {
-                        tool_use_id: String::new(),
-                        content: "[Old tool result content cleared]".to_string(),
-                        is_error: Some(false),
-                    };
-                }
-            }
-        }
-
-        self.pending_edits = cleared_ids;
+    /// Record that a pass just happened, whoever ran it: the interval restarts
+    /// and `ids` becomes what the next request sends as `cache_edits`.
+    pub fn record_pass(&mut self, ids: Vec<String>) {
+        self.pending_edits = ids;
         self.last_run = Instant::now();
         self.run_count += 1;
-        to_clear
+    }
+
+    pub fn keep_recent(&self) -> usize {
+        self.config.keep_recent
     }
 
     /// Consume and clear the pending cache edits (tool_use_ids).
@@ -177,6 +151,51 @@ impl CachedMicroCompact {
             }).collect::<Vec<_>>()
         }))
     }
+}
+
+/// Blank every tool result but the `keep_recent` newest, and report the
+/// `tool_use_id`s that were blanked.
+///
+/// The pass itself, with no state: the interval that decides *when* it runs
+/// and the buffer holding the ids until the next request are the caller's.
+pub fn clear_stale_tool_results(
+    messages: &mut [ModelMessage],
+    keep_recent: usize,
+) -> (usize, Vec<String>) {
+    let mut result_positions: Vec<(usize, usize)> = Vec::new();
+    let mut cleared_ids: Vec<String> = Vec::new();
+
+    for (i, msg) in messages.iter().enumerate().rev() {
+        if msg.role == MessageRole::User {
+            for (j, block) in msg.content.iter().enumerate() {
+                if matches!(block, ModelContentBlock::ToolResult { .. }) {
+                    result_positions.push((i, j));
+                }
+            }
+        }
+    }
+
+    let to_keep = keep_recent.min(result_positions.len());
+    let to_clear = result_positions.len().saturating_sub(to_keep);
+
+    for &(msg_idx, block_idx) in &result_positions[to_keep..] {
+        if let Some(msg) = messages.get_mut(msg_idx) {
+            if let Some(block) = msg.content.get_mut(block_idx) {
+                if let ModelContentBlock::ToolResult { tool_use_id, .. } = &block {
+                    if !tool_use_id.is_empty() {
+                        cleared_ids.push(tool_use_id.clone());
+                    }
+                }
+                *block = ModelContentBlock::ToolResult {
+                    tool_use_id: String::new(),
+                    content: "[Old tool result content cleared]".to_string(),
+                    is_error: Some(false),
+                };
+            }
+        }
+    }
+
+    (to_clear, cleared_ids)
 }
 
 #[cfg(test)]

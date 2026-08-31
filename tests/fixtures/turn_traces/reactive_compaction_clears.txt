@@ -1,0 +1,54 @@
+== events ==
+SystemInit
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+ToolUse Read {}
+ToolResult Read is_error=Some(false) content="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr… <1000 bytes total>"
+TextDelta "\n[Turn 0 used tools: Read]\n"
+TextDelta "done"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024 messages=1 content_bytes=13 truncated_results=0
+golden-model max_tokens=1024 messages=3 content_bytes=1013 truncated_results=0
+golden-model max_tokens=1024 messages=5 content_bytes=2013 truncated_results=0
+golden-model max_tokens=1024 messages=7 content_bytes=3013 truncated_results=0
+golden-model max_tokens=1024 messages=9 content_bytes=4013 truncated_results=0
+golden-model max_tokens=1024 messages=11 content_bytes=5013 truncated_results=0
+golden-model max_tokens=1024 messages=13 content_bytes=5046 truncated_results=0
+golden-model max_tokens=1024 messages=15 content_bytes=5079 truncated_results=0
+unconsumed_replies=0

@@ -173,6 +173,55 @@ impl Tool for GoldenAsk {
     }
 }
 
+/// Returns a kilobyte under the name `Read`.
+///
+/// The name is the point: `micro_compact` only blanks results from a fixed
+/// whitelist of tools, and nothing in the default set here is on it. A case
+/// about a pass that clears old tool results needs a tool whose results that
+/// pass is willing to clear, so this one is registered per-case rather than
+/// globally — adding it to `fake_tools` would change the tool schemas every
+/// other case sends, and with them every other golden.
+#[derive(Debug)]
+struct GoldenReadFile;
+
+#[async_trait::async_trait]
+impl Tool for GoldenReadFile {
+    fn name(&self) -> &str {
+        "Read"
+    }
+    fn description(&self) -> &str {
+        "Return a kilobyte of file contents."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn is_concurrency_safe(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    fn is_read_only(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+        PermissionDecision::allow()
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        Ok(ToolResult::text("r".repeat(1_000)))
+    }
+}
+
+/// A tool whose results the micro-compact whitelist will actually clear.
+pub fn compactable_tool() -> Arc<dyn Tool> {
+    Arc::new(GoldenReadFile)
+}
+
 pub fn fake_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(GoldenEcho),
