@@ -36,6 +36,7 @@
 //! | [`import_callback::ImportCallback`] | the host's answer to an import prompt |
 //! | [`log::Logger`] | log routing |
 //! | [`event_sink::EventSink`] | where the engine's events go |
+//! | [`health::HealthCheck`] | whether a subsystem is working |
 //! | [`elicitation::Elicitation`] | how the engine asks a person something |
 //! | [`tool::SecondaryLlm`] | the small model tools may call |
 //! | [`token_counter::TokenCounter`] | how big the context is judged to be |
@@ -66,6 +67,7 @@ pub mod config_source;
 pub mod credentials;
 pub mod elicitation;
 pub mod event_sink;
+pub mod health;
 #[deprecated(note = "moved to `base::event` — event payloads, not an injectable contract")]
 pub use crate::event;
 pub mod import_callback;

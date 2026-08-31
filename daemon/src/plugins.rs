@@ -145,6 +145,16 @@ mod imp {
             }
         }
 
+        /// The fault records as a health check, so a plugin this process has
+        /// stopped calling is visible to whoever installed it.
+        pub fn health_check(
+            &self,
+        ) -> Option<Arc<dyn base::interface::health::HealthCheck>> {
+            Some(Arc::new(wasm_host::health::PluginBreakers::new(
+                self.health.clone(),
+            )))
+        }
+
         /// The policy in force, for diagnostics.
         pub fn policy(&self) -> &base::interface::settings::PluginsConfig {
             &self.policy
@@ -408,6 +418,11 @@ mod imp {
         }
         pub fn mcp_servers(&self) -> HashMap<String, serde_json::Value> {
             HashMap::new()
+        }
+        pub fn health_check(
+            &self,
+        ) -> Option<Arc<dyn base::interface::health::HealthCheck>> {
+            None
         }
         pub fn count(&self) -> usize {
             0

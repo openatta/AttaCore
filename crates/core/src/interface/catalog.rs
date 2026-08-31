@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 29] = [
+static POINTS: [ExtensionPoint; 30] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -252,6 +252,16 @@ static POINTS: [ExtensionPoint; 29] = [
             frequency: Frequency::PerStreamChunk,
             trust: Trust::host_only(),
             defined_in: "base::interface::event_sink::EventSink",
+        },
+        ExtensionPoint {
+            id: "health.check",
+            kind: Kind::Registration,
+            summary: "whether a subsystem is working, alongside the engine's own answers",
+            timing: "whenever something asks for a health report",
+            rewrites: "nothing — a check reports, it does not repair",
+            frequency: Frequency::PerProcess,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::health::HealthCheck",
         },
         ExtensionPoint {
             id: "elicitation.ask",

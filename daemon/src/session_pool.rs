@@ -280,6 +280,12 @@ pub struct SessionPool {
     /// contribute arrives through it, and in a build without the `plugins`
     /// feature it is a stub that contributes nothing.
     plugins: crate::plugins::PluginSubsystem,
+    /// Process-scope diagnostics, reported by `daemon.doctor` — the plugin
+    /// fault records, plus whatever an embedder registered with
+    /// [`SessionPool::register_health_check`]. Not the same set as a
+    /// session's: a session's checks come and go with the session, and one
+    /// shared registry would grow an entry per session forever.
+    health: std::sync::RwLock<base::interface::health::HealthChecks>,
     /// Command catalog shared by every session — skill-derived + built-in
     /// local commands, rebuilt by
     /// `refresh_plugins()` instead of re-scanning skill dirs per session
@@ -533,6 +539,10 @@ impl SessionPool {
             paths,
             mcp_by_project: AsyncMutex::new(HashMap::new()),
             events_tx,
+            health: std::sync::RwLock::new(match plugins.health_check() {
+                Some(check) => base::interface::health::HealthChecks::new().with(check),
+                None => base::interface::health::HealthChecks::new(),
+            }),
             plugins,
             commands: AsyncRwLock::new(commands),
             task_router: AsyncRwLock::new(task_router),
@@ -1105,14 +1115,23 @@ impl SessionPool {
 
     /// Read-only config/wiring diagnostics — see `crate::doctor`.
     pub async fn doctor_report(&self) -> serde_json::Value {
-        let settings = self.settings.read().await;
+        let settings = self.settings.read().await.clone();
+        let health = self.health.read().unwrap_or_else(|e| e.into_inner());
         crate::doctor::run_doctor(
             self.paths.as_ref(),
             self.scene.id(),
-            &settings,
+            settings,
             self.history_store.is_some(),
             self.plugins.status(),
+            &health,
         )
+    }
+
+    /// Add a diagnostic of the host's own to what `daemon.doctor` reports.
+    pub fn register_health_check(&self, check: Arc<dyn base::interface::health::HealthCheck>) {
+        let mut health = self.health.write().unwrap_or_else(|e| e.into_inner());
+        let existing = std::mem::take(&mut *health);
+        *health = existing.with(check);
     }
 
     /// The currently-active settings snapshot (for config-inspection RPCs).

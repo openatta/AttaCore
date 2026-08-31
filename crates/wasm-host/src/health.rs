@@ -101,8 +101,92 @@ impl HealthRegistry {
         self.lock().get(plugin).is_some_and(|h| h.is_broken())
     }
 
+    /// Every plugin with a record, and what that record says.
+    pub fn snapshot(&self) -> Vec<PluginFaults> {
+        let mut out: Vec<PluginFaults> = self
+            .lock()
+            .iter()
+            .map(|(plugin, h)| PluginFaults {
+                plugin: plugin.clone(),
+                consecutive_faults: h.consecutive_faults(),
+                total_faults: h.total_faults(),
+                broken: h.is_broken(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+        out
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Arc<Health>>> {
         self.by_plugin.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One plugin's record, flattened for reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginFaults {
+    pub plugin: String,
+    pub consecutive_faults: u32,
+    pub total_faults: u32,
+    pub broken: bool,
+}
+
+/// The fault records as a health check.
+///
+/// Setting a plugin aside is a decision this crate was already making and
+/// nobody outside could see: the tool stops being offered, the model stops
+/// asking for it, and whoever installed it gets no signal that any of that
+/// happened. Reported, it becomes something an operator can act on — the
+/// plugin's author has a bug, or this component does not work on this
+/// machine.
+///
+/// Degraded rather than failing when a plugin is broken: the engine is
+/// working, and its answer to "should I keep calling this" is the one the
+/// fault limit was designed to give.
+pub struct PluginBreakers {
+    registry: Arc<HealthRegistry>,
+}
+
+impl PluginBreakers {
+    pub fn new(registry: Arc<HealthRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl base::interface::health::HealthCheck for PluginBreakers {
+    fn name(&self) -> &str {
+        "plugins.breakers"
+    }
+
+    fn check(&self) -> base::interface::health::CheckResult {
+        use base::interface::health::CheckResult;
+
+        let records = self.registry.snapshot();
+        let broken: Vec<&PluginFaults> = records.iter().filter(|r| r.broken).collect();
+        let details = serde_json::json!({
+            "plugins": records
+                .iter()
+                .map(|r| serde_json::json!({
+                    "plugin": r.plugin,
+                    "consecutive_faults": r.consecutive_faults,
+                    "total_faults": r.total_faults,
+                    "broken": r.broken,
+                }))
+                .collect::<Vec<_>>(),
+            "fault_limit": FAULT_LIMIT,
+        });
+
+        if broken.is_empty() {
+            CheckResult::ok(format!("{} plugin(s) called, none set aside", records.len()))
+                .with_details(details)
+        } else {
+            let names: Vec<&str> = broken.iter().map(|r| r.plugin.as_str()).collect();
+            CheckResult::degraded(format!(
+                "set aside after {FAULT_LIMIT} consecutive faults: {}",
+                names.join(", ")
+            ))
+            .with_details(details)
+        }
     }
 }
 
@@ -216,5 +300,29 @@ mod tests {
     #[test]
     fn an_unknown_plugin_is_not_broken() {
         assert!(!HealthRegistry::new().is_broken("never-seen"));
+    }
+
+    #[test]
+    fn the_health_check_is_quiet_until_something_is_actually_set_aside() {
+        use base::interface::health::{HealthCheck, HealthStatus};
+
+        let reg = HealthRegistry::new();
+        reg.for_plugin("fine").record_success();
+        reg.for_plugin("wobbly").record_fault();
+
+        let result = PluginBreakers::new(reg.clone()).check();
+        assert_eq!(result.status, HealthStatus::Ok);
+        assert_eq!(result.details["plugins"].as_array().unwrap().len(), 2);
+
+        for _ in 0..FAULT_LIMIT {
+            reg.for_plugin("wobbly").record_fault();
+        }
+        let result = PluginBreakers::new(reg).check();
+        assert_eq!(result.status, HealthStatus::Degraded);
+        assert!(
+            result.summary.contains("wobbly"),
+            "the operator needs the name, not a count: {}",
+            result.summary
+        );
     }
 }

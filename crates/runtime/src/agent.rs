@@ -193,6 +193,9 @@ pub struct Agent {
     /// What this session's turns may spend, and how much context they may
     /// carry — see [`Builder::budget_policy`].
     pub(crate) budget_policy: Arc<dyn base::interface::budget_policy::BudgetPolicy>,
+    /// Whether this session's subsystems are working — see
+    /// [`Builder::health_check`] and [`Agent::health`].
+    pub(crate) health: Arc<base::interface::health::HealthChecks>,
     /// What to do when a model call goes wrong — see
     /// [`Builder::recovery_policy`].
     pub(crate) recovery_policy: Arc<dyn base::interface::recovery_policy::RecoveryPolicy>,
@@ -353,6 +356,20 @@ impl Agent {
     /// `&Agent` left to ask. Take this before spawning and keep it.
     pub fn commands(&self) -> Arc<crate::commands::CommandRegistry> {
         Arc::clone(&self.commands)
+    }
+
+    /// The diagnostics registered for this session, for a host that wants to
+    /// know whether the engine is well.
+    ///
+    /// Hands out the `Arc` for the same reason [`Agent::commands`] does:
+    /// `run()` holds `&mut self` for the life of the session, so a host that
+    /// has spawned the engine has no `&Agent` left to ask. Take this before
+    /// spawning, and call [`HealthChecks::report`] whenever something asks —
+    /// a status endpoint, a supervisor, a log line every minute.
+    ///
+    /// [`HealthChecks::report`]: base::interface::health::HealthChecks::report
+    pub fn health(&self) -> Arc<base::interface::health::HealthChecks> {
+        Arc::clone(&self.health)
     }
 
     /// Start the agent event loop. Runs until cancelled (caller calls `.cancel()` on the token)
@@ -982,6 +999,8 @@ pub struct Builder {
     turn_policy: Option<Arc<dyn base::interface::turn_policy::TurnPolicy>>,
     /// Spend and context ceilings — see [`Builder::budget_policy`].
     budget_policy: Option<Arc<dyn base::interface::budget_policy::BudgetPolicy>>,
+    /// Diagnostics — see [`Builder::health_check`].
+    health_checks: Vec<Arc<dyn base::interface::health::HealthCheck>>,
     /// Model-failure recovery — see [`Builder::recovery_policy`].
     recovery_policy: Option<Arc<dyn base::interface::recovery_policy::RecoveryPolicy>>,
     /// Model request/response interception — see [`Builder::model_interceptor`].
@@ -1185,6 +1204,7 @@ impl Builder {
             result_transformers: Vec::new(),
             turn_policy: None,
             budget_policy: None,
+            health_checks: Vec::new(),
             recovery_policy: None,
             model_interceptors: Vec::new(),
             memory_retriever: None,
@@ -1334,6 +1354,24 @@ impl Builder {
         p: Arc<dyn base::interface::budget_policy::BudgetPolicy>,
     ) -> Self {
         self.budget_policy = Some(p);
+        self
+    }
+
+    /// Register a diagnostic, reported by [`Agent::health`] beside whatever
+    /// else is registered.
+    ///
+    /// A check reports and never repairs: there is nothing an implementation
+    /// can return that reopens a circuit breaker, reloads configuration or
+    /// restarts anything. It is also expected to answer promptly from state
+    /// it already holds — a probe that blocks on the subsystem it is probing
+    /// hangs exactly when the answer matters most.
+    ///
+    /// [`HealthCheck`]: base::interface::health::HealthCheck
+    pub fn health_check(
+        mut self,
+        check: Arc<dyn base::interface::health::HealthCheck>,
+    ) -> Self {
+        self.health_checks.push(check);
         self
     }
 
@@ -2258,6 +2296,9 @@ impl Builder {
                 result_transformers: Arc::new(self.result_transformers),
                 turn_policy,
                 budget_policy,
+                health: Arc::new(base::interface::health::HealthChecks::from_vec(
+                    self.health_checks,
+                )),
                 recovery_policy,
                 model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self
@@ -4953,6 +4994,62 @@ mod tests {
 
         drop(input_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+    /// P3-15's acceptance: an embedder registers a diagnostic of its own and
+    /// reads the engine's health back — after handing the agent off to its
+    /// own task, which is when a supervisor actually asks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_registers_a_health_check_and_reads_the_report_back() {
+        use base::interface::health::{CheckResult, HealthCheck, HealthStatus};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Queue(Arc<AtomicBool>);
+        impl HealthCheck for Queue {
+            fn name(&self) -> &str {
+                "acme.queue"
+            }
+            fn check(&self) -> CheckResult {
+                if self.0.load(Ordering::SeqCst) {
+                    CheckResult::degraded("queue backed up")
+                        .with_details(serde_json::json!({ "depth": 4096 }))
+                } else {
+                    CheckResult::ok("queue drained")
+                }
+            }
+        }
+
+        let backed_up = Arc::new(AtomicBool::new(false));
+        let (agent, _event_rx, _input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .health_check(Arc::new(Queue(backed_up.clone())))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let health = agent.health();
+        // `run()` takes the agent by `&mut self` for the life of the session,
+        // so a handle taken before that is the only way to ask afterwards.
+        let mut agent = agent;
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+
+        let report = health.report();
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "acme.queue");
+
+        backed_up.store(true, Ordering::SeqCst);
+        let report = health.report();
+        assert_eq!(
+            report.status,
+            HealthStatus::Degraded,
+            "the report is asked fresh every time, not cached at build"
+        );
+        assert_eq!(report.to_json()["checks"][0]["details"]["depth"], 4096);
+
+        engine.abort();
     }
 
     /// P3-3's acceptance: a policy turns an overload from "switch to the

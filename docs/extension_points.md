@@ -41,6 +41,7 @@ anything, which is why those are closed to scripts and plugins outright.
 | `prompt.variable` | registration | prompt assembly, after blocks are merged | its own placeholder, nothing else | per turn (10⁰–10¹) | full | full | add only |
 | `prompt.assemble` | interception | prompt assembly, last | block content, order and membership | per turn (10⁰–10¹) | full | full | declared capability |
 | `event.sink` | contract | every emission, on the sink's own task | nothing — observation only | per streamed chunk (10³–10⁴) | closed | closed | closed |
+| `health.check` | registration | whenever something asks for a health report | nothing — a check reports, it does not repair | per process (10⁰) | closed | closed | closed |
 | `elicitation.ask` | contract | whenever a decision needs a human | the answer | per turn (10⁰–10¹) | closed | closed | closed |
 | `permission.check` | contract | before every tool call | permit, deny, or ask | per tool call (10¹) | closed | closed | closed |
 | `scene` | contract | session build | everything about how an agent presents itself | per session (10⁰) | closed | closed | closed |
@@ -331,6 +332,46 @@ store.append(session, LogEntry::Extension {
 The kernel never parses the payload. An entry whose namespace nobody claims is
 carried along and otherwise ignored, so uninstalling a plugin leaves its old
 sessions loading, forking and resuming exactly as before.
+
+### Whether things are working — `health.check`
+
+```rust
+struct QueueDepth(Arc<Metrics>);
+
+impl HealthCheck for QueueDepth {
+    fn name(&self) -> &str { "acme.queue" }
+    fn check(&self) -> CheckResult {
+        match self.0.depth() {
+            d if d < 1000 => CheckResult::ok("queue drained"),
+            d => CheckResult::degraded(format!("{d} queued"))
+                .with_details(serde_json::json!({ "depth": d })),
+        }
+    }
+}
+
+let agent = Builder::new()./* … */.health_check(Arc::new(QueueDepth(metrics))).build()?;
+let health = agent.health();          // take this before spawning the engine
+let report = health.report();         // fresh answers, every time
+```
+
+The report carries every registered check's verdict and the worst of them.
+The engine's own checks are registered by whoever wires it: `daemon` registers
+the settings tiers, provider routing, hooks configuration and the plugin fault
+records, and reports the lot under `daemon.doctor`'s `health` key.
+
+Two rules the contract enforces rather than asks for. **A check reports and
+never repairs** — there is no return value that reopens a circuit breaker,
+reloads configuration or restarts anything, because a diagnostic that quietly
+fixed things would describe what it just did rather than what it found. And
+**`check()` is synchronous and expected to answer from state it already
+holds**: a probe that blocks on the subsystem it is probing hangs exactly when
+the answer matters most. A check that needs the network keeps a cached verdict
+updated out of band and reports that.
+
+There is no `Err`. A check that cannot determine the answer has determined
+something — it says `Degraded` and puts the reason in its summary, rather than
+leaving every caller to decide for itself whether a failed check means
+unhealthy.
 
 ---
 

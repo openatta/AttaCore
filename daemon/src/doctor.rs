@@ -5,10 +5,17 @@
 //! just logging a warning and moving on — useful for a user (or an IDE
 //! plugin) asking "why isn't my provider config taking effect?" without
 //! grepping daemon logs.
+//!
+//! Its three verdicts — the tiers, provider routing, hooks configuration —
+//! are [`HealthCheck`]s, so the same answers reach an embedder that never
+//! runs a daemon, and so a host's own checks can stand beside them in one
+//! report rather than in a second endpoint.
 
 use crate::config::DaemonPaths;
+use base::interface::health::{CheckResult, HealthCheck, HealthChecks};
 use base::interface::settings::Settings;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Status of a single settings.json layer.
 #[derive(serde::Serialize)]
@@ -59,78 +66,187 @@ fn inspect_tier(tier: &'static str, dir: &Path) -> TierStatus {
     }
 }
 
-/// Build the full diagnostic report as a JSON value (the RPC result body).
-pub fn run_doctor(
-    paths: &dyn DaemonPaths,
-    scene_id: &str,
-    settings: &Settings,
-    history_store_wired: bool,
-    plugin_status: crate::plugins::PluginStatus,
-) -> serde_json::Value {
-    let global_root = paths.global_root();
-    let scene_root = paths.config_root();
-    let project_root = paths.project_root().join(".atta");
+/// The three settings.json tiers: is each one there, and does it parse?
+pub struct SettingsTiersCheck {
+    global: PathBuf,
+    scene: PathBuf,
+    project: PathBuf,
+}
 
-    let tiers = vec![
-        inspect_tier("global", &global_root),
-        inspect_tier("scene", &scene_root),
-        inspect_tier("project", &project_root),
-    ];
-
-    // Provider / task_models routing validation — same call `main.rs` makes
-    // at startup, re-run here so `doctor` reflects the live settings even if
-    // this is a hot-reload/inspection call rather than a fresh process.
-    let (providers_ok, provider_warnings, provider_error) = if settings.providers.is_empty() {
-        (true, Vec::new(), None)
-    } else {
-        match base::provider::resolve_task_models(
-            &settings.providers,
-            settings.default_provider.as_deref(),
-            &settings.task_models,
-        ) {
-            Ok((_, warnings)) => (true, warnings, None),
-            Err(e) => (false, Vec::new(), Some(e)),
+impl SettingsTiersCheck {
+    pub fn new(paths: &dyn DaemonPaths) -> Self {
+        Self {
+            global: paths.global_root(),
+            scene: paths.config_root(),
+            project: paths.project_root().join(".atta"),
         }
-    };
+    }
+}
 
-    let (hooks_ok, hooks_error) = match &settings.hooks_config {
-        None => (true, None),
-        Some(v) => {
-            // Same tolerant parse the engine uses, so `doctor` reports what
-            // will actually be loaded rather than a whole-map verdict the
-            // engine no longer shares.
-            let (_, report) = hooks::parse_hooks_settings(v);
-            if report.is_clean() {
-                (true, None)
-            } else {
-                let mut parts = Vec::new();
-                if !report.unknown_events.is_empty() {
-                    parts.push(format!("unknown events: {:?}", report.unknown_events));
-                }
-                for (event, err) in &report.invalid_configs {
-                    parts.push(format!("{event}: {err}"));
-                }
-                (false, Some(parts.join("; ")))
+impl HealthCheck for SettingsTiersCheck {
+    fn name(&self) -> &str {
+        "settings.tiers"
+    }
+
+    fn check(&self) -> CheckResult {
+        let tiers = vec![
+            inspect_tier("global", &self.global),
+            inspect_tier("scene", &self.scene),
+            inspect_tier("project", &self.project),
+        ];
+        let broken: Vec<&str> = tiers
+            .iter()
+            .filter(|t| !t.parses)
+            .map(|t| t.tier)
+            .collect();
+        let details = serde_json::to_value(&tiers).unwrap_or(serde_json::Value::Null);
+
+        // A tier that is simply absent is the normal case, not a fault: most
+        // deployments write one file and leave the other two alone.
+        if broken.is_empty() {
+            CheckResult::ok("every settings.json present parses").with_details(details)
+        } else {
+            CheckResult::degraded(format!("unreadable settings.json: {}", broken.join(", ")))
+                .with_details(details)
+        }
+    }
+}
+
+/// Provider and task-model routing — the same resolution `main.rs` runs at
+/// startup, re-run here so this reflects the live settings after a reload.
+pub struct ProviderRoutingCheck(Arc<Settings>);
+
+impl ProviderRoutingCheck {
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self(settings)
+    }
+}
+
+impl HealthCheck for ProviderRoutingCheck {
+    fn name(&self) -> &str {
+        "settings.providers"
+    }
+
+    fn check(&self) -> CheckResult {
+        let settings = &self.0;
+        let (ok, warnings, error) = if settings.providers.is_empty() {
+            (true, Vec::new(), None)
+        } else {
+            match base::provider::resolve_task_models(
+                &settings.providers,
+                settings.default_provider.as_deref(),
+                &settings.task_models,
+            ) {
+                Ok((_, warnings)) => (true, warnings, None),
+                Err(e) => (false, Vec::new(), Some(e)),
             }
-        }
-    };
+        };
 
-    serde_json::json!({
-        "scene": scene_id,
-        "settings_tiers": tiers,
-        "providers": {
+        let details = serde_json::json!({
             "configured": settings.providers.keys().collect::<Vec<_>>(),
             "default_provider": settings.default_provider,
             "task_models": settings.task_models.keys().collect::<Vec<_>>(),
-            "ok": providers_ok,
-            "warnings": provider_warnings,
-            "error": provider_error,
-        },
-        "hooks": {
-            "configured": settings.hooks_config.is_some(),
-            "ok": hooks_ok,
-            "error": hooks_error,
-        },
+            "ok": ok,
+            "warnings": warnings,
+            "error": error,
+        });
+
+        match error {
+            Some(e) => CheckResult::failing(e).with_details(details),
+            None if !warnings.is_empty() => {
+                CheckResult::degraded(warnings.join("; ")).with_details(details)
+            }
+            None => CheckResult::ok("provider routing resolves").with_details(details),
+        }
+    }
+}
+
+/// The hooks section, parsed the same tolerant way the engine parses it — so
+/// this reports what will actually load rather than a whole-map verdict the
+/// engine no longer shares.
+pub struct HooksCheck(Arc<Settings>);
+
+impl HooksCheck {
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self(settings)
+    }
+}
+
+impl HealthCheck for HooksCheck {
+    fn name(&self) -> &str {
+        "settings.hooks"
+    }
+
+    fn check(&self) -> CheckResult {
+        let configured = self.0.hooks_config.is_some();
+        let (ok, error) = match &self.0.hooks_config {
+            None => (true, None),
+            Some(v) => {
+                let (_, report) = hooks::parse_hooks_settings(v);
+                if report.is_clean() {
+                    (true, None)
+                } else {
+                    let mut parts = Vec::new();
+                    if !report.unknown_events.is_empty() {
+                        parts.push(format!("unknown events: {:?}", report.unknown_events));
+                    }
+                    for (event, err) in &report.invalid_configs {
+                        parts.push(format!("{event}: {err}"));
+                    }
+                    (false, Some(parts.join("; ")))
+                }
+            }
+        };
+
+        let details = serde_json::json!({
+            "configured": configured,
+            "ok": ok,
+            "error": error,
+        });
+
+        match error {
+            Some(e) => CheckResult::degraded(e).with_details(details),
+            None => CheckResult::ok("hooks configuration parses").with_details(details),
+        }
+    }
+}
+
+/// Build the full diagnostic report as a JSON value (the RPC result body).
+///
+/// `extra` is whatever the process wired in beside the engine's own checks —
+/// the plugin fault records, and anything the embedder registered.
+pub fn run_doctor(
+    paths: &dyn DaemonPaths,
+    scene_id: &str,
+    settings: Arc<Settings>,
+    history_store_wired: bool,
+    plugin_status: crate::plugins::PluginStatus,
+    extra: &HealthChecks,
+) -> serde_json::Value {
+    let mut checks = HealthChecks::new()
+        .with(Arc::new(SettingsTiersCheck::new(paths)))
+        .with(Arc::new(ProviderRoutingCheck::new(settings.clone())))
+        .with(Arc::new(HooksCheck::new(settings.clone())));
+    for check in extra.checks() {
+        checks = checks.with(check.clone());
+    }
+    let health = checks.report();
+
+    let detail = |name: &str| {
+        health
+            .find(name)
+            .map(|c| c.result.details.clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    // The three named keys carry the same data as their entries under
+    // `health`. They are what every existing client reads, so they stay.
+    serde_json::json!({
+        "scene": scene_id,
+        "settings_tiers": detail("settings.tiers"),
+        "providers": detail("settings.providers"),
+        "hooks": detail("settings.hooks"),
+        "health": health.to_json(),
         "session_persistence": {
             "history_store_wired": history_store_wired,
         },
@@ -153,8 +269,12 @@ mod tests {
     use super::*;
     use crate::config::StaticDaemonPaths;
 
-    fn base_settings() -> Settings {
-        Settings::defaults_for("test-model")
+    fn base_settings() -> Arc<Settings> {
+        Arc::new(Settings::defaults_for("test-model"))
+    }
+
+    fn no_extra_checks() -> HealthChecks {
+        HealthChecks::new()
     }
 
     #[test]
@@ -165,9 +285,10 @@ mod tests {
         let report = run_doctor(
             &paths,
             "coding",
-            &settings,
+            settings,
             false,
             crate::plugins::PluginStatus::Enabled,
+            &no_extra_checks(),
         );
         let tiers = report["settings_tiers"].as_array().unwrap();
         assert_eq!(tiers.len(), 3);
@@ -186,9 +307,10 @@ mod tests {
         let report = run_doctor(
             &paths,
             "coding",
-            &settings,
+            settings,
             false,
             crate::plugins::PluginStatus::Enabled,
+            &no_extra_checks(),
         );
         let tiers = report["settings_tiers"].as_array().unwrap();
         // config_root == project_root == dir here, so both entries see the
@@ -202,7 +324,7 @@ mod tests {
     fn reports_provider_routing_errors() {
         let dir = tempfile::tempdir().unwrap();
         let paths = StaticDaemonPaths::new(dir.path().to_path_buf());
-        let mut settings = base_settings();
+        let mut settings = Settings::defaults_for("test-model");
         settings.default_provider = Some("does-not-exist".into());
         settings.providers.insert(
             "real".into(),
@@ -214,12 +336,14 @@ mod tests {
                 models: vec![],
             },
         );
+        let settings = Arc::new(settings);
         let report = run_doctor(
             &paths,
             "coding",
-            &settings,
+            settings,
             false,
             crate::plugins::PluginStatus::Enabled,
+            &no_extra_checks(),
         );
         assert_eq!(report["providers"]["ok"], false);
         assert!(report["providers"]["error"].as_str().is_some());
@@ -233,9 +357,10 @@ mod tests {
         let report = run_doctor(
             &paths,
             "coding",
-            &settings,
+            settings,
             true,
             crate::plugins::PluginStatus::Enabled,
+            &no_extra_checks(),
         );
         assert_eq!(report["session_persistence"]["history_store_wired"], true);
     }
@@ -253,8 +378,89 @@ mod tests {
             crate::plugins::PluginStatus::DisabledByPolicy,
             crate::plugins::PluginStatus::CompiledOut,
         ] {
-            let report = run_doctor(&paths, "coding", &settings, false, status);
+            let report = run_doctor(
+                &paths,
+                "coding",
+                settings.clone(),
+                false,
+                status,
+                &no_extra_checks(),
+            );
             assert_eq!(report["plugins"]["status"], status.as_str());
         }
+    }
+
+    /// P3-15's acceptance from the daemon's side: the diagnostics an embedder
+    /// registers appear beside the engine's own, and a verdict of theirs
+    /// decides the overall status.
+    #[test]
+    fn a_host_registered_check_joins_the_report_and_can_set_its_status() {
+        struct LicenceServer;
+        impl HealthCheck for LicenceServer {
+            fn name(&self) -> &str {
+                "acme.licence"
+            }
+            fn check(&self) -> CheckResult {
+                CheckResult::failing("licence server unreachable")
+                    .with_details(serde_json::json!({ "last_ok": "2026-08-30T11:00:00Z" }))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StaticDaemonPaths::new(dir.path().to_path_buf());
+        let report = run_doctor(
+            &paths,
+            "coding",
+            base_settings(),
+            false,
+            crate::plugins::PluginStatus::Enabled,
+            &HealthChecks::new().with(Arc::new(LicenceServer)),
+        );
+
+        assert_eq!(report["health"]["status"], "failing");
+        let names: Vec<&str> = report["health"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "settings.tiers",
+                "settings.providers",
+                "settings.hooks",
+                "acme.licence"
+            ]
+        );
+        assert_eq!(
+            report["health"]["checks"][3]["details"]["last_ok"],
+            "2026-08-30T11:00:00Z"
+        );
+    }
+
+    /// The keys every existing client reads are the same data as the health
+    /// entries, not a second copy that can drift from them.
+    #[test]
+    fn the_legacy_keys_are_the_checks_own_details() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.json"), "{not json").unwrap();
+        let paths = StaticDaemonPaths::new(dir.path().to_path_buf());
+        let report = run_doctor(
+            &paths,
+            "coding",
+            base_settings(),
+            false,
+            crate::plugins::PluginStatus::Enabled,
+            &no_extra_checks(),
+        );
+
+        assert_eq!(
+            report["settings_tiers"],
+            report["health"]["checks"][0]["details"]
+        );
+        assert_eq!(report["providers"], report["health"]["checks"][1]["details"]);
+        assert_eq!(report["hooks"], report["health"]["checks"][2]["details"]);
+        assert_eq!(report["health"]["status"], "degraded");
     }
 }
