@@ -18,6 +18,7 @@ members = [
     "crates/skills",
     "crates/runtime",
     "crates/compaction",
+    "crates/exec",
     "crates/session",
     "crates/scene",
     "crates/team",
@@ -119,6 +120,7 @@ tools    = { path = "crates/tools" }
 skills   = { path = "crates/skills" }
 runtime    = { path = "crates/runtime" }
 compaction = { path = "crates/compaction" }
+exec = { path = "crates/exec" }
 session    = { path = "crates/session" }
 scene      = { path = "crates/scene" }
 team       = { path = "crates/team" }

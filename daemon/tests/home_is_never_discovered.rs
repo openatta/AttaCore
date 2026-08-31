@@ -49,11 +49,17 @@ const ALLOWED: &[(&str, &str)] = &[
          and replaceable by tests because it lives in the snapshot.",
     ),
     (
-        "crates/tools/src/bash/sandbox.rs",
-        "the sandbox confines a process on this machine, so it needs this \
-         machine's home to deny reads of ~/.ssh and friends. Where AttaCore's \
-         own settings.json lives comes from `SandboxPolicy::state_root`, not \
-         from here.",
+        "crates/core/src/interface/exec/sandbox.rs",
+        "the default deny-read list is ~/.ssh and friends, so building it \
+         needs this machine's home. It is policy, which is why it sits with \
+         the contract rather than with a backend.",
+    ),
+    (
+        "crates/exec/src/sandbox.rs",
+        "a backend confines a process on this machine, and the state root it \
+         protects falls back to $HOME/.atta when the policy does not name one. \
+         Where AttaCore's own settings.json lives comes from \
+         `SandboxPolicy::state_root` first.",
     ),
     (
         "crates/tools/src/bash.rs",

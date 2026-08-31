@@ -1,39 +1,36 @@
-//! 平台沙盒包装。把 `bash -c <cmd>` 之外裹一层平台沙盒，限制写权限到 cwd /
-//! additional 子树以内。
+//! The platform sandbox backends: macOS `sandbox-exec` and Linux `bubblewrap`.
 //!
-//! - **macOS**：`sandbox-exec -p <profile> bash -c <cmd>`，profile 用 TinyScheme
-//!   拒写非允许路径。exec 不限制。网络默认放行（见 [`NetworkMode`]），可选
-//!   `DenyAll`/`Allowlist`——两者都用 `(deny network*)`，Allowlist 再逐域名
-//!   `(allow network-outbound (remote tcp "domain:*"))` 放行；DNS 解析走
-//!   `mDNSResponder` IPC，不受 `network*` 过滤影响，两种受限模式下都还能用。
-//! - **Linux**：`bwrap --ro-bind / / --bind <writable> <writable> ... bash -c <cmd>`。
-//!   bwrap 不在 PATH → 降级（无沙盒）+ warn。网络：`DenyAll` 用 `--unshare-net`
-//!   （新网络命名空间，只剩 loopback）；bwrap 没有域名/IP 级过滤能力，
-//!   `Allowlist` 在这个平台上退化成同样的 `--unshare-net`（+ warn 日志）而不是
-//!   静默放开成 Unrestricted——失败要往"更安全"的方向失败。
-//! - **Windows**：不做；`dangerously_disable_sandbox` 自动开（warn 一次）。
+//! - **macOS**: `sandbox-exec -p <profile> <program> <args…>`. The profile is
+//!   TinyScheme denying writes outside the allowed subtrees; exec is not
+//!   restricted. Network defaults to open; `DenyAll` / `Allowlist` both use
+//!   `(deny network*)`, and the allowlist re-allows named domains. DNS goes
+//!   through `mDNSResponder` IPC, which `network*` does not cover, so name
+//!   resolution keeps working under both restricted modes.
+//! - **Linux**: `bwrap --ro-bind / / --bind <writable> <writable> … <program>`.
+//!   No bwrap on PATH means no constraint, reported as such. `DenyAll` uses
+//!   `--unshare-net`; bwrap has no domain-level filter, so `Allowlist`
+//!   degrades to the same whole-network cut rather than silently opening up —
+//!   failure goes toward the safer side, and says so through `Enforcement`.
+//! - **Windows**: no backend.
 //!
-//! 受 `EngineConfig::dangerously_disable_sandbox` 控制；为 true 直跑无沙盒。
+//! # Known escape paths
 //!
-//! `SandboxPolicy`（含 `network_mode`/`allowed_domains`）由
-//! `bash.rs::to_sandbox_policy()` 从 `ToolContext.sandbox` 转换而来，后者由
-//! `runtime::turn` 从 `EngineConfig::sandbox_policy` 填充，而那一层又来自
-//! `settings.sandbox`。这条链路有回归测试兜底（见
-//! `base::context::config` 与 `runtime::turn` 各自的 sandbox 用例）。
+//! This is a lightweight write restriction, not a security boundary. Known
+//! ways out, none of them closed:
 //!
-//! # 已知沙盒逃逸风险
-//!
-//! 本沙盒是**轻量写限制**，不是安全隔离。已知逃逸路径：
-//!
-//! 1. **`/dev` 写权限**：macOS profile 放行了 `file-write*` 到 `/dev`，进程可
-//!    `mknod` 创建 raw 磁盘设备节点绕过文件 ACL。
-//! 2. **环境变量继承**：`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES` 未清除，可注入动态库。
-//! 3. **`/proc` 泄露**：bwrap 挂载了宿主的 `/proc`，可通过 `/proc/self/{fd,root}`
-//!    访问宿主文件系统 / fd。
-//! 4. **Open fd 泄露**：未设 `CLOEXEC`，子进程可读取继承的 fd（git 仓库、socket 等）。
-//!
-//! 以上四条都是已知的、尚未收口的弱点，不是遗漏。
+//! 1. **Writable `/dev`**: the macOS profile allows `file-write*` to `/dev`,
+//!    so a process can `mknod` a raw disk device and bypass file ACLs.
+//! 2. **Inherited environment**: `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` are
+//!    not cleared, so a dynamic library can be injected.
+//! 3. **`/proc` leak**: bwrap mounts the host's `/proc`, reachable through
+//!    `/proc/self/{fd,root}`.
+//! 4. **Leaked fds**: `CLOEXEC` is not set, so a child can read inherited
+//!    descriptors — git repositories, sockets.
 
+pub use base::interface::exec::{
+    default_deny_read, Confined, Enforcement, NetworkMode, ProcessSpec, Sandbox, SandboxMode,
+    SandboxPolicy,
+};
 use std::path::{Path, PathBuf};
 
 /// Fallback set of scenes to protect when a caller doesn't supply
@@ -47,6 +44,15 @@ use std::path::{Path, PathBuf};
 /// `settings.json` at all. Keep in sync with `daemon::main::resolve_scene`
 /// and `crates/scene/src/scene/*.rs` regardless, since it's still the
 /// default every caller gets today.
+/// The state root to protect: the one the caller named, else the
+/// conventional `$HOME/.atta`.
+fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
+    policy
+        .state_root
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atta")))
+}
+
 const KNOWN_SCENES: &[&str] = &["coding", "chat", "demo", "research"];
 
 /// `policy.known_scenes` if the caller supplied one, else [`KNOWN_SCENES`].
@@ -58,50 +64,6 @@ fn effective_known_scenes(policy: &SandboxPolicy) -> Vec<&str> {
     }
 }
 
-/// 沙盒包装结果：直接喂给 `tokio::process::Command::new(prog).args(args)`。
-#[derive(Debug, Clone)]
-pub struct SandboxedCommand {
-    pub program: String,
-    pub args: Vec<String>,
-    /// 选定的沙盒模式（仅给 logging / 测试用）
-    pub mode: SandboxMode,
-    /// Whether the policy this command was built from is actually being
-    /// enforced.
-    ///
-    /// [`mode`](Self::mode) is advisory — it names *which* backend ran and
-    /// says so in its own doc. This field is the one a caller is expected to
-    /// act on: `None` means the command below runs with no constraint at all,
-    /// whatever the policy asked for. Reporting it separately is what lets a
-    /// consumer that needs an absolute boundary refuse, instead of the
-    /// decision being made for it by a `warn!` nobody reads.
-    pub enforcement: Enforcement,
-}
-
-/// Whether a `SandboxPolicy` is being honored.
-///
-/// Deliberately two-valued today. `Partial` is the shape this will grow when
-/// a backend can honor some of a policy but not all of it (bwrap has no
-/// domain-level network filter, for instance — see [`NetworkMode`]); adding it
-/// before any backend reports it would be a distinction with no producer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Enforcement {
-    /// The backend delivered what the policy asked for.
-    Full,
-    /// No backend ran. The command is unconstrained.
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxMode {
-    /// 用户显式禁用 / 配置关闭
-    Disabled,
-    /// 平台不支持（Windows / 缺 bwrap）
-    Unavailable,
-    /// macOS sandbox-exec
-    MacOSSandboxExec,
-    /// Linux bubblewrap
-    LinuxBwrap,
-}
 
 #[derive(Debug, Clone)]
 pub struct SandboxOptions<'a> {
@@ -114,107 +76,14 @@ pub struct SandboxOptions<'a> {
     pub policy: SandboxPolicy,
 }
 
-/// **Hardening **: declarative sandbox policy. Source can be settings.json
-/// `sandbox.*`. Defaults bake in a sensible deny-read list (~/.ssh, ~/.aws,
-/// etc) so naive Bash commands don't dump credential files into the model's
-/// transcript by accident.
+
+/// Pick the platform backend and wrap the command.
 ///
-/// Linux note: not all features land cleanly on bwrap — see field docs.
-#[derive(Debug, Clone, Default)]
-pub struct SandboxPolicy {
-    /// Absolute paths the sandbox is allowed to **read**, on top of the
-    /// universal default (everything readable). When non-empty, paths in
-    /// `deny_read` matching these get re-allowed (most-specific wins).
-    pub allow_read: Vec<PathBuf>,
-    /// Absolute paths the sandbox is **denied** read access to. Defaults
-    /// include common credential stores (see [`default_deny_read`]).
-    pub deny_read: Vec<PathBuf>,
-    /// Network policy — see [`NetworkMode`].
-    pub network_mode: NetworkMode,
-    /// Domains allowed to make outbound connections when `network_mode` is
-    /// [`NetworkMode::Allowlist`]. Ignored otherwise. Matched literally
-    /// against the connection target's hostname (no wildcards) — see
-    /// `build_macos_profile`'s network section for the exact rule shape.
-    pub allowed_domains: Vec<String>,
-    /// Scene ids whose `~/.atta/scenes/<scene>/settings.json` the profile
-    /// should protect with `deny file-write*` — see [`KNOWN_SCENES`]'s doc
-    /// comment for why this can't just import `scene::scene::SceneRegistry`
-    /// directly. Empty (the default, same as every other `SandboxPolicy`
-    /// field today — see this module's top-level doc comment on
-    /// `ToolContext.sandbox` never actually being populated from
-    /// settings.json yet) falls back to `KNOWN_SCENES`, so callers that
-    /// don't know about a daemon's actual `--scenes` set keep today's
-    /// behavior exactly.
-    pub known_scenes: Vec<String>,
-    /// This instance's global state root. `None` falls back to `$HOME/.atta`,
-    /// which is where an instance usually lives but not where it must: a
-    /// redirected instance whose sandbox protected `$HOME/.atta` would be
-    /// guarding a file it does not use while leaving its real settings.json
-    /// writable.
-    pub state_root: Option<PathBuf>,
-}
-
-/// The state root to protect: the one the caller named, else the
-/// conventional `$HOME/.atta`.
-fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
-    policy
-        .state_root
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atta")))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NetworkMode {
-    /// Unrestricted outbound (default; Bash often needs `curl` / `npm install`).
-    #[default]
-    Unrestricted,
-    /// No outbound network access at all (DNS resolution via the OS
-    /// resolver still works on macOS — it's IPC to `mDNSResponder`, not a
-    /// raw socket the sandbox profile's `network*` filter covers — but no
-    /// TCP/UDP connection actually reaching the network is permitted).
-    DenyAll,
-    /// Outbound TCP restricted to `SandboxPolicy::allowed_domains`; DNS
-    /// resolution still works (same rationale as `DenyAll`). An empty
-    /// `allowed_domains` list under this mode is equivalent to `DenyAll`.
-    Allowlist,
-}
-
-/// Default deny-read paths — credential stores that almost never want to be
-/// inside an LLM tool result. User can override via `sandbox.allow_read` in
-/// settings.json. Returned absolute (`HOME` resolved).
-///
-/// 两个生产调用点（都在 `super`，2026-08-11 审计 N-4 / N-3 之后才接上）：
-/// - `bash::to_sandbox_policy` —— 空 `deny_read` 回落到这里，作为真正的沙盒 profile；
-/// - `bash::classify` —— 命令分类时用同一份名单判断某个参数是不是在读凭据，
-///   避免 `cat ~/.ssh/id_rsa` 被当成"只读命令"静默放行。
-///   两处共用一份定义，是为了不让"沙盒挡得住"和"分类器放得过"两套标准打架。
-pub fn default_deny_read() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut out = Vec::new();
-    let push = |out: &mut Vec<PathBuf>, p: &str| {
-        if let Some(home) = &home {
-            out.push(home.join(p));
-        }
-    };
-    push(&mut out, ".ssh");
-    push(&mut out, ".aws");
-    push(&mut out, ".gnupg");
-    push(&mut out, ".docker/config.json");
-    push(&mut out, ".kube");
-    push(&mut out, ".azure");
-    push(&mut out, ".config/gh");
-    push(&mut out, ".netrc");
-    push(&mut out, ".npmrc");
-    push(&mut out, ".pypirc");
-    push(&mut out, ".gem/credentials");
-    out
-}
-
-/// 主入口：选用合适的平台沙盒包装命令。
-///
-/// 不会 panic、不会失败 —— 沙盒不可用就 fall back 到无沙盒（mode=Unavailable）。
-/// 上层 BashTool 拿到 SandboxedCommand 后照常 spawn。
-pub fn wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
+/// Never fails: no available backend means no constraint, reported honestly
+/// through [`Enforcement`] rather than by refusing here. Whether an
+/// unconstrained run is acceptable is the caller's decision, not this
+/// function's.
+pub fn wrap(opts: SandboxOptions<'_>) -> Confined {
     if opts.disable {
         return plain(opts.command, SandboxMode::Disabled);
     }
@@ -236,10 +105,10 @@ pub fn wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
     }
 }
 
-fn plain(command: &str, mode: SandboxMode) -> SandboxedCommand {
-    SandboxedCommand {
-        program: "bash".into(),
-        args: vec!["-c".into(), command.into()],
+fn plain(command: &str, mode: SandboxMode) -> Confined {
+    Confined {
+        spec: bash_spec(command),
+        unmet: vec!["nothing is constrained".into()],
         mode,
         // Nothing wraps this command, so nothing constrains it — true whether
         // the user asked for no sandbox or the platform could not provide one.
@@ -249,18 +118,17 @@ fn plain(command: &str, mode: SandboxMode) -> SandboxedCommand {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
+fn mac_wrap(opts: SandboxOptions<'_>) -> Confined {
     let profile = build_macos_profile(opts.cwd, opts.additional_writable, &opts.policy);
-    SandboxedCommand {
+    let inner = bash_spec(opts.command);
+    Confined {
         enforcement: Enforcement::Full,
-        program: "sandbox-exec".into(),
-        args: vec![
-            "-p".into(),
-            profile,
-            "bash".into(),
-            "-c".into(),
-            opts.command.to_string(),
-        ],
+        unmet: Vec::new(),
+        spec: ProcessSpec::new("sandbox-exec", &inner.cwd)
+            .arg("-p")
+            .arg(profile)
+            .arg(inner.program)
+            .args(inner.args),
         mode: SandboxMode::MacOSSandboxExec,
     }
 }
@@ -382,7 +250,7 @@ fn sandbox_escape(s: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
+fn linux_wrap(opts: SandboxOptions<'_>) -> Confined {
     if !bwrap_available() {
         return plain(opts.command, SandboxMode::Unavailable);
     }
@@ -499,11 +367,73 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> SandboxedCommand {
     args.push("-c".into());
     args.push(opts.command.to_string());
 
-    SandboxedCommand {
-        enforcement: Enforcement::Full,
-        program: "bwrap".into(),
-        args,
+    // bwrap has no domain-level network filter, so an allowlist arrives here
+    // as the same whole-network cut `DenyAll` gets. Stricter than asked for in
+    // one direction and not what was asked for in the other, which is what
+    // `Partial` is for.
+    let unmet = if opts.policy.network_mode == NetworkMode::Allowlist {
+        vec!["domain allowlist: bwrap can only cut the network entirely".into()]
+    } else {
+        Vec::new()
+    };
+    let inner = bash_spec(opts.command);
+    args.push(inner.program);
+    args.extend(inner.args);
+    Confined {
+        enforcement: if unmet.is_empty() {
+            Enforcement::Full
+        } else {
+            Enforcement::Partial
+        },
+        unmet,
+        spec: ProcessSpec::new("bwrap", &inner.cwd).args(args),
         mode: SandboxMode::LinuxBwrap,
+    }
+}
+
+/// A shell command as a process spec. The one place `bash -c` is spelled, so
+/// that every backend wraps the same thing.
+fn bash_spec(command: &str) -> ProcessSpec {
+    ProcessSpec::new("bash", std::path::Path::new(".")).args(["-c".to_string(), command.to_string()])
+}
+
+/// The platform backends behind the contract.
+///
+/// Holds nothing: which backend applies is a fact about the machine, decided
+/// per call by `cfg`, and the policy arrives as an argument.
+pub struct PlatformSandbox;
+
+impl Sandbox for PlatformSandbox {
+    fn confine(&self, spec: ProcessSpec, policy: &SandboxPolicy) -> Confined {
+        // Today every caller arrives as `bash -c <command>`; the backends
+        // build their own wrapper around that pair. A spec that is not a
+        // shell command is passed through unconstrained rather than
+        // silently mis-wrapped — and says so, which is the whole point of
+        // `unmet`.
+        let command = match (spec.program.as_str(), spec.args.as_slice()) {
+            ("bash", [flag, command]) if flag == "-c" => command.clone(),
+            _ => {
+                return Confined {
+                    spec,
+                    mode: SandboxMode::Unavailable,
+                    enforcement: Enforcement::None,
+                    unmet: vec![
+                        "this backend only confines shell commands (`bash -c …`)".into()
+                    ],
+                }
+            }
+        };
+        let mut confined = wrap(SandboxOptions {
+            command: &command,
+            cwd: &spec.cwd,
+            additional_writable: &[],
+            disable: false,
+            policy: policy.clone(),
+        });
+        confined.spec.cwd = spec.cwd;
+        confined.spec.env = spec.env;
+        confined.spec.stdin = spec.stdin;
+        confined
     }
 }
 
@@ -564,9 +494,9 @@ mod tests {
         let mut o = opts("ls", Path::new("/tmp/work"));
         o.disable = true;
         let cmd = wrap(o);
-        assert_eq!(cmd.program, "bash");
-        assert_eq!(cmd.args[0], "-c");
-        assert_eq!(cmd.args[1], "ls");
+        assert_eq!(cmd.spec.program, "bash");
+        assert_eq!(cmd.spec.args[0], "-c");
+        assert_eq!(cmd.spec.args[1], "ls");
         assert_eq!(cmd.mode, SandboxMode::Disabled);
     }
 
@@ -574,14 +504,14 @@ mod tests {
     #[test]
     fn macos_wraps_with_sandbox_exec_and_profile_includes_cwd() {
         let cmd = wrap(opts("ls", Path::new("/tmp/work")));
-        assert_eq!(cmd.program, "sandbox-exec");
-        assert_eq!(cmd.args[0], "-p");
-        assert!(cmd.args[1].contains("(deny file-write*)"));
-        assert!(cmd.args[1].contains("(subpath \"/tmp/work\")"));
-        assert!(cmd.args[1].contains("(subpath \"/private/tmp\")"));
-        assert_eq!(cmd.args[2], "bash");
-        assert_eq!(cmd.args[3], "-c");
-        assert_eq!(cmd.args[4], "ls");
+        assert_eq!(cmd.spec.program, "sandbox-exec");
+        assert_eq!(cmd.spec.args[0], "-p");
+        assert!(cmd.spec.args[1].contains("(deny file-write*)"));
+        assert!(cmd.spec.args[1].contains("(subpath \"/tmp/work\")"));
+        assert!(cmd.spec.args[1].contains("(subpath \"/private/tmp\")"));
+        assert_eq!(cmd.spec.args[2], "bash");
+        assert_eq!(cmd.spec.args[3], "-c");
+        assert_eq!(cmd.spec.args[4], "ls");
         assert_eq!(cmd.mode, SandboxMode::MacOSSandboxExec);
     }
 
@@ -595,8 +525,8 @@ mod tests {
         let mut o = opts("ls", Path::new("/tmp/work"));
         o.additional_writable = &extras;
         let cmd = wrap(o);
-        assert!(cmd.args[1].contains("(subpath \"/Users/me/scratch\")"));
-        assert!(cmd.args[1].contains("(subpath \"/Users/me/another\")"));
+        assert!(cmd.spec.args[1].contains("(subpath \"/Users/me/scratch\")"));
+        assert!(cmd.spec.args[1].contains("(subpath \"/Users/me/another\")"));
     }
 
     #[cfg(target_os = "macos")]
@@ -604,7 +534,7 @@ mod tests {
     fn macos_path_with_quotes_is_escaped() {
         let cmd = wrap(opts("ls", Path::new("/tmp/with\"quote")));
         // 反斜杠转义后 sandbox-exec 仍然能 parse
-        assert!(cmd.args[1].contains("with\\\"quote"));
+        assert!(cmd.spec.args[1].contains("with\\\"quote"));
     }
 
     #[cfg(target_os = "linux")]
@@ -613,21 +543,21 @@ mod tests {
         let cmd = wrap(opts("ls", Path::new("/tmp/work")));
         match cmd.mode {
             SandboxMode::LinuxBwrap => {
-                assert_eq!(cmd.program, "bwrap");
-                assert!(cmd.args.iter().any(|a| a == "--ro-bind"));
-                assert!(cmd.args.iter().any(|a| a == "/tmp/work"));
+                assert_eq!(cmd.spec.program, "bwrap");
+                assert!(cmd.spec.args.iter().any(|a| a == "--ro-bind"));
+                assert!(cmd.spec.args.iter().any(|a| a == "/tmp/work"));
                 let bash_pos = cmd
                     .args
                     .iter()
                     .position(|a| a == "bash")
                     .expect("bwrap args must end with `-- bash -c <cmd>`");
-                assert_eq!(cmd.args[bash_pos + 1], "-c");
-                assert_eq!(cmd.args[bash_pos + 2], "ls");
+                assert_eq!(cmd.spec.args[bash_pos + 1], "-c");
+                assert_eq!(cmd.spec.args[bash_pos + 2], "ls");
             }
             SandboxMode::Unavailable => {
                 // bwrap 没装 —— 平台合理 fallback
-                assert_eq!(cmd.program, "bash");
-                assert_eq!(cmd.args, vec!["-c", "ls"]);
+                assert_eq!(cmd.spec.program, "bash");
+                assert_eq!(cmd.spec.args, vec!["-c", "ls"]);
             }
             other => panic!("unexpected mode on linux: {other:?}"),
         }
@@ -646,9 +576,9 @@ mod tests {
             .iter()
             .position(|a| a == &needle)
             .expect("expected a --ro-bind-try re-mount for the project settings.json");
-        assert_eq!(cmd.args[pos - 1], "--ro-bind-try");
+        assert_eq!(cmd.spec.args[pos - 1], "--ro-bind-try");
         // Source == dest for a self-remount, and settings.local.json gets the same treatment.
-        assert_eq!(cmd.args[pos + 1], needle);
+        assert_eq!(cmd.spec.args[pos + 1], needle);
         assert!(cmd
             .args
             .iter()
@@ -673,7 +603,7 @@ mod tests {
         for scene in KNOWN_SCENES {
             let needle = format!("{home_str}/.atta/scenes/{scene}/settings.json");
             assert!(
-                cmd.args.iter().any(|a| a == &needle),
+                cmd.spec.args.iter().any(|a| a == &needle),
                 "expected a --ro-bind-try re-mount for scene `{scene}`'s settings.json"
             );
         }
@@ -735,7 +665,7 @@ mod tests {
             state_root: None,
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         // Should at least mention .ssh in the deny-read list
         assert!(profile.contains("(deny file-read*"));
         assert!(profile.contains(".ssh"));
@@ -754,7 +684,7 @@ mod tests {
             state_root: None,
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         // Both rules emitted; allow comes after deny so it wins per
         // sandbox-exec evaluation order.
         let deny_idx = profile
@@ -774,7 +704,7 @@ mod tests {
         let mut o = opts("ls", Path::new("/tmp/work"));
         o.policy.network_mode = NetworkMode::Unrestricted;
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(
             !profile.contains("network"),
             "Unrestricted must not add any network rule, profile:\n{profile}"
@@ -787,7 +717,7 @@ mod tests {
         let mut o = opts("ls", Path::new("/tmp/work"));
         o.policy.network_mode = NetworkMode::DenyAll;
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(profile.contains("(deny network*)"), "profile:\n{profile}");
         assert!(
             !profile.contains("network-outbound"),
@@ -802,7 +732,7 @@ mod tests {
         o.policy.network_mode = NetworkMode::Allowlist;
         o.policy.allowed_domains = vec!["api.example.com".into(), "registry.npmjs.org".into()];
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(profile.contains("(deny network*)"), "profile:\n{profile}");
         assert!(
             profile.contains("(allow network-outbound (remote tcp \"api.example.com:*\"))"),
@@ -828,7 +758,7 @@ mod tests {
         o.policy.network_mode = NetworkMode::Allowlist;
         o.policy.allowed_domains = vec![];
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(profile.contains("(deny network*)"), "profile:\n{profile}");
         assert!(!profile.contains("network-outbound"), "profile:\n{profile}");
     }
@@ -840,7 +770,7 @@ mod tests {
         o.policy.network_mode = NetworkMode::Allowlist;
         o.policy.allowed_domains = vec!["evil\".com".into()];
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(profile.contains("evil\\\".com"), "profile:\n{profile}");
     }
 
@@ -851,7 +781,7 @@ mod tests {
         o.policy.network_mode = NetworkMode::Allowlist;
         o.policy.allowed_domains = vec!["a.example.com".into(), "b.example.com".into()];
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert_eq!(profile.matches('(').count(), profile.matches(')').count());
     }
 
@@ -864,7 +794,7 @@ mod tests {
         if cmd.mode != SandboxMode::LinuxBwrap {
             return; // bwrap not installed in this environment
         }
-        assert!(cmd.args.iter().any(|a| a == "--unshare-net"));
+        assert!(cmd.spec.args.iter().any(|a| a == "--unshare-net"));
     }
 
     #[cfg(target_os = "linux")]
@@ -876,7 +806,7 @@ mod tests {
         if cmd.mode != SandboxMode::LinuxBwrap {
             return;
         }
-        assert!(!cmd.args.iter().any(|a| a == "--unshare-net"));
+        assert!(!cmd.spec.args.iter().any(|a| a == "--unshare-net"));
     }
 
     #[cfg(target_os = "linux")]
@@ -891,7 +821,7 @@ mod tests {
         if cmd.mode != SandboxMode::LinuxBwrap {
             return;
         }
-        assert!(cmd.args.iter().any(|a| a == "--unshare-net"));
+        assert!(cmd.spec.args.iter().any(|a| a == "--unshare-net"));
     }
 
     // ---- Phase 3-3: fault injection tests ----
@@ -935,8 +865,8 @@ mod tests {
             policy: SandboxPolicy::default(),
         };
         let cmd = wrap(empty_opts);
-        assert!(!cmd.program.is_empty());
-        assert!(!cmd.args.is_empty());
+        assert!(!cmd.spec.program.is_empty());
+        assert!(!cmd.spec.args.is_empty());
 
         // Unicode command with no cwd
         let unicode_opts = SandboxOptions {
@@ -947,7 +877,7 @@ mod tests {
             policy: SandboxPolicy::default(),
         };
         let cmd2 = wrap(unicode_opts);
-        assert!(cmd2.args.iter().any(|a| a.contains("🦀")));
+        assert!(cmd2.spec.args.iter().any(|a| a.contains("🦀")));
 
         // Explicit disable must always yield plain bash
         let disabled_opts = SandboxOptions {
@@ -958,7 +888,7 @@ mod tests {
             policy: SandboxPolicy::default(),
         };
         let cmd3 = wrap(disabled_opts);
-        assert_eq!(cmd3.program, "bash");
+        assert_eq!(cmd3.spec.program, "bash");
         assert_eq!(cmd3.mode, SandboxMode::Disabled);
     }
 
@@ -982,7 +912,7 @@ mod tests {
             },
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         let opens = profile.matches('(').count();
         let closes = profile.matches(')').count();
         assert_eq!(
@@ -1016,7 +946,7 @@ mod tests {
             },
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         // Must still deny writes to .atta/settings.json even when deny_read is empty
         assert!(
             profile.contains("(deny file-write* (literal \"/tmp/work/.atta/settings.json\"))"),
@@ -1038,7 +968,7 @@ mod tests {
             policy: SandboxPolicy::default(),
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(
             !KNOWN_SCENES.is_empty(),
             "sanity: scene list must not be empty"
@@ -1063,7 +993,7 @@ mod tests {
             policy: SandboxPolicy::default(),
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         let Some(home) = std::env::var_os("HOME") else {
             return;
         };
@@ -1095,7 +1025,7 @@ mod tests {
             },
         };
         let cmd = wrap(o);
-        let profile = &cmd.args[1];
+        let profile = &cmd.spec.args[1];
         assert!(
             !profile.contains("(deny file-read*"),
             "no deny-read rules when deny_read is empty"
@@ -1186,15 +1116,15 @@ mod enforcement_tests {
         match w.mode {
             SandboxMode::Disabled | SandboxMode::Unavailable => {
                 assert_eq!(w.enforcement, Enforcement::None);
-                assert_eq!(w.program, "bash", "an unenforced command must be plain bash");
+                assert_eq!(w.spec.program, "bash", "an unenforced command must be plain bash");
             }
             SandboxMode::MacOSSandboxExec => {
                 assert_eq!(w.enforcement, Enforcement::Full);
-                assert_eq!(w.program, "sandbox-exec");
+                assert_eq!(w.spec.program, "sandbox-exec");
             }
             SandboxMode::LinuxBwrap => {
                 assert_eq!(w.enforcement, Enforcement::Full);
-                assert_eq!(w.program, "bwrap");
+                assert_eq!(w.spec.program, "bwrap");
             }
         }
     }

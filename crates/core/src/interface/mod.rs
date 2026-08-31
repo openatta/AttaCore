@@ -31,6 +31,10 @@
 //! | [`recovery_policy::RecoveryPolicy`] | what to do when a call goes wrong |
 //! | [`budget_policy::BudgetPolicy`] | what a turn may spend and how much it may carry |
 //! | [`environment::Environment`] | kept time and kept identifiers |
+//! | [`exec::Process`] | where a program runs |
+//! | [`exec::FileSystem`] | where a tool's files are |
+//! | [`exec::Network`] | every request that leaves the process |
+//! | [`exec::Sandbox`] | how a process is constrained |
 //! | [`backoff::BackoffPolicy`] | whether a failed request is sent again, and when |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
@@ -90,6 +94,7 @@ pub mod prompt_assembly;
 pub mod prompt_registry;
 pub mod budget_policy;
 pub mod environment;
+pub mod exec;
 pub mod recovery_policy;
 #[deprecated(note = "moved to `base::prompt` — prompt data types and the assembler function")]
 pub use crate::prompt;

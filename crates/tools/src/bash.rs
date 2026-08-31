@@ -7,8 +7,9 @@
 //! - 超时（默认 120s，上限 600s）+ cancel 通过 kill child 实现
 //! - 命令分类用关键字白名单 / 黑名单（read-only / destructive）
 
-mod sandbox;
-pub use sandbox::{sandbox_status, SandboxMode};
+use exec::sandbox;
+pub use base::interface::exec::SandboxMode;
+pub use exec::sandbox::sandbox_status;
 
 use async_trait::async_trait;
 use base::error::ToolError;
@@ -256,8 +257,8 @@ impl Tool for BashTool {
             );
         }
 
-        let mut cmd = tokio::process::Command::new(&wrapped.program);
-        cmd.args(&wrapped.args);
+        let mut cmd = tokio::process::Command::new(&wrapped.spec.program);
+        cmd.args(&wrapped.spec.args);
         cmd.current_dir(&ctx.cwd);
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
