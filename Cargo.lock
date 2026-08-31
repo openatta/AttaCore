@@ -251,6 +251,7 @@ dependencies = [
  "ignore",
  "libc",
  "regex",
+ "reqwest 0.12.28",
  "schemars",
  "serde",
  "serde_json",
@@ -991,22 +992,6 @@ dependencies = [
  "futures-core",
  "nom",
  "pin-project-lite",
-]
-
-[[package]]
-name = "exec"
-version = "0.1.9"
-dependencies = [
- "async-trait",
- "base",
- "futures",
- "reqwest 0.12.28",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "which",
 ]
 
 [[package]]
@@ -4095,7 +4080,6 @@ dependencies = [
  "async-trait",
  "base",
  "base64 0.22.1",
- "exec",
  "futures",
  "glob",
  "globset",

@@ -3395,6 +3395,7 @@ async fn execute_tool_inner(
         agent_depth: ctx.agent_depth,
         events_tx: None,
         elicitation: Some(Arc::clone(&ctx.elicitation)),
+        exec: Default::default(),
     };
     let input_for_post_hook = input.clone();
     let input_json_size = serde_json::to_string(&input)

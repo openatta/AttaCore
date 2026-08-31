@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use base::interface::exec::{ExecError, HttpRequest, HttpResponse, Network, Origin};
+use crate::interface::exec::{ExecError, HttpRequest, HttpResponse, Network, Origin};
 
 /// This process's own network, under the deployment's egress policy.
 pub struct LocalNetwork {

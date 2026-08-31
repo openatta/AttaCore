@@ -280,6 +280,10 @@ pub struct ToolContext {
     /// asking tool must read as a refusal rather than as permission to make
     /// the answer up.
     pub elicitation: Option<Arc<dyn crate::interface::elicitation::Elicitation>>,
+    /// How this tool reaches the machine — see
+    /// [`crate::interface::exec`]. The default is this machine; a deployment
+    /// executing somewhere else replaces the set and no tool notices.
+    pub exec: crate::interface::exec::ExecProviders,
 }
 impl ToolContext {
     pub fn for_test(cwd: PathBuf) -> Self {
@@ -304,6 +308,7 @@ impl ToolContext {
             agent_depth: 0,
             events_tx: None,
             elicitation: None,
+            exec: Default::default(),
         }
     }
     pub fn from_engine_ctx(cwd: PathBuf, cancel: CancellationToken) -> Self {
@@ -328,6 +333,7 @@ impl ToolContext {
             agent_depth: 0,
             events_tx: None,
             elicitation: None,
+            exec: Default::default(),
         }
     }
 }

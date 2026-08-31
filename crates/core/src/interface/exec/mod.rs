@@ -20,6 +20,7 @@
 //! [`environment`]: crate::interface::environment
 
 pub mod filesystem;
+pub mod local;
 pub mod network;
 pub mod process;
 pub mod sandbox;
@@ -30,6 +31,51 @@ pub use process::{ExitStatus, OutputChunk, OutputStream, Process, ProcessHandle,
 pub use sandbox::{
     default_deny_read, Confined, Enforcement, NetworkMode, Sandbox, SandboxMode, SandboxPolicy,
 };
+
+/// The four providers a tool reaches the machine through.
+///
+/// One field on a [`ToolContext`](crate::interface::tool::ToolContext) rather
+/// than four, because they are swapped as a set: a deployment executing
+/// elsewhere that kept this machine's filesystem would be running commands
+/// against files that are not there.
+#[derive(Clone)]
+pub struct ExecProviders {
+    pub process: std::sync::Arc<dyn Process>,
+    pub filesystem: std::sync::Arc<dyn FileSystem>,
+    pub network: std::sync::Arc<dyn Network>,
+    pub sandbox: std::sync::Arc<dyn Sandbox>,
+}
+
+impl ExecProviders {
+    /// This machine.
+    pub fn local() -> Self {
+        Self {
+            process: std::sync::Arc::new(local::LocalProcess),
+            filesystem: std::sync::Arc::new(local::LocalFileSystem),
+            network: std::sync::Arc::new(local::LocalNetwork::default()),
+            sandbox: std::sync::Arc::new(local::PlatformSandbox),
+        }
+    }
+
+    /// Replace the network without touching the rest — the egress policy is
+    /// per-deployment while the other three are per-machine.
+    pub fn with_network(mut self, n: std::sync::Arc<dyn Network>) -> Self {
+        self.network = n;
+        self
+    }
+}
+
+impl Default for ExecProviders {
+    fn default() -> Self {
+        Self::local()
+    }
+}
+
+impl std::fmt::Debug for ExecProviders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExecProviders")
+    }
+}
 
 /// Why an execution-layer call did not do what was asked.
 ///

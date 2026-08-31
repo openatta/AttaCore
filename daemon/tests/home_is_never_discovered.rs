@@ -55,7 +55,7 @@ const ALLOWED: &[(&str, &str)] = &[
          the contract rather than with a backend.",
     ),
     (
-        "crates/exec/src/sandbox.rs",
+        "crates/core/src/interface/exec/local/sandbox.rs",
         "a backend confines a process on this machine, and the state root it \
          protects falls back to $HOME/.atta when the policy does not name one. \
          Where AttaCore's own settings.json lives comes from \

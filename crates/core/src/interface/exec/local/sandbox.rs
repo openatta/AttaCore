@@ -27,7 +27,7 @@
 //! 4. **Leaked fds**: `CLOEXEC` is not set, so a child can read inherited
 //!    descriptors — git repositories, sockets.
 
-pub use base::interface::exec::{
+pub use crate::interface::exec::{
     default_deny_read, Confined, Enforcement, NetworkMode, ProcessSpec, Sandbox, SandboxMode,
     SandboxPolicy,
 };

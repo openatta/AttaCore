@@ -9,7 +9,6 @@ description  = "AttaCore — built-in tool implementations"
 
 [dependencies]
 base          = { workspace = true }
-exec          = { workspace = true }
 model         = { workspace = true }
 mcp           = { workspace = true }
 permissions   = { workspace = true }
