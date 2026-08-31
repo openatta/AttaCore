@@ -13,6 +13,7 @@ use crate::path::{
     canonicalize_cwd, project_dir, session_file, session_metadata_file, HistoryRoots,
 };
 use crate::project::SessionMetadata;
+use crate::query::{SessionQuery, SessionScope};
 use crate::transcript::{messages_match_query, preview_messages, project_messages};
 use async_trait::async_trait;
 use base::session::SessionId;
@@ -119,6 +120,76 @@ pub trait HistoryStore: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Sessions matching a [`SessionQuery`], newest first.
+    ///
+    /// This is the whole of "which sessions are there" — recency listing and
+    /// text search are the same question with and without a needle, so a
+    /// backend that can answer one cheaply can answer both.
+    ///
+    /// # What an implementation must guarantee
+    ///
+    /// * **Newest first**, and a total order: ties on modification time break
+    ///   on the session id, descending. Two backends holding the same sessions
+    ///   answer in the same order or one of them is wrong.
+    /// * **At most `limit`**, and `limit == 0` is the empty answer rather than
+    ///   an unbounded one.
+    /// * **A session whose transcript contains the needle is in the answer**
+    ///   if the limit allows, matched case-insensitively over the rendered
+    ///   text; so is one whose id contains it. A backend may match *more* than
+    ///   that — an index over titles or working directories is why this is a
+    ///   contract and not a function — but never less.
+    ///
+    /// The default reads every session to answer, which is exactly what a
+    /// backend with an index should not do: overriding this one method is the
+    /// whole of taking search over, and nothing above the trait changes.
+    async fn find_sessions(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let needle = query.needle();
+        let mut rows: Vec<(Option<time::OffsetDateTime>, SessionSummary)> = Vec::new();
+        for session_id in self.list_sessions().await? {
+            let entries = match self.load(session_id).await {
+                Ok(entries) => entries,
+                Err(HistoryError::SessionNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            let messages = project_messages(&entries);
+            if let Some(needle) = needle {
+                if !session_id.to_string().contains(needle)
+                    && !messages_match_query(&messages, needle)
+                {
+                    continue;
+                }
+            }
+            let modified = entries.iter().map(|env| env.ts).max();
+            rows.push((
+                modified,
+                SessionSummary {
+                    session_id,
+                    last_modified: modified.map(format_ts).unwrap_or_else(unknown_time),
+                    entry_count: entries.len(),
+                    message_count: messages.len(),
+                    preview: preview_messages(&messages, 140),
+                    canonical_cwd: None,
+                    title: None,
+                    total_input_tokens: None,
+                    total_output_tokens: None,
+                    compact_count: 0,
+                },
+            ));
+        }
+        rows.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.session_id.to_string().cmp(&a.1.session_id.to_string()))
+        });
+        rows.truncate(query.limit);
+        Ok(rows.into_iter().map(|(_, summary)| summary).collect())
+    }
 }
 
 /// Writes to `<projects_root>/<sanitize(cwd)>/<session>.jsonl`.
@@ -186,13 +257,51 @@ impl JsonlHistoryStore {
             .collect())
     }
 
-    /// Return the `max` most-recently-modified session summaries for the
-    /// current project directory, newest first. Skips sessions that lack
-    /// metadata or whose jsonl store is corrupt.
+    /// The `max` most-recently-modified session summaries for the current
+    /// project directory, newest first.
     pub async fn list_recent_session_summaries(
         &self,
         max: usize,
     ) -> Result<Vec<SessionSummary>, HistoryError> {
+        self.find_sessions(&SessionQuery::recent(max)).await
+    }
+
+    /// Search the current project directory by session ID and message
+    /// content. An empty query lists the most recent instead.
+    pub async fn search_session_summaries(
+        &self,
+        query: &str,
+        max: usize,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
+        self.find_sessions(&SessionQuery::matching(query, max)).await
+    }
+
+    /// Search **all** project directories under the history root. Used by
+    /// `/resume @all <query>`.
+    pub async fn search_all_project_session_summaries(
+        &self,
+        query: &str,
+        max: usize,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
+        self.find_sessions(&SessionQuery::matching(query, max).within(SessionScope::AllProjects))
+            .await
+    }
+
+    /// Search project directories that share the same git repository as the
+    /// current working directory — a monorepo with per-subdirectory history.
+    /// Used by `/resume @repo <query>`.
+    pub async fn search_same_repo_session_summaries(
+        &self,
+        query: &str,
+        max: usize,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
+        let root = repo_root_or_cwd(&self.canonical_cwd).await;
+        self.find_sessions(&SessionQuery::matching(query, max).within(SessionScope::Under(root)))
+            .await
+    }
+
+    /// Skips sessions that lack metadata or whose jsonl store is corrupt.
+    async fn recent_summaries(&self, max: usize) -> Result<Vec<SessionSummary>, HistoryError> {
         let files = self.session_files_by_mtime(max).await?;
         let mut out = Vec::new();
         for (session_id, _path, mtime) in files {
@@ -203,19 +312,11 @@ impl JsonlHistoryStore {
         Ok(out)
     }
 
-    /// Search session summaries in the current project directory by matching
-    /// `query` against session IDs and message content. Falls back to
-    /// [`list_recent_session_summaries`] when the query is empty.
-    pub async fn search_session_summaries(
+    async fn search_current_project(
         &self,
-        query: &str,
+        needle: &str,
         max: usize,
     ) -> Result<Vec<SessionSummary>, HistoryError> {
-        let query = query.trim();
-        if query.is_empty() {
-            return self.list_recent_session_summaries(max).await;
-        }
-
         let files = self.session_files_by_mtime(usize::MAX).await?;
         let mut out = Vec::new();
         for (session_id, _path, mtime) in files {
@@ -225,7 +326,7 @@ impl JsonlHistoryStore {
                 Err(e) => return Err(e),
             };
             let messages = project_messages(&entries);
-            if session_id.to_string().contains(query) || messages_match_query(&messages, query) {
+            if session_id.to_string().contains(needle) || messages_match_query(&messages, needle) {
                 let metadata = load_session_metadata(&self.sessions_root, session_id).await;
                 out.push(self.summary_from_parts(
                     session_id,
@@ -240,32 +341,6 @@ impl JsonlHistoryStore {
             }
         }
         Ok(out)
-    }
-
-    /// Search session summaries across **all** project directories under the
-    /// history root, filtering by session ID and message content. Used by
-    /// `/resume @all <query>`.
-    pub async fn search_all_project_session_summaries(
-        &self,
-        query: &str,
-        max: usize,
-    ) -> Result<Vec<SessionSummary>, HistoryError> {
-        self.search_project_dirs(query, max, ProjectDirFilter::All)
-            .await
-    }
-
-    /// Search session summaries in project directories that share the same
-    /// git repository as the current working directory. Useful when a
-    /// monorepo has multiple project subdirectories with their own history.
-    /// Used by `/resume @repo <query>`.
-    pub async fn search_same_repo_session_summaries(
-        &self,
-        query: &str,
-        max: usize,
-    ) -> Result<Vec<SessionSummary>, HistoryError> {
-        let root = repo_root_or_cwd(&self.canonical_cwd).await;
-        self.search_project_dirs(query, max, ProjectDirFilter::UnderPath(root))
-            .await
     }
 
     async fn search_project_dirs(
@@ -419,9 +494,16 @@ impl JsonlHistoryStore {
 }
 
 fn format_mtime(t: std::time::SystemTime) -> String {
-    let dt = time::OffsetDateTime::from(t);
+    format_ts(time::OffsetDateTime::from(t))
+}
+
+fn format_ts(dt: time::OffsetDateTime) -> String {
     dt.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "unknown".into())
+        .unwrap_or_else(|_| unknown_time())
+}
+
+fn unknown_time() -> String {
+    "unknown".into()
 }
 
 enum ProjectDirFilter {
@@ -644,6 +726,34 @@ impl HistoryStore for JsonlHistoryStore {
             }
         }
         Ok(out)
+    }
+
+    /// Orders by the file's modification time and narrows by directory before
+    /// reading anything, neither of which the default can do. Recency alone
+    /// never opens a transcript at all — the sidecar metadata carries the
+    /// preview.
+    async fn find_sessions(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
+        match (&query.scope, query.needle()) {
+            (SessionScope::CurrentProject, None) => self.recent_summaries(query.limit).await,
+            (SessionScope::CurrentProject, Some(needle)) => {
+                self.search_current_project(needle, query.limit).await
+            }
+            (SessionScope::AllProjects, _) => {
+                self.search_project_dirs(&query.text, query.limit, ProjectDirFilter::All)
+                    .await
+            }
+            (SessionScope::Under(root), _) => {
+                self.search_project_dirs(
+                    &query.text,
+                    query.limit,
+                    ProjectDirFilter::UnderPath(root.clone()),
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -1608,6 +1718,13 @@ impl HistoryStore for ObservedHistoryStore {
     ) -> Result<Vec<SessionId>, HistoryError> {
         self.inner.child_sessions(parent_session_id).await
     }
+
+    async fn find_sessions(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
+        self.inner.find_sessions(query).await
+    }
 }
 
 /// The contract, exercised against every implementation.
@@ -1920,5 +2037,243 @@ mod append_observer_tests {
             inner.load(s).await.unwrap_err(),
             HistoryError::SessionNotFound(_)
         ));
+    }
+}
+
+/// The query contract, exercised against a scanning backend and an indexing
+/// one.
+///
+/// The pair is the point: an index answers from something it built as entries
+/// arrived, a scan answers by reading everything, and a caller must not be
+/// able to tell which one it is talking to.
+#[cfg(test)]
+mod query_contract_tests {
+    use super::*;
+    use crate::transcript::render_search_text;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What an index keeps per session so a search never opens a transcript.
+    struct IndexRow {
+        modified: Option<time::OffsetDateTime>,
+        id: String,
+        text_lower: String,
+        summary: SessionSummary,
+    }
+
+    /// A backend that takes search over outright.
+    ///
+    /// Everything a query needs is derived once, on append, and the search
+    /// path touches nothing else — which is what [`load_calls`] is counted to
+    /// prove.
+    struct IndexedHistoryStore {
+        inner: Arc<InMemoryHistoryStore>,
+        index: std::sync::Mutex<HashMap<SessionId, IndexRow>>,
+        load_calls: AtomicUsize,
+    }
+
+    impl IndexedHistoryStore {
+        fn new(inner: Arc<InMemoryHistoryStore>) -> Self {
+            Self {
+                inner,
+                index: std::sync::Mutex::new(HashMap::new()),
+                load_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn load_calls(&self) -> usize {
+            self.load_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl HistoryStore for IndexedHistoryStore {
+        async fn append(&self, session: SessionId, entry: LogEntry) -> Result<(), HistoryError> {
+            self.inner.append(session, entry).await?;
+            let entries = self.inner.load(session).await?;
+            let messages = project_messages(&entries);
+            let row = IndexRow {
+                modified: entries.iter().map(|env| env.ts).max(),
+                id: session.to_string(),
+                text_lower: render_search_text(&messages).to_lowercase(),
+                summary: SessionSummary {
+                    session_id: session,
+                    last_modified: entries
+                        .iter()
+                        .map(|env| env.ts)
+                        .max()
+                        .map(format_ts)
+                        .unwrap_or_else(unknown_time),
+                    entry_count: entries.len(),
+                    message_count: messages.len(),
+                    preview: preview_messages(&messages, 140),
+                    canonical_cwd: None,
+                    title: None,
+                    total_input_tokens: None,
+                    total_output_tokens: None,
+                    compact_count: 0,
+                },
+            };
+            self.index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session, row);
+            Ok(())
+        }
+
+        async fn load(&self, session: SessionId) -> Result<Vec<EnvelopedEntry>, HistoryError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.load(session).await
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError> {
+            self.inner.list_sessions().await
+        }
+
+        async fn delete(&self, session: SessionId) -> Result<(), HistoryError> {
+            self.index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&session);
+            self.inner.delete(session).await
+        }
+
+        async fn find_sessions(
+            &self,
+            query: &SessionQuery,
+        ) -> Result<Vec<SessionSummary>, HistoryError> {
+            if query.limit == 0 {
+                return Ok(Vec::new());
+            }
+            let lowered = query.needle().map(str::to_lowercase);
+            let index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hits: Vec<&IndexRow> = index
+                .values()
+                .filter(|row| match (query.needle(), &lowered) {
+                    (Some(needle), Some(lowered)) => {
+                        row.id.contains(needle) || row.text_lower.contains(lowered)
+                    }
+                    _ => true,
+                })
+                .collect();
+            hits.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.id.cmp(&a.id)));
+            hits.truncate(query.limit);
+            Ok(hits.into_iter().map(|row| row.summary.clone()).collect())
+        }
+    }
+
+    fn user(text: &str) -> LogEntry {
+        LogEntry::User {
+            content: vec![base::message::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    const CORPUS: [(&str, &str); 4] = [
+        ("first", "planning the Postgres migration"),
+        ("second", "renaming a struct"),
+        ("third", "postgres again, and a deadlock"),
+        ("fourth", "nothing to do with databases"),
+    ];
+
+    async fn fill(store: &dyn HistoryStore, ids: &[SessionId]) {
+        for (id, (label, text)) in ids.iter().zip(CORPUS) {
+            store.append(*id, user(label)).await.unwrap();
+            store.append(*id, user(text)).await.unwrap();
+        }
+    }
+
+    fn queries() -> Vec<SessionQuery> {
+        vec![
+            SessionQuery::recent(10),
+            SessionQuery::recent(2),
+            SessionQuery::matching("postgres", 10),
+            SessionQuery::matching("  Postgres ", 10),
+            SessionQuery::matching("deadlock", 10),
+            SessionQuery::matching("nothing anyone wrote", 10),
+            SessionQuery::matching("postgres", 1),
+            SessionQuery::recent(0),
+        ]
+    }
+
+    /// The acceptance: an index answers exactly what the scan would have, down
+    /// to the order and the preview text, and answers it without reading a
+    /// single transcript.
+    #[tokio::test]
+    async fn an_index_and_a_scan_are_indistinguishable_to_a_caller() {
+        let shared = Arc::new(InMemoryHistoryStore::new());
+        let indexed = IndexedHistoryStore::new(shared.clone());
+        let ids: Vec<SessionId> = (0..CORPUS.len()).map(|_| SessionId::new()).collect();
+        // Written once, through the indexing backend, so both sides see the
+        // same envelopes — two appends of the same entry get two timestamps.
+        fill(&indexed, &ids).await;
+
+        let before = indexed.load_calls();
+        for query in queries() {
+            let scanned = shared.find_sessions(&query).await.unwrap();
+            let from_index = indexed.find_sessions(&query).await.unwrap();
+            assert_eq!(
+                from_index, scanned,
+                "the two backends disagree on {query:?}"
+            );
+        }
+        assert_eq!(
+            indexed.load_calls(),
+            before,
+            "an index that reads transcripts to answer a query is not an index"
+        );
+    }
+
+    /// A ceiling the caller sets is a ceiling both backends keep.
+    #[tokio::test]
+    async fn a_limit_is_a_ceiling_and_zero_means_nothing() {
+        let shared = Arc::new(InMemoryHistoryStore::new());
+        let indexed = IndexedHistoryStore::new(shared.clone());
+        let ids: Vec<SessionId> = (0..CORPUS.len()).map(|_| SessionId::new()).collect();
+        fill(&indexed, &ids).await;
+
+        for store in [&*shared as &dyn HistoryStore, &indexed as &dyn HistoryStore] {
+            assert_eq!(store.find_sessions(&SessionQuery::recent(0)).await.unwrap(), vec![]);
+            assert_eq!(store.find_sessions(&SessionQuery::recent(2)).await.unwrap().len(), 2);
+            assert_eq!(
+                store.find_sessions(&SessionQuery::recent(99)).await.unwrap().len(),
+                CORPUS.len()
+            );
+        }
+    }
+
+    /// The two shipped backends have different notions of "when was this last
+    /// touched" — a file's mtime and an entry's timestamp — so their orders
+    /// can differ by a tie. Which sessions match cannot.
+    #[tokio::test]
+    async fn the_shipped_backends_agree_on_which_sessions_match() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        let projects = tempfile::TempDir::new().unwrap();
+        let jsonl = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+            .await
+            .unwrap();
+        let memory = InMemoryHistoryStore::new();
+        let ids: Vec<SessionId> = (0..CORPUS.len()).map(|_| SessionId::new()).collect();
+        fill(&jsonl, &ids).await;
+        fill(&memory, &ids).await;
+
+        for query in queries() {
+            let matched = |summaries: Vec<SessionSummary>| {
+                let mut ids: Vec<String> = summaries
+                    .into_iter()
+                    .map(|s| s.session_id.to_string())
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let from_files = matched(jsonl.find_sessions(&query).await.unwrap());
+            let from_memory = matched(memory.find_sessions(&query).await.unwrap());
+            assert_eq!(
+                from_files, from_memory,
+                "the shipped backends disagree on {query:?}"
+            );
+        }
     }
 }

@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 26] = [
+static POINTS: [ExtensionPoint; 27] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -352,6 +352,16 @@ static POINTS: [ExtensionPoint; 26] = [
             frequency: Frequency::PerTurn,
             trust: Trust::host_only(),
             defined_in: "history::store::HistoryStore",
+        },
+        ExtensionPoint {
+            id: "history.query",
+            kind: Kind::Contract,
+            summary: "how sessions are found: the recency listing and the text search",
+            timing: "whenever something asks for sessions rather than for one session",
+            rewrites: "which sessions come back, in what order, and how they are matched",
+            frequency: Frequency::PerSession,
+            trust: Trust::host_only(),
+            defined_in: "history::store::HistoryStore::find_sessions",
         },
         ExtensionPoint {
             id: "history.extension_entry",

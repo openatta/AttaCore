@@ -51,6 +51,7 @@ anything, which is why those are closed to scripts and plugins outright.
 | `credentials` | contract | startup, when provider config is read | the credential | per process (10⁰) | closed | closed | closed |
 | `token.count` | contract | every budget check | the number compaction triggers on | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.store` | contract | every append, and on resume | how and where the log persists | per turn (10⁰–10¹) | closed | closed | closed |
+| `history.query` | contract | whenever something asks for sessions rather than for one session | which sessions come back, in what order, and how they are matched | per session (10⁰) | closed | closed | closed |
 | `history.extension_entry` | registration | any time; ordered with everything else | adds only; the kernel never reads the payload | per turn (10⁰–10¹) | full | full | add only |
 | `memory.storage` | contract | recall, and whenever a memory is written | how and where memories persist | per turn (10⁰–10¹) | closed | closed | closed |
 | `memory.retriever` | contract | once per user message, in the background | the recalled set | per turn (10⁰–10¹) | closed | closed | closed |
@@ -59,7 +60,6 @@ anything, which is why those are closed to scripts and plugins outright.
 | `compaction` | contract | when the budget threshold is crossed | the message history | per turn (10⁰–10¹) | closed | closed | closed |
 | `script.carrier` | contract | wherever the carrier is bound; governed by a per-turn quota | whatever the bound point allows, under the script's own provenance | per turn (10⁰–10¹) | full | full | declared capability |
 | `hooks` | interception | thirty named moments; see the hook event list | varies by event: block, rewrite input, end the turn | per tool call (10¹) | full | full | declared capability |
-
 <!-- END GENERATED TABLE -->
 
 The table above is generated from `base::interface::catalog`, and
@@ -150,6 +150,21 @@ names below.
 `InMemoryHistoryStore`. The contract's guarantees are in its doc comment;
 `store::contract_tests` runs the same six properties against both, and is the
 place to point a third backend at.
+
+### Finding sessions — `history.query`
+
+`HistoryStore::find_sessions` takes a `history::query::SessionQuery` — a
+needle, a scope and a ceiling — and answers with summaries, newest first. The
+recency listing and the text search are the same question with and without a
+needle, which is why they are one method: a backend that can answer one
+cheaply can answer both.
+
+The default reads every session in range to answer, and `JsonlHistoryStore`
+does better only by ordering on file mtime and narrowing by directory. A
+backend with a real index overrides this one method and takes search over
+whole; the guarantees it has to keep — newest first with a total order, at
+most the limit, and never fewer matches than a case-insensitive substring
+scan would find — are in the method's doc comment.
 
 ### Memory — `memory.storage`, `memory.retriever`
 
