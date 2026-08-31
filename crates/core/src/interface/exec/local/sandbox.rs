@@ -426,7 +426,7 @@ impl Sandbox for PlatformSandbox {
         let mut confined = wrap(SandboxOptions {
             command: &command,
             cwd: &spec.cwd,
-            additional_writable: &[],
+            additional_writable: &policy.additional_writable,
             disable: false,
             policy: policy.clone(),
         });
@@ -663,6 +663,7 @@ mod tests {
             allowed_domains: Vec::new(),
             known_scenes: Vec::new(),
             state_root: None,
+            additional_writable: Vec::new(),
         };
         let cmd = wrap(o);
         let profile = &cmd.spec.args[1];
@@ -682,6 +683,7 @@ mod tests {
             allowed_domains: vec![],
             known_scenes: Vec::new(),
             state_root: None,
+            additional_writable: Vec::new(),
         };
         let cmd = wrap(o);
         let profile = &cmd.spec.args[1];
@@ -909,6 +911,7 @@ mod tests {
                 allowed_domains: Vec::new(),
                 known_scenes: Vec::new(),
                 state_root: None,
+                additional_writable: Vec::new(),
             },
         };
         let cmd = wrap(o);
@@ -943,6 +946,7 @@ mod tests {
                 allowed_domains: vec![],
                 known_scenes: Vec::new(),
                 state_root: None,
+                additional_writable: Vec::new(),
             },
         };
         let cmd = wrap(o);
@@ -1022,6 +1026,7 @@ mod tests {
                 allowed_domains: vec![],
                 known_scenes: Vec::new(),
                 state_root: None,
+                additional_writable: Vec::new(),
             },
         };
         let cmd = wrap(o);

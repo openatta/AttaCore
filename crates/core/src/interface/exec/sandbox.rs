@@ -46,6 +46,13 @@ pub struct SandboxPolicy {
     /// that list gets no protection for that scene's settings unless it
     /// populates this.
     pub known_scenes: Vec<String>,
+    /// Paths outside `cwd` this command may still write to.
+    ///
+    /// Part of the policy rather than a separate argument because it answers
+    /// the same question the rest of it does — what may be written — and a
+    /// backend that received it separately could be handed a policy that
+    /// looks complete and is not.
+    pub additional_writable: Vec<PathBuf>,
     /// This instance's global state root. `None` falls back to `$HOME/.atta`,
     /// which is where an instance usually lives but not where it must: a
     /// redirected instance whose sandbox protected `$HOME/.atta` would be

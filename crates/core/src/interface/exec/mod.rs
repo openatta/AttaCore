@@ -106,6 +106,20 @@ pub enum ExecError {
     Failed(String),
 }
 
+impl From<ExecError> for crate::error::ToolError {
+    /// The three sentences survive the trip to the model.
+    ///
+    /// `Denied` keeps its own variant because "a policy refused" is something
+    /// the model can work around, and flattening it into a generic execution
+    /// failure is how a model ends up retrying the same refused thing.
+    fn from(e: ExecError) -> Self {
+        match e {
+            ExecError::Denied(m) => Self::Denied(m),
+            other => Self::Execution(anyhow::anyhow!(other.to_string())),
+        }
+    }
+}
+
 impl ExecError {
     pub fn unavailable(m: impl std::fmt::Display) -> Self {
         Self::Unavailable(m.to_string())

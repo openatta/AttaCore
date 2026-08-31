@@ -21,11 +21,7 @@ use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncRead;
-use tokio_util::codec::{FramedRead, LinesCodec};
 
 /// 默认执行超时（120 秒）
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -84,6 +80,9 @@ fn to_sandbox_policy(settings: &base::tool::SandboxSettings) -> sandbox::Sandbox
         // settings today). Empty falls back to `sandbox::KNOWN_SCENES`.
         known_scenes: Vec::new(),
         state_root: settings.state_root.clone(),
+        // Filled in by the caller, which is the only place that knows what
+        // this turn opened up.
+        additional_writable: Vec::new(),
     }
 }
 
@@ -211,38 +210,57 @@ impl Tool for BashTool {
 
         // 平台沙盒包装：拒写 cwd / additional 之外。
         // dangerously_disable_sandbox=true 时直跑 bash。
-        let writable: Vec<PathBuf> = ctx.additional_writable_dirs.clone();
-        let wrapped = sandbox::wrap(sandbox::SandboxOptions {
-            command: &input.command,
-            cwd: &ctx.cwd,
-            additional_writable: &writable,
-            disable: ctx.dangerously_disable_sandbox,
-            policy: to_sandbox_policy(&ctx.sandbox),
-        });
+        let mut policy = to_sandbox_policy(&ctx.sandbox);
+        policy.additional_writable = ctx.additional_writable_dirs.clone();
+        let intent = base::interface::exec::ProcessSpec::new("bash", &ctx.cwd)
+            .args(["-c".to_string(), input.command.clone()]);
+        let confined = if ctx.dangerously_disable_sandbox {
+            base::interface::exec::Confined {
+                spec: intent,
+                mode: base::interface::exec::SandboxMode::Disabled,
+                enforcement: base::interface::exec::Enforcement::None,
+                unmet: vec!["the sandbox is turned off".into()],
+            }
+        } else {
+            ctx.exec.sandbox.confine(intent, &policy)
+        };
+
         // A policy that cannot be enforced is the one case where "log it and
         // carry on" is the wrong default *and* the wrong thing to change
         // silently: refusing breaks every Linux host without bubblewrap and
         // every Windows host, while permitting means a command the operator
         // believes is constrained runs with nothing holding it. So the engine
         // reports honestly and lets the host decide which it wants.
-        if wrapped.enforcement == sandbox::Enforcement::None
-            && wrapped.mode == SandboxMode::Unavailable
-        {
+        //
+        // `Partial` counts as unenforced here. A host that turned
+        // `require_enforcement` on wants an absolute boundary, and "most of
+        // your policy" is not one.
+        let shortfall = match confined.enforcement {
+            base::interface::exec::Enforcement::Full => None,
+            base::interface::exec::Enforcement::None
+                if confined.mode == base::interface::exec::SandboxMode::Disabled =>
+            {
+                None
+            }
+            _ => Some(confined.unmet.join("; ")),
+        };
+        if let Some(shortfall) = shortfall {
             if ctx.sandbox.require_enforcement {
                 return Ok(ToolResult {
                     content: base::tool::ToolResultContent::Text(format!(
-                        "Refused: a sandbox policy is configured but no backend on this \
-                         platform ({}) can enforce it, and `sandbox.require_enforcement` \
-                         is on. Install bubblewrap (Linux), or set \
-                         `sandbox.require_enforcement: false` to accept unsandboxed \
-                         execution, or `sandbox.dangerously_disable_sandbox: true` to \
-                         stop asking for one.",
+                        "Refused: a sandbox policy is configured but this platform ({}) \
+                         cannot enforce all of it — {shortfall} — and \
+                         `sandbox.require_enforcement` is on. Install bubblewrap (Linux), \
+                         or set `sandbox.require_enforcement: false` to accept it, or \
+                         `sandbox.dangerously_disable_sandbox: true` to stop asking for \
+                         a sandbox.",
                         std::env::consts::OS
                     )),
                     is_error: true,
                     structured_content: Some(serde_json::json!({
                         "refused": "sandbox_unenforceable",
                         "platform": std::env::consts::OS,
+                        "unmet": confined.unmet,
                     })),
                     mcp_meta: None,
                     new_messages: Some(vec![]),
@@ -250,58 +268,47 @@ impl Tool for BashTool {
             }
             tracing::warn!(
                 platform = std::env::consts::OS,
-                "BashTool sandbox unavailable on this platform; running UNSANDBOXED \
-                 while a policy is configured. Install bwrap (Linux), set \
-                 sandbox.require_enforcement to refuse instead, or \
+                unmet = %shortfall,
+                "BashTool sandbox policy is not fully enforced. Install bwrap (Linux), \
+                 set sandbox.require_enforcement to refuse instead, or \
                  dangerously_disable_sandbox to stop asking."
             );
         }
 
-        let mut cmd = tokio::process::Command::new(&wrapped.spec.program);
-        cmd.args(&wrapped.spec.args);
-        cmd.current_dir(&ctx.cwd);
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        // 防止子进程泄露 SIGPIPE / SIGINT 行为；bash -c 自带正常默认
-        cmd.kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(|e| ToolError::exec(e.to_string()))?;
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+        let mut child = ctx
+            .exec
+            .process
+            .spawn(confined.spec, ctx.cancel.clone())
+            .await
+            .map_err(exec_error)?;
+        let output = child.output().expect("the stream is taken once");
 
         // 流式读 stdout / stderr
-        let stdout_progress = progress.clone();
-        let stderr_progress = progress.clone();
-        let stdout_handle =
-            tokio::spawn(async move { drain_stream(stdout, true, stdout_progress).await });
-        let stderr_handle =
-            tokio::spawn(async move { drain_stream(stderr, false, stderr_progress).await });
+        let drain = tokio::spawn(drain_output(output, progress.clone()));
 
         // 等待 + 超时 + cancel
         let wait_result = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => {
-            let _ = child.kill().await;
+            child.kill().await;
             return Err(ToolError::Cancelled);
         }
         _ = tokio::time::sleep(timeout) => {
-            let _ = child.kill().await;
+            child.kill().await;
             return Err(ToolError::Timeout(timeout));
         }
         r = child.wait() => r};
-        let status = wait_result.map_err(|e| ToolError::exec(e.to_string()))?;
+        let status = wait_result.map_err(exec_error)?;
 
         // exit code 130 (128 + SIGINT) = user pressed Ctrl-C during this tool.
         // Treat as cancellation so the engine stops the turn instead of feeding
         // a "tool error" back to the model, which would fight the user's intent.
         // Child has already exited, so no kill needed.
-        if let Some(130) = status.code() {
+        if let Some(130) = status.code {
             return Err(ToolError::Cancelled);
         }
 
-        let stdout_text = stdout_handle.await.unwrap_or_default();
-        let stderr_text = stderr_handle.await.unwrap_or_default();
+        let (stdout_text, stderr_text) = drain.await.unwrap_or_default();
         let mut combined = stdout_text;
         if !stderr_text.is_empty() {
             if !combined.is_empty() && !combined.ends_with('\n') {
@@ -313,9 +320,9 @@ impl Tool for BashTool {
         if combined.is_empty() {
             combined.push_str("(no output)");
         }
-        let is_error = !status.success();
+        let is_error = !status.success;
         if is_error {
-            if let Some(code) = status.code() {
+            if let Some(code) = status.code {
                 combined.push_str(&format!("\n[exit code: {code}]"));
             } else {
                 combined.push_str("\n[killed by signal]");
@@ -330,32 +337,87 @@ impl Tool for BashTool {
     }
 }
 
-/// 把 stdout/stderr 行级转 String + 流式喂 progress。
-/// 软上限到 MAX_OUTPUT_BYTES，超了截断（防止超长输出吃光内存）。
-async fn drain_stream<R: AsyncRead + Unpin + Send + 'static>(
-    reader: R,
-    _is_stdout: bool,
-    progress: ProgressSender,
-) -> String {
-    let mut framed = FramedRead::new(reader, LinesCodec::new_with_max_length(64 * 1024));
-    let mut buf = String::new();
-    while let Some(line_res) = framed.next().await {
-        match line_res {
-            Ok(line) => {
-                if buf.len() < MAX_OUTPUT_BYTES {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-                let line_with_nl = format!("{line}\n");
-                progress.send(&line_with_nl);
+/// Accumulate a byte stream into lines the way `LinesCodec` did.
+///
+/// The output of a command is bytes; where the lines are is the reader's
+/// question, which is why the contract does not answer it. This is that
+/// answer for a shell command: split on `\n`, drop a `\r` before it, and treat
+/// a line longer than the cap as the end of usable output — the same shape
+/// the framed reader had.
+#[derive(Default)]
+struct Lines {
+    pending: Vec<u8>,
+    buf: String,
+    stopped: bool,
+}
+
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
+impl Lines {
+    fn feed(&mut self, bytes: &[u8], progress: &ProgressSender) {
+        if self.stopped {
+            return;
+        }
+        self.pending.extend_from_slice(bytes);
+        while let Some(nl) = self.pending.iter().position(|b| *b == b'\n') {
+            let mut line = self.pending.drain(..=nl).collect::<Vec<u8>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
             }
-            Err(_) => break,
+            self.push(String::from_utf8_lossy(&line).into_owned(), progress);
+        }
+        if self.pending.len() > MAX_LINE_BYTES {
+            self.stopped = true;
         }
     }
-    if buf.len() >= MAX_OUTPUT_BYTES {
-        buf.push_str("\n[output truncated]\n");
+
+    fn finish(mut self, progress: &ProgressSender) -> String {
+        if !self.stopped && !self.pending.is_empty() {
+            let line = String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned();
+            self.push(line, progress);
+        }
+        if self.buf.len() >= MAX_OUTPUT_BYTES {
+            self.buf.push_str("\n[output truncated]\n");
+        }
+        self.buf
     }
-    buf
+
+    fn push(&mut self, line: String, progress: &ProgressSender) {
+        if self.buf.len() < MAX_OUTPUT_BYTES {
+            self.buf.push_str(&line);
+            self.buf.push('\n');
+        }
+        progress.send(&format!("{line}\n"));
+    }
+}
+
+/// Drain the tagged output stream into one buffer per pipe.
+///
+/// Two buffers rather than one, because the result reports all of stdout and
+/// then all of stderr — the interleaving on the wire is what keeps a quiet
+/// stdout from holding stderr up, not what the model is shown.
+async fn drain_output(
+    mut output: futures::stream::BoxStream<
+        'static,
+        Result<base::interface::exec::OutputChunk, base::interface::exec::ExecError>,
+    >,
+    progress: ProgressSender,
+) -> (String, String) {
+    use base::interface::exec::OutputStream;
+    let (mut out, mut err) = (Lines::default(), Lines::default());
+    while let Some(chunk) = output.next().await {
+        let Ok(chunk) = chunk else { break };
+        match chunk.stream {
+            OutputStream::Stdout => out.feed(&chunk.bytes, &progress),
+            OutputStream::Stderr => err.feed(&chunk.bytes, &progress),
+        }
+    }
+    (out.finish(&progress), err.finish(&progress))
+}
+
+fn exec_error(e: base::interface::exec::ExecError) -> ToolError {
+    e.into()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1074,6 +1136,112 @@ const DESTRUCTIVE_PREFIXES: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+
+    // ── the invariant this migration must not break ──
+
+    use base::interface::exec::{Confined, Enforcement, ProcessSpec, Sandbox, SandboxMode};
+
+    /// A backend that delivers exactly as much of the policy as it is told to.
+    struct Reports(Enforcement, SandboxMode);
+
+    impl Sandbox for Reports {
+        fn confine(
+            &self,
+            spec: ProcessSpec,
+            _policy: &base::interface::exec::SandboxPolicy,
+        ) -> Confined {
+            Confined {
+                spec,
+                mode: self.1,
+                enforcement: self.0,
+                unmet: match self.0 {
+                    Enforcement::Full => Vec::new(),
+                    _ => vec!["the thing it could not do".into()],
+                },
+            }
+        }
+    }
+
+    async fn run_under(backend: Reports, require: bool, disable: bool) -> ToolResult {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_in(dir.path());
+        ctx.sandbox.require_enforcement = require;
+        ctx.dangerously_disable_sandbox = disable;
+        ctx.exec.sandbox = std::sync::Arc::new(backend);
+        BashTool
+            .call(
+                serde_json::json!({"command": "echo ran"}),
+                ctx,
+                ProgressSender::noop("bash"),
+            )
+            .await
+            .expect("the tool answers rather than erroring")
+    }
+
+    fn refused(r: &ToolResult) -> bool {
+        r.is_error
+            && r.structured_content
+                .as_ref()
+                .and_then(|v| v.get("refused"))
+                .is_some()
+    }
+
+    /// The hard invariant: a policy that asked for constraint never quietly
+    /// becomes an unconstrained run when the host said it must not.
+    #[tokio::test]
+    async fn an_unenforceable_policy_is_refused_when_the_host_demands_enforcement() {
+        let r = run_under(
+            Reports(Enforcement::None, SandboxMode::Unavailable),
+            true,
+            false,
+        )
+        .await;
+        assert!(refused(&r), "got: {:?}", r.content);
+    }
+
+    /// New, and the reason `Partial` was worth adding: "most of your policy"
+    /// is not an absolute boundary, and a host that turned enforcement on
+    /// asked for one. bwrap with a domain allowlist is exactly this case, and
+    /// it used to be reported as fully enforced.
+    #[tokio::test]
+    async fn a_partly_enforced_policy_is_also_refused() {
+        let r = run_under(
+            Reports(Enforcement::Partial, SandboxMode::LinuxBwrap),
+            true,
+            false,
+        )
+        .await;
+        assert!(refused(&r), "got: {:?}", r.content);
+    }
+
+    /// And the other half: without that setting the command still runs, so
+    /// turning the contract on did not break every host without bubblewrap.
+    #[tokio::test]
+    async fn an_unenforceable_policy_still_runs_when_the_host_accepts_it() {
+        let r = run_under(
+            Reports(Enforcement::None, SandboxMode::Unavailable),
+            false,
+            false,
+        )
+        .await;
+        assert!(!refused(&r));
+        assert!(format!("{:?}", r.content).contains("ran"));
+    }
+
+    /// Turning the sandbox off is not a shortfall. Refusing here would make
+    /// `dangerously_disable_sandbox` and `require_enforcement` contradict
+    /// each other instead of answering different questions.
+    #[tokio::test]
+    async fn a_sandbox_that_was_switched_off_is_not_a_failure_to_enforce() {
+        let r = run_under(
+            Reports(Enforcement::Full, SandboxMode::MacOSSandboxExec),
+            true,
+            true,
+        )
+        .await;
+        assert!(!refused(&r), "got: {:?}", r.content);
+    }
+    use std::path::PathBuf;
     use super::*;
     use base::tool::ToolResultContent;
     use serde_json::json;
