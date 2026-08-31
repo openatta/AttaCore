@@ -70,6 +70,10 @@ anything, which is why those are closed to scripts and plugins outright.
 | `model.backoff` | contract | inside the client, below the model contract, per failed attempt | the delay before a retry, and whether there is one | per model call (10⁰–10¹) | closed | closed | closed |
 | `budget` | contract | after each model call, and before each request is assembled | whether the turn continues, what it is told, the compaction ceiling | per model call (10⁰–10¹) | closed | closed | closed |
 | `environment` | contract | whenever an answer is written down rather than measured | log timestamps, entry ids, the date the prompt carries | per turn (10⁰–10¹) | closed | closed | closed |
+| `exec.process` | contract | every command a tool starts | which machine the work happens on | per tool call (10¹) | closed | closed | closed |
+| `exec.filesystem` | contract | every read, write or stat a tool makes | which filesystem the tools see | per tool call (10¹) | closed | closed | closed |
+| `exec.network` | contract | each outbound request; the egress policy binds the ones the model chose | where requests go, whether they go, what answers | per tool call (10¹) | closed | closed | closed |
+| `exec.sandbox` | contract | before a command is started | the command that actually runs, and what it may touch | per tool call (10¹) | closed | closed | closed |
 | `compaction` | contract | once a turn: two aging passes, a predictive one, then the threshold | the message history, and whether it is rewritten at all | per turn (10⁰–10¹) | closed | closed | closed |
 | `script.carrier` | contract | wherever the carrier is bound; governed by a per-turn quota | whatever the bound point allows, under the script's own provenance | per turn (10⁰–10¹) | full | full | declared capability |
 | `hooks` | interception | thirty named moments; see the hook event list | varies by event: block, rewrite input, end the turn | per tool call (10¹) | full | full | declared capability |
@@ -273,6 +277,52 @@ nobody else's time. It cannot pace a turn.
 `base::interface::token_counter::TokenCounter`. The default is a local
 `cl100k_base` estimate that runs 5–15% high because Anthropic publishes no
 tokenizer; a host that can be exact should be.
+
+### Reaching the machine — `exec.process`, `exec.filesystem`, `exec.network`, `exec.sandbox`
+
+Four contracts designed as one, because they are entangled: a sandbox
+constrains a process, a process needs files and a network, and the network
+policy has to reach inside the sandbox. `EXECUTION_LAYER_DESIGN.md` is the
+blueprint; this is the summary.
+
+```rust
+let mut ctx = /* … */;
+ctx.exec = ExecProviders::in_process();   // switching is this call
+```
+
+Two provider sets ship. `ExecProviders::local()` is this machine and the
+default everywhere. `ExecProviders::in_process()` is a memory tree, commands
+decided in advance, a network that answers only what it was given, and a
+sandbox that reports it constrains nothing — paired with a `FixedEnvironment`,
+a whole session runs and replays without touching anything.
+
+Three shapes are worth knowing before implementing a provider of your own.
+
+**`Process` streams and `FileSystem` does not.** A long command's output has to
+reach the user while it runs, so the handle yields chunks tagged with which
+pipe they came from; a provider that returned everything at the end would
+remove that silently. Files are whole values because every call site wants one
+and tool results are capped long before a file could need chunking.
+
+**Path safety is above the contract, canonicalization is inside it.** Whether a
+path may be written is policy, and a provider deciding its own out-of-bounds
+rules could cancel them. But a remote's symlink graph is the remote's, so the
+order is: canonicalize through the provider, check the resolved path, write
+through the provider.
+
+**The egress policy asks where the *model* may reach.** A request carries who
+chose its destination. `allowed_domains` binds `Origin::Agent` — a WebFetch
+url, a Ping host — and not `Origin::Operator`, which is the model endpoint,
+MCP servers, telemetry. Applying it to everything would cut the agent off from
+its own model. Operator traffic still goes through the contract so a
+deployment can audit it or go offline as a whole.
+
+The sandbox has one invariant the engine enforces rather than requests: **a
+policy that asked for constraint never silently becomes an unconstrained
+run.** A backend reports `Full`, `Partial` or `None` and names what it could
+not deliver; `sandbox.require_enforcement` decides whether anything short of
+`Full` is refused. What to constrain and whether to constrain at all stay the
+kernel's — a provider answers only *how*.
 
 ### Compaction — `compaction`
 

@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 40] = [
+static POINTS: [ExtensionPoint; 44] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -547,6 +547,46 @@ static POINTS: [ExtensionPoint; 40] = [
             frequency: Frequency::PerTurn,
             trust: Trust::host_only(),
             defined_in: "base::interface::environment::Environment",
+        },
+        ExtensionPoint {
+            id: "exec.process",
+            kind: Kind::Contract,
+            summary: "where a program runs",
+            timing: "every command a tool starts",
+            rewrites: "which machine the work happens on",
+            frequency: Frequency::PerToolCall,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::exec::process::Process",
+        },
+        ExtensionPoint {
+            id: "exec.filesystem",
+            kind: Kind::Contract,
+            summary: "where a tool's files are",
+            timing: "every read, write or stat a tool makes",
+            rewrites: "which filesystem the tools see",
+            frequency: Frequency::PerToolCall,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::exec::filesystem::FileSystem",
+        },
+        ExtensionPoint {
+            id: "exec.network",
+            kind: Kind::Contract,
+            summary: "every request that leaves the process, and whether it may",
+            timing: "each outbound request; the egress policy binds the ones the model chose",
+            rewrites: "where requests go, whether they go, what answers",
+            frequency: Frequency::PerToolCall,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::exec::network::Network",
+        },
+        ExtensionPoint {
+            id: "exec.sandbox",
+            kind: Kind::Contract,
+            summary: "how a process is constrained — never whether it is",
+            timing: "before a command is started",
+            rewrites: "the command that actually runs, and what it may touch",
+            frequency: Frequency::PerToolCall,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::exec::sandbox::Sandbox",
         },
         ExtensionPoint {
             id: "compaction",
