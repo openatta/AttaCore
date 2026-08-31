@@ -45,6 +45,9 @@
 //! | [`script::ScriptEngine`] | running the operator's own code at a hook point |
 //! | [`memory_contracts::MemoryStorage`] | where durable memories are kept |
 //! | [`memory_contracts::MemoryRetriever`] | which of them a turn sees |
+//! | [`skill_provider::SkillProvider`] | where a session's skills come from |
+//! | [`instruction_provider::InstructionProvider`] | where standing instructions come from |
+//! | [`instruction_provider::RuleProvider`] | where the rule index comes from |
 //!
 //! [`catalog`] is the whole picture, including the contracts below that this
 //! directory cannot re-export: every extension point as data, with when it
@@ -71,6 +74,7 @@ pub mod health;
 #[deprecated(note = "moved to `base::event` — event payloads, not an injectable contract")]
 pub use crate::event;
 pub mod import_callback;
+pub mod instruction_provider;
 pub mod log;
 #[deprecated(note = "moved to `base::memory` — a concrete store, not an injectable contract")]
 pub use crate::memory;
@@ -89,6 +93,7 @@ pub use crate::prompt;
 pub use crate::rules;
 pub mod scene;
 pub mod script;
+pub mod skill_provider;
 pub mod token_counter;
 pub mod tool;
 pub mod turn_policy;

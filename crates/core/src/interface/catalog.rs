@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 30] = [
+static POINTS: [ExtensionPoint; 33] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -447,6 +447,36 @@ static POINTS: [ExtensionPoint; 30] = [
                 plugin: Access::AddOnly,
             },
             defined_in: "history::store::AppendObserver",
+        },
+        ExtensionPoint {
+            id: "skill.source",
+            kind: Kind::Contract,
+            summary: "where a session's skills come from",
+            timing: "at session build, and whenever an MCP server connects",
+            rewrites: "which skills exist, and the text each one expands to",
+            frequency: Frequency::PerSession,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::skill_provider::SkillProvider",
+        },
+        ExtensionPoint {
+            id: "instruction.source",
+            kind: Kind::Contract,
+            summary: "where the standing instructions come from",
+            timing: "at session build",
+            rewrites: "the AGENTS.md text injected once per session",
+            frequency: Frequency::PerSession,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::instruction_provider::InstructionProvider",
+        },
+        ExtensionPoint {
+            id: "rules.source",
+            kind: Kind::Contract,
+            summary: "where the rule index comes from",
+            timing: "while the system prompt is assembled",
+            rewrites: "which rule documents the model is told exist",
+            frequency: Frequency::PerModelCall,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::instruction_provider::RuleProvider",
         },
         ExtensionPoint {
             id: "compaction",

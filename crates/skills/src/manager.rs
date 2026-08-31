@@ -6,6 +6,7 @@
 
 use base::frozen::frontmatter::parse_skill_file;
 use base::frozen::skill::{SkillEntry, SkillSource as FrozenSkillSource};
+use base::interface::skill_provider::{SkillPrecedence, SkillProvider};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -129,6 +130,10 @@ pub struct SkillManager {
     /// wipe the count for a skill whose content just changed).
     invocation_stats: RwLock<HashMap<String, InvocationStats>>,
     invocation_seq: std::sync::atomic::AtomicU64,
+    /// The sources this manager loaded from, kept so a skill whose content
+    /// lives in its source rather than on disk can still be expanded — see
+    /// `get_skill_content`.
+    providers: RwLock<Vec<std::sync::Arc<dyn SkillProvider>>>,
 }
 
 impl SkillManager {
@@ -139,6 +144,7 @@ impl SkillManager {
             watcher_last_seen: std::sync::atomic::AtomicU64::new(0),
             invocation_stats: RwLock::new(HashMap::new()),
             invocation_seq: std::sync::atomic::AtomicU64::new(0),
+            providers: RwLock::new(Vec::new()),
         }
     }
 
@@ -186,62 +192,49 @@ impl SkillManager {
             .unwrap_or(0)
     }
 
+    /// Take everything a source has, and keep the source for the bodies it
+    /// may hold. Returns how many skills this call put in the catalog — a
+    /// source that only fills gaps does not count the names it deferred on.
+    pub fn load_from(&self, provider: std::sync::Arc<dyn SkillProvider>) -> usize {
+        let entries = provider.skills();
+        let overrides = provider.precedence() == SkillPrecedence::Override;
+        let mut count = 0;
+        {
+            let mut skills = self.skills.write().unwrap();
+            for entry in entries {
+                let name = entry.name.clone();
+                match skills.entry(name) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(SkillInfo::from(entry));
+                        count += 1;
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) if overrides => {
+                        e.insert(SkillInfo::from(entry));
+                        count += 1;
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+        self.providers.write().unwrap().push(provider);
+        count
+    }
+
     /// Load skills from a directory (user skills: ~/.atta/<scope>/skills/;
     /// project skills: <cwd>/.agents/skills/).
     /// Each .md file is a skill; filename (without .md) is the skill name.
     pub fn load_dir(&self, dir: &Path, source: SkillSource) -> std::io::Result<usize> {
-        let mut count = 0;
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                        let info = Self::load_skill_at_path(&path, name, source);
-                        if let Some(info) = info {
-                            self.skills.write().unwrap().insert(info.name.clone(), info);
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(count)
+        Ok(self.load_from(std::sync::Arc::new(crate::sources::SkillDirectory::flat(
+            dir, source,
+        ))))
     }
 
     /// Load skills from a directory using SKILL.md subdirectory format.
     /// Each subdirectory containing a SKILL.md becomes a skill.
     pub fn load_dir_subdirs(&self, dir: &Path, source: SkillSource) -> std::io::Result<usize> {
-        let mut count = 0;
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let subdir = entry.path();
-                if subdir.is_dir() {
-                    let skill_md = subdir.join("SKILL.md");
-                    if skill_md.is_file() {
-                        let dir_name = subdir
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let info = Self::load_skill_at_path(&skill_md, &dir_name, source);
-                        if let Some(info) = info {
-                            self.skills.write().unwrap().insert(info.name.clone(), info);
-                            count += 1;
-                        }
-                    }
-                } else if subdir.extension().and_then(|s| s.to_str()) == Some("md") {
-                    // Legacy flat format
-                    if let Some(name) = subdir.file_stem().and_then(|s| s.to_str()) {
-                        let info = Self::load_skill_at_path(&subdir, name, source);
-                        if let Some(info) = info {
-                            self.skills.write().unwrap().insert(info.name.clone(), info);
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(count)
+        Ok(self.load_from(std::sync::Arc::new(crate::sources::SkillDirectory::tier(
+            dir, source,
+        ))))
     }
 
     /// Register a bundled (in-memory) skill. Used for built-in skills.
@@ -350,6 +343,13 @@ impl SkillManager {
         }
         if path_str.starts_with("(mcp:") {
             return crate::mcp_builder::mcp_skill_body(name);
+        }
+        // Newest source first: a source registered later is the one whose
+        // entry is in the catalog if two of them claimed the same name.
+        for provider in self.providers.read().unwrap().iter().rev() {
+            if let Some(body) = provider.body(name) {
+                return Some(body);
+            }
         }
         std::fs::read_to_string(&info.path).ok()
     }
@@ -509,17 +509,10 @@ impl SkillManager {
         server_name: &str,
         tools: &[base::interface::model::ToolDef],
     ) -> usize {
-        let entries = crate::mcp_builder::build_skills_from_mcp(server_name, tools);
-        let mut count = 0;
-        let mut skills = self.skills.write().unwrap();
-        for entry in entries {
-            let name = entry.name.clone();
-            if let std::collections::hash_map::Entry::Vacant(e) = skills.entry(name) {
-                e.insert(SkillInfo::from(entry));
-                count += 1;
-            }
-        }
-        count
+        self.load_from(std::sync::Arc::new(crate::sources::McpSkills::new(
+            server_name,
+            tools.to_vec(),
+        )))
     }
 
     /// Reload a single skill from its file path.

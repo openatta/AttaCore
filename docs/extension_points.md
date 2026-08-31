@@ -60,6 +60,9 @@ anything, which is why those are closed to scripts and plugins outright.
 | `memory.retriever` | contract | once per user message, in the background | the recalled set | per turn (10⁰–10¹) | closed | closed | closed |
 | `memory.retrieval_hook` | interception | around retrieval | the query and the recalled names | per turn (10⁰–10¹) | full | full | declared capability |
 | `history.append_observer` | interception | after each append succeeds | nothing — read-only in the types, not by agreement | per turn (10⁰–10¹) | full | full | add only |
+| `skill.source` | contract | at session build, and whenever an MCP server connects | which skills exist, and the text each one expands to | per session (10⁰) | closed | closed | closed |
+| `instruction.source` | contract | at session build | the AGENTS.md text injected once per session | per session (10⁰) | closed | closed | closed |
+| `rules.source` | contract | while the system prompt is assembled | which rule documents the model is told exist | per model call (10⁰–10¹) | closed | closed | closed |
 | `compaction` | contract | when the budget threshold is crossed | the message history | per turn (10⁰–10¹) | closed | closed | closed |
 | `script.carrier` | contract | wherever the carrier is bound; governed by a per-turn quota | whatever the bound point allows, under the script's own provenance | per turn (10⁰–10¹) | full | full | declared capability |
 | `hooks` | interception | thirty named moments; see the hook event list | varies by event: block, rewrite input, end the turn | per tool call (10¹) | full | full | declared capability |
@@ -269,6 +272,46 @@ tokenizer; a host that can be exact should be.
 `compaction::Compactor`. Not yet reached by this refactor: the trigger and
 several strategy decisions still live in the turn loop rather than behind the
 trait. That is Phase 3.
+
+### Where skills come from — `skill.source`
+
+`base::interface::skill_provider::SkillProvider`. Three implementations ship
+and cover the three places skills have always come from:
+`skills::sources::SkillDirectory` (a directory tier), `BundledSkills` (the
+built-ins compiled into the binary), and `McpSkills` (one connected server's
+tools). A fourth is added, not substituted:
+
+```rust
+Builder::new().skill_provider(Arc::new(StaticSkills::new("company", entries)))
+```
+
+A source registered this way defers to what is already loaded. One that means
+to replace a skill the engine ships returns `SkillPrecedence::Override`.
+
+`SkillProvider::body` is why this is a source rather than a list: a skill
+whose text lives in the source, not in a file, still expands when it is
+invoked. `base::interface::skill_provider::StaticSkills` is the in-memory
+implementation for a host that already holds both.
+
+### Standing instructions and the rule index — `instruction.source`, `rules.source`
+
+`base::interface::instruction_provider::InstructionProvider` decides what the
+`AGENTS.md` / `CLAUDE.md` injection contains; `RuleProvider` decides which
+rule documents the model is told exist. `InstructionFile` and `RuleDirectory`
+are the filesystem implementations, `InlineInstructions` and `StaticRules` the
+in-memory ones.
+
+```rust
+Builder::new().instruction_provider(Arc::new(InlineInstructions::new(
+    "service://conventions",
+    conventions_text,
+)))
+```
+
+The three rule tiers — global, scene, project — are a `RuleProvider` each,
+composed by `base::rules::default_rule_sources` and merged last-wins by
+`discover_rules_from`, so a different tier list is a different composition
+rather than a change to the discovery function.
 
 ---
 

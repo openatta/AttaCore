@@ -986,6 +986,12 @@ pub struct Builder {
     /// callers (tests, library embedding): `build()` self-scans and starts
     /// its own watcher, same as always.
     skill_catalog: Option<Arc<skills::manager::SkillManager>>,
+    /// Skill sources beyond the engine's own three — see
+    /// [`Builder::skill_provider`].
+    skill_providers: Vec<Arc<dyn base::interface::skill_provider::SkillProvider>>,
+    /// Where the standing instructions come from — see
+    /// [`Builder::instruction_provider`].
+    instruction_provider: Option<Arc<dyn base::interface::instruction_provider::InstructionProvider>>,
     /// Replaces the built-in way of asking a person something — see
     /// [`Builder::elicitation`].
     elicitation: Option<Arc<dyn base::interface::elicitation::Elicitation>>,
@@ -1039,28 +1045,32 @@ pub struct Builder {
 /// failing degrades to no live reload, logged, not a hard error — every
 /// other watcher in this codebase handles it the same way).
 pub fn build_default_skill_manager(settings: &Settings) -> skills::manager::SkillManager {
+    use skills::manager::SkillSource;
+    use skills::sources::{BundledSkills, SkillDirectory};
+
     let skill_mgr = skills::manager::SkillManager::new();
     let project_skills_dir = settings.paths.project_root().join(".agents").join("skills");
-    let skill_load_results = [
-        skill_mgr.load_dir_subdirs(
-            &settings.paths.global_data_dir.join("skills"),
-            skills::manager::SkillSource::User,
-        ),
-        skill_mgr.load_dir_subdirs(
-            &settings.paths.user_data_dir.join("skills"),
-            skills::manager::SkillSource::User,
-        ),
-        skill_mgr.load_dir_subdirs(&project_skills_dir, skills::manager::SkillSource::Project),
+    let tiers: [Arc<dyn base::interface::skill_provider::SkillProvider>; 3] = [
+        Arc::new(SkillDirectory::tier(
+            settings.paths.global_data_dir.join("skills"),
+            SkillSource::User,
+        )),
+        Arc::new(SkillDirectory::tier(
+            settings.paths.user_data_dir.join("skills"),
+            SkillSource::User,
+        )),
+        Arc::new(SkillDirectory::tier(
+            project_skills_dir.clone(),
+            SkillSource::Project,
+        )),
     ];
-    let loaded_count: usize = skill_load_results
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
+    let loaded_count: usize = tiers
+        .into_iter()
+        .map(|tier| skill_mgr.load_from(tier))
         .sum();
-    // Register built-in (bundled) skills after disk skills.
-    // Disk-loaded skills with the same name take priority — bundled is fallback.
-    for bundled in skills::bundled::bundled_skills() {
-        skill_mgr.register_bundled(bundled);
-    }
+    // Built-ins come last and defer: a project that writes its own skill of
+    // the same name means to replace the one in the binary.
+    skill_mgr.load_from(Arc::new(BundledSkills));
     let total_skills = skill_mgr.list().len();
     tracing::info!(loaded_count, total_skills, "skills loaded (incl. bundled)");
 
@@ -1198,6 +1208,8 @@ impl Builder {
             scene_registry: None,
             shared_agent_types: None,
             skill_catalog: None,
+            skill_providers: Vec::new(),
+            instruction_provider: None,
             elicitation: None,
             prompt_registry: None,
             tool_middleware: Vec::new(),
@@ -1605,6 +1617,40 @@ impl Builder {
         self
     }
 
+    /// Add a skill source of the host's own.
+    ///
+    /// The engine's three — the directory tiers, the built-ins, the tools of
+    /// each connected MCP server — are `SkillProvider`s too; this one is
+    /// registered after them, so by default it fills names nobody claimed and
+    /// leaves the rest alone. A source that means to replace a skill the
+    /// engine ships says so with
+    /// [`SkillPrecedence::Override`](base::interface::skill_provider::SkillPrecedence::Override).
+    ///
+    /// Can be called more than once; sources are consulted in the order they
+    /// were added.
+    pub fn skill_provider(
+        mut self,
+        provider: Arc<dyn base::interface::skill_provider::SkillProvider>,
+    ) -> Self {
+        self.skill_providers.push(provider);
+        self
+    }
+
+    /// Replace where the standing instructions (`AGENTS.md` / `CLAUDE.md`)
+    /// come from.
+    ///
+    /// The default reads the one path `instruction_file` names, which is what
+    /// a deployment whose conventions live in a file wants. One whose
+    /// conventions live in a service, or that has already loaded them, hands
+    /// them over instead of staging a file for the engine to read back.
+    pub fn instruction_provider(
+        mut self,
+        provider: Arc<dyn base::interface::instruction_provider::InstructionProvider>,
+    ) -> Self {
+        self.instruction_provider = Some(provider);
+        self
+    }
+
     pub fn build(self) -> Result<(Agent, EventReceiver, InputSender), EngineError> {
         let scene = self
             .scene
@@ -1686,21 +1732,26 @@ impl Builder {
         });
         let instruction_file = self.instruction_file.or(settings.instruction_file.clone());
         // Pre-read AGENTS.md / CLAUDE.md content for userContext injection.
-        let claude_md_content = instruction_file.as_ref().and_then(|p| {
-            match std::fs::read_to_string(p) {
-                Ok(content) => {
-                    if content.trim().is_empty() {
-                        None
-                    } else {
-                        Some(content)
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(path = %p.display(), error = %e, "failed to read instruction file for CLAUDE.md context injection");
-                    None
-                }
-            }
+        let instruction_provider: Arc<
+            dyn base::interface::instruction_provider::InstructionProvider,
+        > = self.instruction_provider.clone().unwrap_or_else(|| {
+            Arc::new(base::interface::instruction_provider::InstructionFile::new(
+                instruction_file.clone(),
+            ))
         });
+        let claude_md_content = {
+            let docs = instruction_provider.documents();
+            if docs.is_empty() {
+                None
+            } else {
+                Some(
+                    docs.into_iter()
+                        .map(|d| d.content)
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                )
+            }
+        };
         let memory_store = self.memory_store.unwrap_or_else(|| {
             let p = &settings.paths;
             // memory 不分 scene，只分全局/项目——见 base::paths 模块文档。
@@ -1883,6 +1934,11 @@ impl Builder {
             Some(catalog) => catalog,
             None => std::sync::Arc::new(build_default_skill_manager(&settings)),
         };
+        for provider in self.skill_providers.clone() {
+            let id = provider.id().to_string();
+            let count = skill_mgr_arc.load_from(provider);
+            tracing::info!(source = %id, count, "host skill source registered");
+        }
         // `agent_tool_arc` was built before skills finished loading (see the
         // comment at its own construction site) — hand it the manager now,
         // via interior mutability, so `AgentTypeDefinition.skills` (preload)
@@ -2781,6 +2837,72 @@ mod tests {
         assert!(
             agent.commands.resolve("p2-injected-only").is_some(),
             "the injected catalog's skill should resolve as a slash command"
+        );
+    }
+
+    /// P3-12's acceptance: a fourth skill source, registered from outside the
+    /// engine, is a source in full — its skills list *and* expand, without
+    /// `SkillManager` learning anything about where they came from.
+    #[tokio::test]
+    async fn a_host_can_register_a_fourth_skill_source() {
+        use base::interface::skill_provider::StaticSkills;
+
+        let source = StaticSkills::new(
+            "company-bundle",
+            vec![base::frozen::SkillEntry {
+                name: "file-a-ticket".into(),
+                description: "Open a ticket in the company tracker".into(),
+                source: base::frozen::SkillSource::Plugin,
+                // Deliberately not a readable path: the source owns the body.
+                path: std::path::PathBuf::from("(company:file-a-ticket)"),
+                ..Default::default()
+            }],
+        )
+        .with_body("file-a-ticket", "Ask for a summary, then POST it.");
+
+        let (agent, _event_rx, _input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .skill_provider(Arc::new(source))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let listed = agent.skills().get("file-a-ticket");
+        assert!(
+            listed.is_some(),
+            "the host's source did not reach the catalog: {:?}",
+            agent.skills().list().iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            agent.skills().get_skill_content("file-a-ticket").as_deref(),
+            Some("Ask for a summary, then POST it."),
+            "a skill that lists but cannot be expanded is not a source"
+        );
+    }
+
+    /// P3-12's other half: the instruction file is one implementation of a
+    /// contract, so a host that already holds its conventions needs no file.
+    #[tokio::test]
+    async fn a_host_can_supply_the_standing_instructions_without_a_file() {
+        use base::interface::instruction_provider::InlineInstructions;
+
+        let (agent, _event_rx, _input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .instruction_provider(Arc::new(InlineInstructions::new(
+                "service://conventions",
+                "Always run the linter.",
+            )))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        assert_eq!(
+            agent.claude_md_content.as_deref(),
+            Some("Always run the linter.")
         );
     }
 

@@ -7,9 +7,14 @@
 //! closes the "orphaned rule file" gap: a `.md` file sitting in `.atta/rules/`
 //! that nobody referenced from `AGENTS.md` used to be invisible to the model.
 //! Discovery still only reads each file's first line, never full content.
+//!
+//! Where the documents come from is the
+//! [`RuleProvider`](crate::interface::instruction_provider::RuleProvider)
+//! contract; this module owns the merge and the prompt block.
 
+use crate::interface::instruction_provider::{RuleDirectory, RuleProvider};
 use crate::settings::PathSettings;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One discovered rule document.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,81 +23,45 @@ pub struct RuleEntry {
     pub name: String,
     /// First non-empty line of the file, `#`/whitespace-stripped — same
     /// "fallback to first body line" convention as skills. Capped at
-    /// `MAX_DESCRIPTION_CHARS` regardless of how verbose the line is.
+    /// `MAX_RULE_DESCRIPTION_CHARS` regardless of how verbose the line is.
     pub description: String,
     /// Absolute path — always resolvable by the Read tool regardless of
     /// which tier (project/scene/global) the file came from.
     pub path: PathBuf,
 }
 
-const MAX_DESCRIPTION_CHARS: usize = 150;
+/// The engine's own rule sources: the three tiers, outermost first, so
+/// project overrides scene overrides global — same precedence as
+/// skills/agents (`crates/core/src/frozen/skill.rs`,
+/// `crates/runtime/src/agent_tool.rs::merge_agent_types`).
+pub fn default_rule_sources(paths: &PathSettings) -> Vec<Box<dyn RuleProvider>> {
+    vec![
+        Box::new(RuleDirectory::new(paths.global_data_dir.join("rules"))),
+        Box::new(RuleDirectory::new(paths.user_data_dir.join("rules"))),
+        Box::new(RuleDirectory::new(
+            paths.project_root().join(".atta").join("rules"),
+        )),
+    ]
+}
 
-/// Scan `.atta/rules/` across all three tiers and return one entry per
-/// unique filename stem — project overrides scene overrides global, same
-/// precedence as skills/agents (`crates/core/src/frozen/skill.rs`,
-/// `crates/runtime/src/agent_tool.rs::merge_agent_types`). Sorted by name
-/// for stable output.
+/// Scan the three tiers and return one entry per unique filename stem.
 pub fn discover_rules(paths: &PathSettings) -> Vec<RuleEntry> {
-    let project_dir = paths.project_root().join(".atta").join("rules");
-    let scene_dir = paths.user_data_dir.join("rules");
-    let global_dir = paths.global_data_dir.join("rules");
+    discover_rules_from(&default_rule_sources(paths))
+}
 
+/// Merge `sources` into one index: later sources win a name collision, and
+/// the result is sorted by name for stable output.
+pub fn discover_rules_from(sources: &[Box<dyn RuleProvider>]) -> Vec<RuleEntry> {
     let mut by_name: std::collections::HashMap<String, RuleEntry> =
         std::collections::HashMap::new();
-    for dir in [&global_dir, &scene_dir, &project_dir] {
-        for entry in scan_rules_dir(dir) {
+    for source in sources {
+        for entry in source.rules() {
             by_name.insert(entry.name.clone(), entry);
         }
     }
     let mut entries: Vec<RuleEntry> = by_name.into_values().collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
-}
-
-fn scan_rules_dir(dir: &Path) -> Vec<RuleEntry> {
-    let mut out = Vec::new();
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return out; // directory doesn't exist yet
-    };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let description = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| first_line_description(&content))
-            .unwrap_or_else(|| "(no description)".to_string());
-        out.push(RuleEntry {
-            name: name.to_string(),
-            description,
-            path,
-        });
-    }
-    out
-}
-
-fn first_line_description(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let stripped = trimmed.trim_start_matches('#').trim();
-        if stripped.is_empty() {
-            continue;
-        }
-        let truncated: String = stripped.chars().take(MAX_DESCRIPTION_CHARS).collect();
-        return Some(if stripped.chars().count() > MAX_DESCRIPTION_CHARS {
-            format!("{truncated}...")
-        } else {
-            truncated
-        });
-    }
-    None
 }
 
 /// Render the "Available Rules" system prompt block. Returns `None` when no
@@ -122,7 +91,9 @@ pub fn build_rules_prompt(paths: &PathSettings) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interface::instruction_provider::StaticRules;
     use crate::settings::PathSettings;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn write_rule(dir: &Path, filename: &str, content: &str) {
@@ -232,20 +203,31 @@ mod tests {
         assert!(text.contains("Read tool"));
     }
 
+    /// The tier list is a composition of sources, not three paths written
+    /// into the discovery function — so a fourth source merges by the same
+    /// last-wins rule the tiers use.
     #[test]
-    fn first_line_description_truncates_long_lines() {
-        let long = "a".repeat(300);
-        let desc = first_line_description(&long).unwrap();
-        assert!(desc.ends_with("..."));
-        assert!(desc.chars().count() <= MAX_DESCRIPTION_CHARS + 3);
-    }
-
-    #[test]
-    fn first_line_description_skips_blank_lines_and_bare_hashes() {
-        let content = "\n\n#  \n# Real Title\nbody";
-        assert_eq!(
-            first_line_description(content).as_deref(),
-            Some("Real Title")
-        );
+    fn a_source_the_engine_does_not_own_takes_part_in_the_merge() {
+        let sources: Vec<Box<dyn RuleProvider>> = vec![
+            Box::new(StaticRules::new(
+                "service",
+                vec![RuleEntry {
+                    name: "testing".into(),
+                    description: "from the service".into(),
+                    path: PathBuf::from("/srv/testing.md"),
+                }],
+            )),
+            Box::new(StaticRules::new(
+                "override",
+                vec![RuleEntry {
+                    name: "testing".into(),
+                    description: "from the later source".into(),
+                    path: PathBuf::from("/late/testing.md"),
+                }],
+            )),
+        ];
+        let entries = discover_rules_from(&sources);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].description, "from the later source");
     }
 }
