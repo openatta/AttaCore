@@ -26,6 +26,7 @@
 //! | [`tool_middleware::ToolMiddleware`] | a ring around every tool call |
 //! | [`tool_result::ToolResultTransformer`] | what a result may look like |
 //! | [`scene::AgentScene`] | system prompt, tool surface, budgets |
+//! | [`turn_policy::TurnPolicy`] | when a turn has gone on long enough |
 //! | [`permission::Permission`] | tool authorization |
 //! | [`agent_spawner::AgentSpawner`] | how sub-agents are launched |
 //! | [`import_callback::ImportCallback`] | the host's answer to an import prompt |
@@ -80,6 +81,7 @@ pub mod scene;
 pub mod script;
 pub mod token_counter;
 pub mod tool;
+pub mod turn_policy;
 pub mod tool_middleware;
 pub mod tool_result;
 #[deprecated(note = "moved to `base::settings` — declarative configuration types")]

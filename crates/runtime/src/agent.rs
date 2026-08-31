@@ -187,6 +187,9 @@ pub struct Agent {
     /// [`Builder::tool_result_transformer`].
     pub(crate) result_transformers:
         Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
+    /// When this session's turns have gone on long enough — see
+    /// [`Builder::turn_policy`].
+    pub(crate) turn_policy: Arc<dyn base::interface::turn_policy::TurnPolicy>,
     /// The request on its way out and the message on its way back — see
     /// [`Builder::model_interceptor`].
     pub(crate) model_interceptors:
@@ -969,6 +972,8 @@ pub struct Builder {
     tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
     /// Result policies — see [`Builder::tool_result_transformer`].
     result_transformers: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
+    /// Turn stop conditions — see [`Builder::turn_policy`].
+    turn_policy: Option<Arc<dyn base::interface::turn_policy::TurnPolicy>>,
     /// Model request/response interception — see [`Builder::model_interceptor`].
     model_interceptors: Vec<Arc<dyn base::interface::model_interceptor::ModelInterceptor>>,
     /// Recall — see [`Builder::memory_retriever`].
@@ -1168,6 +1173,7 @@ impl Builder {
             prompt_registry: None,
             tool_middleware: Vec::new(),
             result_transformers: Vec::new(),
+            turn_policy: None,
             model_interceptors: Vec::new(),
             memory_retriever: None,
             retrieval_hooks: Vec::new(),
@@ -1278,6 +1284,28 @@ impl Builder {
     /// whole.
     ///
     /// [`ModelInterceptor`]: base::interface::model_interceptor::ModelInterceptor
+    /// Decide when this session's turns have gone on long enough.
+    ///
+    /// The default holds the engine's two ceilings — model calls per turn, and
+    /// structured-output retries — with the same values as before. A host that
+    /// wants a tighter one should usually compose rather than replace:
+    /// `FirstOf(vec![engine_default, mine])` keeps the engine's limits and adds
+    /// its own.
+    ///
+    /// This decides only judgements about *progress*. Cancellation, a hook
+    /// ending the turn, and "the model asked for tools so there is more to do"
+    /// are not policy and cannot be overridden here — see the contract's
+    /// module documentation for why each one is excluded.
+    ///
+    /// [`TurnPolicy`]: base::interface::turn_policy::TurnPolicy
+    pub fn turn_policy(
+        mut self,
+        p: Arc<dyn base::interface::turn_policy::TurnPolicy>,
+    ) -> Self {
+        self.turn_policy = Some(p);
+        self
+    }
+
     pub fn model_interceptor(
         mut self,
         i: Arc<dyn base::interface::model_interceptor::ModelInterceptor>,
@@ -2103,6 +2131,20 @@ impl Builder {
         // instead of being decorative.
         permission.bind_session_state(session_state.clone());
 
+        // Built before the `Agent` literal takes ownership of `scene` and
+        // `settings`. The ceilings are read once per session, which is when
+        // they are decided — neither can change mid-session.
+        let turn_policy: Arc<dyn base::interface::turn_policy::TurnPolicy> =
+            self.turn_policy.clone().unwrap_or_else(|| {
+                Arc::new(base::interface::turn_policy::LimitsPolicy::new(
+                    settings.execution.max_api_calls_per_turn,
+                    scene.execution_params().max_api_calls_per_turn,
+                    // Was a `const` in the turn function; the value is
+                    // unchanged, its home is not.
+                    5,
+                ))
+            });
+
         agent_tool_arc.set_event_sender(event_tx.clone());
         agent_tool_arc.set_hooks(hooks.clone());
         agent_tool_arc.set_parent_permission(permission.clone());
@@ -2150,6 +2192,7 @@ impl Builder {
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
+                turn_policy,
                 model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self
                     .memory_retriever
@@ -4717,6 +4760,71 @@ mod tests {
         assert_eq!(
             messages, 1,
             "{deltas} chunks must produce one interception, not {messages}"
+        );
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+
+    /// P3-2's acceptance: a host changes "how many steps before stopping"
+    /// with a policy, and the loop is not touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_policy_decides_when_the_loop_stops() {
+        use base::interface::turn_policy::{TurnPolicy, TurnProgress, TurnStep};
+
+        struct StopAfterOne;
+        impl TurnPolicy for StopAfterOne {
+            fn before_model_call(&self, progress: &TurnProgress<'_>) -> TurnStep {
+                if progress.api_calls >= 1 {
+                    return TurnStep::stop("host_said_enough");
+                }
+                TurnStep::Continue
+            }
+        }
+
+        // Asks for a tool every time, so only a stop condition ends this.
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Probe",
+        });
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(ProbeTool));
+
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(test_settings()))
+            .tools(tools)
+            .turn_policy(Arc::new(StopAfterOne))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "go".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { stop_reason, .. }) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the policy should have ended the turn");
+
+        assert_eq!(
+            stop, "host_said_enough",
+            "the policy's reason must reach the host, not be translated into the engine's"
         );
 
         drop(input_tx);

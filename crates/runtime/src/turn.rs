@@ -384,7 +384,7 @@ impl Agent {
         let mut api_calls: u32 = 0;
         let mut tool_calls: u32 = 0;
         let mut structured_output_calls: u32 = 0;
-        const MAX_STRUCTURED_OUTPUT_RETRIES: u32 = 5;
+
         let mut max_tokens_recovery: u32 = 0;
         let mut effective_max_tokens = self.settings.model.max_tokens;
         let mut effective_model = self.settings.model.model_name.clone();
@@ -392,12 +392,8 @@ impl Agent {
         // find `execution_params()` only at its trait definition and the scene
         // impls — this was read straight off `settings.execution`, so a scene
         // could declare any limit it liked and nothing enforced it. Lower of
-        // the two wins; see `ExecutionParams::max_api_calls_per_turn`.
-        let max_calls = self
-            .settings
-            .execution
-            .max_api_calls_per_turn
-            .min(self.scene.execution_params().max_api_calls_per_turn);
+        // the two wins; that rule now lives in `LimitsPolicy::new`, which is
+        // built once per session — see `Builder::turn_policy`.
         let max_budget_tokens = self.settings.execution.max_budget_tokens;
         let mut total_tokens_used: u64 = 0;
         let start = std::time::Instant::now();
@@ -816,11 +812,19 @@ impl Agent {
                     usage: Usage::default(),
                 });
             }
-            if api_calls >= max_calls {
+            if let base::interface::turn_policy::TurnStep::Stop { reason } =
+                self.turn_policy
+                    .before_model_call(&base::interface::turn_policy::TurnProgress {
+                        api_calls,
+                        tool_calls,
+                        structured_output_calls,
+                        stop_reason: "",
+                    })
+            {
                 self.last_had_tool_uses = had_tool_uses_this_turn;
-                self.emit_turn_complete("max_turns", api_calls, tool_calls, start);
+                self.emit_turn_complete(&reason, api_calls, tool_calls, start);
                 return Ok(TurnOutcome {
-                    stop_reason: "max_turns".into(),
+                    stop_reason: reason,
                     api_calls,
                     tool_calls,
                     usage: Usage::default(),
@@ -1094,20 +1098,24 @@ impl Agent {
             if so_calls_this_turn > structured_output_calls {
                 structured_output_calls = so_calls_this_turn;
             }
-            if structured_output_calls >= MAX_STRUCTURED_OUTPUT_RETRIES {
+            if let base::interface::turn_policy::TurnStep::Stop { reason } =
+                self.turn_policy
+                    .after_model_call(&base::interface::turn_policy::TurnProgress {
+                        api_calls,
+                        tool_calls,
+                        structured_output_calls,
+                        stop_reason: &stop_reason,
+                    })
+            {
                 tracing::warn!(
                     structured_output_calls,
-                    "structured output retry limit exceeded"
+                    %reason,
+                    "turn policy ended the turn"
                 );
                 self.last_had_tool_uses = had_tool_uses_this_turn;
-                self.emit_turn_complete(
-                    "max_structured_output_retries",
-                    api_calls,
-                    tool_calls,
-                    start,
-                );
+                self.emit_turn_complete(&reason, api_calls, tool_calls, start);
                 return Ok(TurnOutcome {
-                    stop_reason: "max_structured_output_retries".into(),
+                    stop_reason: reason,
                     api_calls,
                     tool_calls,
                     usage: Usage::default(),
