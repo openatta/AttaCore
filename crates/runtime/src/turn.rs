@@ -2500,15 +2500,17 @@ or project context that should survive across sessions.
             self.tool_results_ever_cleared,
         );
         ctx.available_tools = tools_ref;
-        let blocks = base::interface::prompt::assemble_prompt_with(
-            self.prompt_registry.as_ref(),
-            self.scene.as_ref(),
-            &self.settings,
-            &self.memory_store,
-            &ctx,
-            skills_ref, // skills_text
-            mcp_ref,    // mcp_instructions
-        );
+        let blocks = self
+            .prompt_assembler
+            .assemble(&base::interface::prompt_assembler::AssemblyRequest {
+                registry: self.prompt_registry.as_ref(),
+                scene: self.scene.as_ref(),
+                settings: &self.settings,
+                memory_store: &self.memory_store,
+                ctx: &ctx,
+                skills_text: skills_ref,
+                mcp_instructions: mcp_ref,
+            });
         // Passes that have to await something — a script carrier, most of
         // all. Kept out of `assemble_prompt_with` so assembly stays a
         // synchronous function for every caller that registers none.

@@ -39,6 +39,7 @@ anything, which is why those are closed to scripts and plugins outright.
 | `prompt.block` | registration | prompt assembly, once per turn | adds only | per turn (10⁰–10¹) | full | full | add only |
 | `prompt.context` | registration | prompt assembly, once per turn | adds only | per turn (10⁰–10¹) | full | full | add only |
 | `prompt.variable` | registration | prompt assembly, after blocks are merged | its own placeholder, nothing else | per turn (10⁰–10¹) | full | full | add only |
+| `prompt.assembler` | contract | prompt assembly, in place of the engine's own | order, cache boundaries, merge strategy — the whole result | per model call (10⁰–10¹) | closed | closed | closed |
 | `prompt.assemble` | interception | prompt assembly, last | block content, order and membership | per turn (10⁰–10¹) | full | full | declared capability |
 | `event.sink` | contract | every emission, on the sink's own task | nothing — observation only | per streamed chunk (10³–10⁴) | closed | closed | closed |
 | `health.check` | registration | whenever something asks for a health report | nothing — a check reports, it does not repair | per process (10⁰) | closed | closed | closed |
@@ -415,6 +416,28 @@ There is no `Err`. A check that cannot determine the answer has determined
 something — it says `Degraded` and puts the reason in its summary, rather than
 leaving every caller to decide for itself whether a failed check means
 unhealthy.
+### Prompt assembly itself — `prompt.assembler`
+
+`base::interface::prompt_assembler::PromptAssembler`. The registrations above
+open what goes into the prompt and `prompt.assemble` opens what happens to the
+finished result; this opens the part in between — the order the stages are
+placed in, how a contribution's order merges with the kernel's, where the cache
+boundaries fall, whether two blocks stay two blocks.
+
+```rust
+Builder::new().prompt_assembler(Arc::new(MergedSystemPrompt::default()))
+```
+
+`DefaultAssembler` is the engine's own assembly and the default.
+`MergedSystemPrompt` wraps any assembler and folds its system blocks into one,
+which is what a deployment with more prompt contributors than the four
+`cache_control` breakpoints a request allows wants: one cached prefix rather
+than an arbitrary four.
+
+An assembler receives an `AssemblyRequest` — the registry, the scene, the
+settings, the memory store, the scene context, and the already-rendered skills
+inventory and MCP instructions. It is a struct so that an implementation
+reading two of them need not restate the other five.
 
 ---
 

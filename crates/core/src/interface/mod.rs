@@ -41,6 +41,7 @@
 //! | [`tool::SecondaryLlm`] | the small model tools may call |
 //! | [`token_counter::TokenCounter`] | how big the context is judged to be |
 //! | [`prompt_registry::PromptRegistry`] | what goes into the system prompt |
+//! | [`prompt_assembler::PromptAssembler`] | how the whole prompt is put together |
 //! | [`prompt_assembly::AssemblyHook`] | a last pass over the assembled prompt |
 //! | [`script::ScriptEngine`] | running the operator's own code at a hook point |
 //! | [`memory_contracts::MemoryStorage`] | where durable memories are kept |
@@ -83,6 +84,7 @@ pub mod model;
 pub mod model_factory;
 pub mod model_interceptor;
 pub mod permission;
+pub mod prompt_assembler;
 pub mod prompt_assembly;
 pub mod prompt_registry;
 pub mod budget_policy;

@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 33] = [
+static POINTS: [ExtensionPoint; 34] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -232,6 +232,16 @@ static POINTS: [ExtensionPoint; 33] = [
             frequency: Frequency::PerTurn,
             trust: Trust::operator_full_plugin_adds(),
             defined_in: "base::interface::prompt_registry::PromptRegistry::register_variable",
+        },
+        ExtensionPoint {
+            id: "prompt.assembler",
+            kind: Kind::Contract,
+            summary: "how every contribution becomes the blocks a request carries",
+            timing: "prompt assembly, in place of the engine's own",
+            rewrites: "order, cache boundaries, merge strategy — the whole result",
+            frequency: Frequency::PerModelCall,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::prompt_assembler::PromptAssembler",
         },
         ExtensionPoint {
             id: "prompt.assemble",

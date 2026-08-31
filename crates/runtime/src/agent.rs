@@ -180,6 +180,9 @@ pub struct Agent {
     /// What else contributes to this session's system prompt — see
     /// [`Builder::prompt_registry`].
     pub(crate) prompt_registry: Arc<dyn base::interface::prompt_registry::PromptRegistry>,
+    /// How those contributions become the blocks a request carries — see
+    /// [`Builder::prompt_assembler`].
+    pub(crate) prompt_assembler: Arc<dyn base::interface::prompt_assembler::PromptAssembler>,
     /// Rings around every tool call — see [`Builder::tool_middleware`].
     pub(crate) tool_middleware:
         Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
@@ -997,6 +1000,8 @@ pub struct Builder {
     elicitation: Option<Arc<dyn base::interface::elicitation::Elicitation>>,
     /// Contributions to the system prompt — see [`Builder::prompt_registry`].
     prompt_registry: Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>>,
+    /// Replaces prompt assembly itself — see [`Builder::prompt_assembler`].
+    prompt_assembler: Option<Arc<dyn base::interface::prompt_assembler::PromptAssembler>>,
     /// Rings around tool dispatch — see [`Builder::tool_middleware`].
     tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
     /// Result policies — see [`Builder::tool_result_transformer`].
@@ -1212,6 +1217,7 @@ impl Builder {
             instruction_provider: None,
             elicitation: None,
             prompt_registry: None,
+            prompt_assembler: None,
             tool_middleware: Vec::new(),
             result_transformers: Vec::new(),
             turn_policy: None,
@@ -1272,6 +1278,25 @@ impl Builder {
         r: Arc<dyn base::interface::prompt_registry::PromptRegistry>,
     ) -> Self {
         self.prompt_registry = Some(r);
+        self
+    }
+
+    /// Replace prompt assembly itself.
+    ///
+    /// [`prompt_registry`](Self::prompt_registry) opens what goes in and
+    /// `AssemblyHook` opens what happens to the result; this opens the part
+    /// in between — the order the stages are placed in, how a contribution's
+    /// order merges with the kernel's, where the cache boundaries fall,
+    /// whether two blocks stay two blocks.
+    ///
+    /// The default is
+    /// [`DefaultAssembler`](base::interface::prompt_assembler::DefaultAssembler),
+    /// which is the assembly the engine has always done.
+    pub fn prompt_assembler(
+        mut self,
+        a: Arc<dyn base::interface::prompt_assembler::PromptAssembler>,
+    ) -> Self {
+        self.prompt_assembler = Some(a);
         self
     }
 
@@ -2348,6 +2373,9 @@ impl Builder {
                 prompt_registry: self
                     .prompt_registry
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
+                prompt_assembler: self
+                    .prompt_assembler
+                    .unwrap_or_else(|| Arc::new(base::interface::prompt_assembler::DefaultAssembler)),
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
                 turn_policy,
@@ -5247,6 +5275,124 @@ mod tests {
 
         drop(input_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+    /// Records the prompt blocks of the first request and ends the turn.
+    struct RecordingModel(Arc<std::sync::Mutex<Vec<base::interface::prompt::PromptBlock>>>);
+
+    #[async_trait::async_trait]
+    impl Model for RecordingModel {
+        fn api_type(&self) -> base::provider::ApiType {
+            base::provider::ApiType::Anthropic
+        }
+        async fn stream(
+            &self,
+            prompt_blocks: Vec<base::interface::prompt::PromptBlock>,
+            _tools: Vec<base::interface::model::ToolDef>,
+            _messages: Vec<base::interface::model::ModelMessage>,
+            _params: base::interface::model::StreamParams,
+            _cancel: CancellationToken,
+        ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+        {
+            *self.0.lock().unwrap() = prompt_blocks;
+            let events: Vec<
+                Result<base::interface::model::ModelEvent, base::interface::model::ModelError>,
+            > = vec![Ok(base::interface::model::ModelEvent::EndTurn {
+                stop_reason: "end_turn".into(),
+                usage: Default::default(),
+            })];
+            Ok(Box::new(futures::stream::iter(events)))
+        }
+    }
+
+    /// Runs one turn and returns the prompt blocks the model was given.
+    async fn prompt_blocks_for_one_turn(
+        assembler: Option<Arc<dyn base::interface::prompt_assembler::PromptAssembler>>,
+    ) -> Vec<base::interface::prompt::PromptBlock> {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(RecordingModel(recorded.clone())) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .tools(Arc::new(InMemoryToolRegistry::new()))
+            .skip_warmup(true);
+        if let Some(a) = assembler {
+            builder = builder.prompt_assembler(a);
+        }
+        let (mut agent, mut event_rx, input_tx) = builder.build().expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "go".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::TurnComplete { .. }) | None => break,
+                    Some(_) => continue,
+                }
+            }
+        })
+        .await;
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+
+        let blocks = recorded.lock().unwrap().clone();
+        assert!(!blocks.is_empty(), "the model was never called");
+        blocks
+    }
+
+    /// P3-11's acceptance: the assembler is replaceable outright, not merely
+    /// contributed to. Nothing the kernel would have assembled survives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_can_replace_prompt_assembly_outright() {
+        use base::interface::prompt_assembler::{AssemblyRequest, PromptAssembler};
+
+        struct OnlyThis;
+        impl PromptAssembler for OnlyThis {
+            fn assemble(
+                &self,
+                _request: &AssemblyRequest<'_>,
+            ) -> Vec<base::interface::prompt::PromptBlock> {
+                vec![base::interface::prompt::PromptBlock::system("only this").named("host.only")]
+            }
+        }
+
+        let blocks = prompt_blocks_for_one_turn(Some(Arc::new(OnlyThis))).await;
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the kernel's stages still reached the request: {:?}",
+            blocks.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        assert_eq!(blocks[0].content, "only this");
+    }
+
+    /// The second implementation, in a real session: same content, one block
+    /// and one cache breakpoint instead of several.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_merging_assembler_folds_a_real_session_prompt_into_one_block() {
+        use base::interface::prompt_assembler::MergedSystemPrompt;
+
+        let default_blocks = prompt_blocks_for_one_turn(None).await;
+        assert!(
+            default_blocks.len() > 1,
+            "this assertion is only meaningful when the default produces several blocks"
+        );
+
+        let merged = prompt_blocks_for_one_turn(Some(Arc::new(MergedSystemPrompt::default()))).await;
+        assert_eq!(merged.len(), 1);
+        for block in &default_blocks {
+            assert!(
+                merged[0].content.contains(&block.content),
+                "folding dropped a stage: {:?}",
+                block.name
+            );
+        }
     }
 
     #[test]
