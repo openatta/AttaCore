@@ -20,6 +20,7 @@
 //! [`environment`]: crate::interface::environment
 
 pub mod filesystem;
+pub mod in_process;
 pub mod local;
 pub mod network;
 pub mod process;
@@ -54,6 +55,19 @@ impl ExecProviders {
             filesystem: std::sync::Arc::new(local::LocalFileSystem),
             network: std::sync::Arc::new(local::LocalNetwork::default()),
             sandbox: std::sync::Arc::new(local::PlatformSandbox),
+        }
+    }
+
+    /// Nothing on the machine: a memory tree, commands decided in advance, no
+    /// network, and a sandbox honest enough to say it constrains nothing.
+    ///
+    /// The second provider. Switching is this call.
+    pub fn in_process() -> Self {
+        Self {
+            process: std::sync::Arc::new(in_process::ScriptedProcess::new()),
+            filesystem: std::sync::Arc::new(in_process::InMemoryFileSystem::new()),
+            network: std::sync::Arc::new(in_process::OfflineNetwork::new()),
+            sandbox: std::sync::Arc::new(in_process::NoSandbox),
         }
     }
 
