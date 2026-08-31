@@ -5178,6 +5178,97 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
+    /// P4-4's other half: the policy is computed correctly *and* it reaches a
+    /// tool.
+    ///
+    /// The work order existed because `allowed_domains` was configured, read,
+    /// and never arrived where the model could feel it. Testing the
+    /// computation alone would have left exactly that gap open a second time,
+    /// so this one goes through a real turn and asks a tool what its own
+    /// provider says.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_egress_policy_reaches_the_tool_that_has_to_obey_it() {
+        use base::interface::exec::Origin;
+
+        struct EgressProbe;
+        #[async_trait::async_trait]
+        impl base::tool::Tool for EgressProbe {
+            fn name(&self) -> &str {
+                "Probe"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+                ctx: base::tool::ToolContext,
+                _progress: base::tool::ProgressSender,
+            ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+                let blocked = ctx.exec.network.permits("blocked.test", Origin::Agent);
+                let allowed = ctx.exec.network.permits("allowed.test", Origin::Agent);
+                let endpoint = ctx.exec.network.permits("blocked.test", Origin::Operator);
+                Ok(base::tool::ToolResult::text(format!(
+                    "blocked={blocked} allowed={allowed} endpoint={endpoint}"
+                )))
+            }
+        }
+
+        let mut settings = test_settings();
+        settings.sandbox.network_mode =
+            base::context::config::NetworkModeConfig::Allowlist;
+        settings.sandbox.allowed_domains = vec!["allowed.test".into()];
+
+        let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tool: "Probe",
+        });
+        let tools = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(EgressProbe));
+
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(model)
+            .settings(Arc::new(settings))
+            .tools(tools)
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "go".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let verdict = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::ToolResult { content, .. }) if content.contains("blocked=") => {
+                        break content
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed before the tool answered"),
+                }
+            }
+        })
+        .await
+        .expect("the probe should have run");
+
+        assert_eq!(
+            verdict, "blocked=false allowed=true endpoint=true",
+            "the settings have to arrive at the tool's own provider: a configured \
+             allowlist that the model cannot feel is the defect this work order \
+             was written for"
+        );
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
     /// P3-15's acceptance: an embedder registers a diagnostic of its own and
     /// reads the engine's health back — after handing the agent off to its
     /// own task, which is when a supervisor actually asks.
