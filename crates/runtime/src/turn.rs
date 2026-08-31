@@ -859,11 +859,24 @@ impl Agent {
             // 3. Call model
             let stream_result = self.send(request, cancel.clone()).await;
 
-            // 4. Handle fallback — Overloaded → switch to fallback model
+            // 4. The policy classifies the failure and says what to do; the
+            //    doing stays here, because compacting, rebuilding a request
+            //    and sending it are things only this loop can sequence.
             let stream = match stream_result {
                 Ok(s) => s,
-                Err(base::interface::model::ModelError::Overloaded) => {
-                    self.handle_overloaded_recovery(
+                Err(ref e)
+                    if matches!(
+                        self.classify_failure(e),
+                        base::interface::recovery_policy::Recovery::RetryWith { .. }
+                    ) =>
+                {
+                    let base::interface::recovery_policy::Recovery::RetryWith { model } =
+                        self.classify_failure(e)
+                    else {
+                        unreachable!("guarded by the match arm above")
+                    };
+                    self.retry_with_model(
+                        model,
                         tool_defs,
                         messages,
                         effective_max_tokens,
@@ -873,11 +886,14 @@ impl Agent {
                     )
                     .await?
                 }
-                // T3.1: PTL recovery — catch prompt-too-long before generic error
-                Err(base::interface::model::ModelError::Internal(ref msg))
-                    if msg.contains("prompt too long") || msg.contains("413") =>
+                Err(ref e)
+                    if matches!(
+                        self.classify_failure(e),
+                        base::interface::recovery_policy::Recovery::CompactAndRetry
+                    ) =>
                 {
-                    tracing::warn!("prompt too long, attempting recovery compaction");
+                    let msg = e.to_string();
+                    tracing::warn!("recovering by compacting, then retrying");
                     let threshold = self.scene.token_budget().compact_threshold.max(50000);
                     let keep = self.scene.token_budget().compact_keep_recent.min(5);
                     let messages_before = self.session.messages.len();
@@ -2662,8 +2678,39 @@ or project context that should survive across sessions.
     }
 
     /// Handle model Overloaded error by switching to fallback model and retrying.
-    async fn handle_overloaded_recovery(
+    /// Put a model error to the recovery policy.
+    ///
+    /// The classification is the engine's — which errors *are* an overload and
+    /// which *are* a size refusal is a fact about the protocol, not an
+    /// opinion. What to do about each is the policy's.
+    fn classify_failure(
+        &self,
+        e: &base::interface::model::ModelError,
+    ) -> base::interface::recovery_policy::Recovery {
+        use base::interface::recovery_policy::ModelFailure;
+        // Rendered once so the `Other` arm can borrow it; the two specific
+        // arms borrow from `e` itself.
+        let text = e.to_string();
+        let failure = match e {
+            base::interface::model::ModelError::Overloaded => ModelFailure::Overloaded,
+            // The provider reports this as a generic error with a recognizable
+            // message; the substring match is the protocol's shape, not a
+            // heuristic this code chose.
+            base::interface::model::ModelError::Internal(msg)
+                if msg.contains("prompt too long") || msg.contains("413") =>
+            {
+                ModelFailure::ContextTooLong { message: msg }
+            }
+            _ => ModelFailure::Other { message: &text },
+        };
+        self.recovery_policy.on_failure(&failure)
+    }
+
+    /// Send the same conversation to a different model.
+    #[allow(clippy::too_many_arguments)]
+    async fn retry_with_model(
         &mut self,
+        model: String,
         tool_defs: Vec<ToolDef>,
         messages: Vec<ModelMessage>,
         effective_max_tokens: u32,
@@ -2671,13 +2718,13 @@ or project context that should survive across sessions.
         cancel: CancellationToken,
         origin: Option<base::interface::model::CallOrigin>,
     ) -> Result<ModelStream, TurnError> {
-        if let Some(ref fallback) = self.settings.model.fallback_model {
+        {
             tracing::warn!(
-                model = %*effective_model,
-                fallback = %fallback,
-                "model overloaded, switching to fallback"
+                from = %*effective_model,
+                to = %model,
+                "retrying against a different model"
             );
-            *effective_model = fallback.clone();
+            *effective_model = model;
             // `fallback_model: None` — this retry *is* the fallback, so there
             // is nothing further to fall back to.
             let retry = self.prepare_retry(
@@ -2692,55 +2739,46 @@ or project context that should survive across sessions.
             self.send(retry, cancel)
                 .await
                 .map_err(|e| TurnError::Model(format!("failed to stream model response: {}", e)))
-        } else {
-            Err(TurnError::Model(format!(
-                "model overloaded and no fallback configured: {}",
-                *effective_model
-            )))
         }
     }
 
-    /// Handle max_tokens stop reason by escalating the limit and injecting a continuation message.
-    /// Returns true if recovery was triggered (caller should continue the loop).
-    ///   1. First attempt: escalate to 64K
-    ///   2. Subsequent: escalate to 8K + continuation message (up to 3 total retries)
+    /// Ask the recovery policy whether a stopped-early response should be
+    /// retried with a bigger output limit, and act on the answer.
+    ///
+    /// Returns true when the caller should run another round. The ladder
+    /// itself — 64K first, 8K after, three attempts, the nudge — moved into
+    /// `DefaultRecovery`; what stays here is applying the answer to the loop's
+    /// own state, which is the part that has to happen in this order.
     fn handle_max_tokens_recovery(
         &mut self,
         stop_reason: &str,
         max_tokens_recovery: &mut u32,
         effective_max_tokens: &mut u32,
     ) -> bool {
-        const MAX_TOKENS_RECOVERY_LIMIT: u32 = 3;
-        const ESCALATED_MAX_TOKENS: u32 = 8000;
-        const ESCALATED_64K: u32 = 64000;
-
-        if stop_reason != "max_tokens" || *max_tokens_recovery >= MAX_TOKENS_RECOVERY_LIMIT {
+        let decision = self.recovery_policy.on_early_stop(
+            stop_reason,
+            &base::interface::recovery_policy::RecoveryAttempt {
+                output_limit_escalations: *max_tokens_recovery,
+                current_max_tokens: *effective_max_tokens,
+            },
+        );
+        let base::interface::recovery_policy::StopRecovery::RaiseOutputLimit { max_tokens, nudge } =
+            decision
+        else {
             return false;
-        }
+        };
         *max_tokens_recovery += 1;
-        // First attempt: try 64K override.
-        if *max_tokens_recovery == 1 && *effective_max_tokens < ESCALATED_64K {
-            *effective_max_tokens = ESCALATED_64K;
-            tracing::info!("max_tokens escalated to 64K");
-            return true;
+        *effective_max_tokens = max_tokens;
+        if let Some(nudge) = nudge {
+            self.session.push_message(ModelMessage {
+                role: MessageRole::User,
+                content: vec![ModelContentBlock::Text { text: nudge }],
+            });
         }
-        if *effective_max_tokens < ESCALATED_MAX_TOKENS {
-            *effective_max_tokens = ESCALATED_MAX_TOKENS;
-        }
-        self.session.push_message(ModelMessage {
-            role: MessageRole::User,
-            content: vec![ModelContentBlock::Text {
-                text: "Output token limit hit. Resume directly — no apology, no \
-                       recap of what you were doing. Pick up mid-thought if that \
-                       is where the cut happened. Break remaining work into \
-                       smaller pieces."
-                    .into(),
-            }],
-        });
         tracing::info!(
             recovery = *max_tokens_recovery,
             max_tokens = *effective_max_tokens,
-            "max_tokens recovery triggered"
+            "output limit raised and the call retried"
         );
         true
     }

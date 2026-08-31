@@ -190,6 +190,9 @@ pub struct Agent {
     /// When this session's turns have gone on long enough — see
     /// [`Builder::turn_policy`].
     pub(crate) turn_policy: Arc<dyn base::interface::turn_policy::TurnPolicy>,
+    /// What to do when a model call goes wrong — see
+    /// [`Builder::recovery_policy`].
+    pub(crate) recovery_policy: Arc<dyn base::interface::recovery_policy::RecoveryPolicy>,
     /// The request on its way out and the message on its way back — see
     /// [`Builder::model_interceptor`].
     pub(crate) model_interceptors:
@@ -974,6 +977,8 @@ pub struct Builder {
     result_transformers: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
     /// Turn stop conditions — see [`Builder::turn_policy`].
     turn_policy: Option<Arc<dyn base::interface::turn_policy::TurnPolicy>>,
+    /// Model-failure recovery — see [`Builder::recovery_policy`].
+    recovery_policy: Option<Arc<dyn base::interface::recovery_policy::RecoveryPolicy>>,
     /// Model request/response interception — see [`Builder::model_interceptor`].
     model_interceptors: Vec<Arc<dyn base::interface::model_interceptor::ModelInterceptor>>,
     /// Recall — see [`Builder::memory_retriever`].
@@ -1174,6 +1179,7 @@ impl Builder {
             tool_middleware: Vec::new(),
             result_transformers: Vec::new(),
             turn_policy: None,
+            recovery_policy: None,
             model_interceptors: Vec::new(),
             memory_retriever: None,
             retrieval_hooks: Vec::new(),
@@ -1303,6 +1309,26 @@ impl Builder {
         p: Arc<dyn base::interface::turn_policy::TurnPolicy>,
     ) -> Self {
         self.turn_policy = Some(p);
+        self
+    }
+
+    /// Decide what happens when a model call goes wrong.
+    ///
+    /// The default is what the engine has always done: an overload switches to
+    /// the configured `fallback_model` or fails, a request refused for size is
+    /// compacted and retried once, and a response cut off at the output limit
+    /// escalates to 64K then 8K, three times, with a nudge.
+    ///
+    /// The policy chooses; the turn still performs. Compacting, rebuilding a
+    /// request and sending it are things only the loop can sequence, so they
+    /// stay there.
+    ///
+    /// [`RecoveryPolicy`]: base::interface::recovery_policy::RecoveryPolicy
+    pub fn recovery_policy(
+        mut self,
+        p: Arc<dyn base::interface::recovery_policy::RecoveryPolicy>,
+    ) -> Self {
+        self.recovery_policy = Some(p);
         self
     }
 
@@ -2134,6 +2160,12 @@ impl Builder {
         // Built before the `Agent` literal takes ownership of `scene` and
         // `settings`. The ceilings are read once per session, which is when
         // they are decided — neither can change mid-session.
+        let recovery_policy: Arc<dyn base::interface::recovery_policy::RecoveryPolicy> =
+            self.recovery_policy.clone().unwrap_or_else(|| {
+                Arc::new(base::interface::recovery_policy::DefaultRecovery::new(
+                    settings.model.fallback_model.clone(),
+                ))
+            });
         let turn_policy: Arc<dyn base::interface::turn_policy::TurnPolicy> =
             self.turn_policy.clone().unwrap_or_else(|| {
                 Arc::new(base::interface::turn_policy::LimitsPolicy::new(
@@ -2193,6 +2225,7 @@ impl Builder {
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
                 turn_policy,
+                recovery_policy,
                 model_interceptors: Arc::new(self.model_interceptors),
                 memory_retriever: self
                     .memory_retriever
@@ -4825,6 +4858,82 @@ mod tests {
         assert_eq!(
             stop, "host_said_enough",
             "the policy's reason must reach the host, not be translated into the engine's"
+        );
+
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
+    }
+
+
+    /// P3-3's acceptance: a policy turns an overload from "switch to the
+    /// fallback" into "fail", without the loop knowing anything about it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovery_policy_can_refuse_the_fallback_the_engine_would_take() {
+        use base::interface::recovery_policy::NeverRecover;
+
+        struct AlwaysOverloaded;
+
+        #[async_trait::async_trait]
+        impl Model for AlwaysOverloaded {
+            fn api_type(&self) -> base::provider::ApiType {
+                base::provider::ApiType::Anthropic
+            }
+            async fn stream(
+                &self,
+                _p: Vec<base::interface::prompt::PromptBlock>,
+                _t: Vec<base::interface::model::ToolDef>,
+                _m: Vec<base::interface::model::ModelMessage>,
+                _s: base::interface::model::StreamParams,
+                _c: CancellationToken,
+            ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+            {
+                Err(base::interface::model::ModelError::Overloaded)
+            }
+        }
+
+        // A fallback *is* configured, so the engine's own policy would switch
+        // to it. The point is that the host's policy wins.
+        let mut settings = test_settings();
+        settings.model.fallback_model = Some("some-other-model".into());
+
+        let (mut agent, mut event_rx, input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(AlwaysOverloaded) as Arc<dyn Model>)
+            .settings(Arc::new(settings))
+            .tools(Arc::new(InMemoryToolRegistry::new()))
+            .recovery_policy(Arc::new(NeverRecover))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        let engine = tokio::spawn(async move { agent.run(CancellationToken::new()).await });
+        input_tx
+            .send(InputMessage::User {
+                content: "go".into(),
+                attachments: vec![],
+                turn_id: "t1".into(),
+            })
+            .unwrap();
+
+        let saw_error = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AgentEvent::Error { message, .. }) => break message,
+                    Some(AgentEvent::TurnComplete { stop_reason, .. }) => {
+                        panic!("the turn completed with `{stop_reason}` instead of failing — \
+                                the policy's refusal did not reach the loop")
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the turn should have failed");
+
+        assert!(
+            !saw_error.contains("some-other-model"),
+            "the engine must not have switched to the fallback: {saw_error}"
         );
 
         drop(input_tx);
