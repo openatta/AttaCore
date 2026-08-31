@@ -49,6 +49,7 @@ anything, which is why those are closed to scripts and plugins outright.
 | `model.request` | interception | immediately before each model call | everything in the request | per model call (10⁰–10¹) | full | full | declared capability |
 | `model.message` | interception | after the stream carrying it finishes | the message content | per model call (10⁰–10¹) | full | full | declared capability |
 | `credentials` | contract | startup, when provider config is read | the credential | per process (10⁰) | closed | closed | closed |
+| `config.source` | contract | process start, before anything is built | which layers exist and what JSON is in them; never the merge | per process (10⁰) | closed | closed | closed |
 | `token.count` | contract | every budget check | the number compaction triggers on | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.store` | contract | every append, and on resume | how and where the log persists | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.query` | contract | whenever something asks for sessions rather than for one session | which sessions come back, in what order, and how they are matched | per session (10⁰) | closed | closed | closed |
@@ -113,6 +114,37 @@ let factories = model::factory::builtin_registry()
 
 The value comes back as `Secret`, which has no `Display`, no `Serialize`, and a
 `Debug` that prints `<redacted>`. Reading it takes `.expose()`.
+
+### Where settings come from — `config.source`
+
+`Settings::load` reads six files: `settings.json` and its gitignored
+`settings.local.json` overlay in each of the global, scene and project tiers.
+A deployment whose configuration lives in a config service, a ConfigMap or a
+database implements `base::interface::config_source::ConfigSource` and calls
+`Settings::load_from` instead:
+
+```rust
+let source = config_source::Chain(vec![
+    Arc::new(config_source::FileTiers::new(global.clone(), scene.clone(), project.clone())),
+    Arc::new(control_plane.fetch_layers()?),   // an `InMemoryLayers`
+]);
+let settings = Settings::load_from(&source, global, scene, project, "code", "opus");
+```
+
+A source decides only which layers exist, in what order, and what JSON is in
+them. The merge is the same either way — `paths` stripped from every layer, an
+overlay's `permission_rules` held apart, later layers merged recursively over
+earlier ones — so moving configuration off the disk cannot change what a
+configuration file means.
+
+The directory arguments stay even for a source that reads nothing from them:
+they are where the scene's *data* lives, which is not something a settings file
+is ever allowed to decide.
+
+`layers()` returns layers rather than a `Result`, because `Settings::load`
+never fails. A source that cannot reach its store logs why and returns what it
+has: losing a layer is bad, and refusing to start because a remote service is
+slow is worse.
 
 ### Tool authorization — `permission.check`
 

@@ -172,7 +172,7 @@ pub fn all() -> &'static [ExtensionPoint] {
     &POINTS
 }
 
-static POINTS: [ExtensionPoint; 28] = [
+static POINTS: [ExtensionPoint; 29] = [
         ExtensionPoint {
             id: "tool.registry",
             kind: Kind::Contract,
@@ -332,6 +332,16 @@ static POINTS: [ExtensionPoint; 28] = [
             frequency: Frequency::PerProcess,
             trust: Trust::host_only(),
             defined_in: "base::interface::credentials::CredentialSource",
+        },
+        ExtensionPoint {
+            id: "config.source",
+            kind: Kind::Contract,
+            summary: "where the settings layers come from, before they are merged",
+            timing: "process start, before anything is built",
+            rewrites: "which layers exist and what JSON is in them; never the merge",
+            frequency: Frequency::PerProcess,
+            trust: Trust::host_only(),
+            defined_in: "base::interface::config_source::ConfigSource",
         },
         ExtensionPoint {
             id: "token.count",

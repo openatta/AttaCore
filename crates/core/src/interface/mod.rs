@@ -22,6 +22,7 @@
 //! | [`model_factory::ModelFactory`] | how a protocol is built from config |
 //! | [`model_interceptor::ModelInterceptor`] | the request out, the message back |
 //! | [`credentials::CredentialSource`] | where a provider's API key comes from |
+//! | [`config_source::ConfigSource`] | where the settings layers come from |
 //! | [`tool::Tool`] / [`tool::ToolRegistry`] | a tool, or the whole tool set |
 //! | [`tool_middleware::ToolMiddleware`] | a ring around every tool call |
 //! | [`tool_result::ToolResultTransformer`] | what a result may look like |
@@ -61,6 +62,7 @@ pub mod agent_spawner;
 pub mod backoff;
 pub mod capabilities;
 pub mod catalog;
+pub mod config_source;
 pub mod credentials;
 pub mod elicitation;
 pub mod event_sink;

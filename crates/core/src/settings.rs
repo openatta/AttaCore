@@ -4,11 +4,17 @@
 //! scene → project, generic recursive JSON merge — see its doc comment).
 //! Everything downstream (the AGENT itself, `Builder`) receives the already-
 //! merged result; it does not perform its own multi-layer config merging.
+//!
+//! Where the layers come from is a separate question from what is done with
+//! them: `load()` reads the six files on disk,
+//! [`Settings::load_from`] takes them from any
+//! [`ConfigSource`](crate::interface::config_source::ConfigSource), and both
+//! run the same merge.
 
 use crate::provider::{ApiType, ProviderConfig, TaskModelOverride};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The shared, committed settings file present in every tier.
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -16,29 +22,6 @@ pub const SETTINGS_FILE: &str = "settings.json";
 /// The gitignored per-machine overlay sitting beside `SETTINGS_FILE` in the
 /// same tier, overriding it.
 pub const SETTINGS_LOCAL_FILE: &str = "settings.local.json";
-
-/// Read and parse one settings file. `None` when it doesn't exist, can't be
-/// read, or doesn't parse — each of the latter two warns rather than
-/// aborting, so one broken file can't stop the process from starting.
-fn read_settings_layer(layer_name: &str, path: &Path) -> Option<serde_json::Value> {
-    if !path.exists() {
-        return None;
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to read settings file, skipping this layer");
-            return None;
-        }
-    };
-    match serde_json::from_str(&content) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to parse settings file, skipping this layer");
-            None
-        }
-    }
-}
 
 /// Complete AGENT configuration. Merged by `Settings::load()` before injection.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -658,7 +641,9 @@ impl Settings {
     /// `settings.local.json` overlay, which outranks the `settings.json`
     /// beside it. This is the **single canonical settings.json loader** —
     /// `daemon` and any other embedder should call this rather than parsing
-    /// settings.json themselves.
+    /// settings.json themselves. An embedder whose configuration does not
+    /// live on this machine's disk calls [`load_from`](Self::load_from) with
+    /// its own source and gets the same merge.
     ///
     /// Merging is a **generic recursive JSON merge** (later layer's object
     /// keys override/extend the earlier layer's, non-object values fully
@@ -693,38 +678,59 @@ impl Settings {
         scope: &str,
         default_model: &str,
     ) -> Self {
+        let source = crate::interface::config_source::FileTiers::new(
+            global_dir.clone(),
+            scene_dir.clone(),
+            local_dir.clone(),
+        );
+        Self::load_from(&source, global_dir, scene_dir, local_dir, scope, default_model)
+    }
+
+    /// [`load`](Self::load) with the layers coming from wherever `source` says
+    /// instead of from the six files on disk.
+    ///
+    /// The merge is identical — that is the point of the split. `source`
+    /// decides only which layers exist, in what order, and what JSON is in
+    /// them; everything after that (stripping `paths`, holding an overlay's
+    /// `permission_rules` apart, the recursive merge, the fall back to
+    /// defaults if the result will not deserialize, validation) happens here
+    /// and is the same for every source.
+    ///
+    /// The directory arguments stay because they are not where configuration
+    /// is read from — they are where this scene's *data* lives, which
+    /// `settings.paths` reports and which a settings file is never allowed to
+    /// override.
+    pub fn load_from(
+        source: &dyn crate::interface::config_source::ConfigSource,
+        global_dir: PathBuf,
+        scene_dir: PathBuf,
+        local_dir: PathBuf,
+        scope: &str,
+        default_model: &str,
+    ) -> Self {
         let base = Self::defaults_for(default_model);
         let mut merged_json = serde_json::to_value(&base).unwrap_or_else(|_| serde_json::json!({}));
 
         let mut local_permission_rules: Vec<PermissionRule> = Vec::new();
 
-        for (layer_name, dir) in [
-            ("global", &global_dir),
-            ("scene", &scene_dir),
-            ("project", &local_dir),
-        ] {
-            for file in [SETTINGS_FILE, SETTINGS_LOCAL_FILE] {
-                let path = dir.join(file);
-                let Some(mut layer_json) = read_settings_layer(layer_name, &path) else {
-                    continue;
-                };
-                if let Some(obj) = layer_json.as_object_mut() {
-                    // `paths` is resolved from this function's own arguments,
-                    // never from settings.json content.
-                    obj.remove("paths");
-                    if file == SETTINGS_LOCAL_FILE {
-                        if let Some(rules) = obj.remove("permission_rules") {
-                            match serde_json::from_value::<Vec<PermissionRule>>(rules) {
-                                Ok(r) => local_permission_rules.extend(r),
-                                Err(e) => {
-                                    tracing::warn!(layer = layer_name, path = %path.display(), error = %e, "failed to parse permission_rules, ignoring them");
-                                }
+        for layer in source.layers() {
+            let mut layer_json = layer.value;
+            if let Some(obj) = layer_json.as_object_mut() {
+                // `paths` is resolved from this function's own arguments,
+                // never from settings.json content.
+                obj.remove("paths");
+                if layer.machine_local {
+                    if let Some(rules) = obj.remove("permission_rules") {
+                        match serde_json::from_value::<Vec<PermissionRule>>(rules) {
+                            Ok(r) => local_permission_rules.extend(r),
+                            Err(e) => {
+                                tracing::warn!(layer = layer.tier.name(), origin = %layer.origin, error = %e, "failed to parse permission_rules, ignoring them");
                             }
                         }
                     }
                 }
-                merge_json_values(&mut merged_json, layer_json);
             }
+            merge_json_values(&mut merged_json, layer_json);
         }
 
         let mut settings: Settings = match serde_json::from_value(merged_json) {
@@ -1052,6 +1058,77 @@ mod tests {
 
         let settings = Settings::load(global, scene, project, "code", "cli-default");
         assert_eq!(settings.model.model_name, "scene-model");
+    }
+
+    /// P3-14's acceptance: the same configuration, once from six files and
+    /// once from a source that never touches a disk, has to produce the same
+    /// `Settings` — including the two rules that are not part of the generic
+    /// merge (an overlay's `permission_rules` held apart, `paths` ignored).
+    #[test]
+    fn an_in_memory_source_replaces_the_files_entirely() {
+        use crate::interface::config_source::{InMemoryLayers, Tier};
+
+        let global = r#"{"model": {"model_name": "global-model", "max_tokens": 111}}"#;
+        let scene = r#"{"model": {"model_name": "scene-model"}}"#;
+        let project = r#"{"paths": {"scope": "hijacked"},
+                          "permission_rules": [{"tool": "Bash(rm:*)", "action": "deny"}]}"#;
+        let project_local = r#"{"permission_rules": [{"tool": "Bash(ls)", "action": "allow"}]}"#;
+
+        let root = tempfile::tempdir().unwrap();
+        let global_dir = root.path().join("global");
+        let scene_dir = root.path().join("scene");
+        let project_dir = root.path().join("project");
+        write_settings(&global_dir, global);
+        write_settings(&scene_dir, scene);
+        write_settings(&project_dir, project);
+        write_local_settings(&project_dir, project_local);
+        let from_files = Settings::load(
+            global_dir,
+            scene_dir,
+            project_dir,
+            "code",
+            "cli-default",
+        );
+
+        let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let source = InMemoryLayers::new()
+            .with(Tier::Global, false, "config-service:global", parse(global))
+            .with(Tier::Scene, false, "config-service:scene", parse(scene))
+            .with(Tier::Project, false, "config-service:project", parse(project))
+            .with(Tier::Project, true, "config-service:machine", parse(project_local));
+        // Directories that do not exist, so a fall-back to reading files
+        // could not produce this result.
+        let elsewhere = root.path().join("no-such-tree");
+        let from_memory = Settings::load_from(
+            &source,
+            elsewhere.join("global"),
+            elsewhere.join("scene"),
+            elsewhere.join("project"),
+            "code",
+            "cli-default",
+        );
+
+        assert_eq!(from_memory.model.model_name, from_files.model.model_name);
+        assert_eq!(from_memory.model.model_name, "scene-model");
+        assert_eq!(from_memory.model.max_tokens, from_files.model.max_tokens);
+        assert_eq!(
+            from_memory
+                .permission_rules
+                .iter()
+                .map(|r| r.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bash(rm:*)"]
+        );
+        assert_eq!(
+            from_memory
+                .local_permission_rules
+                .iter()
+                .map(|r| r.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bash(ls)"]
+        );
+        assert_eq!(from_memory.paths.scope, "code");
+        assert_eq!(from_memory.paths.local_data_dir, elsewhere.join("project"));
     }
 
     #[test]
