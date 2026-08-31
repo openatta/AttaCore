@@ -265,6 +265,20 @@ pub trait Compactor: Send + Sync {
         state.threshold > 0 && state.context_tokens > state.threshold
     }
 
+    /// The share of a request the accumulated tool results may hold.
+    ///
+    /// Overriding this changes the numbers; overriding `trim_tool_results`
+    /// changes what is done about them.
+    fn tool_result_budget(&self) -> ToolResultBudget {
+        ToolResultBudget::default()
+    }
+
+    /// Bring the tool results back inside that budget. Returns how many were
+    /// rewritten.
+    fn trim_tool_results(&self, messages: &mut [ModelMessage]) -> usize {
+        enforce_tool_result_budget(messages, &self.tool_result_budget())
+    }
+
     /// Whether it is worth an API call to summarize before anything is
     /// dropped.
     ///
@@ -1033,9 +1047,39 @@ pub fn format_context_analysis(analysis: &ContextAnalysis) -> String {
     s
 }
 
-pub fn enforce_tool_result_budget(messages: &mut [ModelMessage]) -> usize {
-    const MAX_PER_RESULT: usize = 50_000;
-    const MAX_TOTAL: usize = 500_000;
+/// How much of a request the accumulated tool results may hold.
+///
+/// A different question from [`crate::compact::Compactor::compact`] and a
+/// different one again from a tool-result transformer, which decides what one
+/// result looks like as it comes back. This is about the share of the whole
+/// history that results occupy after a hundred individually reasonable ones
+/// have piled up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolResultBudget {
+    /// Truncate any single result past this.
+    pub max_per_result: usize,
+    /// Once the results together pass this, clear them oldest-first until
+    /// they don't.
+    pub max_total: usize,
+}
+
+impl Default for ToolResultBudget {
+    fn default() -> Self {
+        Self {
+            max_per_result: 50_000,
+            max_total: 500_000,
+        }
+    }
+}
+
+pub fn enforce_tool_result_budget(
+    messages: &mut [ModelMessage],
+    budget: &ToolResultBudget,
+) -> usize {
+    let ToolResultBudget {
+        max_per_result,
+        max_total,
+    } = *budget;
 
     let mut modified = 0;
     let mut total_size: usize = 0;
@@ -1044,7 +1088,7 @@ pub fn enforce_tool_result_budget(messages: &mut [ModelMessage]) -> usize {
     for msg in messages.iter_mut() {
         for block in &mut msg.content {
             if let ModelContentBlock::ToolResult { content, .. } = block {
-                if content.len() > MAX_PER_RESULT {
+                if content.len() > max_per_result {
                     // Character-boundary aware — see the note in
                     // `collapse_context`. A tool result is arbitrary bytes
                     // (file contents, command output), so byte 1000 landing
@@ -1052,7 +1096,7 @@ pub fn enforce_tool_result_budget(messages: &mut [ModelMessage]) -> usize {
                     let truncated = format!(
                         "[Tool result truncated: {} bytes > {} max; first 1000 bytes preserved]\n{}...",
                         content.len(),
-                        MAX_PER_RESULT,
+                        max_per_result,
                         truncate_at_char_boundary(content, 1000)
                     );
                     *content = truncated;
@@ -1074,7 +1118,7 @@ pub fn enforce_tool_result_budget(messages: &mut [ModelMessage]) -> usize {
     // Making the traversal order explicit means a future caller that hands
     // this an out-of-order slice gets a documented contract rather than a
     // silent behavior change.
-    if total_size > MAX_TOTAL {
+    if total_size > max_total {
         const CLEARED: &str = "[Old tool result content cleared]";
         // Positions in chronological order.
         let mut positions: Vec<(usize, usize)> = Vec::new();
@@ -1086,7 +1130,7 @@ pub fn enforce_tool_result_budget(messages: &mut [ModelMessage]) -> usize {
             }
         }
         for (mi, bi) in positions {
-            if total_size <= MAX_TOTAL {
+            if total_size <= max_total {
                 break;
             }
             let ModelContentBlock::ToolResult { content, .. } = &mut messages[mi].content[bi]
@@ -1325,6 +1369,40 @@ mod tests {
         assert!(estimate_tokens(&out) < estimate_tokens(&untouched));
     }
 
+    /// Changing the numbers is one method; the algorithm stays the engine's.
+    #[test]
+    fn a_host_tightens_the_tool_result_budget_without_reimplementing_it() {
+        struct Frugal;
+
+        #[async_trait]
+        impl Compactor for Frugal {
+            async fn compact(
+                &self,
+                messages: Vec<ModelMessage>,
+                max_tokens: usize,
+                keep_rounds: usize,
+            ) -> Result<(Vec<ModelMessage>, CompactResult), CompactError> {
+                DefaultCompactor.compact(messages, max_tokens, keep_rounds).await
+            }
+
+            fn tool_result_budget(&self) -> ToolResultBudget {
+                ToolResultBudget {
+                    max_per_result: 100,
+                    max_total: 10_000,
+                }
+            }
+        }
+
+        let mut messages = vec![tool_result("t0", &"x".repeat(5_000))];
+        assert_eq!(
+            DefaultCompactor.trim_tool_results(&mut messages.clone()),
+            0,
+            "5 KB is nothing against the engine's 50 KB"
+        );
+        assert_eq!(Frugal.trim_tool_results(&mut messages), 1);
+        assert!(result_bodies(&messages)[0].starts_with("[Tool result truncated:"));
+    }
+
     /// Both aging passes run, and the cached one hands back the ids the next
     /// request needs.
     #[test]
@@ -1405,7 +1483,7 @@ mod tests {
         // 20_000 Chinese chars = 60_000 bytes > cap, and byte 1000 is inside
         // the 334th character.
         let mut msgs = vec![tool_result("t1", &chinese_text(20_000))];
-        let modified = enforce_tool_result_budget(&mut msgs);
+        let modified = enforce_tool_result_budget(&mut msgs, &ToolResultBudget::default());
         assert_eq!(modified, 1, "oversized result should have been truncated");
         let ModelContentBlock::ToolResult { content, .. } = &msgs[0].content[0] else {
             panic!("expected a tool result");
@@ -1891,7 +1969,7 @@ mod tests {
             .map(|i| tool_result(&format!("t{i}"), &format!("{i:02}{}", &big[2..])))
             .collect();
 
-        let modified = enforce_tool_result_budget(&mut msgs);
+        let modified = enforce_tool_result_budget(&mut msgs, &ToolResultBudget::default());
         assert!(modified > 0);
 
         let cleared: Vec<bool> = msgs
@@ -1918,6 +1996,6 @@ mod tests {
     #[test]
     fn tool_result_budget_is_a_noop_when_under_budget() {
         let mut msgs = vec![tool_result("t1", "small"), tool_result("t2", "also small")];
-        assert_eq!(enforce_tool_result_budget(&mut msgs), 0);
+        assert_eq!(enforce_tool_result_budget(&mut msgs, &ToolResultBudget::default()), 0);
     }
 }

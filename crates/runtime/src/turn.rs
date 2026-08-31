@@ -1915,8 +1915,7 @@ or project context that should survive across sessions.
         }
 
         // Enforce per-message tool result budget BEFORE compaction.
-        let budget_modified =
-            compaction::compact::enforce_tool_result_budget(&mut self.session.messages);
+        let budget_modified = compactor.trim_tool_results(&mut self.session.messages);
         if budget_modified > 0 {
             self.tool_results_ever_cleared = true;
             tracing::debug!(modified = budget_modified, "tool result budget enforced");
