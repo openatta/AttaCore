@@ -110,7 +110,7 @@ impl Tool for SkillTool {
     async fn call(
         &self,
         input: Value,
-        _ctx: ToolContext,
+        ctx: ToolContext,
         _progress: ProgressSender,
     ) -> Result<ToolResult, ToolError> {
         let skill_name = input["skill"]
@@ -140,7 +140,13 @@ impl Tool for SkillTool {
         // escapes its folder or can't be read (see
         // `build_bundled_files_injection`'s doc comment).
         let bundled_files_text = match skill_info {
-            Some(info) => match build_bundled_files_injection(&info.path, skill_name).await {
+            Some(info) => match build_bundled_files_injection(
+                &info.path,
+                skill_name,
+                &*ctx.exec.filesystem,
+            )
+            .await
+            {
                 Ok(text) => text,
                 Err(msg) => {
                     return Ok(ToolResult {
@@ -173,7 +179,7 @@ impl Tool for SkillTool {
                 // path doesn't truncate the body at all today, so this stays
                 // that way; only the bundled-files text is appended.
                 let expanded = format!("{expanded}{bundled_files_text}");
-                let cancel = _ctx.cancel.clone();
+                let cancel = ctx.cancel.clone();
                 // `agent:` frontmatter — which subagent type to fork into.
                 // `None` (unset) falls through to the spawner's own default
                 // (general-purpose).
@@ -188,10 +194,10 @@ impl Tool for SkillTool {
                         .spawn_agent_background(
                             expanded,
                             vec![],
-                            _ctx.cwd.clone(),
+                            ctx.cwd.clone(),
                             cancel,
                             agent_type,
-                            _ctx.session.clone(),
+                            ctx.session.clone(),
                         )
                         .await
                     {
@@ -218,7 +224,7 @@ impl Tool for SkillTool {
                 }
 
                 match spawner
-                    .spawn_agent(expanded, vec![], _ctx.cwd.clone(), cancel, agent_type)
+                    .spawn_agent(expanded, vec![], ctx.cwd.clone(), cancel, agent_type)
                     .await
                 {
                     Ok(output) => {
@@ -257,7 +263,7 @@ impl Tool for SkillTool {
         // the original file. See `expand_dynamic_context`'s doc comment for
         // the security posture (delegates to the real BashTool, not a raw
         // shell-out).
-        let body = expand_dynamic_context(&body, &_ctx).await;
+        let body = expand_dynamic_context(&body, &ctx).await;
 
         // Use full expand_skill_vars ($1..$9, $@, $ARGUMENTS, {ARGS}, etc.)
         let arg_names = skill_info
@@ -297,7 +303,7 @@ impl Tool for SkillTool {
         // Only meaningful for this inline path: a `context: fork` skill's
         // sub-agent gets its own `Permission` instance (`AlwaysPermit` or a
         // team `PermissionBridge`, never the parent's), so injecting a rule
-        // into `_ctx.permission` here wouldn't reach it — see
+        // into `ctx.permission` here wouldn't reach it — see
         // `AgentTool::permission_handler`.
         //
         // Each entry is parsed as a permission rule string, so both `Bash`
@@ -337,7 +343,7 @@ impl Tool for SkillTool {
         let content_hash = hash_skill_content(&skill_msg);
         let already_loaded = {
             let mut sessions = self.already_injected.lock().unwrap();
-            let seen = sessions.entry(_ctx.session_id.clone()).or_default();
+            let seen = sessions.entry(ctx.session_id.clone()).or_default();
             !seen.insert(content_hash)
         };
         if already_loaded {
@@ -394,8 +400,9 @@ const BUNDLED_TOTAL_CHAR_CAP: usize = 6000;
 async fn build_bundled_files_injection(
     skill_path: &std::path::Path,
     skill_name: &str,
+    fs: &dyn base::interface::exec::FileSystem,
 ) -> Result<String, String> {
-    let Ok(content) = tokio::fs::read_to_string(skill_path).await else {
+    let Ok(content) = fs.read_to_string(skill_path).await else {
         return Ok(String::new());
     };
     let dir_name = skill_path
@@ -422,7 +429,7 @@ async fn build_bundled_files_injection(
         return Ok(String::new());
     };
     // Canonicalize once: the root every candidate must stay inside.
-    let Ok(canonical_skill_dir) = tokio::fs::canonicalize(skill_dir).await else {
+    let Ok(canonical_skill_dir) = fs.canonicalize(skill_dir).await else {
         return Ok(String::new());
     };
 
@@ -442,7 +449,7 @@ async fn build_bundled_files_injection(
         // own (canonicalized) folder — this is what rejects `..` traversal.
         // A failed canonicalize (file doesn't exist / not readable) is
         // reported the same way: a named, visible error, not a silent skip.
-        let real_path = match tokio::fs::canonicalize(absolute).await {
+        let real_path = match fs.canonicalize(absolute).await {
             Ok(p) => p,
             Err(e) => {
                 return Err(format!(
@@ -461,7 +468,7 @@ async fn build_bundled_files_injection(
             ));
         }
 
-        let file_content = match tokio::fs::read_to_string(&real_path).await {
+        let file_content = match fs.read_to_string(&real_path).await {
             Ok(c) => c,
             Err(e) => {
                 return Err(format!(
