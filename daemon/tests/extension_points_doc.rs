@@ -62,10 +62,19 @@ fn the_reference_table_matches_the_catalog() {
 #[test]
 fn every_point_in_the_table_is_written_about_somewhere_in_the_document() {
     let doc = std::fs::read_to_string(doc_path()).expect("the extension point index exists");
+    // The prose, with the generated table cut out. Counting mentions across
+    // the whole file would make this test depend on whether the sibling above
+    // has rewritten the table yet, which under `ATTA_UPDATE_DOCS=1` is a race
+    // between two tests in the same binary.
+    let prose = match (doc.find(BEGIN), doc.find(END)) {
+        (Some(start), Some(end)) if start < end => {
+            format!("{}{}", &doc[..start], &doc[end + END.len()..])
+        }
+        _ => doc.clone(),
+    };
     for point in base::interface::catalog::all() {
-        let mentions = doc.matches(&format!("`{}`", point.id)).count();
         assert!(
-            mentions >= 2,
+            prose.contains(&format!("`{}`", point.id)),
             "`{}` appears in the generated table and nowhere else — a row a reader \
              cannot act on is worse than no row",
             point.id

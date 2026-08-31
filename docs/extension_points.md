@@ -56,6 +56,7 @@ anything, which is why those are closed to scripts and plugins outright.
 | `history.store` | contract | every append, and on resume | how and where the log persists | per turn (10⁰–10¹) | closed | closed | closed |
 | `history.query` | contract | whenever something asks for sessions rather than for one session | which sessions come back, in what order, and how they are matched | per session (10⁰) | closed | closed | closed |
 | `history.blob` | contract | every append carrying an image or a large payload, and on load | where large content is kept and how it is addressed | per turn (10⁰–10¹) | closed | closed | closed |
+| `history.projection` | contract | every time a transcript is read: resume, fork, search, paging | which entries become messages, and what they say | per session (10⁰) | closed | closed | closed |
 | `history.extension_entry` | registration | any time; ordered with everything else | adds only; the kernel never reads the payload | per turn (10⁰–10¹) | full | full | add only |
 | `memory.storage` | contract | recall, and whenever a memory is written | how and where memories persist | per turn (10⁰–10¹) | closed | closed | closed |
 | `memory.retriever` | contract | once per user message, in the background | the recalled set | per turn (10⁰–10¹) | closed | closed | closed |
@@ -64,7 +65,12 @@ anything, which is why those are closed to scripts and plugins outright.
 | `skill.source` | contract | at session build, and whenever an MCP server connects | which skills exist, and the text each one expands to | per session (10⁰) | closed | closed | closed |
 | `instruction.source` | contract | at session build | the AGENTS.md text injected once per session | per session (10⁰) | closed | closed | closed |
 | `rules.source` | contract | while the system prompt is assembled | which rule documents the model is told exist | per model call (10⁰–10¹) | closed | closed | closed |
-| `compaction` | contract | when the budget threshold is crossed | the message history | per turn (10⁰–10¹) | closed | closed | closed |
+| `turn.policy` | contract | before each model call, and after each one returns | whether the loop takes another step, and the reported stop reason | per model call (10⁰–10¹) | closed | closed | closed |
+| `model.recovery` | contract | on an error, and on a response cut off at the output limit | whether to switch model, compact and retry, raise the limit, or fail | per model call (10⁰–10¹) | closed | closed | closed |
+| `model.backoff` | contract | inside the client, below the model contract, per failed attempt | the delay before a retry, and whether there is one | per model call (10⁰–10¹) | closed | closed | closed |
+| `budget` | contract | after each model call, and before each request is assembled | whether the turn continues, what it is told, the compaction ceiling | per model call (10⁰–10¹) | closed | closed | closed |
+| `environment` | contract | whenever an answer is written down rather than measured | log timestamps, entry ids, the date the prompt carries | per turn (10⁰–10¹) | closed | closed | closed |
+| `compaction` | contract | once a turn: two aging passes, a predictive one, then the threshold | the message history, and whether it is rewritten at all | per turn (10⁰–10¹) | closed | closed | closed |
 | `script.carrier` | contract | wherever the carrier is bound; governed by a per-turn quota | whatever the bound point allows, under the script's own provenance | per turn (10⁰–10¹) | full | full | declared capability |
 | `hooks` | interception | thirty named moments; see the hook event list | varies by event: block, rewrite input, end the turn | per tool call (10¹) | full | full | declared capability |
 <!-- END GENERATED TABLE -->
@@ -270,9 +276,122 @@ tokenizer; a host that can be exact should be.
 
 ### Compaction — `compaction`
 
-`compaction::Compactor`. Not yet reached by this refactor: the trigger and
-several strategy decisions still live in the turn loop rather than behind the
-trait. That is Phase 3.
+`compaction::compact::Compactor`. Both halves of the question: how a
+conversation is shortened, and when.
+
+A turn offers four opportunities and the contract answers each — two aging
+passes that clear tool results by age, a predictive pass that fires before the
+budget is reached, and the threshold that forces the transformation. Every one
+has a default that is the engine's own arithmetic, so an implementor who only
+cares about the transformation writes `compact` and nothing else.
+`tool_result_budget` is the numbers-only version of the same idea: change how
+much of a request accumulated tool results may hold without reimplementing
+what is done about it.
+
+```rust
+Builder::new().compactor(Arc::new(OnlyAtThreshold(DefaultCompactor)))
+```
+
+`OnlyAtThreshold` wraps any compactor and declines everything the budget did
+not force — the shape a deployment wants when it needs its transcript left
+alone until a rewrite is genuinely unavoidable.
+
+### When a turn has gone on long enough — `turn.policy`
+
+`base::interface::turn_policy::TurnPolicy`. Two ceilings — model calls per
+turn, structured-output retries — asked at the two points they are checked
+today, because consolidating them would reorder the loop.
+
+```rust
+Builder::new().turn_policy(Arc::new(FirstOf(vec![engine_default, mine])))
+```
+
+Compose rather than replace: `FirstOf` keeps the engine's limits and adds
+yours, and a stop is never overridden by a later policy.
+
+Only judgements about *progress* live here. Cancellation is an instruction,
+not an opinion; a `PostToolUse` or `Stop` hook ending a turn is already an
+extension point's output, and letting a policy overrule one would invert the
+trust order; and "the model asked for tools, so there is more to do" is the
+loop's definition rather than a judgement about it.
+
+### When a call goes wrong — `model.recovery`, `model.backoff`
+
+`base::interface::recovery_policy::RecoveryPolicy` decides what a failure
+*means for the turn*: switch to the fallback model, compact and retry, raise
+the output limit, or fail. Classification stays with the engine — which errors
+*are* an overload and which *are* a size refusal is a fact about the wire
+protocol. `NeverRecover` is a real configuration rather than a stub: a
+deployment billed per token would rather return a truncated answer than a
+surprise 64K call.
+
+`base::interface::backoff::BackoffPolicy` sits below the model contract, in
+the clients, and answers the narrower question of whether a failed request is
+sent again and how long to wait first. Both wire protocols go through the same
+one. `retry-after` parsing stays in the Anthropic client, because that is a
+protocol-specific input; what to do with it is the policy's.
+
+### What a turn may spend — `budget`
+
+`base::interface::budget_policy::BudgetPolicy`. Three judgements that were
+constants: a cumulative token ceiling, an output-volume target with its
+diminishing-returns rule, and the compaction threshold the scene returns.
+
+The one that was missing entirely is a ceiling on request *size*. A threshold
+is a trigger — crossing it starts a compaction, and if the compaction cannot
+get far enough the request goes out anyway. `Capped` adds the ceiling, and a
+turn still above it after compaction ends as `context_exceeded` rather than
+sending something the deployment said must never be sent.
+
+```rust
+Builder::new().budget_policy(Arc::new(Capped {
+    inner: EngineBudget::new(settings.execution.max_budget_tokens),
+    context_hard_cap: 120_000,
+}))
+```
+
+### What a log means to the model — `history.projection`
+
+`history::transcript::TranscriptProjection`. Which entries become messages,
+and what they say. It lives on the store rather than the engine because a log
+and the rules for reading it travel together: resume, fork, search and paging
+must all see the same conversation.
+
+```rust
+JsonlHistoryStore::with_roots(cwd, roots).await?
+    .with_projection(Arc::new(ExtensionsAreVisible { namespaces: vec!["com.acme.deploy".into()] }))
+```
+
+`ExtensionsAreVisible` is the answer to the question `history.extension_entry`
+raises and cannot settle: an extension's own entries becoming something the
+model reads.
+
+Saying yes carries one obligation. **Model-visible content must be
+reconstructible from the log alone** — a projection that renders an entry by
+asking the live extension what it means produces a conversation that cannot be
+reopened once the extension is gone.
+`transcript::model_visible_content_is_reconstructible` makes that checkable
+rather than aspirational.
+
+### Kept time and kept identifiers — `environment`
+
+`base::interface::environment::Environment`. Wall-clock now, and fresh ids.
+
+Only the answers that get *kept* come from here: a timestamp written into the
+log, an id naming an entry, the date the prompt tells the model. There is
+deliberately no monotonic clock on the contract — `Instant` cannot be stored
+or transmitted, everything it is used for is measurement, and measurement is
+the category this is not for.
+
+```rust
+let env = Arc::new(FixedEnvironment::epoch());
+let store = JsonlHistoryStore::with_roots(cwd, roots).await?.with_environment(env.clone());
+let agent = Builder::new()./* … */.history_store(store).environment(env).build()?;
+```
+
+Two places, because the log's half is written by the store and the
+model-visible half by the agent. Configure both, or a replay differs in the
+half you forgot.
 
 ### Where skills come from — `skill.source`
 
