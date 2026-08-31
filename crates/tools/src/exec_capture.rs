@@ -5,24 +5,9 @@
 //! `git`, wait, and parse what it printed. Those call sites drain the stream
 //! themselves, and this is the one place that does it.
 
-use base::error::ToolError;
 use base::interface::exec::{ExecError, ExecProviders, ExitStatus, OutputStream, ProcessSpec};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-
-/// The three classes of execution failure, said to the model.
-///
-/// `Denied` is the one that has somewhere else to go: it is the model's to
-/// work around, and `ToolError::Denied` is what the rest of the engine already
-/// reads as "refused, try something else". The other two keep their prefixes
-/// through `ExecError`'s own display, so "the execution environment is
-/// unreachable" does not arrive looking like the command failing.
-pub(crate) fn tool_error(e: ExecError) -> ToolError {
-    match e {
-        ExecError::Denied(m) => ToolError::Denied(m),
-        other => ToolError::exec(other.to_string()),
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct Captured {

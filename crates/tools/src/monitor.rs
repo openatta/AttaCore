@@ -9,7 +9,6 @@
 //! - Cancellation via context cancel token
 //! - Line-by-line streaming via ProgressSender
 
-use crate::exec_capture::tool_error;
 use async_trait::async_trait;
 use base::error::ToolError;
 use base::interface::exec::{OutputStream, ProcessSpec};
@@ -138,7 +137,7 @@ impl Tool for MonitorTool {
             .process
             .spawn(spec, ctx.cancel.clone())
             .await
-            .map_err(tool_error)?;
+            .map_err(ToolError::from)?;
         let chunks = child.output().expect("the first call owns the pipes");
 
         // Spawn a background task to drain stdout lines and send them as progress events.
@@ -194,7 +193,7 @@ impl Tool for MonitorTool {
             }
         };
 
-        let status = wait_result.map_err(tool_error)?;
+        let status = wait_result.map_err(ToolError::from)?;
         let line_count = drain_handle.await.unwrap_or(0);
 
         let summary = if status.success {
