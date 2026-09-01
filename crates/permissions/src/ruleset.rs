@@ -190,17 +190,20 @@ fn behavior_rank(b: RuleBehavior) -> i32 {
     }
 }
 
+/// 工具名是 `__` 分段的命名空间路径（`mcp__github__create_issue`、
+/// `plugin__github-tools__open_pr`),规则可以只写它的任意一段前缀,
+/// 命中该前缀下的全部工具。
+///
+/// 按段匹配而不是按已知命名空间列表匹配:写死 `mcp__` 意味着每加一种载体都要
+/// 回来改这里,而 `plugin__` 就是这么漏掉的——`plugin__github-tools` 一条规则
+/// 谁也匹配不上。段边界的检查不能省,否则 `mcp__git` 会命中 `mcp__github__…`。
 pub(crate) fn matches_tool_name(rule: &str, actual: &str) -> bool {
     if rule == actual {
         return true;
     }
-    // MCP server 前缀匹配："mcp__github" → "mcp__github__create_issue"
-    if let Some(prefix) = rule.strip_prefix("mcp__") {
-        if let Some(actual_after) = actual.strip_prefix("mcp__") {
-            return actual_after == prefix || actual_after.starts_with(&format!("{prefix}__"));
-        }
-    }
-    false
+    actual
+        .strip_prefix(rule)
+        .is_some_and(|rest| rest.starts_with("__"))
 }
 
 pub(crate) fn matches_content(pattern: &str, content: &str) -> bool {
@@ -326,6 +329,45 @@ mod tests {
         ));
         assert!(matches!(
             rs.evaluate("mcp__slack__post_msg", None),
+            RuleHit::None
+        ));
+    }
+
+    /// WASM 插件工具注册成 `plugin__<插件>__<工具>`,取的就是 MCP 那套命名,
+    /// 为的是"一条规则管一个插件"能直接生效。前缀匹配写死 `mcp__` 时它不生效。
+    #[test]
+    fn plugin_prefix_match() {
+        let rs = RuleSet::new(vec![rule(
+            "plugin__github-tools",
+            None,
+            RuleBehavior::Deny,
+            RuleSource::UserSettings,
+        )]);
+        assert!(matches!(
+            rs.evaluate("plugin__github-tools__open_pr", None),
+            RuleHit::Deny(_)
+        ));
+        assert!(matches!(
+            rs.evaluate("plugin__other__open_pr", None),
+            RuleHit::None
+        ));
+    }
+
+    /// 前缀必须落在段边界上,否则一条 `mcp__git` 会连带管住 `mcp__github__*`。
+    #[test]
+    fn a_prefix_only_matches_on_a_segment_boundary() {
+        let rs = RuleSet::new(vec![rule(
+            "mcp__git",
+            None,
+            RuleBehavior::Allow,
+            RuleSource::UserSettings,
+        )]);
+        assert!(matches!(
+            rs.evaluate("mcp__git__log", None),
+            RuleHit::Allow(_)
+        ));
+        assert!(matches!(
+            rs.evaluate("mcp__github__create_issue", None),
             RuleHit::None
         ));
     }

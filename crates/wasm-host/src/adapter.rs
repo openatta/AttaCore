@@ -21,8 +21,9 @@ use std::sync::Arc;
 ///
 /// Chosen to mirror `mcp__<server>__<tool>` so a permission rule can name a
 /// whole plugin — `plugin__github-tools` — exactly the way it can name a
-/// whole MCP server. The permissions crate needs no knowledge of plugins for
-/// that to work.
+/// whole MCP server. `permissions::ruleset` matches a rule against any
+/// `__`-delimited prefix of a tool name, so it needs no knowledge of plugins
+/// for that to work.
 pub const TOOL_PREFIX: &str = "plugin";
 
 /// Fully-qualified name for a tool a plugin exports.
