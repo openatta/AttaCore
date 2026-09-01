@@ -82,7 +82,8 @@ pub struct CallRecord {
     pub turn: u32,
     pub step: u32,
     /// Present for a call made outside any turn — `compact`, `memory`, and so
-    /// on; see `docs/recorder_design.md` for the conventional values. Absent
+    /// on; the conventional values are
+    /// [`base::interface::model::call_purpose`]'s constants. Absent
     /// for turn work, where `turn`/`step` are the coordinates that mean
     /// something. Deliberately not part of the replay divergence check.
     #[serde(default, skip_serializing_if = "Option::is_none")]

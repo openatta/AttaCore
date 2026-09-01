@@ -12,6 +12,12 @@ Start with the question you actually have:
 - **"I want to see or change something in flight."** You want an
   **interception** — sit in the path of something the engine is doing.
 
+All three are Rust: implement the trait, hand it to `runtime::agent::Builder`.
+To extend a build you are not compiling, use a carrier — a script
+(`extending_quickjs.md`) or a WebAssembly plugin (`extending_wasm.md`). Each
+reaches a subset of what is listed here, and each of those documents says which.
+For how the engine is put together, see `ARCHITECTURE.md`.
+
 ## How to read the table
 
 `Config` / `Script` / `Plugin` are the three provenances the engine
@@ -282,8 +288,8 @@ tokenizer; a host that can be exact should be.
 
 Four contracts designed as one, because they are entangled: a sandbox
 constrains a process, a process needs files and a network, and the network
-policy has to reach inside the sandbox. `EXECUTION_LAYER_DESIGN.md` is the
-blueprint; this is the summary.
+policy has to reach inside the sandbox. `ARCHITECTURE.md` §5 has the
+reasoning; this is the summary.
 
 ```rust
 let mut ctx = /* … */;
@@ -735,6 +741,10 @@ The engine is QuickJS, in `crates/script-host`, behind `daemon`'s `scripts`
 feature. `base` holds only the contract — it has no internal dependencies and a
 JavaScript runtime there would end up in every build of everything.
 
+The summary below is enough to decide whether you want this. **`extending_quickjs.md`
+is the guide** — one section per bindable point, with the input and return
+shapes and a working example for each.
+
 Bind a script by writing one in your project and naming it in `settings.json`:
 
 ```jsonc
@@ -879,21 +889,31 @@ holding:
 Nothing is granted by omission: an extension that declares no capabilities can
 compute and no more.
 
+**`extending_wasm.md`** is the guide for the WebAssembly carrier — the world a
+component implements, `plugin.toml`, the capability model, install-time
+disclosure, and what a plugin can contribute.
+
 ---
 
 ## What is not open
 
-Eleven things stay in the kernel, listed with their reasons in
-`docs/EXTENSIBILITY_DESIGN.md` §5. The short version: the turn's skeleton, the
-authorization point, append-only log semantics, the number of plugin
-contribution points, and the resource and interrupt boundaries. A design that
-needs one of them opened is a design to argue about, not a patch to write.
+Eleven things stay in the kernel. Making any of them replaceable would hand
+away the property it exists to guarantee.
 
-Two areas are open in principle and not yet reached:
+| # | Kernel-only | Why it cannot open |
+|---|---|---|
+| 1 | Capability authorization and module resolution | The function that decides whether `import 'host:fs'` resolves. Replaceable means unauthorized |
+| 2 | Permission rule evaluation order | The order of the eight stages *is* the security property — a tool's own Allow must come after deny rules and path checks |
+| 3 | Resource limits and interrupts | The only way to stop a runaway extension |
+| 4 | Scheduling and quota accounting | Replaceable accounting is bypassable quota |
+| 5 | Whether a sandbox policy is applied | The backend is swappable; the decision to apply it is not |
+| 6 | Append-only log semantics and their invariant checks | "Model-visible means logged" is held by runtime assertions; replaceable assertions mean no principle |
+| 7 | The turn skeleton's step order | The order carries every invariant. The *decisions* at each step are open — see §2 of `ARCHITECTURE.md` |
+| 8 | Install-time disclosure | A restriction that only warns is one every auto-installer steps straight over |
+| 9 | Permission rule source precedence | Plugin rules must always rank below user settings and org policy |
+| 10 | Scene composition and inheritance | The combination surface grows exponentially, and it contradicts the one-scene-per-session replay invariant |
+| 11 | The number of plugin contribution points | The plugin subsystem can be compiled out; that depends on the contribution points staying countable |
 
-- **Turn-loop decisions** — stop conditions, backoff, retry, when to compact —
-  are still inside the loop rather than behind strategy contracts. Phase 3.
-- **The execution layer** — process spawning, filesystem, network, sandbox —
-  is still direct. The sandbox now reports honestly whether a policy is
-  actually enforced (`sandbox.require_enforcement` refuses rather than running
-  unconstrained), but the seams themselves are Phase 4.
+The first six are not only safety requirements — they are what distinguishes
+this kernel from a general-purpose framework. A design that needs one of them
+opened is a design to argue about, not a patch to write.

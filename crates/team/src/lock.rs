@@ -5,7 +5,7 @@
 //! time; a second instance touching the same `teams/` directory (index
 //! rebuild, cross-team scan) concurrently is the rare case this exists to
 //! reject rather than to arbitrate finely. Same staleness rules as
-//! `daemon::discovery`'s single-instance lock (docs/session_and_scene_invariants.md §3) (same staleness algorithm,
+//! `daemon::discovery`'s single-instance lock (docs/ARCHITECTURE.md §7) (same staleness algorithm,
 //! same [`base::process_identity::ProcessIdentity`] reuse-safe check) rather
 //! than introducing a second locking mechanism.
 //!

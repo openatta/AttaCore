@@ -17,8 +17,8 @@
 //! It does not validate the contracts the way a remote provider would. It
 //! never has to chunk a transfer, resolve a symlink graph that is not this
 //! one, or answer what partial enforcement means across a machine boundary.
-//! Those stayed as design constraints in `docs/EXECUTION_LAYER_DESIGN.md`
-//! §3.1 precisely because this implementation cannot enforce them.
+//! Those stayed as design constraints in `docs/ARCHITECTURE.md` §5,
+//! precisely because this implementation cannot enforce them.
 //!
 //! [`FixedEnvironment`]: crate::interface::environment::FixedEnvironment
 

@@ -222,7 +222,7 @@ MCP tools are adapted to the native `Tool` trait and injected into the system pr
 
 37 structured event types covering the full agent lifecycle: turn start/complete, tool execution, API errors, permission decisions, compaction operations, memory snapshots, MCP connect/disconnect, session lifecycle, startup timing, model routing, hook execution, slash command usage.
 
-**Recorder**: wrap any `Model` with `RecorderModel` to record every LLM call — the assembled system blocks, the full tool table, every message, and the response stream down to token boundaries — then replay it deterministically. Zero API cost for integration tests, and a recording is a self-contained directory you can hand to someone. Design notes: [`docs/recorder_design.md`](docs/recorder_design.md).
+**Recorder**: wrap any `Model` with `RecorderModel` to record every LLM call — the assembled system blocks, the full tool table, every message, and the response stream down to token boundaries — then replay it deterministically. Zero API cost for integration tests, and a recording is a self-contained directory you can hand to someone. Implementation: `crates/telemetry/src/recorder/`.
 
 ### Plugin System
 
@@ -272,7 +272,7 @@ tests/scripts/locked_build.sh                                 # asserts both, th
 
 Build the locked artifact for that one package — never `--workspace`, since cargo unifies features across the graph and any other member enabling `plugins` turns it back on. With the feature off, `PluginHost` is `None` and every call site is an `if let Some(..)` that does nothing; there is no `#[cfg]` scattered through the engine and no behavior to reason about beyond "there are no plugins".
 
-Full design: [`docs/plugin_system_design.md`](docs/plugin_system_design.md).
+Full guide: [`docs/extending_wasm.md`](docs/extending_wasm.md).
 
 ## Crate Map
 
@@ -494,12 +494,12 @@ let id = Id::parse(s)?;        // Validate and decode external input (checks 16-
 
 ```
 AttaCore/
-├── crates/           # 20 Rust crates (the engine)
+├── crates/           # 21 Rust crates (the engine)
 ├── daemon/           # JSON-RPC 2.0 daemon (reference application)
 ├── bridges/          # Out-of-process bridges (atta-dsh-bridge)
 ├── tests/            # Integration tests + test runner + fixtures
 ├── docs/             # Documentation
-├── Cargo.toml        # Workspace root (24 members)
+├── Cargo.toml        # Workspace root (25 members)
 └── README.md         # You are here
 ```
 
@@ -508,13 +508,11 @@ AttaCore/
 | Document | Audience |
 |---|---|
 | [README.md](README.md) | **You are here** — project overview, architecture, quick start |
-| [daemon_rpc_protocol.md](docs/daemon_rpc_protocol.md) | JSON-RPC method reference — fields, types, error codes, TCP auth handshake. The specification; start here to write a client |
-| [daemon_rpc_developer_guide.md](docs/daemon_rpc_developer_guide.md) | Task-oriented daemon integration guide — connect, run a turn, handle streaming events and errors |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | **The concepts and how they fit** — crates, a turn's skeleton, sessions and scenes, history, the execution layer, locks, disk layout |
+| [daemon_rpc_protocol.md](docs/daemon_rpc_protocol.md) | JSON-RPC method reference — fields, types, error codes, TCP auth handshake. Start here to write a client |
 | [extension_points.md](docs/extension_points.md) | **Every seam in the engine** — what you can replace, contribute to or intercept, what it costs, who is allowed. Start here to build on AttaCore |
-| [EXTENSIBILITY_DESIGN.md](docs/EXTENSIBILITY_DESIGN.md) | Why the extension surface is shaped the way it is, and the eleven things that stay in the kernel |
-| [plugin_system_design.md](docs/plugin_system_design.md) | Plugin system design — manifest, capabilities, component loading, contribution points |
-| [recorder_design.md](docs/recorder_design.md) | LLM interaction recording and deterministic replay |
-| [session_and_scene_invariants.md](docs/session_and_scene_invariants.md) | Cross-module constraints on sessions and scenes — read before changing either |
+| [extending_quickjs.md](docs/extending_quickjs.md) | Writing script extensions for the QuickJS carrier — bindable points, the API, examples |
+| [extending_wasm.md](docs/extending_wasm.md) | Writing WebAssembly plugins — manifest, capabilities, contribution points, examples |
 | [schemas/settings.schema.json](docs/schemas/settings.schema.json) | Generated JSON Schema for `settings.json` |
 
 There is currently no prose API reference for **Library mode**; the entry points are `runtime::agent::Builder` and [extension_points.md](docs/extension_points.md), which lists every trait the builder accepts along with a minimal example for each.

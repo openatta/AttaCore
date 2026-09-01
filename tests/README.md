@@ -34,8 +34,8 @@
 
 **验录像还成立吗：`--rerun`。** 把录像里的输入原样重发给真模型，看输出是否还是同一个
 意思。工具调用逐参数精确比对（不交判官），文本交语义判官。产出终端摘要 + 
-`tests/output/<用例>/rerun.md`。花钱，人工触发，不进 `cargo test`。详见
-`docs/recorder_design.md` §6.1–6.5。
+`tests/output/<用例>/rerun.md`。花钱，人工触发，不进 `cargo test`。实现见
+`crates/telemetry/src/recorder/rerun.rs`。
 
 ```sh
 ./tests/run_rerun.sh                 # 当前轮次所有有录像的用例

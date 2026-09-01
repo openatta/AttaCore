@@ -123,7 +123,7 @@ pub enum CallKind {
     ///
     /// `purpose` is a free string on purpose. The set grows with the engine,
     /// and an enum would mean editing this crate for every addition; the
-    /// conventional values are listed in `docs/recorder_design.md`. Readers
+    /// conventional values are the constants in [`call_purpose`]. Readers
     /// treat it as opaque, and it takes no part in replay divergence checks —
     /// renaming a classification must not turn a passing replay red.
     Auxiliary { purpose: String },

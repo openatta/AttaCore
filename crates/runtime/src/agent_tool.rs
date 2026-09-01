@@ -587,7 +587,7 @@ fn bg_task_id() -> String {
 /// team member) session, linking it back to its parent via
 /// `parent_session_id` and marking it `session_kind: Sidechain` — this is
 /// what makes it discoverable via `HistoryStore::child_sessions` and hidden
-/// from `session.list` by default. See docs/session_and_scene_invariants.md §4.
+/// from `session.list` by default. See docs/ARCHITECTURE.md §3.3.
 ///
 /// `project_root` is left `None` here: this crate has no per-session project
 /// identity yet (single-project daemon, P3's job), so there is nothing

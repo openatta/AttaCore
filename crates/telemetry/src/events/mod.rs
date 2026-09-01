@@ -52,8 +52,6 @@ pub struct TelemetryEvent {
 }
 
 /// 事件体枚举 —— 每种变体序列化为 `type` discriminator + 字段。
-///
-/// 当前 36 个变体 + OutcomeRecord 轻量使用 = 40+ 诊断覆盖。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventPayload {

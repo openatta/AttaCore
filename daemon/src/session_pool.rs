@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 
 /// Outcome of comparing a session's recorded `Meta.scene` (if any) against
 /// every scene this daemon currently serves (`SessionPool::active_scenes`) —
-/// see docs/session_and_scene_invariants.md §1.
+/// see docs/ARCHITECTURE.md §3.1.
 /// Resume/fork/close/delete don't yet take a per-request `scene` param
 /// (every caller implicitly means "whichever active scene this session was
 /// actually recorded under"), so `Mismatch`'s reported `requested_scene`
@@ -3345,7 +3345,7 @@ impl SessionPool {
 
     /// Merged settings for `project_root` (global → scene → project tiers),
     /// built once and cached — see the `projects` field doc comment.
-    /// `None` is the global no-project tier (docs/session_and_scene_invariants.md §2):
+    /// `None` is the global no-project tier (docs/ARCHITECTURE.md §3.2):
     /// `local_data_dir` becomes
     /// `global_data_dir` itself rather than `<project>/.atta`, so project-
     /// layer settings are skipped entirely, same as the design's "no

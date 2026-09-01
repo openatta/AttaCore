@@ -23,8 +23,6 @@
 //! keeping only if it says what was actually sent. So a recording carries
 //! whatever secrets the prompt carried, and its directory deserves the same
 //! handling as the transcript it came from. Recording is off unless configured.
-//!
-//! See `docs/recorder_design.md`.
 
 pub mod blob;
 pub mod format;

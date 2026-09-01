@@ -8,7 +8,7 @@
 #
 # 工具调用逐参数精确比对（不交判官），文本交语义判官。
 # 花钱：每条录到的调用一次真实请求，文本有差异时再加一次判官请求。
-# 详见 docs/recorder_design.md §6.1–6.5。
+# 实现见 crates/telemetry/src/recorder/rerun.rs。
 
 set -uo pipefail
 cd "$(dirname "$0")/.."

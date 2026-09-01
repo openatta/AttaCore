@@ -407,7 +407,7 @@ pub fn check_write_for(
 /// Resolution is the caller's to perform, and deliberately so: the symlink
 /// graph belongs to the filesystem being written to, so resolving a path here
 /// would answer about this machine's disk even when the write is going
-/// somewhere else. See `docs/EXECUTION_LAYER_DESIGN.md` §2.2.
+/// somewhere else. See `docs/ARCHITECTURE.md` §5.
 pub fn check_write_resolve_symlinks(
     target: &Path,
     resolved: Option<&Path>,

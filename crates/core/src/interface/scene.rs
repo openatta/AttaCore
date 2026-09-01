@@ -147,7 +147,7 @@ pub trait AgentScene: Send + Sync + 'static {
     /// Tools this scene contributes that no other scene has.
     ///
     /// The three-way split between this, `tools()` and `deferred_tools()` is
-    /// laid out in docs/session_and_scene_invariants.md §7.
+    /// laid out in docs/ARCHITECTURE.md §3.5.
     ///
     /// [`tools`](Self::tools) can only ever *narrow* — it is a whitelist
     /// intersected with whatever registry the host assembled, so a scene had

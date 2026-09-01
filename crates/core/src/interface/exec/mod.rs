@@ -2,7 +2,7 @@
 //!
 //! Four contracts, designed as one because they are entangled: a sandbox
 //! constrains a process, a process needs files and a network, and the network
-//! policy has to reach inside the sandbox. `docs/EXECUTION_LAYER_DESIGN.md` is
+//! policy has to reach inside the sandbox. `docs/ARCHITECTURE.md` §5 is
 //! the blueprint; this module is its vocabulary.
 //!
 //! # What is deliberately not here
