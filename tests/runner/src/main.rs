@@ -221,6 +221,36 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where a recording for `scenario_leaf` actually is, under `cassette_dir` or
+/// beside it.
+///
+/// `--mode api` and `--mode agent` name the same code path and write to
+/// different directories, so a case recorded under one cannot be replayed
+/// under the other — the reader reports "recording not found" and says nothing
+/// about the copy sitting one directory over. A recording is a recording
+/// whichever mode produced it, so a sibling mode's is used rather than refused.
+///
+/// `None` when there is nothing anywhere, which is the honest answer for a
+/// case nobody has recorded yet.
+fn find_recording(cassette_dir: &Path, scenario_leaf: &str) -> Option<PathBuf> {
+    let asked = cassette_dir.join(scenario_leaf);
+    if asked.join("calls.jsonl").exists() {
+        return Some(asked);
+    }
+    ["api", "agent", "cli"].iter().find_map(|mode| {
+        let candidate = cassette_dir
+            .parent()
+            .and_then(|round| round.parent())
+            .map(|scenario_root| {
+                scenario_root
+                    .join(mode)
+                    .join(cassette_dir.file_name().unwrap_or_default())
+                    .join(scenario_leaf)
+            })?;
+        candidate.join("calls.jsonl").exists().then_some(candidate)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_api_mode(
     args: &Args,
@@ -267,11 +297,27 @@ async fn run_api_mode(
         eprintln!("Scene from the case: {scene_name}");
     }
 
+    // Recording writes where it was told; replay reads wherever the recording
+    // is. The directory holds the recording under its leaf name, so the parent
+    // is what the recorder is handed.
+    let recordings_dir = match recorder_mode {
+        RecorderMode::Replay => find_recording(cassette_dir, scenario_leaf)
+            .and_then(|dir| dir.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| cassette_dir.to_path_buf()),
+        _ => cassette_dir.to_path_buf(),
+    };
+    if recordings_dir != cassette_dir {
+        eprintln!(
+            "Replaying the recording at {} — it was made under a different --mode",
+            recordings_dir.display()
+        );
+    }
+
     let runner_config = api_runner::AgentRunnerConfig {
         model: model.clone(),
         recorder_mode,
         recorder_name: scenario_leaf.to_string(),
-        recordings_dir: cassette_dir.to_path_buf(),
+        recordings_dir,
         telemetry_path: Some(telemetry_path),
         fixture_dir: fixture_dir.clone(),
         scene: resolve_scene(&scene_name)?,
@@ -449,29 +495,12 @@ async fn run_rerun_mode(
     // `--mode` selects how a case is *driven*; a recording is a recording
     // whichever mode produced it. Looking under the sibling mode rather than
     // failing keeps `--rerun` from needing a `--mode` that has no meaning here.
-    let mut dir = cassette_dir.join(scenario_leaf);
-    if !dir.join("calls.jsonl").exists() {
-        let alternatives = ["api", "agent", "cli"];
-        let found =
-            alternatives.iter().find_map(|mode| {
-                let candidate = cassette_dir.parent().and_then(|round| round.parent()).map(
-                    |scenario_root| {
-                        scenario_root
-                            .join(mode)
-                            .join(cassette_dir.file_name().unwrap_or_default())
-                            .join(scenario_leaf)
-                    },
-                )?;
-                candidate.join("calls.jsonl").exists().then_some(candidate)
-            });
-        match found {
-            Some(c) => dir = c,
-            None => anyhow::bail!(
-                "no recording at {} — record it first (tests/run_api.sh {scenario})",
-                dir.display()
-            ),
-        }
-    }
+    let dir = find_recording(cassette_dir, scenario_leaf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no recording at {} — record it first (tests/run_api.sh {scenario})",
+            cassette_dir.join(scenario_leaf).display()
+        )
+    })?;
     eprintln!(
         "Rerun: {} (judge={})",
         dir.display(),
