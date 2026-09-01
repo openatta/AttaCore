@@ -375,7 +375,7 @@ fn compile_in_process(dir: &Path) -> anyhow::Result<usize> {
 
 #[cfg(not(feature = "compile"))]
 async fn compile_out_of_process(dir: &Path) -> anyhow::Result<()> {
-    let exe = locate_tool("atta-plugin-compile").ok_or_else(|| {
+    let exe = locate_tool("atta-plugin-compile", "ATTA_PLUGIN_COMPILE").ok_or_else(|| {
         anyhow::anyhow!(
             "this build cannot compile plugin components and `atta-plugin-compile` was not \
              found; set ATTA_PLUGIN_COMPILE to its path"
@@ -449,10 +449,14 @@ fn search_near_executable(relatives: &[&str]) -> Option<std::path::PathBuf> {
 }
 
 /// Find a companion executable this build needs but does not contain.
+///
+/// The environment variable is named rather than derived from `name`: every
+/// one of these tools is already called `atta-something`, so deriving it
+/// produced `ATTA_ATTA_PLUGIN_COMPILE` and nothing anyone was told to set
+/// was ever read.
 #[cfg_attr(feature = "compile", allow(dead_code))]
-fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
-    let var = format!("ATTA_{}", name.to_uppercase().replace('-', "_"));
-    if let Ok(p) = std::env::var(&var) {
+fn locate_tool(name: &str, var: &str) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var(var) {
         let p = std::path::PathBuf::from(p);
         if p.is_file() {
             return Some(p);
