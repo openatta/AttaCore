@@ -1601,12 +1601,23 @@ impl SessionPool {
         if let Some(host) = self.plugins.host() {
             builder = builder.plugin_host(host);
         }
+        // A project's scripts belong to that project: the paths in its
+        // settings resolve against it, and so does the question of whether a
+        // file is inside it — which is what decides whether the script may
+        // rewrite the prompt or only add to it. Binding a session against the
+        // pool's own directory instead gets both wrong for every session
+        // created with a `project_root` of its own: the paths miss, so the
+        // whole set is dropped, and had they hit, the project's own code
+        // would have been judged to come from outside it.
+        let script_root = project_root_for_meta
+            .clone()
+            .unwrap_or_else(|| self.cwd.clone());
         #[cfg(feature = "scripts")]
-        if let Some(bound) = bind_scripts(&settings_snapshot, &self.cwd) {
+        if let Some(bound) = bind_scripts(&settings_snapshot, &script_root) {
             builder = builder.bound_scripts(bound);
         }
         #[cfg(not(feature = "scripts"))]
-        let _ = bind_scripts(&settings_snapshot, &self.cwd);
+        let _ = bind_scripts(&settings_snapshot, &script_root);
 
         // Give this session its own owned `McpManager` built from this
         // project's centrally-connected client handles (cheap `Arc` clones

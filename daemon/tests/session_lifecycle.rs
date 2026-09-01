@@ -1280,6 +1280,164 @@ async fn session_create_binds_to_a_different_project_with_its_own_settings() {
     srv.stop().await;
 }
 
+// ── scripts ─────────────────────────────────────────────────────────────
+
+/// A project that binds a script gets it, through the daemon, on the prompt
+/// the daemon sends.
+///
+/// The harness that covers the nine extension points drives `Builder`
+/// directly, which is the right place to ask what an adapter does and the
+/// wrong place to ask whether a *session* ever gets one: everything between a
+/// `scripts` section on disk and an adapter installed on a session belongs to
+/// the daemon — parsing it, resolving it against a root, binding it once per
+/// session. None of that had a test.
+///
+/// Two claims in one case, because they fail together. The mark proves the
+/// script ran at all. The rewrite proves the daemon judged it the operator's
+/// own code: authority follows the file's location, so a script bound against
+/// the wrong root is a script demoted to add-only — which looks exactly like a
+/// script that chose not to rewrite anything.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn a_projects_own_script_reaches_the_prompt_the_daemon_sends() {
+    let (srv, seen) = start_scripted_server(
+        vec![text_round("hi")],
+        ask_settings_no_memory(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let project = srv._dir.path().join("scripted-project");
+    std::fs::create_dir_all(project.join(".atta").join("scripts")).unwrap();
+    std::fs::write(
+        project.join(".atta").join("scripts").join("house.js"),
+        // Adds one block and rewrites every block already there. The rewrite
+        // is the half only the operator's own code may do.
+        r#"function onAssemble(blocks) {
+             var out = blocks.map(function (b) {
+               return { name: b.name, content: b.content + "\nDAEMON-SCRIPT-EDIT" };
+             });
+             out.push({ name: "daemon.house", content: "DAEMON-SCRIPT-ADD" });
+             return out;
+           }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".atta").join("settings.json"),
+        r#"{
+             "memory_enabled": false,
+             "scripts": [
+               {"path": ".atta/scripts/house.js", "point": "prompt.assemble", "entry": "onAssemble"}
+             ]
+           }"#,
+    )
+    .unwrap();
+
+    let created = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.create","params":{{"project_root":"{}"}},"id":1}}"#,
+            project.display()
+        ),
+    )
+    .await;
+    let sid = created["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session.create failed: {created}"))
+        .to_string();
+
+    run_turn(&srv.sock, Some(&sid), "hello").await;
+
+    // Marks only: a failure here otherwise prints the whole system prompt,
+    // which is a screenful of noise around one missing word.
+    let sent = {
+        let requests = seen.lock().unwrap();
+        let last = requests
+            .last()
+            .expect("the turn must have called the model");
+        format!("{:?}", last.system)
+    };
+    assert!(
+        sent.contains("DAEMON-SCRIPT-ADD"),
+        "the project's script never reached the prompt the daemon sent — \
+         nothing between the settings file and the session installed it"
+    );
+    assert!(
+        sent.contains("DAEMON-SCRIPT-EDIT"),
+        "the script was demoted to add-only, so the daemon judged the \
+         project's own file to be from outside it"
+    );
+
+    srv.stop().await;
+}
+
+/// A binding the daemon cannot honor costs the session every script, not some
+/// of them.
+///
+/// `bind` refuses the set and the daemon logs it; what matters out here is
+/// that the session still starts and runs, carrying none of them. A daemon
+/// that failed the session instead would turn one typo in a settings file
+/// into an agent that will not start.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn one_bad_binding_leaves_the_session_running_with_no_scripts() {
+    let (srv, seen) = start_scripted_server(
+        vec![text_round("hi")],
+        ask_settings_no_memory(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let project = srv._dir.path().join("half-scripted-project");
+    std::fs::create_dir_all(project.join(".atta").join("scripts")).unwrap();
+    std::fs::write(
+        project.join(".atta").join("scripts").join("house.js"),
+        r#"function onAssemble(blocks) {
+             blocks.push({ name: "daemon.house", content: "DAEMON-SCRIPT-ADD" });
+             return blocks;
+           }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".atta").join("settings.json"),
+        r#"{
+             "memory_enabled": false,
+             "scripts": [
+               {"path": ".atta/scripts/house.js", "point": "prompt.assemble", "entry": "onAssemble"},
+               {"path": ".atta/scripts/missing.js", "point": "tool.result", "entry": "onResult"}
+             ]
+           }"#,
+    )
+    .unwrap();
+
+    let created = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.create","params":{{"project_root":"{}"}},"id":1}}"#,
+            project.display()
+        ),
+    )
+    .await;
+    let sid = created["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session.create failed: {created}"))
+        .to_string();
+
+    run_turn(&srv.sock, Some(&sid), "hello").await;
+
+    let sent = {
+        let requests = seen.lock().unwrap();
+        format!("{:?}", requests.last().expect("the turn ran").system)
+    };
+    assert!(
+        !sent.contains("DAEMON-SCRIPT-ADD"),
+        "the good binding was applied although another one could not be \
+         honored — half a configuration is one nobody wrote"
+    );
+
+    srv.stop().await;
+}
+
 #[tokio::test]
 async fn session_create_rejects_a_nonexistent_project_root() {
     let (srv, _seen) =
