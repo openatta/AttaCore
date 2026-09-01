@@ -159,6 +159,13 @@ pub struct ScriptedModel {
     /// rather than folded in — a case asserts on one or the other, and the
     /// goldens stay counts.
     request_texts: Mutex<Vec<String>>,
+    /// The tools each request offered, by name, in order.
+    ///
+    /// Kept beside the text for the same reason the text is kept beside the
+    /// counts: a point whose only effect is to withdraw a tool leaves nothing
+    /// in the prompt and nothing in a count, so without this there is no
+    /// channel a case about it could assert on.
+    request_tools: Mutex<Vec<Vec<String>>>,
 }
 
 /// One model request, reduced to the parts a decision can move.
@@ -184,6 +191,7 @@ impl ScriptedModel {
             replies: Mutex::new(replies.into()),
             calls: Mutex::new(Vec::new()),
             request_texts: Mutex::new(Vec::new()),
+            request_tools: Mutex::new(Vec::new()),
         })
     }
 
@@ -196,6 +204,14 @@ impl ScriptedModel {
     /// call's system prompt and every message in it.
     pub fn request_texts(&self) -> Vec<String> {
         self.request_texts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The tools each request offered, by name, one entry per call.
+    pub fn request_tools(&self) -> Vec<Vec<String>> {
+        self.request_tools
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -218,7 +234,7 @@ impl Model for ScriptedModel {
     async fn stream(
         &self,
         prompt_blocks: Vec<PromptBlock>,
-        _tools: Vec<ToolDef>,
+        tools: Vec<ToolDef>,
         messages: Vec<ModelMessage>,
         params: StreamParams,
         _cancel: CancellationToken,
@@ -253,6 +269,10 @@ impl Model for ScriptedModel {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(text);
+        self.request_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tools.iter().map(|t| t.name.clone()).collect());
         self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())

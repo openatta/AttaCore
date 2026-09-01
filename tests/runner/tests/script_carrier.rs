@@ -7,15 +7,21 @@
 //! consulted, or an adapter installed on a builder nobody reads.
 //!
 //! So this drives a real `Agent`, from real `Settings`, with the scripts read
-//! off `tests/fixtures/scripts/`, and asserts on the requests that reached
+//! off `tests/fixtures/scripts/`, and asserts on what reached
 //! `ScriptedModel`. Each fixture leaves a `SCRIPT-TRACE-` mark that nothing
 //! else in the engine produces — a script that logged, or that made a change
 //! the engine would have made anyway, would let this pass without running.
 //!
-//! Each case is run twice: once with the `scripts` section and once without.
-//! The second run is the load-bearing one. Without it "the mark is in the
-//! request" would also be satisfied by a mark that was in the request all
-//! along.
+//! # Three runs per point
+//!
+//! **Bound** is the one that looks like the feature. **Unbound** is the one
+//! that makes it mean something: without it, "the mark is in the request"
+//! would also be satisfied by a mark that was in the request all along.
+//! **Broken** — the same point, bound to a script that throws — is the one
+//! that would catch the worst failure, an adapter that half-applies what a
+//! dead script asked for. It reads the ledger rather than the request,
+//! because the whole claim is that nothing observable happened; a run where
+//! the script was never bound at all would look identical.
 //!
 //! # Adding a point
 //!
@@ -26,6 +32,7 @@
 
 use base::interface::model::Model;
 use base::interface::scene::AgentScene;
+use base::interface::script::{ScriptLedger, ScriptOutcome};
 use base::interface::settings::{PathSettings, ScriptBinding, Settings, ThinkingMode};
 use base::interface::tool::{
     InMemoryToolRegistry, PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext,
@@ -47,16 +54,27 @@ enum Needs {
     Recall,
 }
 
-/// One bindable point, its fixture, and the mark that fixture leaves.
+/// What the bound run must show, and therefore what the unbound run must not.
+///
+/// Two shapes rather than one, because not every point leaves a mark. A point
+/// whose only effect is to take something away has nothing to add to the
+/// prompt, and a table that could only say "this string appears" left the one
+/// point shaped that way — `model.request` — with no row at all.
+enum Expect {
+    /// This mark reaches the model.
+    MarkAppears(&'static str),
+    /// This tool is no longer among the ones the request offers.
+    ToolWithdrawn(&'static str),
+}
+
+/// One bindable point, its fixture, and what binding it does.
 struct ScriptCase {
     /// Catalog id of the point. Also what a failure names.
     point: &'static str,
     /// File under `tests/fixtures/scripts/`.
     script: &'static str,
     entry: &'static str,
-    /// Must reach the model when the script is bound, and must not when it
-    /// is not.
-    trace: &'static str,
+    expect: Expect,
     /// Must reach the model in neither run. For a script whose job is partly
     /// to take something away: the mark above proves the script ran, this
     /// proves the removing half of it did.
@@ -82,7 +100,7 @@ fn cases() -> Vec<ScriptCase> {
             point: "prompt.assemble",
             script: "prompt_assemble.js",
             entry: "onAssemble",
-            trace: "SCRIPT-TRACE-ASSEMBLE",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-ASSEMBLE"),
             absent: None,
             also: &[],
             turns: &["hello"],
@@ -95,7 +113,7 @@ fn cases() -> Vec<ScriptCase> {
             entry: "onResult",
             // The tool's name is in the mark, so this also pins that the
             // script was told which call it was looking at.
-            trace: "SCRIPT-TRACE-RESULT(ScriptEcho)",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-RESULT(ScriptEcho)"),
             absent: None,
             also: &[],
             turns: &["use the tool"],
@@ -118,7 +136,7 @@ fn cases() -> Vec<ScriptCase> {
             // The rewritten query is the only thing that matches either
             // memory, so a recall reaching the model at all is proof the
             // `before` half ran.
-            trace: "SCRIPT-TRACE-RECALL",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-RECALL"),
             // Which the `after` half then dropped, though the rewritten
             // query found it too.
             absent: Some("secret-key-rotation"),
@@ -131,7 +149,7 @@ fn cases() -> Vec<ScriptCase> {
             point: "prompt.block",
             script: "prompt_block.js",
             entry: "onBlock",
-            trace: "SCRIPT-TRACE-BLOCK",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-BLOCK"),
             absent: None,
             also: &[],
             turns: &["hello"],
@@ -145,7 +163,7 @@ fn cases() -> Vec<ScriptCase> {
             // The mark carries `cwd`, which the identity call cannot see —
             // so a block that was registered with static text at bind time
             // would arrive without it and this would fail.
-            trace: "SCRIPT-TRACE-CONTEXT: working in",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-CONTEXT: working in"),
             absent: None,
             also: &[],
             turns: &["hello"],
@@ -156,7 +174,7 @@ fn cases() -> Vec<ScriptCase> {
             point: "prompt.variable",
             script: "prompt_variable.js",
             entry: "onVariable",
-            trace: "SCRIPT-TRACE-VARIABLE(",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-VARIABLE("),
             absent: None,
             // A variable nothing mentions expands nowhere, so a block that
             // mentions it comes along.
@@ -174,7 +192,7 @@ fn cases() -> Vec<ScriptCase> {
             // and the unbound run is exactly where the tool does answer. So
             // the mark carries the proof on its own: nothing but this script
             // produces it, and the model still got a result.
-            trace: "SCRIPT-TRACE-AROUND",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-AROUND"),
             absent: None,
             also: &[],
             turns: &["use the tool"],
@@ -194,13 +212,28 @@ fn cases() -> Vec<ScriptCase> {
             point: "model.message",
             script: "model_message.js",
             entry: "onMessage",
-            trace: "SCRIPT-TRACE-MESSAGE",
+            expect: Expect::MarkAppears("SCRIPT-TRACE-MESSAGE"),
             absent: None,
             also: &[],
             // Two turns: the mark is put on the *first* turn's reply, and
             // only reaches the model as history on the second.
             turns: &["hello", "and again"],
             replies: || vec![Reply::Text("first answer"), Reply::Text("second answer")],
+            needs: Needs::Nothing,
+        },
+        ScriptCase {
+            point: "model.request",
+            script: "model_request.js",
+            entry: "onRequest",
+            // Nothing this point can do is visible in the prompt: it is handed
+            // the knobs and the tool *names*, and the only one of those the
+            // model's own copy of the request shows is which tools it was
+            // offered. So the absence is the assertion.
+            expect: Expect::ToolWithdrawn("WebSearch"),
+            absent: None,
+            also: &[],
+            turns: &["hello"],
+            replies: || vec![Reply::Text("hi")],
             needs: Needs::Nothing,
         },
     ]
@@ -241,8 +274,47 @@ fn fixtures() -> std::path::PathBuf {
         .join("scripts")
 }
 
-/// Run one case and return every request that reached the model, as text.
-async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
+/// Which of the three runs this is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bind {
+    /// The point's own fixture.
+    Fixture,
+    /// Nothing at this point. The `also` bindings stay, so the two runs still
+    /// differ in exactly the script under test.
+    Nothing,
+    /// A script that throws, at the same point, with the same everything else.
+    Throwing,
+}
+
+/// What one run left behind.
+struct Ran {
+    /// Every request that reached the model, as text.
+    requests: Vec<String>,
+    /// The tools each of those requests offered.
+    tools: Vec<Vec<String>>,
+    ledger: Arc<ScriptLedger>,
+}
+
+impl Ran {
+    fn holds(&self, needle: &str) -> bool {
+        self.requests.iter().any(|r| r.contains(needle))
+    }
+
+    fn offers(&self, tool: &str) -> bool {
+        self.tools.iter().any(|t| t.iter().any(|n| n == tool))
+    }
+
+    fn outcomes_at(&self, point: &str) -> Vec<ScriptOutcome> {
+        self.ledger
+            .records()
+            .into_iter()
+            .filter(|r| r.point == point)
+            .map(|r| r.outcome)
+            .collect()
+    }
+}
+
+async fn run(case: &ScriptCase, bind: Bind) -> Ran {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
 
@@ -272,8 +344,14 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
         .iter()
         .map(|(p, pt, e)| binding(p, pt, e))
         .collect();
-    if bind_scripts {
-        settings.scripts.push(binding(case.script, case.point, case.entry));
+    match bind {
+        Bind::Fixture => settings
+            .scripts
+            .push(binding(case.script, case.point, case.entry)),
+        Bind::Throwing => settings
+            .scripts
+            .push(binding("broken/throws.js", case.point, "boom")),
+        Bind::Nothing => {}
     }
     let settings = Arc::new(settings);
 
@@ -307,11 +385,16 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
 
     // The same call the daemon makes. Installing adapters is `Builder`'s job
     // precisely so this test cannot bind a point the session would not.
-    if let Some(bound) = script_host::bindings::bind_quickjs(&settings.scripts, &fixtures())
+    let ledger = match script_host::bindings::bind_quickjs(&settings.scripts, &fixtures())
         .unwrap_or_else(|e| panic!("case `{}`: {e}", case.point))
     {
-        builder = builder.bound_scripts(bound);
-    }
+        Some(bound) => {
+            let ledger = bound.ledger.clone();
+            builder = builder.bound_scripts(bound);
+            ledger
+        }
+        None => Arc::new(ScriptLedger::new()),
+    };
 
     let (mut agent, mut event_rx, input_tx) = builder.build().expect("agent builds");
 
@@ -348,36 +431,44 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
     drop(input_tx);
     let _ = join.await;
 
-    model_arc.request_texts()
-}
-
-fn holds(requests: &[String], needle: &str) -> bool {
-    requests.iter().any(|r| r.contains(needle))
+    Ran {
+        requests: model_arc.request_texts(),
+        tools: model_arc.request_tools(),
+        ledger,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bound_script_leaves_its_mark_on_what_the_model_receives() {
     for case in cases() {
-        let sent = requests(&case, true).await;
+        let ran = run(&case, Bind::Fixture).await;
         assert!(
-            !sent.is_empty(),
+            !ran.requests.is_empty(),
             "case `{}`: the model was never called",
             case.point
         );
-        assert!(
-            holds(&sent, case.trace),
-            "case `{}`: `{}` never reached the model. Requests:\n{}",
-            case.point,
-            case.trace,
-            sent.join("\n---\n")
-        );
+        match case.expect {
+            Expect::MarkAppears(mark) => assert!(
+                ran.holds(mark),
+                "case `{}`: `{mark}` never reached the model. Requests:\n{}",
+                case.point,
+                ran.requests.join("\n---\n")
+            ),
+            Expect::ToolWithdrawn(tool) => assert!(
+                !ran.offers(tool),
+                "case `{}`: `{tool}` was still offered, so the script did not \
+                 narrow the request. Tools: {:?}",
+                case.point,
+                ran.tools
+            ),
+        }
         if let Some(absent) = case.absent {
             assert!(
-                !holds(&sent, absent),
+                !ran.holds(absent),
                 "case `{}`: `{absent}` reached the model, so the script's \
                  removing half did not run. Requests:\n{}",
                 case.point,
-                sent.join("\n---\n")
+                ran.requests.join("\n---\n")
             );
         }
     }
@@ -389,23 +480,78 @@ async fn a_bound_script_leaves_its_mark_on_what_the_model_receives() {
 #[tokio::test(flavor = "multi_thread")]
 async fn with_no_scripts_section_no_mark_reaches_the_model() {
     for case in cases() {
-        let sent = requests(&case, false).await;
+        let ran = run(&case, Bind::Nothing).await;
         assert!(
-            !sent.is_empty(),
+            !ran.requests.is_empty(),
             "case `{}`: the model was never called",
             case.point
         );
-        assert!(
-            !holds(&sent, case.trace),
-            "case `{}`: `{}` reached the model with no script bound, so the \
-             case proves nothing. Requests:\n{}",
-            case.point,
-            case.trace,
-            sent.join("\n---\n")
-        );
-        if let Some(absent) = case.absent {
-            assert!(!holds(&sent, absent), "case `{}`: `{absent}`", case.point);
+        match case.expect {
+            Expect::MarkAppears(mark) => assert!(
+                !ran.holds(mark),
+                "case `{}`: `{mark}` reached the model with no script bound, so \
+                 the case proves nothing. Requests:\n{}",
+                case.point,
+                ran.requests.join("\n---\n")
+            ),
+            Expect::ToolWithdrawn(tool) => assert!(
+                ran.offers(tool),
+                "case `{}`: `{tool}` was missing with no script bound, so the \
+                 case proves nothing. Tools: {:?}",
+                case.point,
+                ran.tools
+            ),
         }
+        if let Some(absent) = case.absent {
+            assert!(!ran.holds(absent), "case `{}`: `{absent}`", case.point);
+        }
+    }
+}
+
+/// The same point, bound to a script that throws.
+///
+/// Every point promises the same thing about failure: the point is left as the
+/// adapter found it. What makes that hard to check is that a point left alone
+/// looks exactly like a point nothing was bound to — so the observable half of
+/// this (no mark, tool still offered) is only half the case. The ledger is the
+/// other half: it says the script was called and did not come back, which is
+/// the difference between an adapter that survived a failure and an adapter
+/// that was never reached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_that_throws_leaves_its_point_alone_and_the_turn_finishes() {
+    for case in cases() {
+        let ran = run(&case, Bind::Throwing).await;
+        assert!(
+            !ran.requests.is_empty(),
+            "case `{}`: the turn did not reach the model with a throwing script \
+             bound — a failing script must cost its own contribution and nothing \
+             else",
+            case.point
+        );
+        match case.expect {
+            Expect::MarkAppears(mark) => assert!(
+                !ran.holds(mark),
+                "case `{}`: `{mark}` reached the model although the script threw",
+                case.point
+            ),
+            Expect::ToolWithdrawn(tool) => assert!(
+                ran.offers(tool),
+                "case `{}`: `{tool}` was withdrawn although the script threw, so \
+                 a dead script still changed the request",
+                case.point
+            ),
+        }
+
+        let outcomes = ran.outcomes_at(case.point);
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ScriptOutcome::Failed { .. })),
+            "case `{}`: nothing in the ledger says the script failed, so this \
+             run cannot be told apart from one where it was never called. \
+             Ledger at this point: {outcomes:?}",
+            case.point
+        );
     }
 }
 

@@ -384,7 +384,7 @@ function onRetrieval(recall) {
 ```js
 // tests/fixtures/scripts/model_request.js
 function onRequest(req) {
-  return { tools: req.tools.filter(function (t) { return t !== "ScriptEcho"; }) };
+  return { tools: req.tools.filter(function (t) { return t !== "WebSearch"; }) };
 }
 ```
 
