@@ -21,10 +21,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      # Clean today, and the only way it stays that way.
+      # Both are clean today, and the gate is the only thing that keeps them
+      # that way. Formatting is checked first because it needs no build.
+      - name: fmt
+        run: cargo fmt --all --check
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -65,8 +69,3 @@ jobs:
             echo "the two carriers compiled together; the guard in daemon/src/lib.rs is gone"
             exit 1
           fi
-
-# Formatting is deliberately not gated. `cargo fmt --check` currently reports
-# 245 differences across 75 files, and reformatting them in one commit would
-# rewrite the blame of most of the repository to settle a question nobody has
-# asked. Gate it the day the tree is clean, not before.
