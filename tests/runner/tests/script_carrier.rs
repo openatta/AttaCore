@@ -30,19 +30,14 @@
 //! asserting that an unbound point changes nothing passes for the wrong
 //! reason.
 
-use base::interface::model::Model;
-use base::interface::scene::AgentScene;
-use base::interface::script::{ScriptLedger, ScriptOutcome};
-use base::interface::settings::{PathSettings, ScriptBinding, Settings, ThinkingMode};
+use base::interface::script::ScriptOutcome;
 use base::interface::tool::{
-    InMemoryToolRegistry, PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext,
-    ToolResult,
+    PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
 };
 use base::memory::{DurableMemory, MemoryStore, MemoryType};
-use runtime::agent::{Builder, InputMessage};
 use std::sync::Arc;
-use test_runner::scripted_model::{Reply, ScriptedModel};
-use tokio_util::sync::CancellationToken;
+use test_runner::script_session::{drive, Ran, Session};
+use test_runner::scripted_model::Reply;
 
 /// What the session needs beyond a model and a tool for the point to fire.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -239,6 +234,14 @@ fn cases() -> Vec<ScriptCase> {
     ]
 }
 
+/// A store holding the two memories, under the run's own root so the run
+/// leaves nothing behind it.
+fn seeded_memories(root: &std::path::Path) -> Arc<MemoryStore> {
+    let store = Arc::new(MemoryStore::new(root.join("mem-user"), root.join("mem-local")));
+    seed_memories(&store);
+    store
+}
+
 /// Two memories the fixture's rewritten query finds and the user's own words
 /// do not. One of them is the one the fixture then filters out.
 fn seed_memories(store: &MemoryStore) {
@@ -286,246 +289,36 @@ enum Bind {
     Throwing,
 }
 
-/// What one run left behind.
-struct Ran {
-    /// Every request that reached the model, as text.
-    requests: Vec<String>,
-    /// The tools each of those requests offered.
-    tools: Vec<Vec<String>>,
-    /// The transcript the run left, if it was asked to keep one.
-    log: String,
-    ledger: Arc<ScriptLedger>,
+fn session(turns: &[&str], replies: Vec<Reply>) -> Session {
+    Session::new(fixtures(), turns, replies).tool(Arc::new(ScriptEcho) as Arc<dyn Tool>)
 }
 
-impl Ran {
-    fn holds(&self, needle: &str) -> bool {
-        self.requests.iter().any(|r| r.contains(needle))
-    }
-
-    fn offers(&self, tool: &str) -> bool {
-        self.tools.iter().any(|t| t.iter().any(|n| n == tool))
-    }
-
-    fn outcomes_at(&self, point: &str) -> Vec<ScriptOutcome> {
-        self.ledger
-            .records()
-            .into_iter()
-            .filter(|r| r.point == point)
-            .map(|r| r.outcome)
-            .collect()
-    }
-}
-
-/// One session to drive: what is bound, what the user says, what the model
-/// answers.
-///
-/// Separate from [`ScriptCase`] because the crossing cases below are not rows
-/// in a table — each is a specific pair of points arranged a specific way —
-/// and they need the same session, driven the same way, or they are testing a
-/// different engine from the one the table tests.
-struct Session {
-    bindings: Vec<(String, String, String)>,
-    turns: Vec<String>,
-    replies: Vec<Reply>,
-    needs: Needs,
-    keep_log: bool,
-}
-
-impl Session {
-    fn new(turns: &[&str], replies: Vec<Reply>) -> Self {
-        Self {
-            bindings: Vec::new(),
-            turns: turns.iter().map(|t| (*t).to_string()).collect(),
-            replies,
-            needs: Needs::Nothing,
-            keep_log: false,
-        }
-    }
-
-    /// Bind `path` (under `tests/fixtures/scripts/`) at `point`. Order is the
-    /// order of these calls, which is what decides which of two scripts on one
-    /// point is the outer one.
-    fn bind(mut self, path: &str, point: &str, entry: &str) -> Self {
-        self.bindings
-            .push((path.into(), point.into(), entry.into()));
-        self
-    }
-
-    fn recall(mut self) -> Self {
-        self.needs = Needs::Recall;
-        self
-    }
-
-    /// Attach a history store, so the run leaves a transcript to read back.
-    fn logged(mut self) -> Self {
-        self.keep_log = true;
-        self
-    }
-}
-
-fn from_case(case: &ScriptCase, bind: Bind) -> Session {
-    let mut session = Session::new(case.turns, (case.replies)());
-    session.needs = case.needs;
+fn from_case(root: &std::path::Path, case: &ScriptCase, bind: Bind) -> Session {
+    let mut s = session(case.turns, (case.replies)());
     for (path, point, entry) in case.also {
-        session = session.bind(path, point, entry);
+        s = s.bind(path, point, entry);
+    }
+    if case.needs == Needs::Recall {
+        s = s.memory(seeded_memories(root));
     }
     match bind {
-        Bind::Fixture => session.bind(case.script, case.point, case.entry),
-        Bind::Throwing => session.bind("broken/throws.js", case.point, "boom"),
-        Bind::Nothing => session,
+        Bind::Fixture => s.bind(case.script, case.point, case.entry),
+        Bind::Throwing => s.bind("broken/throws.js", case.point, "boom"),
+        Bind::Nothing => s,
     }
 }
 
 async fn run(case: &ScriptCase, bind: Bind) -> Ran {
-    drive(from_case(case, bind)).await
-}
-
-async fn drive(session: Session) -> Ran {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path();
-
-    let model_arc = ScriptedModel::new(session.replies);
-    let model: Arc<dyn Model> = model_arc.clone();
-
-    let mut settings = Settings::defaults_for("script-model");
-    settings.model.model_name = "script-model".into();
-    settings.model.max_tokens = 1024;
-    settings.model.thinking_mode = ThinkingMode::Off;
-    settings.paths = PathSettings {
-        user_data_dir: root.join("user"),
-        global_data_dir: root.join("global"),
-        local_data_dir: root.join("local"),
-        scope: "code".into(),
-    };
-    settings.memory_enabled = session.needs == Needs::Recall;
-    settings.scripts = session
-        .bindings
-        .iter()
-        .map(|(path, point, entry)| ScriptBinding {
-            path: path.into(),
-            point: point.clone(),
-            entry: entry.clone(),
-            timeout_ms: None,
-            calls_per_turn: None,
-        })
-        .collect();
-    let settings = Arc::new(settings);
-
-    let registry = Arc::new(InMemoryToolRegistry::new());
-    registry.register(Arc::new(ScriptEcho) as Arc<dyn Tool>);
-
-    let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::chat::ChatScene);
-    let mut builder = Builder::new()
-        .scene(scene)
-        .model(model)
-        .tools(registry)
-        .settings(settings.clone())
-        .skip_warmup(true);
-
-    if session.keep_log {
-        let store = history::store::JsonlHistoryStore::with_roots(
-            &root.join("workdir"),
-            history::path::HistoryRoots::under(&root.join("global")),
-        )
-        .await
-        .expect("history store");
-        builder = builder.history_store(Arc::new(store));
-    }
-
-    if session.needs == Needs::Recall {
-        let store = Arc::new(MemoryStore::new(
-            root.join("mem-user"),
-            root.join("mem-local"),
-        ));
-        seed_memories(&store);
-        builder = builder.memory_store(store);
-        // The shipped retriever asks the model which memories are relevant,
-        // and a scripted model has no answer to give. The substring one is
-        // the other shipped implementation and exists for exactly this: it
-        // makes recall a pure function of the query, which is what lets a
-        // rewritten query be the thing under test.
-        builder = builder.memory_retriever(Arc::new(
-            base::interface::memory_contracts::SubstringRetriever,
-        ));
-    }
-
-    // The same call the daemon makes. Installing adapters is `Builder`'s job
-    // precisely so this test cannot bind a point the session would not.
-    let ledger = match script_host::bindings::bind_quickjs(&settings.scripts, &fixtures())
-        .unwrap_or_else(|e| panic!("a binding in this session is invalid: {e}"))
-    {
-        Some(bound) => {
-            let ledger = bound.ledger.clone();
-            builder = builder.bound_scripts(bound);
-            ledger
-        }
-        None => Arc::new(ScriptLedger::new()),
-    };
-
-    let (mut agent, mut event_rx, input_tx) = builder.build().expect("agent builds");
-
-    let cancel = CancellationToken::new();
-    let run_cancel = cancel.clone();
-    let join = tokio::spawn(async move { agent.run(run_cancel).await });
-
-    for (i, turn) in session.turns.iter().enumerate() {
-        input_tx
-            .send(InputMessage::User {
-                content: turn.to_string(),
-                attachments: vec![],
-                turn_id: format!("t{i}"),
-            })
-            .expect("send turn");
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let ev = tokio::time::timeout_at(deadline, event_rx.recv())
-                .await
-                .expect("the turn never finished")
-                .expect("event channel closed early");
-            if matches!(
-                ev,
-                base::event::AgentEvent::TurnComplete { .. }
-                    | base::event::AgentEvent::Error { .. }
-            ) {
-                break;
-            }
-        }
-    }
-
-    cancel.cancel();
-    drop(input_tx);
-    let _ = join.await;
-
-    Ran {
-        requests: model_arc.request_texts(),
-        tools: model_arc.request_tools(),
-        log: read_log(root),
-        ledger,
-    }
+    drive(tmp.path(), from_case(tmp.path(), case, bind)).await
 }
 
-/// The transcript this run left, or empty if it kept none.
-fn read_log(root: &std::path::Path) -> String {
-    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                collect(&p, out);
-            } else if p.extension().is_some_and(|x| x == "jsonl") {
-                out.push(p);
-            }
-        }
-    }
-    let mut logs = Vec::new();
-    collect(&root.join("global"), &mut logs);
-    logs.iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The session is built from the run's own root, so anything a case needs on
+/// disk lands inside the directory that goes away with it.
+async fn run_session(build: impl FnOnce(&std::path::Path) -> Session) -> Ran {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let session = build(tmp.path());
+    drive(tmp.path(), session).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -676,8 +469,8 @@ fn calls_the_echo_tool() -> Vec<Reply> {
 /// that only appears when some other script starts answering from a cache.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_from_the_around_ring_skips_the_result_point() {
-    let ran = drive(
-        Session::new(&["use the tool"], calls_the_echo_tool())
+    let ran = run_session(|_| 
+        session(&["use the tool"], calls_the_echo_tool())
             .bind("tool_around.js", "tool.around", "onAround")
             .bind("tool_result.js", "tool.result", "onResult"),
     )
@@ -703,8 +496,8 @@ async fn an_answer_from_the_around_ring_skips_the_result_point() {
 /// error, and the result point is not offered it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_denial_from_the_around_ring_reaches_the_model_unrewritten() {
-    let ran = drive(
-        Session::new(&["use the tool"], calls_the_echo_tool())
+    let ran = run_session(|_| 
+        session(&["use the tool"], calls_the_echo_tool())
             .bind("tool_around_deny.js", "tool.around", "onAround")
             .bind("tool_result.js", "tool.result", "onResult"),
     )
@@ -731,8 +524,8 @@ async fn a_denial_from_the_around_ring_reaches_the_model_unrewritten() {
 /// round would look identical until the day two scripts disagree.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_rings_on_one_point_run_in_the_order_they_were_bound() {
-    let ran = drive(
-        Session::new(&["use the tool"], calls_the_echo_tool())
+    let ran = run_session(|_| 
+        session(&["use the tool"], calls_the_echo_tool())
             .bind("tool_around.js", "tool.around", "onAround")
             .bind("tool_around_second.js", "tool.around", "onAround"),
     )
@@ -757,8 +550,8 @@ async fn two_rings_on_one_point_run_in_the_order_they_were_bound() {
 /// contribution permanent for the session.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_block_one_script_registered_can_be_removed_by_another() {
-    let with_both = drive(
-        Session::new(&["hello"], vec![Reply::Text("hi")])
+    let with_both = run_session(|_| 
+        session(&["hello"], vec![Reply::Text("hi")])
             .bind("prompt_block.js", "prompt.block", "onBlock")
             .bind("prompt_assemble_delete.js", "prompt.assemble", "onAssemble"),
     )
@@ -770,8 +563,8 @@ async fn a_block_one_script_registered_can_be_removed_by_another() {
 
     // Without the remover the block is there, so the assertion above is about
     // the removal and not about the block never having been registered.
-    let registered_only = drive(
-        Session::new(&["hello"], vec![Reply::Text("hi")])
+    let registered_only = run_session(|_| 
+        session(&["hello"], vec![Reply::Text("hi")])
             .bind("prompt_block.js", "prompt.block", "onBlock"),
     )
     .await;
@@ -789,8 +582,8 @@ async fn a_block_one_script_registered_can_be_removed_by_another() {
 /// it appears *where the placeholder was*, in text a different script wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_variable_expands_inside_a_block_another_script_contributed() {
-    let ran = drive(
-        Session::new(&["hello"], vec![Reply::Text("hi")])
+    let ran = run_session(|_| 
+        session(&["hello"], vec![Reply::Text("hi")])
             .bind("prompt_block_var.js", "prompt.block", "onBlock")
             .bind("prompt_variable.js", "prompt.variable", "onVariable"),
     )
@@ -818,8 +611,8 @@ async fn a_variable_expands_inside_a_block_another_script_contributed() {
 /// one: that is what `tool.around` and the permission gate are for.
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
-    let ran = drive(
-        Session::new(
+    let ran = run_session(|_| 
+        session(
             &["use the skill"],
             vec![
                 Reply::Tool {
@@ -860,8 +653,8 @@ async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
 /// place would say so.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewritten_message_is_the_one_that_gets_logged() {
-    let ran = drive(
-        Session::new(
+    let ran = run_session(|_| 
+        session(
             &["hello", "and again"],
             vec![Reply::Text("first answer"), Reply::Text("second answer")],
         )
@@ -894,8 +687,8 @@ async fn a_rewritten_message_is_the_one_that_gets_logged() {
 /// in the ledger is what makes the difference visible.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_recall_hook_runs_on_every_turn() {
-    let ran = drive(
-        Session::new(
+    let ran = run_session(|root| 
+        session(
             &["when can I ship this?", "and after that?"],
             // Spare answers: memory work makes model calls of its own, and
             // running out of scripted replies would fail this case for a
@@ -908,7 +701,7 @@ async fn the_recall_hook_runs_on_every_turn() {
             ],
         )
         .bind("memory_retrieval.js", "memory.retrieval_hook", "onRetrieval")
-        .recall(),
+        .memory(seeded_memories(root)),
     )
     .await;
 
