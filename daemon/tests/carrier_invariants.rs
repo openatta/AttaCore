@@ -180,6 +180,40 @@ fn every_carrier_is_optional_at_compile_time() {
     }
 }
 
+/// **Rule 3, the other half.** Optional is not enough: two optional features
+/// can both be on, and cargo's unification means that is reachable without
+/// anyone choosing it. The guard that refuses it lives in `lib.rs`, where a
+/// grep for the feature names would not find it — so this looks for it by
+/// name, and `locked_build.sh` proves it actually fires.
+#[test]
+fn the_two_carriers_cannot_both_be_compiled_in() {
+    let root = repo_root();
+    let lib = std::fs::read_to_string(root.join("daemon/src/lib.rs")).expect("daemon lib");
+    let guard = lib
+        .lines()
+        .position(|l| l.contains(r#"cfg(all(feature = "scripts", feature = "plugins"))"#))
+        .expect("daemon/src/lib.rs must refuse a build carrying both carriers");
+    assert!(
+        lib.lines()
+            .skip(guard)
+            .take(3)
+            .any(|l| l.contains("compile_error!")),
+        "the both-carriers cfg must be attached to a `compile_error!`, not to \
+         something that merely warns"
+    );
+
+    let manifest =
+        std::fs::read_to_string(root.join("daemon/Cargo.toml")).expect("daemon manifest");
+    let default = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("default = ["))
+        .expect("daemon must declare default features");
+    assert!(
+        default.contains("scripts") && !default.contains("plugins"),
+        "the script carrier is the default one; found: {default}"
+    );
+}
+
 /// **Rule 4.** Disclosure is about what an extension *says*, not about how it
 /// runs, so it cannot be a property of one carrier. This checks the module
 /// that builds it reaches for the manifest and not for a runtime.

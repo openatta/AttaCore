@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the plugin-free build.
+# Verify the carrier builds: one carrier or none, never both.
 #
 # Some deployments must be able to state that the binary they ship contains no
 # plugin execution path at all. That claim is only true if the plugin crates
@@ -28,10 +28,20 @@ LOCKED_TARGET="${TMPDIR:-/tmp}/atta-locked-check-$$"
 trap 'rm -rf "$LOCKED_TARGET"' EXIT
 export CARGO_TARGET_DIR="$LOCKED_TARGET"
 
-echo "==> building daemon without the plugins feature"
+echo "==> asserting the two carriers cannot be built together"
+# The rule the feature layout exists to state. It is enforced by a
+# `compile_error!` in `daemon/src/lib.rs`, and a compile-time guard nobody
+# tests is a guard that gets deleted by whoever is fixing an unrelated build.
+if cargo check -p daemon --features plugins >/dev/null 2>&1; then
+  echo "FAIL: a build carrying both the script and plugin carriers was accepted" >&2
+  echo "The guard in daemon/src/lib.rs is gone or unreachable." >&2
+  exit 1
+fi
+
+echo "==> building daemon without either carrier"
 cargo build -p daemon --no-default-features
 
-echo "==> asserting the carrier crates are absent from the dependency graph"
+echo "==> asserting no carrier machinery is in the dependency graph"
 leaked=$(cargo tree -p daemon --no-default-features -e normal \
   | grep -Eo '\b(plugin|plugin-host|wasm-host|wasmtime|cranelift-codegen|script-host|rquickjs|rquickjs-core|rquickjs-sys) v' || true)
 if [ -n "$leaked" ]; then
@@ -61,6 +71,13 @@ fi
 
 echo "==> running the daemon test suite in the locked configuration"
 cargo test -p daemon --no-default-features
+
+# The plugin carrier is no longer part of the default build, so `cargo test
+# --workspace` does not reach it any more. Nothing else does either — which
+# would leave the whole subsystem untested a week after it stopped being the
+# default, and nobody would notice until a release.
+echo "==> running the daemon test suite carrying the plugin carrier"
+cargo test -p daemon --no-default-features --features plugin-compile
 
 echo "==> the DSH bridge is a separate process and has its own suite"
 if command -v node >/dev/null 2>&1; then

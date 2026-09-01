@@ -796,10 +796,16 @@ holding:
    `CapabilityDeclaration` and asks; it does not answer.
 2. **Carriers do not call each other.** They reach each other through host
    contracts, never a direct call across memory models.
-3. **Every carrier is a compile-time feature, independently.** A build carries
-   one, both or neither: `plugins` brings the WebAssembly tier, `scripts`
-   brings QuickJS, and `cargo build -p daemon --no-default-features` links
-   neither.
+3. **Every carrier is a compile-time feature, and a build carries at most
+   one.** `scripts` brings QuickJS and is the default; `plugins` brings the
+   WebAssembly tier and needs `--no-default-features` to get it, because
+   asking for both is refused by a `compile_error!` rather than quietly
+   accepted. `cargo build -p daemon --no-default-features` links neither.
+
+   Exclusive because carrying both is twice the attack surface for a
+   capability nobody asked for twice, and because cargo's feature unification
+   makes "both" somewhere you arrive by accident rather than by choice —
+   `--features plugins` without `--no-default-features` is enough to do it.
 4. **Disclosure covers every carrier.** It is about what an extension *says*,
    so it names no carrier at all.
 

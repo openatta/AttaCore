@@ -13,6 +13,8 @@ use daemon::config::StaticDaemonPaths;
 use daemon::rpc::codes;
 use daemon::{DaemonServer, SessionPool};
 use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
+// Only the plugin-archive helper hashes anything, and that helper is gated.
+#[cfg(feature = "plugins")]
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
