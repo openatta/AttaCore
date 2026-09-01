@@ -274,6 +274,55 @@ Build the locked artifact for that one package — never `--workspace`, since ca
 
 Full guide: [`docs/extending_wasm.md`](docs/extending_wasm.md).
 
+### Script Carrier
+
+The tier between "recompile the engine" and "spawn a process". A script is a
+`.js` file and one line of configuration; the engine reads it when the session
+is built, calls the function you named at the point you named, and hands the
+result back to whichever part of the engine asked. No build step, no
+subprocess, no network — QuickJS is embedded in the daemon and a call costs
+microseconds.
+
+```json
+{ "scripts": [
+  { "path": ".atta/scripts/house_style.js", "point": "prompt.assemble", "entry": "onAssemble" }
+] }
+```
+
+**Nine points today**: the four that write a prompt (`prompt.assemble`,
+`prompt.block`, `prompt.context`, `prompt.variable`), the two rings around a
+tool call (`tool.around`, `tool.result`), the two around a model call
+(`model.request`, `model.message`), and both ends of memory recall
+(`memory.retrieval_hook`).
+
+**A failing script changes nothing.** Throwing, running past its clock,
+exhausting its quota, or answering in a shape the point cannot use all leave
+that point exactly as the adapter found it — a prompt half-edited by a script
+that died mid-pass is worse than an unedited one, because nothing downstream
+can tell which it is looking at. Every call is written down: which point, which
+turn, and whether the point took the answer, found nothing to take, never got
+one, or refused it.
+
+**What a script may do follows the file, not the declaration.** A script inside
+the project is the operator's own code and may rewrite the prompt; one that
+arrived from anywhere else may add to it and no more — because a declaration is
+exactly what a script from outside would lie in.
+
+**Policy follows the work.** The rings around tool and model calls travel into
+sub-agents, team members and background tasks; the prompt contributions stay
+with the session that bound them. A rule that stopped at the first delegation
+would be one `Agent` call away from being bypassed, by the model, without
+anyone deciding it.
+
+**Budgets are per binding, per turn**: 100 ms and 1000 calls by default, both
+configurable, with the clock enforced inside the interpreter so a `while (true)`
+stops too. Memory is capped at 16 MB per runtime.
+
+The carrier is the `scripts` feature of `daemon`, on by default, and mutually
+exclusive with `plugins` — a build carries one extension carrier or none.
+
+Full guide: [`docs/extending_quickjs.md`](docs/extending_quickjs.md).
+
 ## Crate Map
 
 | Layer | Crate | Responsibility | Key Exports |
@@ -513,7 +562,9 @@ AttaCore/
 | [extension_points.md](docs/extension_points.md) | **Every seam in the engine** — what you can replace, contribute to or intercept, what it costs, who is allowed. Start here to build on AttaCore |
 | [extending_quickjs.md](docs/extending_quickjs.md) | Writing script extensions for the QuickJS carrier — bindable points, the API, examples |
 | [extending_wasm.md](docs/extending_wasm.md) | Writing WebAssembly plugins — manifest, capabilities, contribution points, examples |
+| [testing_scripts.md](docs/testing_scripts.md) | How the script carrier's nine points are tested, and what a case has to satisfy to count |
 | [schemas/settings.schema.json](docs/schemas/settings.schema.json) | Generated JSON Schema for `settings.json` |
+| [tests/README.md](tests/README.md) | The four layers of the test system, how to run each, and why recordings are not committed |
 
 There is currently no prose API reference for **Library mode**; the entry points are `runtime::agent::Builder` and [extension_points.md](docs/extension_points.md), which lists every trait the builder accepts along with a minimal example for each.
 

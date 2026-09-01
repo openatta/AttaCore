@@ -1,7 +1,8 @@
 # template_project
 
-AttaCore 测试系统用的模板项目 fixture。目录结构对齐 `docs/CONFIG_LAYOUT.md` 定义的项目级布局，
-AGENT/SKILLS/HOOK/RULES/MCP 全部配好，用来验证"配置真的生效"，不是只测裸 Agent。
+AttaCore 测试系统用的模板项目 fixture。目录结构就是一个真实项目的项目级布局
+（`docs/ARCHITECTURE.md` 的「磁盘布局」一节），AGENT/SKILLS/HOOK/RULES/MCP 全部配好，
+用来验证"配置真的生效"，不是只测裸 Agent。
 
 | 配置面 | 位置 | 验证点 |
 |---|---|---|
