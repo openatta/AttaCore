@@ -325,7 +325,7 @@
       "properties": {
         "api_key": {
           "default": null,
-          "description": "Stored in plaintext, same as every other settings.json field.",
+          "description": "Stored in plaintext, same as every other settings.json field — which\nis why [`Debug`](std::fmt::Debug) is hand-written below rather than\nderived. A host that must not keep a credential on disk supplies one\nthrough [`CredentialSource`](crate::interface::credentials::CredentialSource)\nand leaves this unset.",
           "type": [
             "string",
             "null"
@@ -420,6 +420,13 @@
           },
           "type": "array"
         },
+        "allow_write": {
+          "description": "Paths to re-allow writing, on top of the built-in deny defaults. Most\nspecific wins.\n\nThe write-side counterpart of [`allow_read`](Self::allow_read), and it\nexists for the same reason: the defaults sit on real workflows. A\nproject that keeps a checked-in `.env.example`, or a deployment whose\nagent is meant to maintain a private-registry `.npmrc`, has to be able\nto say \"that one is fine here\".\n\nThis exempts a path from the *deny* rules only. Where a tool may write\nat all is a different question, answered by `additional_directories` —\nkeeping them apart is what stops one setting quietly widening the\nproject boundary.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "allowed_domains": {
           "items": {
             "type": "string"
@@ -437,15 +444,68 @@
           },
           "type": "array"
         },
+        "deny_write": {
+          "description": "Extra filename segments a tool may never write, on top of the built-in\ncredential defaults (`.env`, `id_rsa`, `.ssh`, `.atta`, ...). A path is\nrefused if *any* of its components matches one, or begins with one\nfollowed by a dot — so `.env` also covers `.env.production`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "network_mode": {
           "$ref": "#/$defs/NetworkModeConfig",
           "default": "unrestricted",
           "description": "Outbound network policy for sandboxed `Bash` commands."
+        },
+        "require_enforcement": {
+          "default": false,
+          "description": "Refuse to run a sandboxed command when the platform cannot actually\nenforce the policy, instead of running it unconstrained.\n\nOff by default, which is the historical behavior: on Linux without\n`bwrap`, and on platforms with no backend at all, a command whose\npolicy cannot be honored runs anyway with a warning. That is a silent\ndowngrade from \"constrained\" to \"unconstrained\" — fine for a laptop,\nnot fine for a host that treats the sandbox as a boundary.\n\nTurning it on makes such a command fail with an error naming the\nmissing backend. The default is `false` rather than `true` only\nbecause flipping it would break every Linux box without bubblewrap\ninstalled, and every Windows host, on upgrade.",
+          "type": "boolean"
         }
       },
       "required": [
         "deny_read",
         "allowed_domains"
+      ],
+      "type": "object"
+    },
+    "ScriptBinding": {
+      "description": "One script, bound to one extension point.\n\n```jsonc\n\"scripts\": [\n  { \"path\": \".atta/scripts/prompt.js\", \"point\": \"prompt.assemble\", \"entry\": \"onAssemble\" }\n]\n```\n\nThe point is a catalog id — see `base::interface::catalog` and\n`docs/extension_points.md`. A binding naming a point the engine does not\nhave, or one scripts may not use, is refused at startup with a message\nsaying which; it is not silently ignored, because a script that quietly\nnever runs is worse than one that fails to load.\n\nAuthority follows the file's location, not the configuration: a script\ninside the project is the operator's own and may rewrite anything, while\none that arrived with a plugin may add. Nothing in this struct can change\nthat, which is deliberate — it would otherwise be a field a plugin could\nset for itself.",
+      "properties": {
+        "calls_per_turn": {
+          "description": "How many times it may run in a turn. Defaults to the carrier's.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "entry": {
+          "description": "The function the script exports.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the script, relative to the project root or absolute.",
+          "type": "string"
+        },
+        "point": {
+          "description": "Which extension point, by its catalog id.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Wall clock for one call. Defaults to the carrier's own budget.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "point",
+        "entry"
       ],
       "type": "object"
     },
@@ -650,8 +710,16 @@
         "allowed_domains": [],
         "dangerously_disable_sandbox": false,
         "deny_read": [],
-        "network_mode": "unrestricted"
+        "network_mode": "unrestricted",
+        "require_enforcement": false
       }
+    },
+    "scripts": {
+      "description": "Scripts bound to extension points — see [`ScriptBinding`]. Empty by\ndefault, and inert in a build without a script engine.",
+      "items": {
+        "$ref": "#/$defs/ScriptBinding"
+      },
+      "type": "array"
     },
     "session_dir": {
       "default": null,
