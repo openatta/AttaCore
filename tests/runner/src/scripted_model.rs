@@ -151,6 +151,14 @@ pub struct ScriptedModel {
     /// history, the tool-result budget truncating one of its entries, a
     /// continuation nudge being appended.
     calls: Mutex<Vec<Call>>,
+    /// The same requests as text, prompt blocks and messages together.
+    ///
+    /// `Call` deliberately reduces a request to counts, which is what keeps
+    /// the behavior net's goldens readable. An extension that leaves a mark
+    /// in the prompt is invisible in counts, so the text is kept alongside
+    /// rather than folded in — a case asserts on one or the other, and the
+    /// goldens stay counts.
+    request_texts: Mutex<Vec<String>>,
 }
 
 /// One model request, reduced to the parts a decision can move.
@@ -175,12 +183,22 @@ impl ScriptedModel {
         Arc::new(Self {
             replies: Mutex::new(replies.into()),
             calls: Mutex::new(Vec::new()),
+            request_texts: Mutex::new(Vec::new()),
         })
     }
 
     /// Each request the engine made, in order.
     pub fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Everything the engine sent, as text: one entry per call, holding that
+    /// call's system prompt and every message in it.
+    pub fn request_texts(&self) -> Vec<String> {
+        self.request_texts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Scripted replies never consumed. A case that ends with leftovers took a
@@ -199,31 +217,42 @@ impl Model for ScriptedModel {
 
     async fn stream(
         &self,
-        _prompt_blocks: Vec<PromptBlock>,
+        prompt_blocks: Vec<PromptBlock>,
         _tools: Vec<ToolDef>,
         messages: Vec<ModelMessage>,
         params: StreamParams,
         _cancel: CancellationToken,
     ) -> Result<ModelStream, ModelError> {
+        let mut text = String::new();
+        for b in &prompt_blocks {
+            text.push_str(&b.content);
+            text.push('\n');
+        }
         let mut content_bytes = 0usize;
         let mut truncated_results = 0usize;
         for m in &messages {
             for block in &m.content {
-                let text = match block {
+                let text_of = match block {
                     base::interface::model::ModelContentBlock::Text { text } => Some(text.as_str()),
                     base::interface::model::ModelContentBlock::ToolResult { content, .. } => {
                         Some(content.as_str())
                     }
                     _ => None,
                 };
-                if let Some(text) = text {
-                    content_bytes += text.len();
-                    if text.starts_with("[Tool result truncated:") {
+                if let Some(block_text) = text_of {
+                    content_bytes += block_text.len();
+                    if block_text.starts_with("[Tool result truncated:") {
                         truncated_results += 1;
                     }
+                    text.push_str(block_text);
+                    text.push('\n');
                 }
             }
         }
+        self.request_texts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(text);
         self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())

@@ -418,6 +418,7 @@ pub mod bindings {
         "prompt.context",
         "prompt.variable",
         "tool.result",
+        "memory.retrieval_hook",
     ];
 
     /// What a set of bindings produced, sorted by where each piece has to be
@@ -443,6 +444,8 @@ pub mod bindings {
         pub prompt_variables: Vec<(String, base::interface::prompt_registry::VariableProvider)>,
         /// What a tool result may look like.
         pub tool_results: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
+        /// Both ends of memory recall.
+        pub retrieval_hooks: Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>,
         /// Every carrier that was built, so a turn can reset their quotas.
         ///
         /// Without this the per-turn budget is a per-session one: nothing
@@ -458,13 +461,16 @@ pub mod bindings {
                 .field("prompt_blocks", &self.prompt_blocks.len())
                 .field("prompt_variables", &self.prompt_variables.len())
                 .field("tool_results", &self.tool_results.len())
+                .field("retrieval_hooks", &self.retrieval_hooks.len())
                 .finish()
         }
     }
 
     impl BoundScripts {
         pub fn is_empty(&self) -> bool {
-            !self.registers_on_prompt_registry() && self.tool_results.is_empty()
+            !self.registers_on_prompt_registry()
+                && self.tool_results.is_empty()
+                && self.retrieval_hooks.is_empty()
         }
 
         /// Whether [`apply_to_registry`](Self::apply_to_registry) has anything
@@ -641,6 +647,12 @@ pub mod bindings {
                         &binding.entry,
                     ),
                 ),
+                "memory.retrieval_hook" => out.retrieval_hooks.push(Arc::new(
+                    base::interface::script_adapters::RetrievalHookScript::new(
+                        carrier,
+                        &binding.entry,
+                    ),
+                )),
                 "tool.result" => out.tool_results.push(Arc::new(
                     base::interface::script_adapters::ToolResultScript::new(
                         carrier,
@@ -1057,4 +1069,83 @@ mod binding_tests {
         std::fs::create_dir_all(&base).unwrap();
         base
     }
+
+
+    /// One function, called twice, told which half of recall it is in. The
+    /// phase argument is the whole of that design, so a case that does two
+    /// different things off it is what pins it.
+    #[test]
+    fn one_script_answers_both_ends_of_recall() {
+        use base::interface::memory_contracts::RetrievalRequest;
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("recall.js"),
+            "function onRetrieval(r) {\n\
+               if (r.phase === 'before') { return { query: r.query + ' (expanded)' }; }\n\
+               return r.names.filter(function (n) { return n.indexOf('secret') === -1; });\n\
+             }",
+        )
+        .unwrap();
+
+        let mut b = binding("recall.js");
+        b.point = "memory.retrieval_hook".into();
+        b.entry = "onRetrieval".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding is valid");
+        assert_eq!(bound.retrieval_hooks.len(), 1);
+
+        let mut request = RetrievalRequest {
+            query: "how do we deploy".into(),
+            limit: 5,
+            already_surfaced: Default::default(),
+            recent_tools: Vec::new(),
+            model_name: "test".into(),
+            session_id: None,
+        };
+        bound.retrieval_hooks[0].before_retrieve(&mut request);
+        assert_eq!(request.query, "how do we deploy (expanded)");
+
+        let mut names = vec!["deploy-window".to_string(), "secret-key".to_string()];
+        bound.retrieval_hooks[0].after_retrieve(&request, &mut names);
+        assert_eq!(names, ["deploy-window"]);
+    }
+
+
+    /// A script that throws is a script that decided nothing.
+    #[test]
+    fn a_recall_script_that_throws_leaves_recall_alone() {
+        use base::interface::memory_contracts::RetrievalRequest;
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("boom.js"),
+            "function onRetrieval() { throw new Error('boom'); }",
+        )
+        .unwrap();
+        let mut b = binding("boom.js");
+        b.point = "memory.retrieval_hook".into();
+        b.entry = "onRetrieval".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).unwrap();
+
+        let mut request = RetrievalRequest {
+            query: "untouched".into(),
+            limit: 5,
+            already_surfaced: Default::default(),
+            recent_tools: Vec::new(),
+            model_name: "test".into(),
+            session_id: None,
+        };
+        bound.retrieval_hooks[0].before_retrieve(&mut request);
+        assert_eq!(request.query, "untouched");
+        assert_eq!(request.limit, 5);
+
+        let mut names = vec!["kept".to_string()];
+        bound.retrieval_hooks[0].after_retrieve(&request, &mut names);
+        assert_eq!(names, ["kept"]);
+    }
+
 }

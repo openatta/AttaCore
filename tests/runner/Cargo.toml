@@ -46,3 +46,4 @@ time          = { workspace = true }
 
 [dev-dependencies]
 tempfile      = { workspace = true }
+script-host   = { workspace = true }
