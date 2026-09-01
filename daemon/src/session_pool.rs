@@ -1605,7 +1605,7 @@ impl SessionPool {
         // prompt ones on a registry, the rest on the builder.
         #[cfg(feature = "scripts")]
         if let Some(bound) = bind_scripts(&settings_snapshot, &self.cwd) {
-            if !bound.assembly_hooks.is_empty() {
+            if bound.registers_on_prompt_registry() {
                 let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
                 bound.apply_to_registry(registry.as_ref());
                 builder = builder.prompt_registry(registry);

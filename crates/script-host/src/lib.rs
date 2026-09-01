@@ -412,7 +412,13 @@ pub mod bindings {
     /// and saying so is the point — a binding to a point that is open in
     /// principle and unimplemented here is refused at startup with a message
     /// naming what is available, rather than accepted and silently never run.
-    pub const BINDABLE_POINTS: &[&str] = &["prompt.assemble", "tool.result"];
+    pub const BINDABLE_POINTS: &[&str] = &[
+        "prompt.assemble",
+        "prompt.block",
+        "prompt.context",
+        "prompt.variable",
+        "tool.result",
+    ];
 
     /// What a set of bindings produced, sorted by where each piece has to be
     /// installed.
@@ -430,6 +436,11 @@ pub mod bindings {
             Arc<dyn base::interface::prompt_assembly::AsyncAssemblyHook>,
             Authority,
         )>,
+        /// Blocks the scripts contribute, each already carrying the name and
+        /// the order its script asked for.
+        pub prompt_blocks: Vec<base::interface::prompt_registry::RegisteredBlock>,
+        /// What `{{name}}` expands to, by name.
+        pub prompt_variables: Vec<(String, base::interface::prompt_registry::VariableProvider)>,
         /// What a tool result may look like.
         pub tool_results: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
         /// Every carrier that was built, so a turn can reset their quotas.
@@ -444,6 +455,8 @@ pub mod bindings {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("BoundScripts")
                 .field("assembly_hooks", &self.assembly_hooks.len())
+                .field("prompt_blocks", &self.prompt_blocks.len())
+                .field("prompt_variables", &self.prompt_variables.len())
                 .field("tool_results", &self.tool_results.len())
                 .finish()
         }
@@ -451,13 +464,28 @@ pub mod bindings {
 
     impl BoundScripts {
         pub fn is_empty(&self) -> bool {
-            self.assembly_hooks.is_empty() && self.tool_results.is_empty()
+            !self.registers_on_prompt_registry() && self.tool_results.is_empty()
+        }
+
+        /// Whether [`apply_to_registry`](Self::apply_to_registry) has anything
+        /// to install, and therefore whether the session needs a registry of
+        /// its own at all.
+        pub fn registers_on_prompt_registry(&self) -> bool {
+            !self.assembly_hooks.is_empty()
+                || !self.prompt_blocks.is_empty()
+                || !self.prompt_variables.is_empty()
         }
 
         /// Install the prompt-side pieces on a registry.
         pub fn apply_to_registry(&self, registry: &dyn PromptRegistry) {
             for (hook, authority) in &self.assembly_hooks {
                 registry.register_async_assembly_hook(hook.clone(), authority.clone());
+            }
+            for block in &self.prompt_blocks {
+                registry.register_block(block.clone());
+            }
+            for (name, provider) in &self.prompt_variables {
+                registry.register_variable(name, provider.clone());
             }
         }
     }
@@ -592,6 +620,27 @@ pub mod bindings {
                     Arc::new(PromptAssemblyScript::new(carrier, &binding.entry)),
                     authority,
                 )),
+                // A contribution that could not say what it contributes is
+                // not registered, and that is the whole failure: the prompt is
+                // the one that would have been assembled with nothing bound.
+                "prompt.block" => out.prompt_blocks.extend(
+                    base::interface::script_adapters::prompt_block_from_script(
+                        carrier,
+                        &binding.entry,
+                    ),
+                ),
+                "prompt.context" => out.prompt_blocks.extend(
+                    base::interface::script_adapters::prompt_context_from_script(
+                        carrier,
+                        &binding.entry,
+                    ),
+                ),
+                "prompt.variable" => out.prompt_variables.extend(
+                    base::interface::script_adapters::prompt_variable_from_script(
+                        carrier,
+                        &binding.entry,
+                    ),
+                ),
                 "tool.result" => out.tool_results.push(Arc::new(
                     base::interface::script_adapters::ToolResultScript::new(
                         carrier,
@@ -833,6 +882,151 @@ mod binding_tests {
         };
         bound.tool_results[0].transform(&call, &mut draft);
         assert_eq!(draft.text, "untouched");
+    }
+
+    /// The three contribution points, through the real interpreter and the
+    /// real registry: a script names itself, places itself, and its text is in
+    /// the assembled block.
+    #[test]
+    fn a_script_contributes_a_block_a_computed_block_and_a_variable() {
+        use base::interface::prompt_registry::{interpolate, PromptContent};
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("block.js"),
+            "function onBlock() { return { name: 'team.conventions', order: 250, \
+               content: 'be brief' }; }",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("context.js"),
+            "function onContext(ctx) {\n\
+               if (ctx === null) { return { name: 'project.status', order: 260 }; }\n\
+               return 'on ' + ctx.gitBranch + ' in ' + ctx.cwd;\n\
+             }",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("variable.js"),
+            "function onVariable(ctx) {\n\
+               if (ctx === null) { return { name: 'branch' }; }\n\
+               return ctx.gitBranch;\n\
+             }",
+        )
+        .unwrap();
+
+        let point = |file: &str, point: &str, entry: &str| ScriptBinding {
+            point: point.into(),
+            entry: entry.into(),
+            ..binding(file)
+        };
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(
+            engine,
+            &[
+                point("block.js", "prompt.block", "onBlock"),
+                point("context.js", "prompt.context", "onContext"),
+                point("variable.js", "prompt.variable", "onVariable"),
+            ],
+            &project,
+        )
+        .expect("the bindings are valid");
+        assert_eq!(bound.prompt_blocks.len(), 2);
+        assert_eq!(bound.prompt_variables.len(), 1);
+        assert!(bound.registers_on_prompt_registry());
+
+        let registry = InMemoryPromptRegistry::new();
+        bound.apply_to_registry(registry.as_ref());
+
+        let ctx = on_branch("lane-s1");
+        let mut placed: Vec<(i32, String, String)> = registry
+            .blocks()
+            .into_iter()
+            .map(|b| {
+                let text = match &b.content {
+                    PromptContent::Static(s) => Some(s.clone()),
+                    PromptContent::Provider(p) => p(&ctx),
+                };
+                (b.order, b.name, text.unwrap_or_default())
+            })
+            .collect();
+        placed.sort_by_key(|(order, _, _)| *order);
+        assert_eq!(
+            placed,
+            vec![
+                (250, "team.conventions".to_string(), "be brief".to_string()),
+                (
+                    260,
+                    "project.status".to_string(),
+                    "on lane-s1 in /tmp/proj".to_string()
+                ),
+            ]
+        );
+
+        assert_eq!(
+            interpolate("we are on {{branch}}.", &registry.variables(), &ctx),
+            "we are on lane-s1."
+        );
+    }
+
+    /// A script that cannot get through its first call registers nothing, and
+    /// the placeholder it would have filled stays in the prompt as written.
+    #[test]
+    fn a_contribution_script_that_throws_leaves_the_prompt_as_it_was() {
+        use base::interface::prompt_registry::interpolate;
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("bad.js"),
+            "function onVariable() { throw new Error('deliberate'); }",
+        )
+        .unwrap();
+        let mut b = binding("bad.js");
+        b.point = "prompt.variable".into();
+        b.entry = "onVariable".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding itself is valid");
+        assert!(bound.prompt_variables.is_empty());
+        assert!(!bound.registers_on_prompt_registry());
+
+        let registry = InMemoryPromptRegistry::new();
+        bound.apply_to_registry(registry.as_ref());
+        assert_eq!(
+            interpolate("a {{anything}} b", &registry.variables(), &ctx()),
+            "a {{anything}} b"
+        );
+    }
+
+    /// A script may add a block; it may not become one that already exists.
+    #[test]
+    fn a_script_cannot_register_itself_under_a_kernel_blocks_name() {
+        let project = tempdir();
+        std::fs::write(
+            project.join("greedy.js"),
+            "function onBlock() { return { name: 'rules', order: 1, content: 'no rules' }; }",
+        )
+        .unwrap();
+        let mut b = binding("greedy.js");
+        b.point = "prompt.block".into();
+        b.entry = "onBlock".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding itself is valid");
+        assert!(
+            bound.prompt_blocks.is_empty(),
+            "a contribution took the name of a block the engine contributes"
+        );
+    }
+
+    fn on_branch(branch: &'static str) -> base::interface::scene::ScenePromptContext<'static> {
+        use std::borrow::Cow;
+        base::interface::scene::ScenePromptContext {
+            cwd: Cow::Borrowed("/tmp/proj"),
+            git_branch: Some(Cow::Borrowed(branch)),
+            is_git: true,
+            ..ctx()
+        }
     }
 
     /// All or nothing. A configuration half of which was applied is a
