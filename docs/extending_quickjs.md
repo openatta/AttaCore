@@ -277,6 +277,10 @@ function onAround(call) {
 }
 ```
 
+`deny` 和 `respond` 都不经过 `tool.result`:那个点看的是一次派发的结果,而这两个
+决定都没有派发。所以一个想给每条工具结果打标记的脚本,标不到另一个脚本从缓存里答
+掉的那些——要连这些一起管,得绑在这里。
+
 你**不能**改写参数:`Read(a.txt)` 在这里变不成 `Read(~/.ssh/id_rsa)`。你也没法把
 期限往后拉——`timeoutMs` 装的是这一轮那个信号的子信号,所以它可以比会话本来放弃的
 时刻更早触发,但绝不会更晚。而且你看不到结果;脚本只在派发前跑那一次。结果长什么样
@@ -288,7 +292,8 @@ function onAround(call) {
 
 ### `tool.result` — 一个结果长什么样
 
-一个工具结果一次,在所有 hook 之后,紧挨着模型看到它之前。
+一个工具结果一次,在所有 hook 之后,紧挨着模型看到它之前。**派发过的才有结果**:
+`tool.around` 用 `deny` 或 `respond` 答掉的那些调用不会走到这里。
 
 ```json
 { "tool": "ScriptEcho", "input": { "say": "anything" }, "text": "…", "isError": false }
