@@ -69,27 +69,33 @@ impl Session {
 
     /// Bind `path` at `point`. Order is the order of these calls, which is
     /// what decides which of two scripts on one point is the outer one.
-    pub fn bind(self, path: &str, point: &str, entry: &str) -> Self {
-        self.bind_within(path, point, entry, None, None)
-    }
-
-    /// The same, with this binding's own budget.
-    pub fn bind_within(
-        mut self,
-        path: &str,
-        point: &str,
-        entry: &str,
-        timeout_ms: Option<u64>,
-        calls_per_turn: Option<u32>,
-    ) -> Self {
+    pub fn bind(mut self, path: &str, point: &str, entry: &str) -> Self {
         self.bindings.push(ScriptBinding {
             path: path.into(),
             point: point.into(),
             entry: entry.into(),
-            timeout_ms,
-            calls_per_turn,
+            timeout_ms: None,
+            calls_per_turn: None,
         });
         self
+    }
+
+    /// Give the binding just made a clock of its own.
+    pub fn within_ms(mut self, timeout_ms: u64) -> Self {
+        self.last_binding().timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Give the binding just made a quota of its own.
+    pub fn calls_per_turn(mut self, calls: u32) -> Self {
+        self.last_binding().calls_per_turn = Some(calls);
+        self
+    }
+
+    fn last_binding(&mut self) -> &mut ScriptBinding {
+        self.bindings
+            .last_mut()
+            .expect("a budget belongs to a binding; call `bind` first")
     }
 
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {

@@ -212,7 +212,8 @@ async fn a_script_that_never_returns_costs_its_own_call_and_no_more() {
             &["use the tool"],
             vec![calls_echo("call-1", "anything"), Reply::Text("done")],
         )
-        .bind_within("broken/hangs.js", "tool.result", "boom", Some(50), None),
+        .bind("broken/hangs.js", "tool.result", "boom")
+            .within_ms(50),
     )
     .await;
 
@@ -243,13 +244,8 @@ async fn a_script_that_never_returns_costs_its_own_call_and_no_more() {
 async fn a_script_that_eats_memory_fails_alone() {
     let ran = run(
         session(&["hello"], vec![Reply::Text("hi")])
-            .bind_within(
-                "broken/eats_memory.js",
-                "prompt.context",
-                "boom",
-                Some(5_000),
-                None,
-            )
+            .bind("broken/eats_memory.js", "prompt.context", "boom")
+            .within_ms(5_000)
             .bind("prompt_block.js", "prompt.block", "onBlock"),
     )
     .await;
@@ -297,13 +293,8 @@ async fn the_quota_stops_a_turn_and_the_next_turn_starts_over() {
                 Reply::Text("done again"),
             ],
         )
-        .bind_within(
-            "tool_result_quota.js",
-            "tool.result",
-            "onResult",
-            None,
-            Some(2),
-        ),
+        .bind("tool_result_quota.js", "tool.result", "onResult")
+        .calls_per_turn(2),
     )
     .await;
 
@@ -602,8 +593,10 @@ async fn two_bindings_of_one_file_have_budgets_of_their_own() {
                 Reply::Text("done"),
             ],
         )
-        .bind_within("two_points.js", "tool.around", "onAround", None, Some(1))
-        .bind_within("two_points.js", "tool.result", "onResult", None, Some(1)),
+        .bind("two_points.js", "tool.around", "onAround")
+        .calls_per_turn(1)
+        .bind("two_points.js", "tool.result", "onResult")
+        .calls_per_turn(1),
     )
     .await;
 

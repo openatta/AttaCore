@@ -317,6 +317,7 @@ async fn run_api_mode(
         model: model.clone(),
         recorder_mode,
         recorder_name: scenario_leaf.to_string(),
+        case_id: scenario.to_string(),
         recordings_dir,
         telemetry_path: Some(telemetry_path),
         fixture_dir: fixture_dir.clone(),

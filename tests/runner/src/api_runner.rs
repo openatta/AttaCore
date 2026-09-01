@@ -37,6 +37,10 @@ pub struct AgentRunnerConfig {
     /// 用哪个 `AgentScene` 跑这个用例——之前这里写死 `CodingScene`，chat/research
     /// 场景从没被端到端跑过。调用方（`main.rs`）负责按 `--scene` 解析出实例。
     pub scene: Arc<dyn AgentScene>,
+    /// This case's full name, including the directory it lives in — the
+    /// working directory is derived from it, and two cases in different
+    /// directories can share a leaf name.
+    pub case_id: String,
     /// 一次运行里所有 Agent 共用的录制状态。
     ///
     /// 必须共享：`run_test_case` 每个测试轮次新建一个 Agent，而 `recorder_name`
@@ -93,7 +97,7 @@ pub async fn run_test_case(
     config: AgentRunnerConfig,
     case: &TestCase,
 ) -> anyhow::Result<Vec<TurnOutput>> {
-    let tmp = run_dir(&config.recorder_name);
+    let tmp = run_dir(&config.case_id);
 
     if let Some(fixture) = &config.fixture_dir {
         let workdir = tmp.join("workdir");
@@ -143,7 +147,7 @@ pub async fn run_test_case_same_session(
     case: &TestCase,
     mutations: Option<&crate::mutations::MutationManifest>,
 ) -> anyhow::Result<Vec<TurnOutput>> {
-    let tmp = run_dir(&config.recorder_name);
+    let tmp = run_dir(&config.case_id);
 
     if let Some(fixture) = &config.fixture_dir {
         let workdir = tmp.join("workdir");

@@ -92,6 +92,7 @@ fn runner_config(recordings_dir: &std::path::Path, scenario: &str) -> AgentRunne
         // 会话语义，不是录制回放。
         recorder_mode: RecorderMode::Record,
         recorder_name: scenario.to_string(),
+        case_id: scenario.to_string(),
         recordings_dir: recordings_dir.to_path_buf(),
         telemetry_path: None,
         fixture_dir: None,
