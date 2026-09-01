@@ -2696,7 +2696,7 @@ impl SessionPool {
 
         // 从 HistoryStore 查历史（inactive sessions）
         if let Some(ref store) = self.history_store {
-            let query = history::query::SessionQuery::recent(usize::MAX);
+            let query = history::query::SessionQuery::recent(usize::MAX).ids_only();
             if let Ok(summaries) = store.find_sessions(&query).await {
                 for summary in summaries {
                     let sid_str = summary.session_id.to_string();

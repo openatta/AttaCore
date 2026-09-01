@@ -227,7 +227,7 @@ async fn read_file_to_text(
 
     // PDF handling
     if ext == "pdf" {
-        return read_pdf_text(fs, path, &metadata, max_bytes, input.pages.as_deref())
+        return read_pdf_text(path, &metadata, max_bytes, input.pages.as_deref())
             .await
             .map(ToolResult::text);
     }
@@ -338,7 +338,6 @@ async fn read_image(
 
 /// Read a PDF file — returns basic text extraction via the `pdftotext` CLI tool.
 async fn read_pdf_text(
-    fs: &dyn FileSystem,
     path: &Path,
     metadata: &Metadata,
     max_bytes: u64,
@@ -387,10 +386,12 @@ async fn read_pdf_text(
             ))
         }
         _ => {
-            // The bytes are discarded: without pdftotext there is nothing to
-            // extract, and the read is here so that a file we cannot actually
-            // open reports that instead of a cheerful "install poppler".
-            fs.read(path).await?;
+            // No probe read here. It used to open the file so that an
+            // unreadable PDF reported that rather than a cheerful "install
+            // poppler" — but the contract reads whole values, so the probe
+            // meant pulling up to fifty megabytes into memory and dropping
+            // them to sharpen one error message. `metadata` above already
+            // establishes the file is there.
             Ok(format!(
                 "[PDF: {} — {} bytes. Install pdftotext (poppler-utils) for text extraction.]",
                 path.file_name()

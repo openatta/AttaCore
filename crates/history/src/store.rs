@@ -356,12 +356,26 @@ impl JsonlHistoryStore {
             .await
     }
 
-    async fn recent_summaries(&self, max: usize) -> Result<Vec<SessionSummary>, HistoryError> {
+    async fn recent_summaries(
+        &self,
+        max: usize,
+        detail: crate::query::SummaryDetail,
+    ) -> Result<Vec<SessionSummary>, HistoryError> {
         let files = self.session_files_by_mtime(max).await?;
         let mut out = Vec::new();
         for (session_id, _path, mtime) in files {
-            if let Some(summary) = self.session_summary(session_id, mtime).await? {
-                out.push(summary);
+            match detail {
+                // The directory listing already answered the question. Opening
+                // each transcript to fill in a preview nobody asked for turns
+                // a listing into a full parse of every session in the project.
+                crate::query::SummaryDetail::IdsOnly => {
+                    out.push(self.summary_from_parts(session_id, mtime, 0, &[], None))
+                }
+                crate::query::SummaryDetail::Full => {
+                    if let Some(summary) = self.session_summary(session_id, mtime).await? {
+                        out.push(summary);
+                    }
+                }
             }
         }
         Ok(out)
@@ -800,15 +814,22 @@ impl HistoryStore for JsonlHistoryStore {
     }
 
     /// Orders by the file's modification time and narrows by directory before
-    /// reading anything, neither of which the default can do. Recency alone
-    /// never opens a transcript at all — the sidecar metadata carries the
-    /// preview.
+    /// reading anything, neither of which the default can do.
+    ///
+    /// A recency query still opens each transcript to build its preview,
+    /// unless the caller asked for [`SummaryDetail::IdsOnly`] — which is what
+    /// a listing wants, and what keeps `session.list` a directory read rather
+    /// than a parse of every session in the project.
+    ///
+    /// [`SummaryDetail::IdsOnly`]: crate::query::SummaryDetail::IdsOnly
     async fn find_sessions(
         &self,
         query: &SessionQuery,
     ) -> Result<Vec<SessionSummary>, HistoryError> {
         match (&query.scope, query.needle()) {
-            (SessionScope::CurrentProject, None) => self.recent_summaries(query.limit).await,
+            (SessionScope::CurrentProject, None) => {
+                self.recent_summaries(query.limit, query.detail).await
+            }
             (SessionScope::CurrentProject, Some(needle)) => {
                 self.search_current_project(needle, query.limit).await
             }
@@ -1155,6 +1176,54 @@ mod tests {
         assert_eq!(summaries[0].entry_count, 2);
         assert_eq!(summaries[0].message_count, 2);
         assert!(summaries[0].preview.contains("useful answer"));
+    }
+
+    /// A listing asks which sessions there are. Building a preview for each
+    /// costs a full transcript read, and `session.list` throws every preview
+    /// away — so a few hundred sessions turned a directory read into a parse
+    /// of all of them.
+    #[tokio::test]
+    async fn an_ids_only_query_does_not_open_the_transcripts() {
+        let (store, _cwd, _proj) = make_store().await;
+        let s = SessionId::new();
+        for text in ["a question", "a useful answer"] {
+            store
+                .append(
+                    s,
+                    LogEntry::User {
+                        content: vec![ContentBlock::Text {
+                            text: text.into(),
+                            cache_control: None,
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let full = store
+            .find_sessions(&crate::query::SessionQuery::recent(5))
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].message_count, 2);
+        assert!(full[0].preview.contains("useful answer"));
+
+        let ids = store
+            .find_sessions(&crate::query::SessionQuery::recent(5).ids_only())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "the same sessions, in the same order");
+        assert_eq!(ids[0].session_id, s);
+        assert_eq!(
+            (ids[0].message_count, ids[0].entry_count),
+            (0, 0),
+            "a count that was never read is reported as unread, not guessed"
+        );
+        assert!(
+            ids[0].preview.is_empty(),
+            "a preview here would mean the transcript was opened after all"
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,22 @@ pub struct SessionQuery {
     pub text: String,
     pub scope: SessionScope,
     pub limit: usize,
+    /// How much of each answer the caller actually needs.
+    pub detail: SummaryDetail,
+}
+
+/// How much of a summary to build.
+///
+/// A preview costs a transcript read, and a caller that only wants to know
+/// *which* sessions exist should not pay for one per session — `session.list`
+/// asks for a few hundred and uses the identifier from each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SummaryDetail {
+    /// Identity and ordering. No transcript is opened.
+    IdsOnly,
+    /// Everything the summary can carry, including the preview.
+    #[default]
+    Full,
 }
 
 impl SessionQuery {
@@ -42,7 +58,14 @@ impl SessionQuery {
             text: String::new(),
             scope: SessionScope::CurrentProject,
             limit,
+            detail: SummaryDetail::Full,
         }
+    }
+
+    /// Identity and ordering only — for a caller that lists rather than shows.
+    pub fn ids_only(mut self) -> Self {
+        self.detail = SummaryDetail::IdsOnly;
+        self
     }
 
     /// Sessions in the store's own project matching `text`.
@@ -51,6 +74,7 @@ impl SessionQuery {
             text: text.into(),
             scope: SessionScope::CurrentProject,
             limit,
+            detail: SummaryDetail::Full,
         }
     }
 
