@@ -224,17 +224,21 @@ impl SkillManager {
     /// project skills: <cwd>/.agents/skills/).
     /// Each .md file is a skill; filename (without .md) is the skill name.
     pub fn load_dir(&self, dir: &Path, source: SkillSource) -> std::io::Result<usize> {
-        Ok(self.load_from(std::sync::Arc::new(crate::sources::SkillDirectory::flat(
-            dir, source,
-        ))))
+        Ok(
+            self.load_from(std::sync::Arc::new(crate::sources::SkillDirectory::flat(
+                dir, source,
+            ))),
+        )
     }
 
     /// Load skills from a directory using SKILL.md subdirectory format.
     /// Each subdirectory containing a SKILL.md becomes a skill.
     pub fn load_dir_subdirs(&self, dir: &Path, source: SkillSource) -> std::io::Result<usize> {
-        Ok(self.load_from(std::sync::Arc::new(crate::sources::SkillDirectory::tier(
-            dir, source,
-        ))))
+        Ok(
+            self.load_from(std::sync::Arc::new(crate::sources::SkillDirectory::tier(
+                dir, source,
+            ))),
+        )
     }
 
     /// Register a bundled (in-memory) skill. Used for built-in skills.

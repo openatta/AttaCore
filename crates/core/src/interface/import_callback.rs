@@ -125,7 +125,10 @@ pub async fn maybe_detect_and_import_asking(
     let request = ElicitRequest {
         id: format!("import:{}", cwd.display()),
         kind: ElicitKind::Import {
-            sources: sources.iter().map(|s| s.kind().as_str().to_string()).collect(),
+            sources: sources
+                .iter()
+                .map(|s| s.kind().as_str().to_string())
+                .collect(),
         },
         message: "Configuration from another agent tool was found here. Import it?".to_string(),
         options: sources
@@ -374,11 +377,10 @@ mod tests {
             .await
             .unwrap();
 
-        let asker: Arc<dyn Elicitation> = crate::interface::elicitation::FixedElicitation::new(
-            ElicitOutcome::answered(&ImportDecision::Import(
-                crate::frozen::ImportSourceKind::ClaudeCode,
-            )),
-        );
+        let asker: Arc<dyn Elicitation> =
+            crate::interface::elicitation::FixedElicitation::new(ElicitOutcome::answered(
+                &ImportDecision::Import(crate::frozen::ImportSourceKind::ClaudeCode),
+            ));
         let summary =
             maybe_detect_and_import_asking(dir.path(), Some(&asker), Duration::from_secs(5))
                 .await

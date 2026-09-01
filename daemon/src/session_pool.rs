@@ -3776,7 +3776,10 @@ impl SessionPool {
     /// on disk — all three mean the same thing to `session.resume`'s caller
     /// ("no prior conversation"), so they don't need distinguishing here.
     async fn history_counts(&self, session_id: &str) -> (usize, usize) {
-        match (self.load_entries(session_id).await, self.history_store.as_ref()) {
+        match (
+            self.load_entries(session_id).await,
+            self.history_store.as_ref(),
+        ) {
             (Ok(entries), Some(store)) => (
                 history::transcript::project_messages_with(&entries, store.projection()).len(),
                 entries.len(),

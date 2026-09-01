@@ -85,7 +85,10 @@ impl InMemoryStorage {
 
 impl MemoryStorage for InMemoryStorage {
     fn load_all(&self) -> Vec<DurableMemory> {
-        self.memories.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.memories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn search(&self, query: &str) -> Vec<DurableMemory> {

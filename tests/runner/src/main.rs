@@ -238,15 +238,16 @@ fn find_recording(cassette_dir: &Path, scenario_leaf: &str) -> Option<PathBuf> {
         return Some(asked);
     }
     ["api", "agent", "cli"].iter().find_map(|mode| {
-        let candidate = cassette_dir
-            .parent()
-            .and_then(|round| round.parent())
-            .map(|scenario_root| {
-                scenario_root
-                    .join(mode)
-                    .join(cassette_dir.file_name().unwrap_or_default())
-                    .join(scenario_leaf)
-            })?;
+        let candidate =
+            cassette_dir
+                .parent()
+                .and_then(|round| round.parent())
+                .map(|scenario_root| {
+                    scenario_root
+                        .join(mode)
+                        .join(cassette_dir.file_name().unwrap_or_default())
+                        .join(scenario_leaf)
+                })?;
         candidate.join("calls.jsonl").exists().then_some(candidate)
     })
 }

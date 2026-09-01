@@ -129,12 +129,7 @@ pub trait PromptRegistry: Send + Sync {
     /// Sugar for [`register_block`](Self::register_block) with
     /// [`PromptContent::Provider`] — the same thing, named after what it is
     /// usually for: context that only exists once the session is running.
-    fn register_context(
-        &self,
-        name: &str,
-        order: i32,
-        provider: ContextProvider,
-    ) -> Disposer {
+    fn register_context(&self, name: &str, order: i32, provider: ContextProvider) -> Disposer {
         self.register_block(RegisteredBlock {
             name: name.to_string(),
             role: BlockRole::System,
@@ -153,11 +148,8 @@ pub trait PromptRegistry: Send + Sync {
     /// may do beyond adding, and is the registrar's to establish honestly:
     /// nothing downstream can tell a plugin apart from a script except by
     /// what it was registered as.
-    fn register_assembly_hook(
-        &self,
-        hook: Arc<dyn AssemblyHook>,
-        authority: Authority,
-    ) -> Disposer;
+    fn register_assembly_hook(&self, hook: Arc<dyn AssemblyHook>, authority: Authority)
+        -> Disposer;
 
     /// Everything registered, in registration order. Assembly sorts.
     fn blocks(&self) -> Vec<RegisteredBlock>;
@@ -455,10 +447,8 @@ mod tests {
 
     #[test]
     fn a_variable_that_declines_leaves_its_placeholder_alone() {
-        let vars: Vec<(String, VariableProvider)> = vec![(
-            "maybe".into(),
-            Arc::new(|_: &ScenePromptContext<'_>| None),
-        )];
+        let vars: Vec<(String, VariableProvider)> =
+            vec![("maybe".into(), Arc::new(|_: &ScenePromptContext<'_>| None))];
         assert_eq!(interpolate("a {{maybe}} b", &vars, &ctx()), "a {{maybe}} b");
     }
 

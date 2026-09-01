@@ -211,7 +211,10 @@ fn wiring_scan_detects_an_event_that_is_fired_nowhere() {
 #[test]
 fn is_wired_agrees_with_the_const() {
     for &event in hooks::UNWIRED_EVENTS {
-        assert!(!event.is_wired(), "{event:?} is in UNWIRED_EVENTS but reports wired");
+        assert!(
+            !event.is_wired(),
+            "{event:?} is in UNWIRED_EVENTS but reports wired"
+        );
     }
     assert!(hooks::HookEvent::PreToolUse.is_wired());
 }

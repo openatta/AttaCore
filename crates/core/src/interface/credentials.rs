@@ -223,6 +223,9 @@ mod tests {
         let err = source
             .api_key("main", &ProviderConfig::default())
             .unwrap_err();
-        assert!(err.contains("ATTA_TEST_CREDENTIAL_THAT_IS_NOT_SET"), "{err}");
+        assert!(
+            err.contains("ATTA_TEST_CREDENTIAL_THAT_IS_NOT_SET"),
+            "{err}"
+        );
     }
 }

@@ -113,15 +113,13 @@ impl Elicitation for ChannelElicitation {
 
         // Registered before emitting, so an answer that comes back instantly
         // still finds somewhere to land.
-        let _ = self
-            .events
-            .send(base::event::AgentEvent::PermissionPrompt {
-                prompt_id: request.id,
-                tool_name,
-                message: request.message,
-                paths,
-                turn_id: String::new(),
-            });
+        let _ = self.events.send(base::event::AgentEvent::PermissionPrompt {
+            prompt_id: request.id,
+            tool_name,
+            message: request.message,
+            paths,
+            turn_id: String::new(),
+        });
 
         match rx.await {
             Ok(decision) => ElicitOutcome::answered(&decision),
@@ -139,7 +137,10 @@ mod tests {
     use super::*;
     use base::interface::elicitation::ElicitKind;
 
-    fn bus() -> (EventSender, tokio::sync::mpsc::UnboundedReceiver<base::event::AgentEvent>) {
+    fn bus() -> (
+        EventSender,
+        tokio::sync::mpsc::UnboundedReceiver<base::event::AgentEvent>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (crate::event_bus::EventBus::new(tx), rx)
     }
@@ -235,7 +236,9 @@ mod tests {
                 })
                 .await;
             assert!(
-                outcome.decline_reason().is_some_and(|r| r.contains("no way to put")),
+                outcome
+                    .decline_reason()
+                    .is_some_and(|r| r.contains("no way to put")),
                 "an unservable kind must say why, not answer: {outcome:?}"
             );
         }

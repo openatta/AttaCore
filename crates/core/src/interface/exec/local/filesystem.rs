@@ -37,7 +37,9 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ExecError> {
-        let mut rd = tokio::fs::read_dir(path).await.map_err(|e| failed(path, e))?;
+        let mut rd = tokio::fs::read_dir(path)
+            .await
+            .map_err(|e| failed(path, e))?;
         let mut out = Vec::new();
         while let Some(e) = rd.next_entry().await.map_err(|e| failed(path, e))? {
             let is_dir = e

@@ -184,8 +184,7 @@ pub struct Agent {
     /// [`Builder::prompt_assembler`].
     pub(crate) prompt_assembler: Arc<dyn base::interface::prompt_assembler::PromptAssembler>,
     /// Rings around every tool call — see [`Builder::tool_middleware`].
-    pub(crate) tool_middleware:
-        Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
+    pub(crate) tool_middleware: Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
     /// The last hands on a tool's output — see
     /// [`Builder::tool_result_transformer`].
     pub(crate) result_transformers:
@@ -214,8 +213,7 @@ pub struct Agent {
     /// Which memories a turn sees — see [`Builder::memory_retriever`].
     pub(crate) memory_retriever: Arc<dyn base::interface::memory_contracts::MemoryRetriever>,
     /// A look at the recall question before, and the answer after.
-    pub(crate) retrieval_hooks:
-        Arc<Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>>,
+    pub(crate) retrieval_hooks: Arc<Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>>,
     /// Cancellation token of the turn currently in flight — replaced by
     /// `run()` before each turn, cancelled by the input demultiplexer on
     /// `EngineCommand::CancelTurn`. `Arc`-shared for the same reason
@@ -1000,7 +998,8 @@ pub struct Builder {
     skill_providers: Vec<Arc<dyn base::interface::skill_provider::SkillProvider>>,
     /// Where the standing instructions come from — see
     /// [`Builder::instruction_provider`].
-    instruction_provider: Option<Arc<dyn base::interface::instruction_provider::InstructionProvider>>,
+    instruction_provider:
+        Option<Arc<dyn base::interface::instruction_provider::InstructionProvider>>,
     /// Replaces the built-in way of asking a person something — see
     /// [`Builder::elicitation`].
     elicitation: Option<Arc<dyn base::interface::elicitation::Elicitation>>,
@@ -1274,10 +1273,7 @@ impl Builder {
     /// wire form for them.
     ///
     /// [`Elicitation`]: base::interface::elicitation::Elicitation
-    pub fn elicitation(
-        mut self,
-        e: Arc<dyn base::interface::elicitation::Elicitation>,
-    ) -> Self {
+    pub fn elicitation(mut self, e: Arc<dyn base::interface::elicitation::Elicitation>) -> Self {
         self.elicitation = Some(e);
         self
     }
@@ -1384,10 +1380,7 @@ impl Builder {
     /// module documentation for why each one is excluded.
     ///
     /// [`TurnPolicy`]: base::interface::turn_policy::TurnPolicy
-    pub fn turn_policy(
-        mut self,
-        p: Arc<dyn base::interface::turn_policy::TurnPolicy>,
-    ) -> Self {
+    pub fn turn_policy(mut self, p: Arc<dyn base::interface::turn_policy::TurnPolicy>) -> Self {
         self.turn_policy = Some(p);
         self
     }
@@ -1421,10 +1414,7 @@ impl Builder {
     /// A history store carries its own; configure both to replay a session.
     ///
     /// [`Environment`]: base::interface::environment::Environment
-    pub fn environment(
-        mut self,
-        e: Arc<dyn base::interface::environment::Environment>,
-    ) -> Self {
+    pub fn environment(mut self, e: Arc<dyn base::interface::environment::Environment>) -> Self {
         self.environment = Some(e);
         self
     }
@@ -1440,10 +1430,7 @@ impl Builder {
     /// A registry is created only if something needs one: a session with no
     /// prompt contributions should not acquire an empty registry that
     /// overrides whatever else was going to provide it.
-    pub fn bound_scripts(
-        mut self,
-        bound: base::interface::script_adapters::BoundScripts,
-    ) -> Self {
+    pub fn bound_scripts(mut self, bound: base::interface::script_adapters::BoundScripts) -> Self {
         if bound.registers_on_prompt_registry() {
             let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
             bound.apply_to_registry(registry.as_ref());
@@ -1495,10 +1482,7 @@ impl Builder {
     /// hangs exactly when the answer matters most.
     ///
     /// [`HealthCheck`]: base::interface::health::HealthCheck
-    pub fn health_check(
-        mut self,
-        check: Arc<dyn base::interface::health::HealthCheck>,
-    ) -> Self {
+    pub fn health_check(mut self, check: Arc<dyn base::interface::health::HealthCheck>) -> Self {
         self.health_checks.push(check);
         self
     }
@@ -2501,9 +2485,9 @@ impl Builder {
                 prompt_registry: self
                     .prompt_registry
                     .unwrap_or_else(|| Arc::new(base::interface::prompt_registry::NoRegistrations)),
-                prompt_assembler: self
-                    .prompt_assembler
-                    .unwrap_or_else(|| Arc::new(base::interface::prompt_assembler::DefaultAssembler)),
+                prompt_assembler: self.prompt_assembler.unwrap_or_else(|| {
+                    Arc::new(base::interface::prompt_assembler::DefaultAssembler)
+                }),
                 tool_middleware: Arc::new(self.tool_middleware),
                 result_transformers: Arc::new(self.result_transformers),
                 turn_policy,
@@ -3093,7 +3077,12 @@ mod tests {
         assert!(
             listed.is_some(),
             "the host's source did not reach the catalog: {:?}",
-            agent.skills().list().iter().map(|s| &s.name).collect::<Vec<_>>()
+            agent
+                .skills()
+                .list()
+                .iter()
+                .map(|s| &s.name)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             agent.skills().get_skill_content("file-a-ticket").as_deref(),
@@ -4845,7 +4834,6 @@ mod tests {
         );
     }
 
-
     /// P2-4's acceptance: a wrapper gives one tool a deadline, and the tool
     /// actually feels it. Without the wrapper `Hang` waits for the session's
     /// own cancellation, which this test never sends.
@@ -4940,7 +4928,6 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
-
     /// P2-5's point: a deployment can guarantee a string never reaches the
     /// model, and the guarantee holds through the path a tool result actually
     /// takes — including when the tool failed.
@@ -5023,7 +5010,6 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
-
     /// P2-9: recall goes through the contract, so a host can replace the
     /// judgement with something deterministic — and a hook can see both ends
     /// of it — without touching the engine.
@@ -5094,7 +5080,11 @@ mod tests {
         .expect("the turn should complete");
 
         let asked = asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), 1, "recall must have gone through the substitute");
+        assert_eq!(
+            asked.len(),
+            1,
+            "recall must have gone through the substitute"
+        );
         assert_eq!(
             asked[0], "[expanded] what did we decide about deploys",
             "the hook must have seen the question before the retriever did"
@@ -5103,7 +5093,6 @@ mod tests {
         drop(input_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
-
 
     /// Emits many text deltas, so a per-chunk hook would be obvious.
     struct ChattyModel;
@@ -5144,9 +5133,7 @@ mod tests {
     /// message, and the counts say so.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_model_interceptor_sees_whole_things_never_chunks() {
-        use base::interface::model_interceptor::{
-            ModelInterceptor, ModelRequestView,
-        };
+        use base::interface::model_interceptor::{ModelInterceptor, ModelRequestView};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Default)]
@@ -5215,7 +5202,6 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
 
-
     /// P3-2's acceptance: a host changes "how many steps before stopping"
     /// with a policy, and the loop is not touched.
     #[tokio::test(flavor = "multi_thread")]
@@ -5279,7 +5265,6 @@ mod tests {
         drop(input_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine).await;
     }
-
 
     /// P3-6's acceptance: a deployment configures a ceiling on request size
     /// and the engine honours it. There was no such configuration before —
@@ -5375,8 +5360,7 @@ mod tests {
         }
 
         let mut settings = test_settings();
-        settings.sandbox.network_mode =
-            base::context::config::NetworkModeConfig::Allowlist;
+        settings.sandbox.network_mode = base::context::config::NetworkModeConfig::Allowlist;
         settings.sandbox.allowed_domains = vec!["allowed.test".into()];
 
         let model: Arc<dyn Model> = Arc::new(ToolThenStopModel {
@@ -5407,7 +5391,9 @@ mod tests {
         let verdict = tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 match event_rx.recv().await {
-                    Some(AgentEvent::ToolResult { content, .. }) if content.contains("blocked=") => {
+                    Some(AgentEvent::ToolResult { content, .. })
+                        if content.contains("blocked=") =>
+                    {
                         break content
                     }
                     Some(_) => continue,
@@ -5540,8 +5526,10 @@ mod tests {
                 match event_rx.recv().await {
                     Some(AgentEvent::Error { message, .. }) => break message,
                     Some(AgentEvent::TurnComplete { stop_reason, .. }) => {
-                        panic!("the turn completed with `{stop_reason}` instead of failing — \
-                                the policy's refusal did not reach the loop")
+                        panic!(
+                            "the turn completed with `{stop_reason}` instead of failing — \
+                                the policy's refusal did not reach the loop"
+                        )
                     }
                     Some(_) => continue,
                     None => panic!("event channel closed"),
@@ -5667,7 +5655,8 @@ mod tests {
             "this assertion is only meaningful when the default produces several blocks"
         );
 
-        let merged = prompt_blocks_for_one_turn(Some(Arc::new(MergedSystemPrompt::default()))).await;
+        let merged =
+            prompt_blocks_for_one_turn(Some(Arc::new(MergedSystemPrompt::default()))).await;
         assert_eq!(merged.len(), 1);
         for block in &default_blocks {
             assert!(

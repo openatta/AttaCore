@@ -130,7 +130,8 @@ impl base::interface::token_counter::TokenCounter for TiktokenCounter {
 pub fn default_counter() -> std::sync::Arc<dyn base::interface::token_counter::TokenCounter> {
     static C: OnceLock<std::sync::Arc<dyn base::interface::token_counter::TokenCounter>> =
         OnceLock::new();
-    C.get_or_init(|| std::sync::Arc::new(TiktokenCounter)).clone()
+    C.get_or_init(|| std::sync::Arc::new(TiktokenCounter))
+        .clone()
 }
 
 fn estimate_model_block_tokens_with(block: &ModelContentBlock, bpe: &CoreBPE) -> usize {
@@ -460,7 +461,10 @@ mod counter_contract_tests {
                 estimate_model_block_tokens(block)
             );
         }
-        assert_eq!(counter.count_text("hello there"), count_text(bpe(), "hello there"));
+        assert_eq!(
+            counter.count_text("hello there"),
+            count_text(bpe(), "hello there")
+        );
     }
 
     #[test]

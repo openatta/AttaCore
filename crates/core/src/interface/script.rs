@@ -453,7 +453,10 @@ mod tests {
     #[tokio::test]
     async fn with_no_engine_a_call_says_what_is_missing() {
         let c = carrier(Arc::new(RefusingEngine), ScriptLimits::default());
-        let err = c.call("onAssemble", serde_json::json!({})).await.unwrap_err();
+        let err = c
+            .call("onAssemble", serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert_eq!(err, ScriptError::NoEngine);
         assert!(err.to_string().contains("no script engine"), "{err}");
     }
@@ -472,7 +475,10 @@ mod tests {
             },
         );
         let started = std::time::Instant::now();
-        let err = c.call("onAssemble", serde_json::json!({})).await.unwrap_err();
+        let err = c
+            .call("onAssemble", serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ScriptError::TimedOut { .. }), "{err:?}");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -495,9 +501,9 @@ mod tests {
             },
         );
         let fine = carrier(
-            Arc::new(FnScriptEngine(|_: &ScriptSource, _: &str, input| async move {
-                Ok(input)
-            })),
+            Arc::new(FnScriptEngine(
+                |_: &ScriptSource, _: &str, input| async move { Ok(input) },
+            )),
             ScriptLimits::default(),
         );
 
@@ -865,8 +871,8 @@ mod prompt_hook_tests {
             move |_s: &ScriptSource, _e: &str, input: serde_json::Value| {
                 let f = f.clone();
                 async move {
-                    let blocks: Vec<serde_json::Value> =
-                        serde_json::from_value(input).map_err(|e| ScriptError::Failed(e.to_string()))?;
+                    let blocks: Vec<serde_json::Value> = serde_json::from_value(input)
+                        .map_err(|e| ScriptError::Failed(e.to_string()))?;
                     Ok(serde_json::Value::Array(f(blocks)))
                 }
             },
@@ -918,7 +924,11 @@ mod prompt_hook_tests {
             .await
             .expect("an identity pass asks for nothing and cannot be refused");
 
-        let contents: Vec<&str> = assembly.blocks().iter().map(|b| b.content.as_str()).collect();
+        let contents: Vec<&str> = assembly
+            .blocks()
+            .iter()
+            .map(|b| b.content.as_str())
+            .collect();
         assert_eq!(
             contents,
             vec!["first section", "second section", "third section"],
@@ -951,7 +961,11 @@ mod prompt_hook_tests {
             .expect_err("an edit nothing can address must be reported");
         assert!(refused.contains("names 2 blocks"), "{refused}");
 
-        let contents: Vec<&str> = assembly.blocks().iter().map(|b| b.content.as_str()).collect();
+        let contents: Vec<&str> = assembly
+            .blocks()
+            .iter()
+            .map(|b| b.content.as_str())
+            .collect();
         assert_eq!(
             contents,
             vec!["first section", "second section"],

@@ -704,7 +704,14 @@ impl Settings {
             scene_dir.clone(),
             local_dir.clone(),
         );
-        Self::load_from(&source, global_dir, scene_dir, local_dir, scope, default_model)
+        Self::load_from(
+            &source,
+            global_dir,
+            scene_dir,
+            local_dir,
+            scope,
+            default_model,
+        )
     }
 
     /// [`load`](Self::load) with the layers coming from wherever `source` says
@@ -1103,20 +1110,24 @@ mod tests {
         write_settings(&scene_dir, scene);
         write_settings(&project_dir, project);
         write_local_settings(&project_dir, project_local);
-        let from_files = Settings::load(
-            global_dir,
-            scene_dir,
-            project_dir,
-            "code",
-            "cli-default",
-        );
+        let from_files = Settings::load(global_dir, scene_dir, project_dir, "code", "cli-default");
 
         let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
         let source = InMemoryLayers::new()
             .with(Tier::Global, false, "config-service:global", parse(global))
             .with(Tier::Scene, false, "config-service:scene", parse(scene))
-            .with(Tier::Project, false, "config-service:project", parse(project))
-            .with(Tier::Project, true, "config-service:machine", parse(project_local));
+            .with(
+                Tier::Project,
+                false,
+                "config-service:project",
+                parse(project),
+            )
+            .with(
+                Tier::Project,
+                true,
+                "config-service:machine",
+                parse(project_local),
+            );
         // Directories that do not exist, so a fall-back to reading files
         // could not produce this result.
         let elsewhere = root.path().join("no-such-tree");

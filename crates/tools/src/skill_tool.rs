@@ -140,22 +140,20 @@ impl Tool for SkillTool {
         // escapes its folder or can't be read (see
         // `build_bundled_files_injection`'s doc comment).
         let bundled_files_text = match skill_info {
-            Some(info) => match build_bundled_files_injection(
-                &info.path,
-                skill_name,
-                &*ctx.exec.filesystem,
-            )
-            .await
-            {
-                Ok(text) => text,
-                Err(msg) => {
-                    return Ok(ToolResult {
-                        content: ToolResultContent::Text(msg),
-                        is_error: true,
-                        ..Default::default()
-                    });
+            Some(info) => {
+                match build_bundled_files_injection(&info.path, skill_name, &*ctx.exec.filesystem)
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(msg) => {
+                        return Ok(ToolResult {
+                            content: ToolResultContent::Text(msg),
+                            is_error: true,
+                            ..Default::default()
+                        });
+                    }
                 }
-            },
+            }
             None => String::new(),
         };
 

@@ -1,8 +1,8 @@
 //! Prompt assembly — pure function that stitches together multi-source content.
 
+use crate::interface::scene::{AgentScene, ScenePromptContext};
 use crate::memory::{build_memory_prompt, MemoryStore};
 use crate::rules::build_rules_prompt;
-use crate::interface::scene::{AgentScene, ScenePromptContext};
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 
@@ -339,8 +339,7 @@ pub fn assemble_prompt_with(
     let assembled: Vec<PromptBlock> = merged
         .into_iter()
         .map(|(_, mut b)| {
-            b.content =
-                crate::interface::prompt_registry::interpolate(&b.content, &variables, ctx);
+            b.content = crate::interface::prompt_registry::interpolate(&b.content, &variables, ctx);
             b
         })
         .collect();
@@ -357,12 +356,12 @@ pub fn assemble_prompt_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryStore;
     use crate::interface::scene::TokenBudget;
+    use crate::memory::MemoryStore;
+    use crate::provider::ApiType;
     use crate::settings::{
         ExecutionSettings, ModelSettings, PathSettings, PermissionMode, Settings, ThinkingMode,
     };
-    use crate::provider::ApiType;
     use std::borrow::Cow;
     use tempfile::TempDir;
 
@@ -592,7 +591,7 @@ mod tests {
         assert!(blocks[0].origin.is_kernel());
     }
 
-        /// Sections a scene leaves unnamed are numbered, because a name is the
+    /// Sections a scene leaves unnamed are numbered, because a name is the
     /// only handle anything downstream has on a block.
     ///
     /// They all used to be `scene.skeleton`. Everything that addresses a block
@@ -767,7 +766,9 @@ mod tests {
             Some("skills inventory"),
             None,
         );
-        assert!(after.iter().all(|b| b.name.as_deref() != Some("mine.preamble")));
+        assert!(after
+            .iter()
+            .all(|b| b.name.as_deref() != Some("mine.preamble")));
     }
 
     #[test]
@@ -791,7 +792,9 @@ mod tests {
             None,
             None,
         );
-        assert!(blocks.iter().all(|b| b.name.as_deref() != Some("mine.sometimes")));
+        assert!(blocks
+            .iter()
+            .all(|b| b.name.as_deref() != Some("mine.sometimes")));
     }
 
     #[test]

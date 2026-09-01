@@ -98,7 +98,10 @@ mod tests {
     fn whitespace_only_text_is_no_filter() {
         assert_eq!(SessionQuery::matching("  \t ", 10).needle(), None);
         assert_eq!(SessionQuery::recent(10).needle(), None);
-        assert_eq!(SessionQuery::matching(" needle ", 10).needle(), Some("needle"));
+        assert_eq!(
+            SessionQuery::matching(" needle ", 10).needle(),
+            Some("needle")
+        );
     }
 
     #[test]

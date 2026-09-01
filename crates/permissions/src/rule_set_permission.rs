@@ -16,9 +16,9 @@ use async_trait::async_trait;
 use base::context::SessionState;
 use base::interface::permission::{Permission, PermissionOutcome};
 use base::permission::{PermissionDecision as GateDecision, PermissionMode};
-use base::tool::{ToolContext, ToolRegistry};
 #[cfg(test)]
 use base::tool::InMemoryToolRegistry;
+use base::tool::{ToolContext, ToolRegistry};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;

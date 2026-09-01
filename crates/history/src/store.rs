@@ -329,7 +329,8 @@ impl JsonlHistoryStore {
         query: &str,
         max: usize,
     ) -> Result<Vec<SessionSummary>, HistoryError> {
-        self.find_sessions(&SessionQuery::matching(query, max)).await
+        self.find_sessions(&SessionQuery::matching(query, max))
+            .await
     }
 
     /// Search **all** project directories under the history root. Used by
@@ -1828,7 +1829,10 @@ mod tests {
         let raw = tokio::fs::read_to_string(store.session_file_path(&s))
             .await
             .unwrap();
-        assert!(raw.contains("\"describes\":\"tool_result\""), "raw jsonl: {raw}");
+        assert!(
+            raw.contains("\"describes\":\"tool_result\""),
+            "raw jsonl: {raw}"
+        );
         assert!(!raw.contains(&output));
 
         match &store.load(s).await.unwrap()[0].entry {
@@ -1870,7 +1874,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            raw.lines().filter(|l| l.contains("\"kind\":\"blob\"")).count(),
+            raw.lines()
+                .filter(|l| l.contains("\"kind\":\"blob\""))
+                .count(),
             2,
             "both the message and the tool result carry an image: {raw}"
         );
@@ -1952,7 +1958,9 @@ mod tests {
         for (label, store) in [
             (
                 "nothing mounted",
-                JsonlHistoryStore::with_roots(cwd.path(), roots()).await.unwrap(),
+                JsonlHistoryStore::with_roots(cwd.path(), roots())
+                    .await
+                    .unwrap(),
             ),
             (
                 "a different store mounted",
@@ -1973,7 +1981,11 @@ mod tests {
                 .load(s)
                 .await
                 .unwrap_or_else(|e| panic!("{label}: a session must still load: {e:?}"));
-            assert_eq!(loaded.len(), 3, "{label}: an unreachable entry is still an entry");
+            assert_eq!(
+                loaded.len(),
+                3,
+                "{label}: an unreachable entry is still an entry"
+            );
             assert!(
                 matches!(loaded[1].entry, LogEntry::Blob { .. }),
                 "{label}: expected the reference left in place, got {:?}",
@@ -2002,23 +2014,28 @@ mod tests {
             content: vec![text_block(&"C".repeat(1500))],
         };
 
-        let written = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
-            .await
-            .unwrap()
-            .with_paste_store(PasteStore::new(paste_base.path()));
+        let written =
+            JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap()
+                .with_paste_store(PasteStore::new(paste_base.path()));
         written.append(s, entry.clone()).await.unwrap();
 
         let impostor = InMemoryBlobStore::new();
         impostor
             .put(serde_json::to_string(&entry).unwrap().as_bytes())
             .unwrap();
-        let reader = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
-            .await
-            .unwrap()
-            .with_blob_store(Arc::new(impostor));
+        let reader =
+            JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
+                .await
+                .unwrap()
+                .with_blob_store(Arc::new(impostor));
 
         assert!(
-            matches!(reader.load(s).await.unwrap()[0].entry, LogEntry::Blob { .. }),
+            matches!(
+                reader.load(s).await.unwrap()[0].entry,
+                LogEntry::Blob { .. }
+            ),
             "a store that was not named must leave the reference alone"
         );
     }
@@ -2036,7 +2053,9 @@ mod tests {
         let original = LogEntry::User {
             content: vec![text_block("what the paste held")],
         };
-        let paste_id = pastes.store(&serde_json::to_string(&original).unwrap()).unwrap();
+        let paste_id = pastes
+            .store(&serde_json::to_string(&original).unwrap())
+            .unwrap();
         let store = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
             .await
             .unwrap()
@@ -2172,7 +2191,11 @@ mod contract_tests {
     use crate::entry::SessionKind;
     use base::permission::PermissionMode;
 
-    async fn jsonl() -> (Box<dyn HistoryStore>, Option<tempfile::TempDir>, tempfile::TempDir) {
+    async fn jsonl() -> (
+        Box<dyn HistoryStore>,
+        Option<tempfile::TempDir>,
+        tempfile::TempDir,
+    ) {
         let cwd = tempfile::TempDir::new().unwrap();
         let projects = tempfile::TempDir::new().unwrap();
         let store = JsonlHistoryStore::with_roots(cwd.path(), HistoryRoots::under(projects.path()))
@@ -2249,13 +2272,16 @@ mod contract_tests {
         assert_eq!(texts, ["m0", "m1", "m2", "m3", "m4"]);
     });
 
-    for_each_store!(a_session_that_was_never_written_is_not_an_empty_one, |store| {
-        let err = store.load(SessionId::new()).await.unwrap_err();
-        assert!(
-            matches!(err, HistoryError::SessionNotFound(_)),
-            "absent must be distinguishable from empty: {err:?}"
-        );
-    });
+    for_each_store!(
+        a_session_that_was_never_written_is_not_an_empty_one,
+        |store| {
+            let err = store.load(SessionId::new()).await.unwrap_err();
+            assert!(
+                matches!(err, HistoryError::SessionNotFound(_)),
+                "absent must be distinguishable from empty: {err:?}"
+            );
+        }
+    );
 
     for_each_store!(listing_finds_every_written_session, |store| {
         let a = SessionId::new();
@@ -2289,27 +2315,30 @@ mod contract_tests {
             .expect("deleting what is not there is not an error");
     });
 
-    for_each_store!(the_parent_link_is_readable_and_drives_the_child_walk, |store| {
-        let parent = SessionId::new();
-        let child = SessionId::new();
-        let orphan = SessionId::new();
-        store.append(parent, meta(None)).await.unwrap();
-        store
-            .append(child, meta(Some(&parent.to_string())))
-            .await
-            .unwrap();
-        store.append(orphan, meta(None)).await.unwrap();
+    for_each_store!(
+        the_parent_link_is_readable_and_drives_the_child_walk,
+        |store| {
+            let parent = SessionId::new();
+            let child = SessionId::new();
+            let orphan = SessionId::new();
+            store.append(parent, meta(None)).await.unwrap();
+            store
+                .append(child, meta(Some(&parent.to_string())))
+                .await
+                .unwrap();
+            store.append(orphan, meta(None)).await.unwrap();
 
-        assert_eq!(store.session_parent(parent).await.unwrap(), None);
-        assert_eq!(
-            store.session_parent(child).await.unwrap(),
-            Some(parent.to_string())
-        );
-        assert_eq!(
-            store.child_sessions(&parent.to_string()).await.unwrap(),
-            vec![child]
-        );
-    });
+            assert_eq!(store.session_parent(parent).await.unwrap(), None);
+            assert_eq!(
+                store.session_parent(child).await.unwrap(),
+                Some(parent.to_string())
+            );
+            assert_eq!(
+                store.child_sessions(&parent.to_string()).await.unwrap(),
+                vec![child]
+            );
+        }
+    );
 
     for_each_store!(an_extension_entry_comes_back_exactly_as_written, |store| {
         let s = SessionId::new();
@@ -2330,11 +2359,17 @@ mod contract_tests {
         let loaded = store.load(s).await.unwrap();
         assert_eq!(loaded.len(), 3, "an unreadable entry is still an entry");
         let LogEntry::Extension { ns, event, payload } = &loaded[1].entry else {
-            panic!("expected the extension entry in position, got {:?}", loaded[1].entry);
+            panic!(
+                "expected the extension entry in position, got {:?}",
+                loaded[1].entry
+            );
         };
         assert_eq!(ns, "com.example.gone");
         assert_eq!(event, "checkpoint");
-        assert_eq!(payload, &serde_json::json!({"step": 3, "nested": {"a": [1, 2]}}));
+        assert_eq!(
+            payload,
+            &serde_json::json!({"step": 3, "nested": {"a": [1, 2]}})
+        );
 
         assert_eq!(
             store.load_messages(s).await.unwrap().len(),
@@ -2497,7 +2532,10 @@ mod append_observer_tests {
 
         let observer = Arc::new(Recording::default());
         let watched = ObservedHistoryStore::new(Arc::new(AlwaysFails), vec![observer.clone()]);
-        assert!(watched.append(SessionId::new(), user("never")).await.is_err());
+        assert!(watched
+            .append(SessionId::new(), user("never"))
+            .await
+            .is_err());
         assert!(
             observer.seen.lock().unwrap().is_empty(),
             "an observer must not be told about a write that did not happen"
@@ -2719,10 +2757,24 @@ mod query_contract_tests {
         fill(&indexed, &ids).await;
 
         for store in [&*shared as &dyn HistoryStore, &indexed as &dyn HistoryStore] {
-            assert_eq!(store.find_sessions(&SessionQuery::recent(0)).await.unwrap(), vec![]);
-            assert_eq!(store.find_sessions(&SessionQuery::recent(2)).await.unwrap().len(), 2);
             assert_eq!(
-                store.find_sessions(&SessionQuery::recent(99)).await.unwrap().len(),
+                store.find_sessions(&SessionQuery::recent(0)).await.unwrap(),
+                vec![]
+            );
+            assert_eq!(
+                store
+                    .find_sessions(&SessionQuery::recent(2))
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                store
+                    .find_sessions(&SessionQuery::recent(99))
+                    .await
+                    .unwrap()
+                    .len(),
                 CORPUS.len()
             );
         }

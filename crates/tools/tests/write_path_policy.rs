@@ -45,7 +45,9 @@ async fn a_credential_file_inside_the_project_is_refused() {
         );
     }
     // A nested one too — the rule is about any component, not just the leaf.
-    assert!(denied(&write_decision(&ctx, &dir.path().join(".ssh/config")).await));
+    assert!(denied(
+        &write_decision(&ctx, &dir.path().join(".ssh/config")).await
+    ));
 }
 
 /// And the ordinary case still works, which is what makes the refusals worth
@@ -92,8 +94,12 @@ async fn a_deployment_can_add_a_name_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let mut ctx = ctx_in(dir.path());
     ctx.sandbox.deny_write = vec!["secrets".into()];
-    assert!(denied(&write_decision(&ctx, &dir.path().join("secrets")).await));
-    assert!(denied(&write_decision(&ctx, &dir.path().join("secrets.yaml")).await));
+    assert!(denied(
+        &write_decision(&ctx, &dir.path().join("secrets")).await
+    ));
+    assert!(denied(
+        &write_decision(&ctx, &dir.path().join("secrets.yaml")).await
+    ));
     assert!(matches!(
         write_decision(&ctx, &dir.path().join("public.yaml")).await,
         PermissionDecision::Allow { .. }

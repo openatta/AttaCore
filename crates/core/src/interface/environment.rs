@@ -102,7 +102,11 @@ mod tests {
         let a = env.now();
         let b = env.now();
         assert_eq!(a, OffsetDateTime::UNIX_EPOCH);
-        assert_eq!(b - a, time::Duration::seconds(1), "entries must still order");
+        assert_eq!(
+            b - a,
+            time::Duration::seconds(1),
+            "entries must still order"
+        );
     }
 
     #[test]
@@ -122,7 +126,11 @@ mod tests {
         let mut sorted: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), 64, "a counter that repeats is not an id source");
+        assert_eq!(
+            sorted.len(),
+            64,
+            "a counter that repeats is not an id source"
+        );
     }
 
     #[test]

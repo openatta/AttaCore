@@ -10,7 +10,7 @@ pub mod fixture;
 pub mod mutations;
 pub mod plugin_fixture;
 pub mod reporter;
-pub mod scripted_model;
 pub mod rerun;
 pub mod script;
 pub mod script_session;
+pub mod scripted_model;

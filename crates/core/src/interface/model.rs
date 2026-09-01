@@ -1,8 +1,8 @@
 //! `Model` trait — protocol-agnostic LLM backend interface.
 
 use crate::prompt::PromptBlock;
-use crate::settings::ThinkingMode;
 use crate::provider::ApiType;
+use crate::settings::ThinkingMode;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

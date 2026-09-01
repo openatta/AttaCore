@@ -81,7 +81,10 @@ impl CollectingSink {
     }
 
     pub fn events(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn len(&self) -> usize {

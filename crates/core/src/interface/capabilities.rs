@@ -135,13 +135,18 @@ impl Capabilities {
     /// May it read this path?
     pub fn allows_read(&self, path: &Path) -> bool {
         self.fs_read.iter().any(|granted| path.starts_with(granted))
-            || self.fs_write.iter().any(|granted| path.starts_with(granted))
+            || self
+                .fs_write
+                .iter()
+                .any(|granted| path.starts_with(granted))
     }
 
     /// May it write this path? Write does not imply read's grants, and read
     /// does not imply write.
     pub fn allows_write(&self, path: &Path) -> bool {
-        self.fs_write.iter().any(|granted| path.starts_with(granted))
+        self.fs_write
+            .iter()
+            .any(|granted| path.starts_with(granted))
     }
 
     /// Does this grant anything beyond pure computation? Drives what the
@@ -280,8 +285,14 @@ mod tests {
         })
         .unwrap();
         assert!(r.allows_url("https://api.github.com/repos"));
-        assert!(r.allows_url("https://API.GitHub.com/repos"), "case-insensitive");
-        assert!(r.allows_url("https://api.github.com:443/repos"), "port is not the host");
+        assert!(
+            r.allows_url("https://API.GitHub.com/repos"),
+            "case-insensitive"
+        );
+        assert!(
+            r.allows_url("https://api.github.com:443/repos"),
+            "port is not the host"
+        );
         assert!(!r.allows_url("https://github.com/x"), "not a suffix rule");
         assert!(!r.allows_url("https://api.github.com.attacker.test/x"));
         assert!(

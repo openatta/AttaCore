@@ -207,10 +207,8 @@ mod tests {
                 _messages: Vec<base::interface::model::ModelMessage>,
                 _params: base::interface::model::StreamParams,
                 _cancel: tokio_util::sync::CancellationToken,
-            ) -> Result<
-                base::interface::model::ModelStream,
-                base::interface::model::ModelError,
-            > {
+            ) -> Result<base::interface::model::ModelStream, base::interface::model::ModelError>
+            {
                 unimplemented!("never called — this test is about construction and routing")
             }
         }
@@ -273,10 +271,11 @@ mod tests {
             "with no key anywhere, this must still fail"
         );
 
-        let factories = builtins().with_credentials(std::sync::Arc::new(StaticCredentials::new([(
-            "vaulted".to_string(),
-            Secret::new("sk-from-the-vault"),
-        )])));
+        let factories =
+            builtins().with_credentials(std::sync::Arc::new(StaticCredentials::new([(
+                "vaulted".to_string(),
+                Secret::new("sk-from-the-vault"),
+            )])));
         assert!(
             factories.build("vaulted", &cfg).is_ok(),
             "the registry must ask the source, not the config field"

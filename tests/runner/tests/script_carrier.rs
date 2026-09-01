@@ -237,7 +237,10 @@ fn cases() -> Vec<ScriptCase> {
 /// A store holding the two memories, under the run's own root so the run
 /// leaves nothing behind it.
 fn seeded_memories(root: &std::path::Path) -> Arc<MemoryStore> {
-    let store = Arc::new(MemoryStore::new(root.join("mem-user"), root.join("mem-local")));
+    let store = Arc::new(MemoryStore::new(
+        root.join("mem-user"),
+        root.join("mem-local"),
+    ));
     seed_memories(&store);
     store
 }
@@ -469,11 +472,11 @@ fn calls_the_echo_tool() -> Vec<Reply> {
 /// that only appears when some other script starts answering from a cache.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_from_the_around_ring_skips_the_result_point() {
-    let ran = run_session(|_| 
+    let ran = run_session(|_| {
         session(&["use the tool"], calls_the_echo_tool())
             .bind("tool_around.js", "tool.around", "onAround")
-            .bind("tool_result.js", "tool.result", "onResult"),
-    )
+            .bind("tool_result.js", "tool.result", "onResult")
+    })
     .await;
 
     assert!(
@@ -496,11 +499,11 @@ async fn an_answer_from_the_around_ring_skips_the_result_point() {
 /// error, and the result point is not offered it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_denial_from_the_around_ring_reaches_the_model_unrewritten() {
-    let ran = run_session(|_| 
+    let ran = run_session(|_| {
         session(&["use the tool"], calls_the_echo_tool())
             .bind("tool_around_deny.js", "tool.around", "onAround")
-            .bind("tool_result.js", "tool.result", "onResult"),
-    )
+            .bind("tool_result.js", "tool.result", "onResult")
+    })
     .await;
 
     assert!(
@@ -524,11 +527,11 @@ async fn a_denial_from_the_around_ring_reaches_the_model_unrewritten() {
 /// round would look identical until the day two scripts disagree.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_rings_on_one_point_run_in_the_order_they_were_bound() {
-    let ran = run_session(|_| 
+    let ran = run_session(|_| {
         session(&["use the tool"], calls_the_echo_tool())
             .bind("tool_around.js", "tool.around", "onAround")
-            .bind("tool_around_second.js", "tool.around", "onAround"),
-    )
+            .bind("tool_around_second.js", "tool.around", "onAround")
+    })
     .await;
 
     assert!(
@@ -550,11 +553,11 @@ async fn two_rings_on_one_point_run_in_the_order_they_were_bound() {
 /// contribution permanent for the session.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_block_one_script_registered_can_be_removed_by_another() {
-    let with_both = run_session(|_| 
+    let with_both = run_session(|_| {
         session(&["hello"], vec![Reply::Text("hi")])
             .bind("prompt_block.js", "prompt.block", "onBlock")
-            .bind("prompt_assemble_delete.js", "prompt.assemble", "onAssemble"),
-    )
+            .bind("prompt_assemble_delete.js", "prompt.assemble", "onAssemble")
+    })
     .await;
     assert!(
         !with_both.holds("SCRIPT-TRACE-BLOCK"),
@@ -563,10 +566,13 @@ async fn a_block_one_script_registered_can_be_removed_by_another() {
 
     // Without the remover the block is there, so the assertion above is about
     // the removal and not about the block never having been registered.
-    let registered_only = run_session(|_| 
-        session(&["hello"], vec![Reply::Text("hi")])
-            .bind("prompt_block.js", "prompt.block", "onBlock"),
-    )
+    let registered_only = run_session(|_| {
+        session(&["hello"], vec![Reply::Text("hi")]).bind(
+            "prompt_block.js",
+            "prompt.block",
+            "onBlock",
+        )
+    })
     .await;
     assert!(
         registered_only.holds("SCRIPT-TRACE-BLOCK"),
@@ -582,11 +588,11 @@ async fn a_block_one_script_registered_can_be_removed_by_another() {
 /// it appears *where the placeholder was*, in text a different script wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_variable_expands_inside_a_block_another_script_contributed() {
-    let ran = run_session(|_| 
+    let ran = run_session(|_| {
         session(&["hello"], vec![Reply::Text("hi")])
             .bind("prompt_block_var.js", "prompt.block", "onBlock")
-            .bind("prompt_variable.js", "prompt.variable", "onVariable"),
-    )
+            .bind("prompt_variable.js", "prompt.variable", "onVariable")
+    })
     .await;
 
     assert!(
@@ -611,7 +617,7 @@ async fn a_variable_expands_inside_a_block_another_script_contributed() {
 /// one: that is what `tool.around` and the permission gate are for.
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
-    let ran = run_session(|_| 
+    let ran = run_session(|_| {
         session(
             &["use the skill"],
             vec![
@@ -623,12 +629,8 @@ async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
                 Reply::Text("done"),
             ],
         )
-        .bind(
-            "model_request_drop_skill.js",
-            "model.request",
-            "onRequest",
-        ),
-    )
+        .bind("model_request_drop_skill.js", "model.request", "onRequest")
+    })
     .await;
 
     assert!(
@@ -653,14 +655,14 @@ async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
 /// place would say so.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewritten_message_is_the_one_that_gets_logged() {
-    let ran = run_session(|_| 
+    let ran = run_session(|_| {
         session(
             &["hello", "and again"],
             vec![Reply::Text("first answer"), Reply::Text("second answer")],
         )
         .bind("model_message.js", "model.message", "onMessage")
-        .logged(),
-    )
+        .logged()
+    })
     .await;
 
     assert!(
@@ -687,7 +689,7 @@ async fn a_rewritten_message_is_the_one_that_gets_logged() {
 /// in the ledger is what makes the difference visible.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_recall_hook_runs_on_every_turn() {
-    let ran = run_session(|root| 
+    let ran = run_session(|root| {
         session(
             &["when can I ship this?", "and after that?"],
             // Spare answers: memory work makes model calls of its own, and
@@ -700,9 +702,13 @@ async fn the_recall_hook_runs_on_every_turn() {
                 Reply::Text("spare"),
             ],
         )
-        .bind("memory_retrieval.js", "memory.retrieval_hook", "onRetrieval")
-        .memory(seeded_memories(root)),
-    )
+        .bind(
+            "memory_retrieval.js",
+            "memory.retrieval_hook",
+            "onRetrieval",
+        )
+        .memory(seeded_memories(root))
+    })
     .await;
 
     let turns: Vec<u32> = ran

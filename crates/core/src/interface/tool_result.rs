@@ -185,7 +185,11 @@ mod tests {
         t.transform(&call(), &mut d);
         assert!(!d.text.contains("sk-live-abc123"), "{}", d.text);
         assert!(d.text.contains("<redacted>"), "{}", d.text);
-        assert!(d.text.contains("OTHER=fine"), "the rest must survive: {}", d.text);
+        assert!(
+            d.text.contains("OTHER=fine"),
+            "the rest must survive: {}",
+            d.text
+        );
     }
 
     /// A failure message carries the same things a success does. A policy that

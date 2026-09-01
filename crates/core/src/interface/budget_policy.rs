@@ -44,7 +44,9 @@ pub enum Spending {
         limit: u64,
     },
     /// The turn ends, reporting `budget_exceeded`.
-    Exhausted { limit: u64 },
+    Exhausted {
+        limit: u64,
+    },
 }
 
 /// Progress toward an output-volume target.
@@ -200,15 +202,11 @@ mod tests {
     fn the_bill_warns_at_ninety_percent_and_stops_at_the_cap() {
         let p = engine(1_000);
         assert_eq!(
-            p.on_usage(&Spend {
-                total_tokens: 899
-            }),
+            p.on_usage(&Spend { total_tokens: 899 }),
             Spending::WithinBudget
         );
         assert!(matches!(
-            p.on_usage(&Spend {
-                total_tokens: 900
-            }),
+            p.on_usage(&Spend { total_tokens: 900 }),
             Spending::Warn { .. }
         ));
         assert_eq!(
@@ -265,7 +263,7 @@ mod tests {
         assert!(matches!(
             p.on_output_target(&progress(10_000, 2, 400, 400)),
             OutputTarget::KeepGoing { .. },
-            ),);
+        ),);
         assert!(matches!(
             p.on_output_target(&progress(10_000, 3, 600, 400)),
             OutputTarget::KeepGoing { .. }
@@ -291,7 +289,10 @@ mod tests {
         };
         let engine_only = EngineBudget::new(None).context_budget(&scene);
         assert_eq!(engine_only.compact_threshold, 150_000);
-        assert_eq!(engine_only.hard_cap, None, "the shape of the gap this fills");
+        assert_eq!(
+            engine_only.hard_cap, None,
+            "the shape of the gap this fills"
+        );
 
         let capped = Capped {
             inner: EngineBudget::new(None),

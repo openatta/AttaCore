@@ -43,8 +43,8 @@ pub use bound::BoundScripts;
 pub use memory_retrieval::RetrievalHookScript;
 pub use model_message::ModelMessageScript;
 pub use model_request::ModelRequestScript;
-pub use tool_around::ToolAroundScript;
 pub use prompt_contributions::{
     prompt_block_from_script, prompt_context_from_script, prompt_variable_from_script,
 };
+pub use tool_around::ToolAroundScript;
 pub use tool_result::ToolResultScript;

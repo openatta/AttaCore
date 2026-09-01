@@ -101,7 +101,9 @@ mod tests {
         let messages = vec![ModelMessage {
             role: crate::interface::model::MessageRole::User,
             content: vec![
-                ModelContentBlock::Text { text: "abcd".into() },
+                ModelContentBlock::Text {
+                    text: "abcd".into(),
+                },
                 ModelContentBlock::Text { text: "ef".into() },
             ],
         }];

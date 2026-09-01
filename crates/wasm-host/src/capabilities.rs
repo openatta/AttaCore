@@ -17,7 +17,9 @@ use std::path::Path;
 pub use base::interface::capabilities::{host_of, Capabilities as ResolvedCapabilities};
 
 /// What a `plugin.toml` declared, as the kernel's neutral declaration.
-fn declaration(caps: &plugin::manifest::Capabilities) -> base::interface::capabilities::CapabilityDeclaration {
+fn declaration(
+    caps: &plugin::manifest::Capabilities,
+) -> base::interface::capabilities::CapabilityDeclaration {
     base::interface::capabilities::CapabilityDeclaration {
         fs_read: caps.fs_read.clone(),
         fs_write: caps.fs_write.clone(),

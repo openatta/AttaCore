@@ -84,6 +84,9 @@ pub mod instruction_provider;
 pub mod log;
 #[deprecated(note = "moved to `base::memory` — a concrete store, not an injectable contract")]
 pub use crate::memory;
+pub mod budget_policy;
+pub mod environment;
+pub mod exec;
 pub mod memory_contracts;
 pub mod model;
 pub mod model_factory;
@@ -92,9 +95,6 @@ pub mod permission;
 pub mod prompt_assembler;
 pub mod prompt_assembly;
 pub mod prompt_registry;
-pub mod budget_policy;
-pub mod environment;
-pub mod exec;
 pub mod recovery_policy;
 #[deprecated(note = "moved to `base::prompt` — prompt data types and the assembler function")]
 pub use crate::prompt;
@@ -106,9 +106,9 @@ pub mod script_adapters;
 pub mod skill_provider;
 pub mod token_counter;
 pub mod tool;
-pub mod turn_policy;
 pub mod tool_middleware;
 pub mod tool_result;
+pub mod turn_policy;
 #[deprecated(note = "moved to `base::settings` — declarative configuration types")]
 pub use crate::settings;
 

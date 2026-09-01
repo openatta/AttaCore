@@ -88,7 +88,12 @@ fn no_carrier_defines_its_own_authorization() {
     let root = repo_root();
     let kernel = root.join("crates/core/src/interface/capabilities.rs");
     let kernel_src = std::fs::read_to_string(&kernel).expect("the kernel table exists");
-    for predicate in ["fn allows_url", "fn allows_env", "fn allows_read", "fn allows_write"] {
+    for predicate in [
+        "fn allows_url",
+        "fn allows_env",
+        "fn allows_read",
+        "fn allows_write",
+    ] {
         assert!(
             kernel_src.contains(predicate),
             "the kernel table must define `{predicate}`"
@@ -102,7 +107,12 @@ fn no_carrier_defines_its_own_authorization() {
     ] {
         for (path, source) in read_all(&root.join(carrier)) {
             let production = without_tests(&source);
-            for predicate in ["fn allows_url", "fn allows_env", "fn allows_read", "fn allows_write"] {
+            for predicate in [
+                "fn allows_url",
+                "fn allows_env",
+                "fn allows_read",
+                "fn allows_write",
+            ] {
                 assert!(
                     !production.contains(predicate),
                     "{} defines `{predicate}` — authorization belongs to \
@@ -159,7 +169,8 @@ fn carriers_do_not_reach_for_each_other() {
 #[test]
 fn every_carrier_is_optional_at_compile_time() {
     let root = repo_root();
-    let manifest = std::fs::read_to_string(root.join("daemon/Cargo.toml")).expect("daemon manifest");
+    let manifest =
+        std::fs::read_to_string(root.join("daemon/Cargo.toml")).expect("daemon manifest");
 
     for (dependency, feature) in [
         ("plugin-host", "plugins = ["),

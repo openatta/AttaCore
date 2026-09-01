@@ -207,12 +207,18 @@ mod tests {
             }
         }
 
-        let chain: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(Deadline(Duration::from_millis(20)))];
-        let outcome = dispatch_through(&chain, call(), CancellationToken::new(), |cancel| async move {
-            // A tool that would run forever if nothing stopped it.
-            cancel.cancelled().await;
-            Err("cancelled".to_string())
-        })
+        let chain: Vec<Arc<dyn ToolMiddleware>> =
+            vec![Arc::new(Deadline(Duration::from_millis(20)))];
+        let outcome = dispatch_through(
+            &chain,
+            call(),
+            CancellationToken::new(),
+            |cancel| async move {
+                // A tool that would run forever if nothing stopped it.
+                cancel.cancelled().await;
+                Err("cancelled".to_string())
+            },
+        )
         .await;
         assert_eq!(outcome, Err("cancelled".to_string()));
     }
@@ -273,7 +279,11 @@ mod tests {
         })
         .await;
         assert_eq!(out, Ok(("from cache".to_string(), None)));
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "a short circuit must not dispatch");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a short circuit must not dispatch"
+        );
     }
 
     #[tokio::test]

@@ -188,7 +188,10 @@ mod tests {
         let Err(err) = registry.build("p", &ProviderConfig::default()) else {
             panic!("the stub factory never succeeds");
         };
-        assert_eq!(err, "stub", "an absent api_type must reach the anthropic factory");
+        assert_eq!(
+            err, "stub",
+            "an absent api_type must reach the anthropic factory"
+        );
     }
 
     #[test]

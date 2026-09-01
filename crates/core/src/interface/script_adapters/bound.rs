@@ -52,8 +52,7 @@ pub struct BoundScripts {
     /// A ring in front of every tool call.
     pub tool_middleware: Vec<Arc<dyn crate::interface::tool_middleware::ToolMiddleware>>,
     /// The request on its way out and the message on its way back.
-    pub model_interceptors:
-        Vec<Arc<dyn crate::interface::model_interceptor::ModelInterceptor>>,
+    pub model_interceptors: Vec<Arc<dyn crate::interface::model_interceptor::ModelInterceptor>>,
     /// Every carrier that was built, so a turn can reset their quotas.
     ///
     /// Without this the per-turn budget is a per-session one: nothing

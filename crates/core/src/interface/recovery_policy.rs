@@ -196,7 +196,10 @@ mod tests {
             }
         );
         let without = DefaultRecovery::new(None);
-        assert_eq!(without.on_failure(&ModelFailure::Overloaded), Recovery::Fail);
+        assert_eq!(
+            without.on_failure(&ModelFailure::Overloaded),
+            Recovery::Fail
+        );
     }
 
     #[test]
@@ -257,7 +260,10 @@ mod tests {
 
     #[test]
     fn a_deployment_can_refuse_to_spend_anything_on_recovery() {
-        assert_eq!(NeverRecover.on_failure(&ModelFailure::Overloaded), Recovery::Fail);
+        assert_eq!(
+            NeverRecover.on_failure(&ModelFailure::Overloaded),
+            Recovery::Fail
+        );
         assert_eq!(
             NeverRecover.on_early_stop("max_tokens", &attempt(0, 2000)),
             StopRecovery::Accept

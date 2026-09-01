@@ -94,11 +94,7 @@ impl HealthCheck for SettingsTiersCheck {
             inspect_tier("scene", &self.scene),
             inspect_tier("project", &self.project),
         ];
-        let broken: Vec<&str> = tiers
-            .iter()
-            .filter(|t| !t.parses)
-            .map(|t| t.tier)
-            .collect();
+        let broken: Vec<&str> = tiers.iter().filter(|t| !t.parses).map(|t| t.tier).collect();
         let details = serde_json::to_value(&tiers).unwrap_or(serde_json::Value::Null);
 
         // A tier that is simply absent is the normal case, not a fault: most
@@ -459,7 +455,10 @@ mod tests {
             report["settings_tiers"],
             report["health"]["checks"][0]["details"]
         );
-        assert_eq!(report["providers"], report["health"]["checks"][1]["details"]);
+        assert_eq!(
+            report["providers"],
+            report["health"]["checks"][1]["details"]
+        );
         assert_eq!(report["hooks"], report["health"]["checks"][2]["details"]);
         assert_eq!(report["health"]["status"], "degraded");
     }

@@ -64,7 +64,6 @@ fn effective_known_scenes(policy: &SandboxPolicy) -> Vec<&str> {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct SandboxOptions<'a> {
     pub command: &'a str,
@@ -75,7 +74,6 @@ pub struct SandboxOptions<'a> {
     /// Falls back to safe defaults via `SandboxPolicy::default()`.
     pub policy: SandboxPolicy,
 }
-
 
 /// Pick the platform backend and wrap the command.
 ///
@@ -391,7 +389,8 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> Confined {
 /// A shell command as a process spec. The one place `bash -c` is spelled, so
 /// that every backend wraps the same thing.
 fn bash_spec(command: &str) -> ProcessSpec {
-    ProcessSpec::new("bash", std::path::Path::new(".")).args(["-c".to_string(), command.to_string()])
+    ProcessSpec::new("bash", std::path::Path::new("."))
+        .args(["-c".to_string(), command.to_string()])
 }
 
 /// The platform backends behind the contract.
@@ -414,9 +413,7 @@ impl Sandbox for PlatformSandbox {
                     spec,
                     mode: SandboxMode::Unavailable,
                     enforcement: Enforcement::None,
-                    unmet: vec![
-                        "this backend only confines shell commands (`bash -c …`)".into()
-                    ],
+                    unmet: vec!["this backend only confines shell commands (`bash -c …`)".into()],
                 }
             }
         };
@@ -499,7 +496,11 @@ mod tests {
     fn the_command_reaches_the_shell_exactly_once() {
         let c = wrap(opts("echo hi", Path::new("/tmp/work")));
         assert_eq!(
-            c.spec.args.iter().filter(|a| a.as_str() == "echo hi").count(),
+            c.spec
+                .args
+                .iter()
+                .filter(|a| a.as_str() == "echo hi")
+                .count(),
             1,
             "argv: {:?}",
             c.spec.args
@@ -1144,7 +1145,10 @@ mod enforcement_tests {
         match w.mode {
             SandboxMode::Disabled | SandboxMode::Unavailable => {
                 assert_eq!(w.enforcement, Enforcement::None);
-                assert_eq!(w.spec.program, "bash", "an unenforced command must be plain bash");
+                assert_eq!(
+                    w.spec.program, "bash",
+                    "an unenforced command must be plain bash"
+                );
             }
             SandboxMode::MacOSSandboxExec => {
                 assert_eq!(w.enforcement, Enforcement::Full);

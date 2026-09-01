@@ -227,9 +227,11 @@ mod tests {
     #[test]
     fn an_absent_instruction_file_contributes_nothing() {
         assert!(InstructionFile::new(None).documents().is_empty());
-        assert!(InstructionFile::new(Some(PathBuf::from("/nonexistent/AGENTS.md")))
-            .documents()
-            .is_empty());
+        assert!(
+            InstructionFile::new(Some(PathBuf::from("/nonexistent/AGENTS.md")))
+                .documents()
+                .is_empty()
+        );
     }
 
     #[test]

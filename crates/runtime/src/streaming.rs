@@ -7,13 +7,13 @@
 //! Sibling abort on error (any tool error cancels all siblings in the same batch).
 
 use crate::agent::EventSender;
-use std::sync::Arc;
 use base::interface::event::AgentEvent;
 use base::interface::model::{
     MessageRole, ModelContentBlock, ModelEvent, ModelMessage, ModelStream, Usage,
 };
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Result of processing a single model stream.
@@ -170,7 +170,12 @@ where
                 // tool call have to be in the transcript ahead of the
                 // `tool_use` block, or the *next* request in this turn is
                 // rejected for a missing/misordered thinking block.
-                flush_assistant_prefix(session, &mut completed_thinking, &mut pending_text, interceptors);
+                flush_assistant_prefix(
+                    session,
+                    &mut completed_thinking,
+                    &mut pending_text,
+                    interceptors,
+                );
                 // Buffer every ToolUse the model actually emitted — duplicate or
                 // not — it gets flushed together with its ToolResult once the
                 // batch resolves (see module-level doc comment).
@@ -322,7 +327,12 @@ where
     // Flush remaining thinking + pending text. On a no-tool turn this is the
     // only flush, and it is what puts the reasoning into the transcript so a
     // later turn (or a resume) still sees it.
-    flush_assistant_prefix(session, &mut completed_thinking, &mut pending_text, interceptors);
+    flush_assistant_prefix(
+        session,
+        &mut completed_thinking,
+        &mut pending_text,
+        interceptors,
+    );
 
     // Drain any remaining in-flight concurrent tools, then flush the final batch.
     //

@@ -134,13 +134,14 @@ async fn trace(case: Case) -> String {
     // regardless of `settings.permission_mode` — so a case about approval
     // would pass while proving nothing. The first draft of this file did
     // exactly that: the approve and deny goldens came out byte-identical.
-    let permission: Arc<dyn base::interface::permission::Permission> =
-        Arc::new(permissions::rule_set_permission::RuleSetPermission::from_settings(
+    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(
+        permissions::rule_set_permission::RuleSetPermission::from_settings(
             &settings,
             case.permission_mode.into(),
             registry.clone(),
             [],
-        ));
+        ),
+    );
 
     let scene: Arc<dyn AgentScene> = {
         let scene = BudgetScene::new(case.compact_threshold);

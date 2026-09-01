@@ -328,9 +328,7 @@ impl EngineConfig {
             crate::settings::ThinkingMode::Auto => ThinkingModeConfig::Auto,
             crate::settings::ThinkingMode::Off => ThinkingModeConfig::Off,
             crate::settings::ThinkingMode::On => ThinkingModeConfig::On,
-            crate::settings::ThinkingMode::OnBudget(n) => {
-                ThinkingModeConfig::OnBudget(n)
-            }
+            crate::settings::ThinkingMode::OnBudget(n) => ThinkingModeConfig::OnBudget(n),
         };
 
         c.permission_prompt_timeout_secs = settings.execution.permission_prompt_timeout_secs;
@@ -428,9 +426,7 @@ mod sandbox_wiring_tests {
     use super::*;
     use crate::settings::Settings;
 
-    fn settings_with_sandbox(
-        f: impl FnOnce(&mut crate::settings::SandboxConfig),
-    ) -> Settings {
+    fn settings_with_sandbox(f: impl FnOnce(&mut crate::settings::SandboxConfig)) -> Settings {
         let mut s = Settings::defaults_for("test-model");
         f(&mut s.sandbox);
         s

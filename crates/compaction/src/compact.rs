@@ -203,11 +203,7 @@ pub trait Compactor: Send + Sync {
     /// blanks tool-result bodies in place and never drops a message, so
     /// counting messages meant the result was discarded every time and this
     /// whole path had no consequence.
-    fn reactive(
-        &self,
-        messages: &mut Vec<ModelMessage>,
-        input: &ReactiveInput,
-    ) -> ReactiveOutcome {
+    fn reactive(&self, messages: &mut Vec<ModelMessage>, input: &ReactiveInput) -> ReactiveOutcome {
         if !input.enabled || input.context_limit == 0 || input.circuit_open {
             return ReactiveOutcome::NotTriggered;
         }
@@ -1302,14 +1298,22 @@ mod tests {
             threshold: 10_000,
             warned_already: warned,
         };
-        assert!(DefaultCompactor.context_warning(&state(7_999, false)).is_none());
-        assert!(DefaultCompactor.context_warning(&state(8_001, false)).is_some());
+        assert!(DefaultCompactor
+            .context_warning(&state(7_999, false))
+            .is_none());
+        assert!(DefaultCompactor
+            .context_warning(&state(8_001, false))
+            .is_some());
         assert!(
-            DefaultCompactor.context_warning(&state(8_001, true)).is_none(),
+            DefaultCompactor
+                .context_warning(&state(8_001, true))
+                .is_none(),
             "already said"
         );
         assert!(
-            DefaultCompactor.context_warning(&state(10_001, false)).is_none(),
+            DefaultCompactor
+                .context_warning(&state(10_001, false))
+                .is_none(),
             "past the threshold there is nothing to warn about — it is compacting"
         );
     }
@@ -1382,7 +1386,9 @@ mod tests {
                 max_tokens: usize,
                 keep_rounds: usize,
             ) -> Result<(Vec<ModelMessage>, CompactResult), CompactError> {
-                DefaultCompactor.compact(messages, max_tokens, keep_rounds).await
+                DefaultCompactor
+                    .compact(messages, max_tokens, keep_rounds)
+                    .await
             }
 
             fn tool_result_budget(&self) -> ToolResultBudget {
@@ -1996,6 +2002,9 @@ mod tests {
     #[test]
     fn tool_result_budget_is_a_noop_when_under_budget() {
         let mut msgs = vec![tool_result("t1", "small"), tool_result("t2", "also small")];
-        assert_eq!(enforce_tool_result_budget(&mut msgs, &ToolResultBudget::default()), 0);
+        assert_eq!(
+            enforce_tool_result_budget(&mut msgs, &ToolResultBudget::default()),
+            0
+        );
     }
 }

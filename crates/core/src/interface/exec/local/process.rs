@@ -98,8 +98,11 @@ fn interleave(
         })
         .boxed()
     }
-    futures::stream::select(chunks(stdout, OutputStream::Stdout), chunks(stderr, OutputStream::Stderr))
-        .boxed()
+    futures::stream::select(
+        chunks(stdout, OutputStream::Stdout),
+        chunks(stderr, OutputStream::Stderr),
+    )
+    .boxed()
 }
 
 struct LocalHandle {
@@ -196,7 +199,10 @@ mod tests {
     #[tokio::test]
     async fn output_arrives_before_the_process_exits() {
         let mut h = LocalProcess
-            .spawn(sh("echo first; sleep 5; echo never"), CancellationToken::new())
+            .spawn(
+                sh("echo first; sleep 5; echo never"),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         let mut out = h.output().unwrap();

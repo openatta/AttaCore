@@ -245,7 +245,11 @@ mod tests {
             while sink.len() < 3 && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            assert_eq!(sink.len(), 3, "each sink gets the whole stream, not a share of it");
+            assert_eq!(
+                sink.len(),
+                3,
+                "each sink gets the whole stream, not a share of it"
+            );
         }
     }
 
@@ -261,7 +265,9 @@ mod tests {
             .await
             .expect("the bridge must forward, not swallow")
             .expect("channel open");
-        assert!(matches!(received, AgentEvent::TextDelta { turn_id, .. } if turn_id == "from-below"));
+        assert!(
+            matches!(received, AgentEvent::TextDelta { turn_id, .. } if turn_id == "from-below")
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while sink.is_empty() && Instant::now() < deadline {

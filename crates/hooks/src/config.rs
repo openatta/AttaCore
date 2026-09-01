@@ -248,7 +248,8 @@ pub fn parse_hooks_settings(value: &serde_json::Value) -> (HooksSettings, HooksP
     };
 
     for (name, configs) in map {
-        let Ok(event) = serde_json::from_value::<HookEvent>(serde_json::Value::String(name.clone()))
+        let Ok(event) =
+            serde_json::from_value::<HookEvent>(serde_json::Value::String(name.clone()))
         else {
             report.unknown_events.push(name.clone());
             continue;

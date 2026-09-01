@@ -441,7 +441,12 @@ mod tests {
     #[tokio::test]
     async fn collects_basic_fields_for_arbitrary_dir() {
         let dir = TempDir::new().unwrap();
-        let ctx = FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path()), &crate::interface::environment::SystemEnvironment).await;
+        let ctx = FrozenContext::collect(
+            dir.path().to_path_buf(),
+            &test_paths(dir.path()),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         assert!(!ctx.platform.is_empty());
         assert!(ctx.today.len() == 10); // YYYY-MM-DD
                                         // 不在 git 仓库下，is_git=false 且 git_* 字段都 None
@@ -453,7 +458,12 @@ mod tests {
     async fn detects_git_repo_in_a_real_repo() {
         // 当前 cwd 是 attacode 仓库本身，已经初始化了 git
         let pwd = std::env::current_dir().unwrap();
-        let ctx = FrozenContext::collect(pwd.clone(), &test_paths(&pwd), &crate::interface::environment::SystemEnvironment).await;
+        let ctx = FrozenContext::collect(
+            pwd.clone(),
+            &test_paths(&pwd),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         assert!(ctx.is_git, "expected attacode workspace to be inside git");
         assert!(ctx.git_branch.is_some());
     }
@@ -499,8 +509,12 @@ mod tests {
         run(&["commit", "--allow-empty", "-q", "-m", "init"]);
         run(&["checkout", "-q", "-b", "original-branch"]);
 
-        let mut ctx =
-            FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path()), &crate::interface::environment::SystemEnvironment).await;
+        let mut ctx = FrozenContext::collect(
+            dir.path().to_path_buf(),
+            &test_paths(dir.path()),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         assert_eq!(ctx.git_branch.as_deref(), Some("original-branch"));
 
         run(&["checkout", "-q", "-b", "new-branch"]);
@@ -534,8 +548,12 @@ mod tests {
             .unwrap();
         run(&["add", "dirty.txt"]);
 
-        let mut ctx =
-            FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path()), &crate::interface::environment::SystemEnvironment).await;
+        let mut ctx = FrozenContext::collect(
+            dir.path().to_path_buf(),
+            &test_paths(dir.path()),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         assert!(
             ctx.git_status
                 .as_deref()
@@ -565,8 +583,12 @@ mod tests {
     #[tokio::test]
     async fn refresh_git_status_is_a_noop_outside_a_repo() {
         let dir = TempDir::new().unwrap();
-        let mut ctx =
-            FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path()), &crate::interface::environment::SystemEnvironment).await;
+        let mut ctx = FrozenContext::collect(
+            dir.path().to_path_buf(),
+            &test_paths(dir.path()),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         assert!(!ctx.is_git);
         ctx.refresh_git_status().await;
         assert!(ctx.git_status.is_none());
@@ -580,7 +602,12 @@ mod tests {
         tokio::fs::write(&p, "# Test instructions\nbe concise.")
             .await
             .unwrap();
-        let ctx = FrozenContext::collect(dir.path().to_path_buf(), &test_paths(dir.path()), &crate::interface::environment::SystemEnvironment).await;
+        let ctx = FrozenContext::collect(
+            dir.path().to_path_buf(),
+            &test_paths(dir.path()),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         assert_eq!(ctx.memory_blocks.len(), 1, "expected one AGENTS.md");
         assert!(ctx.memory_blocks[0].content.contains("be concise"));
     }
@@ -598,7 +625,12 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = FrozenContext::collect(child, &test_paths(dir.path()), &crate::interface::environment::SystemEnvironment).await;
+        let ctx = FrozenContext::collect(
+            child,
+            &test_paths(dir.path()),
+            &crate::interface::environment::SystemEnvironment,
+        )
+        .await;
         // 应该顺序：parent 在前，child 在后（远到近）
         assert!(ctx.memory_blocks.len() >= 2);
         let parent_idx = ctx

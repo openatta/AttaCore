@@ -228,7 +228,11 @@ mod tests {
         }
     }
 
-    async fn call(code: &str, entry: &str, input: serde_json::Value) -> Result<serde_json::Value, ScriptError> {
+    async fn call(
+        code: &str,
+        entry: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, ScriptError> {
         QuickJsEngine::new()
             .eval(&script(code), entry, input, &ScriptLimits::default())
             .await
@@ -341,7 +345,10 @@ mod tests {
             stuck.call("f", serde_json::json!({})),
             fine.call("f", serde_json::json!({"ok": true}))
         );
-        assert!(matches!(stuck_out, Err(ScriptError::TimedOut { .. })), "{stuck_out:?}");
+        assert!(
+            matches!(stuck_out, Err(ScriptError::TimedOut { .. })),
+            "{stuck_out:?}"
+        );
         assert_eq!(fine_out, Ok(serde_json::json!({"ok": true})));
     }
 
@@ -358,10 +365,19 @@ mod tests {
                     }";
         for _ in 0..3 {
             let out = engine
-                .eval(&script(code), "f", serde_json::json!({}), &ScriptLimits::default())
+                .eval(
+                    &script(code),
+                    "f",
+                    serde_json::json!({}),
+                    &ScriptLimits::default(),
+                )
                 .await
                 .expect("runs");
-            assert_eq!(out, serde_json::json!(1), "a fresh runtime starts from nothing");
+            assert_eq!(
+                out,
+                serde_json::json!(1),
+                "a fresh runtime starts from nothing"
+            );
         }
     }
 
@@ -426,7 +442,6 @@ pub mod bindings {
     ];
 
     pub use base::interface::script_adapters::BoundScripts;
-
 
     /// Why a binding could not be honored.
     ///
@@ -546,11 +561,10 @@ pub mod bindings {
             } else {
                 project_root.join(&binding.path)
             };
-            let code =
-                std::fs::read_to_string(&path).map_err(|e| BindingError::Unreadable {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
+            let code = std::fs::read_to_string(&path).map_err(|e| BindingError::Unreadable {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            })?;
             let origin = origin_of(&path, project_root);
             let defaults = ScriptLimits::default();
             prepared.push((
@@ -851,7 +865,11 @@ mod binding_tests {
         use base::interface::tool_result::ToolResultDraft;
 
         let project = tempdir();
-        std::fs::write(project.join("bad.js"), "function onResult() { return {oops: 1}; }").unwrap();
+        std::fs::write(
+            project.join("bad.js"),
+            "function onResult() { return {oops: 1}; }",
+        )
+        .unwrap();
         let mut b = binding("bad.js");
         b.point = "tool.result".into();
         b.entry = "onResult".into();
@@ -1021,9 +1039,18 @@ mod binding_tests {
     #[test]
     fn one_bad_binding_registers_none_of_them() {
         let project = tempdir();
-        std::fs::write(project.join("good.js"), "function onAssemble(b) { return b; }").unwrap();
+        std::fs::write(
+            project.join("good.js"),
+            "function onAssemble(b) { return b; }",
+        )
+        .unwrap();
         let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
-        let err = bind(engine, &[binding("good.js"), binding("missing.js")], &project).unwrap_err();
+        let err = bind(
+            engine,
+            &[binding("good.js"), binding("missing.js")],
+            &project,
+        )
+        .unwrap_err();
         assert!(matches!(err, BindingError::Unreadable { .. }), "{err:?}");
         // Nothing came back at all, so the good one was not bound either — the
         // point of returning a set rather than registering as it goes.
@@ -1044,7 +1071,6 @@ mod binding_tests {
         std::fs::create_dir_all(&base).unwrap();
         base
     }
-
 
     /// One function, called twice, told which half of recall it is in. The
     /// phase argument is the whole of that design, so a case that does two
@@ -1087,7 +1113,6 @@ mod binding_tests {
         assert_eq!(names, ["deploy-window"]);
     }
 
-
     /// A script that throws is a script that decided nothing.
     #[test]
     fn a_recall_script_that_throws_leaves_recall_alone() {
@@ -1122,8 +1147,6 @@ mod binding_tests {
         bound.retrieval_hooks[0].after_retrieve(&request, &mut names);
         assert_eq!(names, ["kept"]);
     }
-
-
 
     /// The ring around a tool call, end to end. A script refuses a call and
     /// the tool never runs — the acceptance case for a point whose whole
@@ -1186,7 +1209,6 @@ mod binding_tests {
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
-
     /// The request point, end to end and through the blocking path: a script
     /// takes the tool set down to what it wants and leaves everything it did
     /// not name.
@@ -1239,7 +1261,6 @@ mod binding_tests {
         assert_eq!(names, ["Read"]);
     }
 
-
     /// The message point, end to end. A script redacts the text and the
     /// thinking block beside it — signature and all — is not its to touch.
     #[test]
@@ -1289,5 +1310,4 @@ mod binding_tests {
             other => panic!("the text block was replaced by something else: {other:?}"),
         }
     }
-
 }

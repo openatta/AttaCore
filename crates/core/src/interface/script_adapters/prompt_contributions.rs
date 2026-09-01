@@ -212,7 +212,9 @@ fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
         carrier.record(
             entry,
             ScriptOutcome::NoChange {
-                detail: Some("answered its first call without a `name`; nothing was registered".into()),
+                detail: Some(
+                    "answered its first call without a `name`; nothing was registered".into(),
+                ),
             },
         );
         return None;
@@ -227,7 +229,10 @@ fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
         carrier.record(
             entry,
             ScriptOutcome::NoChange {
-                detail: Some("asked for a name the engine already contributes; nothing was registered".into()),
+                detail: Some(
+                    "asked for a name the engine already contributes; nothing was registered"
+                        .into(),
+                ),
             },
         );
         return None;
@@ -249,7 +254,7 @@ fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
                 detail: Some("answered with an `order` the prompt cannot be sorted by; nothing was registered".into()),
             },
         );
-        return None;
+                return None;
             }
         },
     };

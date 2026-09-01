@@ -1,6 +1,8 @@
 //! A sandbox that admits it is not one.
 
-use crate::interface::exec::{Confined, Enforcement, ProcessSpec, Sandbox, SandboxMode, SandboxPolicy};
+use crate::interface::exec::{
+    Confined, Enforcement, ProcessSpec, Sandbox, SandboxMode, SandboxPolicy,
+};
 
 /// Constrains nothing, and says so.
 ///

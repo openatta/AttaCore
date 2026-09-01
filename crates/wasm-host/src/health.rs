@@ -177,8 +177,11 @@ impl base::interface::health::HealthCheck for PluginBreakers {
         });
 
         if broken.is_empty() {
-            CheckResult::ok(format!("{} plugin(s) called, none set aside", records.len()))
-                .with_details(details)
+            CheckResult::ok(format!(
+                "{} plugin(s) called, none set aside",
+                records.len()
+            ))
+            .with_details(details)
         } else {
             let names: Vec<&str> = broken.iter().map(|r| r.plugin.as_str()).collect();
             CheckResult::degraded(format!(

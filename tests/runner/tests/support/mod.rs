@@ -45,7 +45,11 @@ impl Tool for GoldenEcho {
     fn is_read_only(&self, _: &serde_json::Value) -> bool {
         true
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::allow()
     }
     async fn prompt(&self, _: &PromptContext) -> String {
@@ -87,7 +91,11 @@ impl Tool for GoldenFlood {
     fn is_read_only(&self, _: &serde_json::Value) -> bool {
         true
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::allow()
     }
     async fn prompt(&self, _: &PromptContext) -> String {
@@ -120,7 +128,11 @@ impl Tool for GoldenBoom {
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::allow()
     }
     async fn prompt(&self, _: &PromptContext) -> String {
@@ -154,7 +166,11 @@ impl Tool for GoldenAsk {
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::Ask {
             message: "GoldenAsk wants to run".into(),
             decision_reason: None,
@@ -201,7 +217,11 @@ impl Tool for GoldenReadFile {
     fn is_read_only(&self, _: &serde_json::Value) -> bool {
         true
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::allow()
     }
     async fn prompt(&self, _: &PromptContext) -> String {
@@ -337,11 +357,7 @@ fn elide(s: &str) -> String {
     if head.len() <= KEEP && head.len() == s.len() {
         return head.to_string();
     }
-    format!(
-        "{}… <{} bytes total>",
-        truncate_chars(head, KEEP),
-        s.len()
-    )
+    format!("{}… <{} bytes total>", truncate_chars(head, KEEP), s.len())
 }
 
 /// Character-boundary-safe prefix. A tool result is arbitrary bytes, so a

@@ -263,7 +263,10 @@ mod contract_tests {
         let id = store.store("hello paste store").unwrap();
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(store.load(&id).unwrap().as_deref(), Some("hello paste store"));
+        assert_eq!(
+            store.load(&id).unwrap().as_deref(),
+            Some("hello paste store")
+        );
     }
 
     #[test]

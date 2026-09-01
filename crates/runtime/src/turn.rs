@@ -821,14 +821,14 @@ impl Agent {
                     usage: Usage::default(),
                 });
             }
-            if let base::interface::turn_policy::TurnStep::Stop { reason } =
-                self.turn_policy
-                    .before_model_call(&base::interface::turn_policy::TurnProgress {
-                        api_calls,
-                        tool_calls,
-                        structured_output_calls,
-                        stop_reason: "",
-                    })
+            if let base::interface::turn_policy::TurnStep::Stop { reason } = self
+                .turn_policy
+                .before_model_call(&base::interface::turn_policy::TurnProgress {
+                    api_calls,
+                    tool_calls,
+                    structured_output_calls,
+                    stop_reason: "",
+                })
             {
                 self.last_had_tool_uses = had_tool_uses_this_turn;
                 self.emit_turn_complete(&reason, api_calls, tool_calls, start);
@@ -953,15 +953,16 @@ impl Agent {
                             // KB, which is not what blew the context budget
                             // (the message history is), and the compaction
                             // that just ran freed far more than they take.
-                            let retry = self.prepare_retry(
-                                &effective_model,
-                                effective_max_tokens,
-                                tool_defs.clone(),
-                                self.session.messages().to_vec(),
-                                self.settings.model.fallback_model.clone(),
-                                origin.clone(),
-                            )
-                            .await;
+                            let retry = self
+                                .prepare_retry(
+                                    &effective_model,
+                                    effective_max_tokens,
+                                    tool_defs.clone(),
+                                    self.session.messages().to_vec(),
+                                    self.settings.model.fallback_model.clone(),
+                                    origin.clone(),
+                                )
+                                .await;
                             match self.send(retry, cancel.clone()).await {
                                 Ok(s) => s,
                                 Err(e2) => {
@@ -1142,14 +1143,14 @@ impl Agent {
             if so_calls_this_turn > structured_output_calls {
                 structured_output_calls = so_calls_this_turn;
             }
-            if let base::interface::turn_policy::TurnStep::Stop { reason } =
-                self.turn_policy
-                    .after_model_call(&base::interface::turn_policy::TurnProgress {
-                        api_calls,
-                        tool_calls,
-                        structured_output_calls,
-                        stop_reason: &stop_reason,
-                    })
+            if let base::interface::turn_policy::TurnStep::Stop { reason } = self
+                .turn_policy
+                .after_model_call(&base::interface::turn_policy::TurnProgress {
+                    api_calls,
+                    tool_calls,
+                    structured_output_calls,
+                    stop_reason: &stop_reason,
+                })
             {
                 tracing::warn!(
                     structured_output_calls,
@@ -1175,8 +1176,7 @@ impl Agent {
                     .budget_policy
                     .on_usage(&base::interface::budget_policy::Spend {
                         total_tokens: total_tokens_used,
-                    })
-                {
+                    }) {
                     base::interface::budget_policy::Spending::WithinBudget => {}
                     base::interface::budget_policy::Spending::Warn { reminder, limit } => {
                         tracing::warn!(
@@ -2512,17 +2512,17 @@ or project context that should survive across sessions.
             &*self.environment,
         );
         ctx.available_tools = tools_ref;
-        let blocks = self
-            .prompt_assembler
-            .assemble(&base::interface::prompt_assembler::AssemblyRequest {
-                registry: self.prompt_registry.as_ref(),
-                scene: self.scene.as_ref(),
-                settings: &self.settings,
-                memory_store: &self.memory_store,
-                ctx: &ctx,
-                skills_text: skills_ref,
-                mcp_instructions: mcp_ref,
-            });
+        let blocks =
+            self.prompt_assembler
+                .assemble(&base::interface::prompt_assembler::AssemblyRequest {
+                    registry: self.prompt_registry.as_ref(),
+                    scene: self.scene.as_ref(),
+                    settings: &self.settings,
+                    memory_store: &self.memory_store,
+                    ctx: &ctx,
+                    skills_text: skills_ref,
+                    mcp_instructions: mcp_ref,
+                });
         // Passes that have to await something — a script carrier, most of
         // all. Kept out of `assemble_prompt_with` so assembly stays a
         // synchronous function for every caller that registers none.
@@ -2680,7 +2680,8 @@ or project context that should survive across sessions.
     /// What the scene asked for, after the deployment's budget policy has had
     /// its say.
     fn context_budget(&self) -> base::interface::budget_policy::ContextBudget {
-        self.budget_policy.context_budget(&self.scene.token_budget())
+        self.budget_policy
+            .context_budget(&self.scene.token_budget())
     }
 
     /// Handle model Overloaded error by switching to fallback model and retrying.
@@ -2733,15 +2734,16 @@ or project context that should survive across sessions.
             *effective_model = model;
             // `fallback_model: None` — this retry *is* the fallback, so there
             // is nothing further to fall back to.
-            let retry = self.prepare_retry(
-                effective_model.as_str(),
-                effective_max_tokens,
-                tool_defs,
-                messages,
-                None,
-                origin,
-            )
-            .await;
+            let retry = self
+                .prepare_retry(
+                    effective_model.as_str(),
+                    effective_max_tokens,
+                    tool_defs,
+                    messages,
+                    None,
+                    origin,
+                )
+                .await;
             self.send(retry, cancel)
                 .await
                 .map_err(|e| TurnError::Model(format!("failed to stream model response: {}", e)))
@@ -2789,7 +2791,6 @@ or project context that should survive across sessions.
         true
     }
 }
-
 
 /// Tokens a request spends before any conversation content: the assembled
 /// system prompt plus every tool definition's name, description and JSON
@@ -2915,8 +2916,7 @@ pub(crate) struct ToolExecCtx {
     pub tool_middleware: Arc<Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>>,
     /// The last hands on a tool's output — see
     /// [`base::interface::tool_result`].
-    pub result_transformers:
-        Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
+    pub result_transformers: Arc<Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>>,
     /// Images returned by tools this round, collected out-of-band.
     ///
     /// The tool-dispatch closure returns `(String, Option<Vec<Value>>)` — text
@@ -6260,7 +6260,15 @@ mod extract_memories_tests {
         let messages = vec![user_msg("hello"), user_msg("world")];
         let model = CapturingModel::new();
 
-        extract_memories_after_turn(&store, &messages, &model, "custom-vendor-model", None, &base::interface::environment::SystemEnvironment).await;
+        extract_memories_after_turn(
+            &store,
+            &messages,
+            &model,
+            "custom-vendor-model",
+            None,
+            &base::interface::environment::SystemEnvironment,
+        )
+        .await;
 
         let (params, _) = model
             .captured
@@ -6277,7 +6285,15 @@ mod extract_memories_tests {
         let messages = vec![user_msg("hello"), user_msg("world")];
         let model = CapturingModel::new();
 
-        extract_memories_after_turn(&store, &messages, &model, "m", None, &base::interface::environment::SystemEnvironment).await;
+        extract_memories_after_turn(
+            &store,
+            &messages,
+            &model,
+            "m",
+            None,
+            &base::interface::environment::SystemEnvironment,
+        )
+        .await;
 
         let (_, prompt_text) = model
             .captured

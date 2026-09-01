@@ -98,10 +98,7 @@ pub async fn write_policy(ctx: &base::tool::ToolContext) -> permissions::path_sa
         .with_allowed(allowed)
 }
 
-
-
 // ── Write policy types ──
-
 
 pub fn is_path_within_root(path: &Path, root: &Path) -> bool {
     canonicalize_best_effort(path).starts_with(canonicalize_best_effort(root))

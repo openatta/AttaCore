@@ -101,12 +101,18 @@ async fn run_and_read_log(root: &std::path::Path, fixed: bool) -> String {
 
     let mut logs: Vec<std::path::PathBuf> = Vec::new();
     collect_jsonl(&root.join("global"), &mut logs);
-    assert_eq!(logs.len(), 1, "expected exactly one transcript, got {logs:?}");
+    assert_eq!(
+        logs.len(),
+        1,
+        "expected exactly one transcript, got {logs:?}"
+    );
     std::fs::read_to_string(&logs[0]).expect("read log")
 }
 
 fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -125,7 +131,10 @@ async fn the_same_session_replayed_leaves_the_same_log() {
     let first = run_and_read_log(a.path(), true).await;
     let second = run_and_read_log(b.path(), true).await;
 
-    assert!(!first.trim().is_empty(), "the run must have logged something");
+    assert!(
+        !first.trim().is_empty(),
+        "the run must have logged something"
+    );
     assert_eq!(
         first, second,
         "the same conversation under a fixed environment must produce the same log"

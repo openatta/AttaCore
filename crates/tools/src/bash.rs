@@ -8,8 +8,8 @@
 //! - 命令分类用关键字白名单 / 黑名单（read-only / destructive）
 
 use base::interface::exec::local::sandbox;
-pub use base::interface::exec::SandboxMode;
 pub use base::interface::exec::local::sandbox::sandbox_status;
+pub use base::interface::exec::SandboxMode;
 
 use async_trait::async_trait;
 use base::error::ToolError;
@@ -1241,10 +1241,10 @@ mod tests {
         .await;
         assert!(!refused(&r), "got: {:?}", r.content);
     }
-    use std::path::PathBuf;
     use super::*;
     use base::tool::ToolResultContent;
     use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn ctx_in(cwd: &std::path::Path) -> ToolContext {

@@ -197,9 +197,11 @@ mod tests {
 
     #[test]
     fn a_missing_directory_is_not_an_error() {
-        assert!(SkillDirectory::tier("/nonexistent/skills", SkillSource::User)
-            .skills()
-            .is_empty());
+        assert!(
+            SkillDirectory::tier("/nonexistent/skills", SkillSource::User)
+                .skills()
+                .is_empty()
+        );
     }
 
     /// The two in-memory sources are the reason `body` is on the contract at

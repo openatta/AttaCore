@@ -111,11 +111,7 @@ impl PromptAssembler for MergedSystemPrompt {
     }
 }
 
-fn fold_system_blocks(
-    blocks: Vec<PromptBlock>,
-    separator: &str,
-    name: &str,
-) -> Vec<PromptBlock> {
+fn fold_system_blocks(blocks: Vec<PromptBlock>, separator: &str, name: &str) -> Vec<PromptBlock> {
     let mut systems: Vec<String> = Vec::new();
     // The one breakpoint the merged block gets goes at its end, so it covers
     // every stage that asked to be cached rather than the first of them.
@@ -171,7 +167,10 @@ mod tests {
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content, "first\n\nsecond\n\nthird");
-        assert_eq!(out[0].name.as_deref(), Some(MergedSystemPrompt::MERGED_NAME));
+        assert_eq!(
+            out[0].name.as_deref(),
+            Some(MergedSystemPrompt::MERGED_NAME)
+        );
     }
 
     /// One breakpoint, at the end of everything that asked to be cached —

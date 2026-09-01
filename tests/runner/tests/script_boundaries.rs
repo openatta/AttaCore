@@ -131,15 +131,13 @@ fn a_binding_whose_file_is_missing_drops_every_other() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_script_from_outside_the_project_may_add_and_may_not_rewrite() {
     let path = outside();
-    let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")])
-            .bind("prompt_block.js", "prompt.block", "onBlock")
-            .bind(
-                path.to_str().expect("fixture path is utf-8"),
-                "prompt.assemble",
-                "onAssemble",
-            ),
-    )
+    let ran = run(session(&["hello"], vec![Reply::Text("hi")])
+        .bind("prompt_block.js", "prompt.block", "onBlock")
+        .bind(
+            path.to_str().expect("fixture path is utf-8"),
+            "prompt.assemble",
+            "onAssemble",
+        ))
     .await;
 
     assert!(
@@ -180,7 +178,11 @@ async fn the_operators_own_script_may_rewrite_what_it_likes() {
 
     let session = Session::new(project, &["hello"], vec![Reply::Text("hi")])
         .tool(Arc::new(Echo) as Arc<dyn Tool>)
-        .bind(fixtures().join("prompt_block.js").to_str().unwrap(), "prompt.block", "onBlock")
+        .bind(
+            fixtures().join("prompt_block.js").to_str().unwrap(),
+            "prompt.block",
+            "onBlock",
+        )
         .bind("add_and_modify.js", "prompt.assemble", "onAssemble");
     let ran = drive(project, session).await;
 
@@ -207,14 +209,12 @@ async fn the_operators_own_script_may_rewrite_what_it_likes() {
 /// is checked rather than believed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_script_that_never_returns_costs_its_own_call_and_no_more() {
-    let ran = run(
-        session(
-            &["use the tool"],
-            vec![calls_echo("call-1", "anything"), Reply::Text("done")],
-        )
-        .bind("broken/hangs.js", "tool.result", "boom")
-            .within_ms(50),
+    let ran = run(session(
+        &["use the tool"],
+        vec![calls_echo("call-1", "anything"), Reply::Text("done")],
     )
+    .bind("broken/hangs.js", "tool.result", "boom")
+    .within_ms(50))
     .await;
 
     assert!(
@@ -242,12 +242,10 @@ async fn a_script_that_never_returns_costs_its_own_call_and_no_more() {
 /// the ceiling rather than the deadline — the case is about memory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_script_that_eats_memory_fails_alone() {
-    let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")])
-            .bind("broken/eats_memory.js", "prompt.context", "boom")
-            .within_ms(5_000)
-            .bind("prompt_block.js", "prompt.block", "onBlock"),
-    )
+    let ran = run(session(&["hello"], vec![Reply::Text("hi")])
+        .bind("broken/eats_memory.js", "prompt.context", "boom")
+        .within_ms(5_000)
+        .bind("prompt_block.js", "prompt.block", "onBlock"))
     .await;
 
     assert!(
@@ -279,23 +277,21 @@ async fn a_script_that_eats_memory_fails_alone() {
 /// to say why.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_quota_stops_a_turn_and_the_next_turn_starts_over() {
-    let ran = run(
-        session(
-            &["three calls", "one more"],
-            vec![
-                Reply::Tools(vec![
-                    ("c1", "Echo", serde_json::json!({"say": "one"})),
-                    ("c2", "Echo", serde_json::json!({"say": "two"})),
-                    ("c3", "Echo", serde_json::json!({"say": "three"})),
-                ]),
-                Reply::Text("done"),
-                calls_echo("c4", "four"),
-                Reply::Text("done again"),
-            ],
-        )
-        .bind("tool_result_quota.js", "tool.result", "onResult")
-        .calls_per_turn(2),
+    let ran = run(session(
+        &["three calls", "one more"],
+        vec![
+            Reply::Tools(vec![
+                ("c1", "Echo", serde_json::json!({"say": "one"})),
+                ("c2", "Echo", serde_json::json!({"say": "two"})),
+                ("c3", "Echo", serde_json::json!({"say": "three"})),
+            ]),
+            Reply::Text("done"),
+            calls_echo("c4", "four"),
+            Reply::Text("done again"),
+        ],
     )
+    .bind("tool_result_quota.js", "tool.result", "onResult")
+    .calls_per_turn(2))
     .await;
 
     let first_turn: Vec<ScriptOutcome> = ran
@@ -355,15 +351,13 @@ async fn the_quota_stops_a_turn_and_the_next_turn_starts_over() {
 /// only one that would notice the ring being moved inside the gate.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_lands_before_the_permission_question_is_asked() {
-    let refused = run(
-        session(
-            &["use the tool"],
-            vec![calls_guarded(), Reply::Text("done")],
-        )
-        .asking()
-        .tool(Arc::new(Guarded) as Arc<dyn Tool>)
-        .bind("tool_around_deny_guarded.js", "tool.around", "onAround"),
+    let refused = run(session(
+        &["use the tool"],
+        vec![calls_guarded(), Reply::Text("done")],
     )
+    .asking()
+    .tool(Arc::new(Guarded) as Arc<dyn Tool>)
+    .bind("tool_around_deny_guarded.js", "tool.around", "onAround"))
     .await;
 
     assert!(
@@ -379,14 +373,12 @@ async fn a_refusal_lands_before_the_permission_question_is_asked() {
 
     // Without the script the same call does reach the gate — so the assertion
     // above is about the ring and not about a tool that never asks.
-    let asked = run(
-        session(
-            &["use the tool"],
-            vec![calls_guarded(), Reply::Text("done")],
-        )
-        .asking()
-        .tool(Arc::new(Guarded) as Arc<dyn Tool>),
+    let asked = run(session(
+        &["use the tool"],
+        vec![calls_guarded(), Reply::Text("done")],
     )
+    .asking()
+    .tool(Arc::new(Guarded) as Arc<dyn Tool>))
     .await;
     assert_eq!(
         asked.prompts,
@@ -405,13 +397,11 @@ async fn a_refusal_lands_before_the_permission_question_is_asked() {
 /// can reason about.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_rewrite_of_the_wrong_length_changes_nothing() {
-    let ran = run(
-        session(
-            &["hello", "and again"],
-            vec![Reply::Text("first answer"), Reply::Text("second answer")],
-        )
-        .bind("broken/wrong_shape.js", "model.message", "onMessage"),
+    let ran = run(session(
+        &["hello", "and again"],
+        vec![Reply::Text("first answer"), Reply::Text("second answer")],
     )
+    .bind("broken/wrong_shape.js", "model.message", "onMessage"))
     .await;
 
     assert!(
@@ -439,11 +429,9 @@ async fn a_message_rewrite_of_the_wrong_length_changes_nothing() {
 /// says so with `""`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_variable_that_is_not_a_string_leaves_its_placeholder_alone() {
-    let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")])
-            .bind("prompt_block_var.js", "prompt.block", "onBlock")
-            .bind("broken/wrong_shape.js", "prompt.variable", "onVariable"),
-    )
+    let ran = run(session(&["hello"], vec![Reply::Text("hi")])
+        .bind("prompt_block_var.js", "prompt.block", "onBlock")
+        .bind("broken/wrong_shape.js", "prompt.variable", "onVariable"))
     .await;
 
     assert!(
@@ -461,13 +449,11 @@ async fn a_variable_that_is_not_a_string_leaves_its_placeholder_alone() {
 /// including the refusals that keep an outside script away from it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_contribution_cannot_take_a_kernel_block_name() {
-    let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")]).bind(
-            "broken/kernel_name.js",
-            "prompt.block",
-            "onBlock",
-        ),
-    )
+    let ran = run(session(&["hello"], vec![Reply::Text("hi")]).bind(
+        "broken/kernel_name.js",
+        "prompt.block",
+        "onBlock",
+    ))
     .await;
 
     assert!(
@@ -508,19 +494,23 @@ async fn a_script_edited_mid_session_does_not_take_effect_until_the_next_one() {
     .unwrap();
 
     let edited = script.clone();
-    let session = Session::new(project, &["one", "two"], vec![Reply::Text("a"), Reply::Text("b")])
-        .tool(Arc::new(Echo) as Arc<dyn Tool>)
-        .bind("house.js", "prompt.assemble", "onAssemble")
-        .between_turns(move |_turn, _root| {
-            std::fs::write(
-                &edited,
-                r#"function onAssemble(blocks) {
+    let session = Session::new(
+        project,
+        &["one", "two"],
+        vec![Reply::Text("a"), Reply::Text("b")],
+    )
+    .tool(Arc::new(Echo) as Arc<dyn Tool>)
+    .bind("house.js", "prompt.assemble", "onAssemble")
+    .between_turns(move |_turn, _root| {
+        std::fs::write(
+            &edited,
+            r#"function onAssemble(blocks) {
                      blocks.push({ name: "house", content: "SCRIPT-TRACE-SECOND" });
                      return blocks;
                    }"#,
-            )
-            .unwrap();
-        });
+        )
+        .unwrap();
+    });
     let ran = drive(project, session).await;
 
     assert!(
@@ -553,11 +543,9 @@ async fn a_file_that_is_not_javascript_binds_and_then_fails_every_call() {
         "binding reads the file; it does not evaluate it"
     );
 
-    let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")])
-            .bind("broken/syntax_error.js", "prompt.assemble", "boom")
-            .bind("prompt_block.js", "prompt.block", "onBlock"),
-    )
+    let ran = run(session(&["hello"], vec![Reply::Text("hi")])
+        .bind("broken/syntax_error.js", "prompt.assemble", "boom")
+        .bind("prompt_block.js", "prompt.block", "onBlock"))
     .await;
 
     assert!(
@@ -582,22 +570,20 @@ async fn a_file_that_is_not_javascript_binds_and_then_fails_every_call() {
 /// that had been bound but never ran.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_bindings_of_one_file_have_budgets_of_their_own() {
-    let ran = run(
-        session(
-            &["twice"],
-            vec![
-                Reply::Tools(vec![
-                    ("c1", "Echo", serde_json::json!({"say": "one"})),
-                    ("c2", "Echo", serde_json::json!({"say": "two"})),
-                ]),
-                Reply::Text("done"),
-            ],
-        )
-        .bind("two_points.js", "tool.around", "onAround")
-        .calls_per_turn(1)
-        .bind("two_points.js", "tool.result", "onResult")
-        .calls_per_turn(1),
+    let ran = run(session(
+        &["twice"],
+        vec![
+            Reply::Tools(vec![
+                ("c1", "Echo", serde_json::json!({"say": "one"})),
+                ("c2", "Echo", serde_json::json!({"say": "two"})),
+            ]),
+            Reply::Text("done"),
+        ],
     )
+    .bind("two_points.js", "tool.around", "onAround")
+    .calls_per_turn(1)
+    .bind("two_points.js", "tool.result", "onResult")
+    .calls_per_turn(1))
     .await;
 
     for point in ["tool.around", "tool.result"] {
@@ -629,14 +615,12 @@ async fn two_bindings_of_one_file_have_budgets_of_their_own() {
 /// first called, and then keeps finding out.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_binding_that_names_a_function_the_file_does_not_have_fails_at_its_point() {
-    let ran = run(
-        session(
-            &["use the tool"],
-            vec![calls_echo("call-1", "anything"), Reply::Text("done")],
-        )
-        .bind("tool_result.js", "tool.result", "onNoSuchFunction")
-        .bind("prompt_block.js", "prompt.block", "onNoSuchFunction"),
+    let ran = run(session(
+        &["use the tool"],
+        vec![calls_echo("call-1", "anything"), Reply::Text("done")],
     )
+    .bind("tool_result.js", "tool.result", "onNoSuchFunction")
+    .bind("prompt_block.js", "prompt.block", "onNoSuchFunction"))
     .await;
 
     assert!(
@@ -667,11 +651,13 @@ async fn a_binding_that_names_a_function_the_file_does_not_have_fails_at_its_poi
 /// first.
 #[tokio::test(flavor = "multi_thread")]
 async fn handing_the_blocks_back_in_another_order_rewrites_nothing() {
-    let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")])
-            .bind("prompt_block.js", "prompt.block", "onBlock")
-            .bind("prompt_assemble_reverse.js", "prompt.assemble", "onAssemble"),
-    )
+    let ran = run(session(&["hello"], vec![Reply::Text("hi")])
+        .bind("prompt_block.js", "prompt.block", "onBlock")
+        .bind(
+            "prompt_assemble_reverse.js",
+            "prompt.assemble",
+            "onAssemble",
+        ))
     .await;
 
     assert!(
@@ -713,7 +699,11 @@ impl Tool for Guarded {
     fn is_read_only(&self, _: &serde_json::Value) -> bool {
         false
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::ask("this tool always asks")
     }
     async fn prompt(&self, _: &PromptContext) -> String {
@@ -751,7 +741,11 @@ impl Tool for Echo {
     fn is_read_only(&self, _: &serde_json::Value) -> bool {
         true
     }
-    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
         PermissionDecision::allow()
     }
     async fn prompt(&self, _: &PromptContext) -> String {

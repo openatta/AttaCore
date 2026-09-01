@@ -37,9 +37,7 @@ impl From<crate::settings::PermissionMode> for PermissionMode {
         match m {
             crate::settings::PermissionMode::Default => Self::Default,
             crate::settings::PermissionMode::AcceptEdits => Self::AcceptEdits,
-            crate::settings::PermissionMode::BypassPermissions => {
-                Self::BypassPermissions
-            }
+            crate::settings::PermissionMode::BypassPermissions => Self::BypassPermissions,
             crate::settings::PermissionMode::Plan => Self::Plan,
             crate::settings::PermissionMode::Auto => Self::Auto,
             crate::settings::PermissionMode::DontAsk => Self::DontAsk,

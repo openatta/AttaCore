@@ -5,7 +5,9 @@
 //! program under a sandbox — so it is the one worth proving this on. Nothing
 //! below forks a process, writes a file or opens a socket.
 
-use base::interface::exec::in_process::{InMemoryFileSystem, NoSandbox, ScriptedProcess, ScriptedRun};
+use base::interface::exec::in_process::{
+    InMemoryFileSystem, NoSandbox, ScriptedProcess, ScriptedRun,
+};
 use base::interface::exec::ExecProviders;
 use base::interface::tool::{ProgressSender, Tool, ToolContext, ToolResult};
 use std::sync::Arc;

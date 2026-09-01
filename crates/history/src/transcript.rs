@@ -149,7 +149,8 @@ pub fn model_visible_content_is_reconstructible(
     let Ok(round_tripped) = entries
         .iter()
         .map(|env| {
-            serde_json::to_string(env).and_then(|line| serde_json::from_str::<EnvelopedEntry>(&line))
+            serde_json::to_string(env)
+                .and_then(|line| serde_json::from_str::<EnvelopedEntry>(&line))
         })
         .collect::<Result<Vec<_>, _>>()
     else {
@@ -988,7 +989,6 @@ mod extension_entry_tests {
         );
     }
 
-
     /// P3-8's acceptance: whether an extension's state reaches the model is
     /// now a question with somewhere to be answered, and both answers work.
     #[test]
@@ -1018,7 +1018,10 @@ mod extension_entry_tests {
             panic!("expected text");
         };
         assert!(text.contains("com.acme.deploy:checkpoint"));
-        assert!(text.contains("\"step\":3"), "the payload, not just the name");
+        assert!(
+            text.contains("\"step\":3"),
+            "the payload, not just the name"
+        );
 
         assert_eq!(
             latest_projected_message_entry_id_with(&entries, &visible),

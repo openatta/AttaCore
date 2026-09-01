@@ -182,7 +182,9 @@ impl PromptAssembly {
 
     /// Position of the block named `name`, if it is present.
     pub fn position(&self, name: &str) -> Option<usize> {
-        self.blocks.iter().position(|b| b.name.as_deref() == Some(name))
+        self.blocks
+            .iter()
+            .position(|b| b.name.as_deref() == Some(name))
     }
 
     /// Add a block at the end. Always permitted — adding cannot unsay
@@ -419,10 +421,14 @@ mod tests {
         };
         let mut asm = PromptAssembly::new(prompt(), downloaded(caps));
 
-        assert_eq!(asm.modify(names::SKILLS_CATALOG, "skills: a".into()), Ok(true));
+        assert_eq!(
+            asm.modify(names::SKILLS_CATALOG, "skills: a".into()),
+            Ok(true)
+        );
         assert!(asm.remove(names::RULES).is_err(), "remove was not declared");
         assert!(
-            asm.move_before(names::RULES, names::SCENE_SKELETON).is_err(),
+            asm.move_before(names::RULES, names::SCENE_SKELETON)
+                .is_err(),
             "reorder was not declared"
         );
     }
@@ -430,13 +436,20 @@ mod tests {
     #[test]
     fn a_script_the_operator_wrote_may_rewrite_anything() {
         let mut asm = PromptAssembly::new(prompt(), own_script());
-        assert_eq!(asm.modify(names::RULES, "rules: rewritten".into()), Ok(true));
+        assert_eq!(
+            asm.modify(names::RULES, "rules: rewritten".into()),
+            Ok(true)
+        );
         assert_eq!(asm.remove(names::SKILLS_CATALOG), Ok(true));
         assert_eq!(
             asm.move_before(names::RULES, names::SCENE_SKELETON),
             Ok(true)
         );
-        let names: Vec<&str> = asm.blocks().iter().filter_map(|b| b.name.as_deref()).collect();
+        let names: Vec<&str> = asm
+            .blocks()
+            .iter()
+            .filter_map(|b| b.name.as_deref())
+            .collect();
         assert_eq!(names, [names::RULES, names::SCENE_SKELETON]);
         assert!(asm.refusals().is_empty());
     }

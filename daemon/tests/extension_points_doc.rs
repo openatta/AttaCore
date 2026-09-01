@@ -13,7 +13,8 @@
 
 use std::path::PathBuf;
 
-const BEGIN: &str = "<!-- BEGIN GENERATED TABLE — see base::interface::catalog::render_markdown -->";
+const BEGIN: &str =
+    "<!-- BEGIN GENERATED TABLE — see base::interface::catalog::render_markdown -->";
 const END: &str = "<!-- END GENERATED TABLE -->";
 
 fn doc_path() -> PathBuf {
@@ -106,8 +107,11 @@ fn every_point_names_a_module_that_exists() {
         let mut segments = point.defined_in.split("::");
         let krate = segments.next().expect("a crate name");
         let Some(dir) = crate_dir(krate) else {
-            panic!("`{}` names crate `{krate}`, which this test does not know how to \
-                   locate — teach it, or fix the path", point.id);
+            panic!(
+                "`{}` names crate `{krate}`, which this test does not know how to \
+                   locate — teach it, or fix the path",
+                point.id
+            );
         };
         // Walk down to the last segment that names a module rather than a
         // type: modules are lowercase, types are not.

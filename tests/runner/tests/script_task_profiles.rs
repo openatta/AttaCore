@@ -32,8 +32,8 @@
 //! What the task itself does is pinned by the scripted replies.
 
 use base::interface::memory::MemoryStore;
-use base::interface::script::ScriptOutcome;
 use base::interface::scene::AgentScene;
+use base::interface::script::ScriptOutcome;
 use base::interface::tool::InMemoryToolRegistry;
 use base::memory::{DurableMemory, MemoryType};
 use std::path::Path;
@@ -229,7 +229,10 @@ fn seed_memories(store: &MemoryStore) {
     };
     store
         .persist_batch(vec![
-            memory("deploy-window", "SCRIPT-TRACE-RECALL: deploys land on Tuesdays."),
+            memory(
+                "deploy-window",
+                "SCRIPT-TRACE-RECALL: deploys land on Tuesdays.",
+            ),
             memory(
                 "secret-key-rotation",
                 "SCRIPT-TRACE-RECALL: rotate the signing key quarterly.",

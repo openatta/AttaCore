@@ -945,7 +945,10 @@ mod registry_contract_tests {
         let keep = reg.register(stub("Beta"));
         d.dispose();
         assert!(reg.find("Alpha").is_none(), "disposed tool still reachable");
-        assert!(reg.find("Beta").is_some(), "disposer took an unrelated entry");
+        assert!(
+            reg.find("Beta").is_some(),
+            "disposer took an unrelated entry"
+        );
         let _ = keep;
 
         // `replace` substitutes rather than shadowing.
@@ -1025,6 +1028,9 @@ mod registry_contract_tests {
         base.register(stub("Shared"));
         let layer = LayeredToolRegistry::new(base);
         layer.register(stub("Shared"));
-        assert_eq!(layer.all().iter().filter(|t| t.name() == "Shared").count(), 1);
+        assert_eq!(
+            layer.all().iter().filter(|t| t.name() == "Shared").count(),
+            1
+        );
     }
 }

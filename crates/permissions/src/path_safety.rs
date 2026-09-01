@@ -304,9 +304,9 @@ pub fn check_write_for(
 
         // 7a. The engine's own settings, by name and location.
         if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
-            let under_settings_dir = target.components().any(|c| {
-                matches!(c, Component::Normal(d) if SETTINGS_DIRS.iter().any(|s| d == *s))
-            });
+            let under_settings_dir = target.components().any(
+                |c| matches!(c, Component::Normal(d) if SETTINGS_DIRS.iter().any(|s| d == *s)),
+            );
             if under_settings_dir && SETTINGS_FILENAMES.contains(&name) {
                 return Err(PathSafetyError::BlacklistedFilename {
                     path: target.to_path_buf(),
@@ -598,7 +598,8 @@ mod tests {
             );
         }
 
-        let permitted = policy("/tmp/work").with_allowed(vec![PathBuf::from("/tmp/work/.gitignore")]);
+        let permitted =
+            policy("/tmp/work").with_allowed(vec![PathBuf::from("/tmp/work/.gitignore")]);
         assert!(
             check_write(Path::new("/tmp/work/.gitignore"), &permitted).is_ok(),
             "an exemption is what makes the default a policy rather than a wall"
