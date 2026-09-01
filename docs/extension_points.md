@@ -314,8 +314,13 @@ through the provider.
 chose its destination. `allowed_domains` binds `Origin::Agent` — a WebFetch
 url, a Ping host — and not `Origin::Operator`, which is the model endpoint,
 MCP servers, telemetry. Applying it to everything would cut the agent off from
-its own model. Operator traffic still goes through the contract so a
-deployment can audit it or go offline as a whole.
+its own model.
+
+Operator traffic is built through the same contract, but a host cannot yet
+replace the providers those clients use — the model, OAuth, telemetry and
+registry clients each construct their own. So replacing this point governs
+what the model can reach, and auditing or going offline *as a whole* is not
+something it delivers today.
 
 The sandbox has one invariant the engine enforces rather than requests: **a
 policy that asked for constraint never silently becomes an unconstrained

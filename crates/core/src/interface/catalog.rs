@@ -571,7 +571,7 @@ static POINTS: [ExtensionPoint; 44] = [
         ExtensionPoint {
             id: "exec.network",
             kind: Kind::Contract,
-            summary: "every request that leaves the process, and whether it may",
+            summary: "the requests a tool makes, and whether they may leave",
             timing: "each outbound request; the egress policy binds the ones the model chose",
             rewrites: "where requests go, whether they go, what answers",
             frequency: Frequency::PerToolCall,

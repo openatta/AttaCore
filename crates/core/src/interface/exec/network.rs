@@ -1,4 +1,11 @@
-//! `Network` — every request that leaves the process.
+//! `Network` — outbound requests, and whether they may leave.
+//!
+//! Every client in the engine builds its requests through this. What a host
+//! can *replace* today is narrower: the provider a tool uses arrives through
+//! `ToolContext.exec`, while the model, OAuth, telemetry and registry clients
+//! each construct their own. Their traffic is `Origin::Operator`, which no
+//! policy restricts, so the behavior is right — but auditing or going offline
+//! as a whole needs an injection point that does not exist yet.
 
 use std::collections::BTreeMap;
 
