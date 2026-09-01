@@ -33,9 +33,17 @@ async fn plugin_install_list_uninstall_round_trips() {
             .expect("package demo-plugin");
     let download_url = test_runner::plugin_fixture::file_url(&zip_path);
 
+    let workdir = tmp.join("workdir");
+    std::fs::create_dir_all(&workdir).unwrap();
+
     let mut child = tokio::process::Command::new(&daemon_binary)
         .arg("--socket")
         .arg(&socket_path)
+        // A daemon's project is its working directory, and a child that
+        // inherits this one's works on the crate it was launched from — it
+        // writes `.atta/` into the repository. `ATTA_CONFIG_HOME` redirects
+        // the user-level root and says nothing about the project-level one.
+        .current_dir(&workdir)
         .env("ATTA_CONFIG_HOME", &config_home)
         // Startup requires *some* auth token even though this test never
         // triggers a real model call (plugin install/list/uninstall is pure
