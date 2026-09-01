@@ -123,6 +123,31 @@ pub trait ScriptEngine: Send + Sync {
         input: serde_json::Value,
         limits: &ScriptLimits,
     ) -> Result<serde_json::Value, ScriptError>;
+
+    /// The same call, from somewhere that cannot await.
+    ///
+    /// Most hook points are synchronous by contract and always will be: a
+    /// prompt variable provider is a plain `Fn`, a tool-result transformer
+    /// takes `&self` and returns nothing. A script bound to one of those has
+    /// to run somewhere, and the only honest answer is the calling thread.
+    ///
+    /// That is affordable because a script's clock is enforced inside the
+    /// interpreter rather than by a future that can be dropped — the deadline
+    /// travels with `limits`, so the worst case is one thread held for
+    /// `limits.timeout`, not until the script decides to stop. An engine
+    /// whose work is genuinely asynchronous should not implement this; the
+    /// default refuses rather than blocking a runtime from inside itself.
+    fn eval_blocking(
+        &self,
+        _script: &ScriptSource,
+        _entry: &str,
+        _input: serde_json::Value,
+        _limits: &ScriptLimits,
+    ) -> Result<serde_json::Value, ScriptError> {
+        Err(ScriptError::Failed(
+            "this script engine cannot be called from a synchronous hook point".into(),
+        ))
+    }
 }
 
 /// The engine when there is none.
@@ -231,6 +256,27 @@ impl ScriptCarrier {
                 after: self.limits.timeout,
             }),
         }
+    }
+
+    /// Run the script from a synchronous hook point, within the same budget.
+    ///
+    /// The quota is the same counter, so a script bound at both a
+    /// synchronous and an asynchronous point shares one budget rather than
+    /// getting two. The clock is the engine's, for the reason given on
+    /// [`ScriptEngine::eval_blocking`]: there is no future here to time out.
+    pub fn call_blocking(
+        &self,
+        entry: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, ScriptError> {
+        let used = self.calls_this_turn.fetch_add(1, Ordering::Relaxed);
+        if used >= self.limits.calls_per_turn {
+            return Err(ScriptError::QuotaExhausted {
+                calls_per_turn: self.limits.calls_per_turn,
+            });
+        }
+        self.engine
+            .eval_blocking(&self.script, entry, input, &self.limits)
     }
 }
 
@@ -371,13 +417,17 @@ mod tests {
 /// mid-pass is worse than an unedited one, because nothing downstream can tell
 /// which it is looking at.
 pub struct PromptAssemblyScript {
-    carrier: ScriptCarrier,
+    carrier: Arc<ScriptCarrier>,
     entry: String,
 }
 
 impl PromptAssemblyScript {
     /// `entry` is the function the script exports, e.g. `onAssemble`.
-    pub fn new(carrier: ScriptCarrier, entry: impl Into<String>) -> Self {
+    ///
+    /// The carrier is shared rather than owned because the quota it counts is
+    /// per *turn*, and something outside the adapter has to say when a turn
+    /// began. A carrier moved into an adapter can never be told.
+    pub fn new(carrier: Arc<ScriptCarrier>, entry: impl Into<String>) -> Self {
         Self {
             carrier,
             entry: entry.into(),
@@ -538,7 +588,7 @@ mod prompt_hook_tests {
 
     fn script_hook(engine: Arc<dyn ScriptEngine>, origin: BlockOrigin) -> PromptAssemblyScript {
         PromptAssemblyScript::new(
-            ScriptCarrier::new(
+            Arc::new(ScriptCarrier::new(
                 engine,
                 ScriptSource {
                     id: "./.atta/scripts/prompt.js".into(),
@@ -546,7 +596,7 @@ mod prompt_hook_tests {
                     code: String::new(),
                 },
                 ScriptLimits::default(),
-            ),
+            )),
             "onAssemble",
         )
     }
@@ -643,7 +693,7 @@ mod prompt_hook_tests {
             },
         ));
         let hook = PromptAssemblyScript::new(
-            ScriptCarrier::new(
+            Arc::new(ScriptCarrier::new(
                 engine,
                 ScriptSource {
                     id: "./.atta/scripts/slow.js".into(),
@@ -654,7 +704,7 @@ mod prompt_hook_tests {
                     timeout: Duration::from_millis(20),
                     ..Default::default()
                 },
-            ),
+            )),
             "onAssemble",
         );
         let hooks: Vec<(Arc<dyn AsyncAssemblyHook>, Authority)> = vec![(

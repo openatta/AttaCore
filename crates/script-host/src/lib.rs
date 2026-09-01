@@ -186,6 +186,31 @@ impl base::interface::script::ScriptEngine for QuickJsEngine {
             ScriptError::Failed(format!("script returned something that is not JSON: {e}"))
         })
     }
+
+    /// QuickJS is synchronous; the asynchronous path above exists only to keep
+    /// a CPU-bound interpreter off a runtime worker. From a synchronous hook
+    /// point there is no worker to protect and nothing to hand off to, so this
+    /// is the same interpreter run on the calling thread.
+    fn eval_blocking(
+        &self,
+        script: &ScriptSource,
+        entry: &str,
+        input: serde_json::Value,
+        limits: &ScriptLimits,
+    ) -> Result<serde_json::Value, ScriptError> {
+        let input = serde_json::to_string(&input)
+            .map_err(|e| ScriptError::Failed(format!("input is not serializable: {e}")))?;
+        let out = run_blocking(
+            script.code.clone(),
+            entry.to_string(),
+            input,
+            Instant::now() + limits.timeout,
+            self.memory_limit_bytes,
+        )?;
+        serde_json::from_str(&out).map_err(|e| {
+            ScriptError::Failed(format!("script returned something that is not JSON: {e}"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -380,7 +405,62 @@ pub mod bindings {
     /// A short list on purpose. Every entry is a place where a script's cost
     /// is bounded and its authority is defined; adding one means answering
     /// both questions for the new place, not appending a string here.
-    pub const BINDABLE_POINTS: &[&str] = &["prompt.assemble"];
+    /// The points a script can be bound to today.
+    ///
+    /// The catalog's `script` column says what the *contract* allows; this
+    /// says what the carrier has an adapter for. They are not the same list
+    /// and saying so is the point — a binding to a point that is open in
+    /// principle and unimplemented here is refused at startup with a message
+    /// naming what is available, rather than accepted and silently never run.
+    pub const BINDABLE_POINTS: &[&str] = &["prompt.assemble", "tool.result"];
+
+    /// What a set of bindings produced, sorted by where each piece has to be
+    /// installed.
+    ///
+    /// The carrier used to hand back a `PromptRegistry` because the one point
+    /// it supported lived there. Most points do not: a tool-result transformer
+    /// and a model interceptor go on the session builder, and a prompt hook
+    /// goes on the registry. So this is the shape of the answer — the caller
+    /// owns those three places and puts each pile where it belongs.
+    #[derive(Default)]
+    pub struct BoundScripts {
+        /// Passes over the assembled prompt, with the authority each was
+        /// granted by where its file lives.
+        pub assembly_hooks: Vec<(
+            Arc<dyn base::interface::prompt_assembly::AsyncAssemblyHook>,
+            Authority,
+        )>,
+        /// What a tool result may look like.
+        pub tool_results: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
+        /// Every carrier that was built, so a turn can reset their quotas.
+        ///
+        /// Without this the per-turn budget is a per-session one: nothing
+        /// would ever call `begin_turn`, and a script bound to a per-tool-call
+        /// point would go quiet partway through a long session and stay quiet.
+        pub carriers: Vec<Arc<base::interface::script::ScriptCarrier>>,
+    }
+
+    impl std::fmt::Debug for BoundScripts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BoundScripts")
+                .field("assembly_hooks", &self.assembly_hooks.len())
+                .field("tool_results", &self.tool_results.len())
+                .finish()
+        }
+    }
+
+    impl BoundScripts {
+        pub fn is_empty(&self) -> bool {
+            self.assembly_hooks.is_empty() && self.tool_results.is_empty()
+        }
+
+        /// Install the prompt-side pieces on a registry.
+        pub fn apply_to_registry(&self, registry: &dyn PromptRegistry) {
+            for (hook, authority) in &self.assembly_hooks {
+                registry.register_async_assembly_hook(hook.clone(), authority.clone());
+            }
+        }
+    }
 
     /// Why a binding could not be honored.
     ///
@@ -454,12 +534,13 @@ pub mod bindings {
     ///
     /// All-or-nothing: a partially applied script configuration is a
     /// configuration nobody wrote.
-    pub fn register_all(
-        registry: &dyn PromptRegistry,
+    /// Read every binding, build a carrier for each, and sort the adapters by
+    /// where they have to be installed.
+    pub fn bind(
         engine: Arc<dyn ScriptEngine>,
         bindings: &[ScriptBinding],
         project_root: &Path,
-    ) -> Result<usize, BindingError> {
+    ) -> Result<BoundScripts, BindingError> {
         let mut prepared = Vec::new();
         for binding in bindings {
             if base::interface::catalog::find(&binding.point).is_none() {
@@ -502,15 +583,33 @@ pub mod bindings {
             ));
         }
 
-        let count = prepared.len();
+        let mut out = BoundScripts::default();
         for (binding, source, limits, authority) in prepared {
-            let carrier = ScriptCarrier::new(engine.clone(), source, limits);
-            registry.register_async_assembly_hook(
-                Arc::new(PromptAssemblyScript::new(carrier, &binding.entry)),
-                authority,
-            );
+            let carrier = Arc::new(ScriptCarrier::new(engine.clone(), source, limits));
+            out.carriers.push(carrier.clone());
+            match binding.point.as_str() {
+                "prompt.assemble" => out.assembly_hooks.push((
+                    Arc::new(PromptAssemblyScript::new(carrier, &binding.entry)),
+                    authority,
+                )),
+                "tool.result" => out.tool_results.push(Arc::new(
+                    base::interface::script_adapters::ToolResultScript::new(
+                        carrier,
+                        &binding.entry,
+                    ),
+                )),
+                // Unreachable: `BINDABLE_POINTS` gates this above, and the two
+                // are meant to be read together. A point added to that list
+                // and not to this match is a script bound to nothing, so it
+                // fails loudly rather than joining the set silently.
+                other => {
+                    return Err(BindingError::UnbindablePoint {
+                        point: other.to_string(),
+                    })
+                }
+            }
         }
-        Ok(count)
+        Ok(out)
     }
 }
 
@@ -585,9 +684,9 @@ mod binding_tests {
 
         let registry = InMemoryPromptRegistry::new();
         let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
-        let n = register_all(registry.as_ref(), engine, &[binding("prompt.js")], &project)
-            .expect("the binding is valid");
-        assert_eq!(n, 1);
+        let bound = bind(engine, &[binding("prompt.js")], &project).expect("the binding is valid");
+        assert_eq!(bound.assembly_hooks.len(), 1);
+        bound.apply_to_registry(registry.as_ref());
 
         let out = base::interface::prompt_assembly::run_async_assembly_hooks(
             prompt(),
@@ -622,13 +721,9 @@ mod binding_tests {
 
         let registry = InMemoryPromptRegistry::new();
         let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
-        register_all(
-            registry.as_ref(),
-            engine,
-            &[binding(script.to_str().unwrap())],
-            &project,
-        )
-        .expect("the binding is valid");
+        bind(engine, &[binding(script.to_str().unwrap())], &project)
+            .expect("the binding is valid")
+            .apply_to_registry(registry.as_ref());
 
         let out = base::interface::prompt_assembly::run_async_assembly_hooks(
             prompt(),
@@ -649,11 +744,10 @@ mod binding_tests {
 
     #[test]
     fn a_binding_naming_a_point_that_does_not_exist_is_refused() {
-        let registry = InMemoryPromptRegistry::new();
         let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
         let mut b = binding("prompt.js");
         b.point = "prompt.nonexistent".into();
-        let err = register_all(registry.as_ref(), engine, &[b], &tempdir()).unwrap_err();
+        let err = bind(engine, &[b], &tempdir()).unwrap_err();
         assert_eq!(
             err,
             BindingError::UnknownPoint {
@@ -665,17 +759,80 @@ mod binding_tests {
 
     #[test]
     fn a_binding_to_a_point_scripts_may_not_use_says_which_they_may() {
-        let registry = InMemoryPromptRegistry::new();
         let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
         let mut b = binding("prompt.js");
         // A real point, and one a script has no business in.
         b.point = "event.sink".into();
-        let err = register_all(registry.as_ref(), engine, &[b], &tempdir()).unwrap_err();
+        let err = bind(engine, &[b], &tempdir()).unwrap_err();
         assert!(
             matches!(err, BindingError::UnbindablePoint { .. }),
             "{err:?}"
         );
         assert!(err.to_string().contains("prompt.assemble"), "{err}");
+    }
+
+    /// A synchronous point, end to end. `tool.result` hands the script the
+    /// call and the draft and takes back the text — and it is a `&self`
+    /// method with nowhere to await, so this also exercises the blocking path
+    /// through the interpreter.
+    #[test]
+    fn a_script_rewrites_a_tool_result() {
+        use base::interface::tool_result::ToolResultDraft;
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("result.js"),
+            "function onResult(r) { return `[${r.tool}] ` + r.text.toUpperCase(); }",
+        )
+        .unwrap();
+
+        let mut b = binding("result.js");
+        b.point = "tool.result".into();
+        b.entry = "onResult".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding is valid");
+        assert_eq!(bound.tool_results.len(), 1);
+
+        let call = base::interface::tool_middleware::ToolCall {
+            name: "Read".into(),
+            input: serde_json::json!({"path": "a.txt"}),
+        };
+        let mut draft = ToolResultDraft {
+            text: "hello".into(),
+            images: Vec::new(),
+            is_error: false,
+        };
+        bound.tool_results[0].transform(&call, &mut draft);
+        assert_eq!(draft.text, "[Read] HELLO");
+    }
+
+    /// A script that returns something the point cannot use leaves it alone.
+    /// The same outcome as a script with a bug, on purpose: neither should be
+    /// able to blank a tool result.
+    #[test]
+    fn a_tool_result_script_that_answers_nonsense_changes_nothing() {
+        use base::interface::tool_result::ToolResultDraft;
+
+        let project = tempdir();
+        std::fs::write(project.join("bad.js"), "function onResult() { return {oops: 1}; }").unwrap();
+        let mut b = binding("bad.js");
+        b.point = "tool.result".into();
+        b.entry = "onResult".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).unwrap();
+        let call = base::interface::tool_middleware::ToolCall {
+            name: "Read".into(),
+            input: serde_json::json!({}),
+        };
+        let mut draft = ToolResultDraft {
+            text: "untouched".into(),
+            images: Vec::new(),
+            is_error: false,
+        };
+        bound.tool_results[0].transform(&call, &mut draft);
+        assert_eq!(draft.text, "untouched");
     }
 
     /// All or nothing. A configuration half of which was applied is a
@@ -684,21 +841,11 @@ mod binding_tests {
     fn one_bad_binding_registers_none_of_them() {
         let project = tempdir();
         std::fs::write(project.join("good.js"), "function onAssemble(b) { return b; }").unwrap();
-
-        let registry = InMemoryPromptRegistry::new();
         let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
-        let err = register_all(
-            registry.as_ref(),
-            engine,
-            &[binding("good.js"), binding("missing.js")],
-            &project,
-        )
-        .unwrap_err();
+        let err = bind(engine, &[binding("good.js"), binding("missing.js")], &project).unwrap_err();
         assert!(matches!(err, BindingError::Unreadable { .. }), "{err:?}");
-        assert!(
-            registry.async_assembly_hooks().is_empty(),
-            "the good one must not have been registered either"
-        );
+        // Nothing came back at all, so the good one was not bound either — the
+        // point of returning a set rather than registering as it goes.
     }
 
     /// A fresh directory per call. The counter is load-bearing: two calls in

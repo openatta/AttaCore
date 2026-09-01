@@ -201,6 +201,9 @@ pub struct Agent {
     pub(crate) health: Arc<base::interface::health::HealthChecks>,
     /// Kept time and kept identifiers — see [`Builder::environment`].
     pub(crate) environment: Arc<dyn base::interface::environment::Environment>,
+    /// Every script carrier bound in this session, so a turn can reset the
+    /// per-turn quotas — see [`Builder::script_carriers`].
+    pub(crate) script_carriers: Arc<Vec<Arc<base::interface::script::ScriptCarrier>>>,
     /// What to do when a model call goes wrong — see
     /// [`Builder::recovery_policy`].
     pub(crate) recovery_policy: Arc<dyn base::interface::recovery_policy::RecoveryPolicy>,
@@ -1017,6 +1020,9 @@ pub struct Builder {
     health_checks: Vec<Arc<dyn base::interface::health::HealthCheck>>,
     /// Kept time and ids — see [`Builder::environment`].
     environment: Option<Arc<dyn base::interface::environment::Environment>>,
+    /// Script carriers whose quota resets each turn — see
+    /// [`Builder::script_carriers`].
+    script_carriers: Vec<Arc<base::interface::script::ScriptCarrier>>,
     /// Model-failure recovery — see [`Builder::recovery_policy`].
     recovery_policy: Option<Arc<dyn base::interface::recovery_policy::RecoveryPolicy>>,
     /// Model request/response interception — see [`Builder::model_interceptor`].
@@ -1229,6 +1235,7 @@ impl Builder {
             budget_policy: None,
             health_checks: Vec::new(),
             environment: None,
+            script_carriers: Vec::new(),
             recovery_policy: None,
             model_interceptors: Vec::new(),
             memory_retriever: None,
@@ -1415,6 +1422,24 @@ impl Builder {
         e: Arc<dyn base::interface::environment::Environment>,
     ) -> Self {
         self.environment = Some(e);
+        self
+    }
+
+    /// The script carriers bound in this session.
+    ///
+    /// A carrier counts calls against a *per-turn* quota, and a quota only
+    /// means that if something says when a turn began. Nothing did: the
+    /// carriers were moved into their adapters and never seen again, so the
+    /// budget was really per session — a script on a per-tool-call point would
+    /// go quiet partway through a long one and stay quiet, which is the least
+    /// debuggable failure a hook point has.
+    ///
+    /// [`ScriptCarrier`]: base::interface::script::ScriptCarrier
+    pub fn script_carriers(
+        mut self,
+        carriers: Vec<Arc<base::interface::script::ScriptCarrier>>,
+    ) -> Self {
+        self.script_carriers = carriers;
         self
     }
 
@@ -2388,6 +2413,7 @@ impl Builder {
 
         Ok((
             Agent {
+                script_carriers: Arc::new(self.script_carriers),
                 scene,
                 model,
                 tools,

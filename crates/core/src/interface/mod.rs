@@ -102,6 +102,7 @@ pub use crate::prompt;
 pub use crate::rules;
 pub mod scene;
 pub mod script;
+pub mod script_adapters;
 pub mod skill_provider;
 pub mod token_counter;
 pub mod tool;

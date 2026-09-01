@@ -293,6 +293,15 @@ impl Agent {
         attachments: Vec<crate::agent::Attachment>,
         cancel: CancellationToken,
     ) -> Result<TurnOutcome, TurnError> {
+        // A script's budget is per turn, and this is where a turn begins.
+        // Without this the counter only ever climbs, so the quota is a
+        // per-session one wearing a per-turn name — and a script bound to a
+        // point that fires per tool call goes quiet in the middle of a long
+        // session with nothing to say why.
+        for carrier in self.script_carriers.iter() {
+            carrier.begin_turn();
+        }
+
         // UserPromptSubmit: the one point where a hook sees the user's
         // message before any turn setup (skills rescan, FrozenContext,
         // CLAUDE.md injection, ...) has touched anything. Previously in the

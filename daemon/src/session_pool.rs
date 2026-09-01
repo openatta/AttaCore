@@ -1601,9 +1601,22 @@ impl SessionPool {
         if let Some(host) = self.plugins.host() {
             builder = builder.plugin_host(host);
         }
-        if let Some(registry) = build_script_registry(&settings_snapshot, &self.cwd) {
-            builder = builder.prompt_registry(registry);
+        // Each pile of adapters goes where that kind of extension lives: the
+        // prompt ones on a registry, the rest on the builder.
+        #[cfg(feature = "scripts")]
+        if let Some(bound) = bind_scripts(&settings_snapshot, &self.cwd) {
+            if !bound.assembly_hooks.is_empty() {
+                let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
+                bound.apply_to_registry(registry.as_ref());
+                builder = builder.prompt_registry(registry);
+            }
+            for t in &bound.tool_results {
+                builder = builder.tool_result_transformer(t.clone());
+            }
+            builder = builder.script_carriers(bound.carriers);
         }
+        #[cfg(not(feature = "scripts"))]
+        let _ = bind_scripts(&settings_snapshot, &self.cwd);
 
         // Give this session its own owned `McpManager` built from this
         // project's centrally-connected client handles (cheap `Arc` clones
@@ -4207,25 +4220,22 @@ fn effective_permission_mode(
 /// purpose: a script that silently never runs sends its author looking for a
 /// bug in their JavaScript.
 #[cfg(feature = "scripts")]
-fn build_script_registry(
+fn bind_scripts(
     settings: &Arc<base::interface::settings::Settings>,
     project_root: &std::path::Path,
-) -> Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>> {
+) -> Option<script_host::bindings::BoundScripts> {
     if settings.scripts.is_empty() {
         return None;
     }
-    let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
     let engine: Arc<dyn base::interface::script::ScriptEngine> =
         Arc::new(script_host::QuickJsEngine::new());
-    match script_host::bindings::register_all(
-        registry.as_ref(),
-        engine,
-        &settings.scripts,
-        project_root,
-    ) {
-        Ok(n) => {
-            info!(scripts = n, "bound scripts to extension points");
-            Some(registry)
+    match script_host::bindings::bind(engine, &settings.scripts, project_root) {
+        Ok(bound) => {
+            info!(
+                scripts = bound.carriers.len(),
+                "bound scripts to extension points"
+            );
+            Some(bound)
         }
         Err(e) => {
             error!(error = %e, "a script binding is invalid; no scripts were bound");
@@ -4237,15 +4247,15 @@ fn build_script_registry(
 /// Without the script carrier compiled in, a `scripts` section is refused
 /// loudly rather than ignored.
 #[cfg(not(feature = "scripts"))]
-fn build_script_registry(
+fn bind_scripts(
     settings: &Arc<base::interface::settings::Settings>,
     _project_root: &std::path::Path,
-) -> Option<Arc<dyn base::interface::prompt_registry::PromptRegistry>> {
+) -> Option<()> {
     if !settings.scripts.is_empty() {
         error!(
-            count = settings.scripts.len(),
-            "settings.json configures scripts, but this build has no script engine \
-             (the `scripts` feature is off); none of them will run"
+            scripts = settings.scripts.len(),
+            "this build carries no script engine, so a `scripts` section cannot be honored; \
+             rebuild with the `scripts` feature or remove the section"
         );
     }
     None
