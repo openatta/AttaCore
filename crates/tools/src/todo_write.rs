@@ -154,8 +154,18 @@ mod tests {
         ToolContext::for_test(PathBuf::from("/tmp"))
     }
 
+    /// `TODO_STORE` is one `static` for the whole process, and cargo runs a
+    /// crate's tests as threads in one process. Every test that writes it and
+    /// reads it back has to hold this, or it reads what a sibling wrote.
+    static STORE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
+        STORE.lock().await
+    }
+
     #[tokio::test]
     async fn writes_todos() {
+        let _guard = exclusive().await;
         let tool = TodoWriteTool;
         let r = tool
             .call(
@@ -177,6 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn replaces_entire_list() {
+        let _guard = exclusive().await;
         // Seed the store
         *todo_store().lock().unwrap() = vec![TodoItem {
             content: "old".into(),
@@ -198,6 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_list_clears_todos() {
+        let _guard = exclusive().await;
         *todo_store().lock().unwrap() = vec![TodoItem {
             content: "x".into(),
             status: TodoStatus::Pending,
@@ -245,6 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_summary() {
+        let _guard = exclusive().await;
         let tool = TodoWriteTool;
         let r = tool
             .call(
