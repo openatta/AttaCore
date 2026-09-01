@@ -1,23 +1,19 @@
-# Extending AttaCore with QuickJS scripts
+# 用 QuickJS 脚本扩展 AttaCore
 
-A script is a `.js` file plus a line of configuration. The engine reads the
-file when a session is built, runs the function you name at the extension
-point you name, and hands the result back to whatever part of the engine was
-asking. No build step, no subprocess, no network.
+一个脚本就是一个 `.js` 文件加一行配置。会话构建时引擎读这个文件,在你指定的
+扩展点上调用你指定的函数,再把结果交回给发问的那部分引擎。不用构建,不起子进程,
+不走网络。
 
-That is the whole tier: something between "recompile the engine" and "spawn a
-process" for the small jobs — rewrite one line of a prompt, tag a tool result,
-answer a tool call from a cache, narrow a recall query. The interpreter is
-QuickJS, embedded in the daemon, and a call costs microseconds.
+这一层就是这么点东西:在"重编译引擎"和"起一个进程"之间,给那些小活留的位置
+——改提示词里的一行、给工具结果打个标记、拿缓存答掉一次工具调用、把召回的查询
+收窄一点。解释器是 QuickJS,嵌在 daemon 里,一次调用的开销是微秒级。
 
-`docs/extension_points.md` is the catalog of everything in the engine that can
-be extended, by anyone, in any way. This document covers the nine points a
-script can be bound to today, and only those.
+`docs/extension_points.md` 是引擎里所有可扩展之处的总目录,不限使用者、不限方式。
+本文只讲今天脚本能绑上去的那九个点。
 
-## Is the carrier in this build?
+## 这个构建带载体吗
 
-The script carrier is the `scripts` feature of the `daemon` crate, and it is
-**on by default**:
+脚本载体是 `daemon` crate 的 `scripts` feature,**默认开启**:
 
 ```sh
 cargo build -p daemon                                             # QuickJS
@@ -25,23 +21,22 @@ cargo build -p daemon --no-default-features --features plugin-compile
 cargo build -p daemon --no-default-features                       # neither
 ```
 
-A build carries **one** extension carrier or none. `scripts` and `plugins` are
-mutually exclusive and the combination fails to compile — a plugin build needs
-`--no-default-features`, because without it cargo unions the default `scripts`
-back in and the guard in `daemon/src/lib.rs` refuses.
+一个构建只带**一个**扩展载体,或者一个都不带。`scripts` 和 `plugins` 互斥,同时
+开启编译不过——插件构建必须带 `--no-default-features`,否则 cargo 会把默认的
+`scripts` 并回来,`daemon/src/lib.rs` 里的守卫会拒绝。
 
-Without the feature, no JavaScript engine is linked in at all, and a `scripts`
-section in `settings.json` is refused loudly:
+不开这个 feature,就没有任何 JavaScript 引擎被链接进来,`settings.json` 里出现
+`scripts` 段会被明确拒绝:
 
 ```
 this build carries no script engine, so a `scripts` section cannot be honored;
 rebuild with the `scripts` feature or remove the section
 ```
 
-## From zero
+## 从零开始
 
-**1. Write the script.** Anywhere inside the project; `.atta/scripts/` is the
-convention. This one is `tests/fixtures/script_project/.atta/scripts/house_style.js`:
+**1. 写脚本。** 放项目里哪儿都行,`.atta/scripts/` 是惯例。下面这个是
+`tests/fixtures/script_project/.atta/scripts/house_style.js`:
 
 ```js
 function onAssemble(blocks) {
@@ -56,7 +51,7 @@ function onAssemble(blocks) {
 }
 ```
 
-**2. Bind it** in the project's `.atta/settings.json`:
+**2. 绑定它**,在项目的 `.atta/settings.json` 里:
 
 ```json
 {
@@ -70,47 +65,43 @@ function onAssemble(blocks) {
 }
 ```
 
-**3. Start the daemon** with that project as its working directory — relative
-script paths resolve against it. When a session is created it logs
+**3. 启动 daemon**,把那个项目当成它的工作目录——相对的脚本路径是按它解析的。
+会话创建时会打出
 
 ```
 bound scripts to extension points  scripts=1
 ```
 
-and from then on every reply in that session ends with the house-style line.
-`tests/cases/010.script_carrier.test` is that exact setup, asked of a real
-model.
+从此这个会话里每一次回复都以那行 house-style 结尾。
+`tests/cases/010.script_carrier.test` 就是这套配置,而且是拿真模型问出来的。
 
-Two things to know about step 3. The file is read **when a session is built**,
-so editing the script changes nothing until a new session starts. And a
-binding that cannot be honored — an unreadable file, a point that does not
-exist, a point scripts cannot use — drops the **whole** set: the daemon logs
+第 3 步有两件事要知道。文件是**在会话构建时**读的,所以改了脚本,不新起一个会话
+就什么都不会变。还有,一条兑现不了的绑定——文件读不出来、点不存在、点不给脚本用
+——会让**整组**绑定作废:daemon 打出
 
 ```
 a script binding is invalid; no scripts were bound
 ```
 
-and the session runs with no scripts at all rather than with half of them.
+然后这个会话一个脚本都不带地跑,而不是带着其中一半跑。
 
-## The binding
+## 绑定的字段
 
-| Field | Meaning |
+| 字段 | 含义 |
 |---|---|
-| `path` | The script file. Absolute, or relative to the daemon's working directory — the same root that decides the script's authority. |
-| `point` | Which extension point, by its catalog id. One of the nine below. |
-| `entry` | The function in the file to call. |
-| `timeout_ms` | Wall clock for one call. Default 100. |
-| `calls_per_turn` | How many calls this binding may make in one turn. Default 1000. |
+| `path` | 脚本文件。绝对路径,或相对于 daemon 的工作目录——决定脚本权限的也是这个根。 |
+| `point` | 绑到哪个扩展点,用它在目录里的 id。下面九个之一。 |
+| `entry` | 调这个文件里的哪个函数。 |
+| `timeout_ms` | 一次调用的墙钟时间。默认 100。 |
+| `calls_per_turn` | 这条绑定在一轮里能调多少次。默认 1000。 |
 
-One file can be bound more than once — several points, or the same point with
-different entry points. Each line is its own binding with its own budget.
-Where two scripts share a point they are installed in the order the bindings
-appear, which at `tool.around` means the first one is the outermost ring.
+一个文件可以绑不止一次——绑到几个点,或者同一个点上换不同的入口函数。每一行都是
+自己独立的绑定,各有各的预算。两个脚本共用一个点时,按绑定出现的顺序安装;在
+`tool.around` 上这意味着第一条是最外面那一环。
 
-The `Script` column of the catalog in `docs/extension_points.md` says what
-each point's *contract* allows a script to do. The nine below are what the
-carrier has an adapter for. They are not the same list, and a binding to a
-point that is open in principle but has no adapter is refused by name:
+`docs/extension_points.md` 目录里的「脚本」那一列,说的是每个点的*契约*允许脚本
+做什么。下面这九个是载体真的写了适配器的。两份名单不是一回事,绑到一个原则上开放
+但没有适配器的点,会被指着名字拒绝:
 
 ```
 `history.append_observer` exists but scripts cannot be bound to it; today that
@@ -118,52 +109,45 @@ is prompt.assemble, prompt.block, prompt.context, prompt.variable, tool.around,
 tool.result, memory.retrieval_hook, model.request, model.message
 ```
 
-## How a script is called
+## 脚本是怎么被调用的
 
-Your file is evaluated, then the `entry` function is called with one argument:
-the point's input, already parsed from JSON. What you return is serialized
-back to JSON. Returning nothing is the same as returning `null`.
+你的文件先被求值,然后 `entry` 函数被调用,只带一个参数:这个点的输入,已经从
+JSON 解析好了。你返回的东西会被序列化回 JSON。什么都不返回等于返回 `null`。
 
-Declare the entry as a plain top-level function — `function onAssemble(input)`.
-There are no modules and no `export`.
+入口要声明成顶层的普通函数——`function onAssemble(input)`。没有模块,也没有
+`export`。
 
-Every call gets a **fresh runtime**. Nothing survives between calls: no
-globals you set, no cache you built, nothing another session could see. If you
-need state, it has to be in the input.
+每次调用都拿到一个**全新的运行时**。调用之间什么都不留:你设的全局变量不留,你建
+的缓存不留,别的会话也看不见任何东西。要状态,就得从输入里带进来。
 
-A script can reach **nothing** outside itself. There is no `require`, no
-`process`, no `fetch`, no `XMLHttpRequest`, no filesystem and no network.
-`Date` works. Input in, output out.
+脚本够不到自己以外的**任何**东西。没有 `require`,没有 `process`,没有 `fetch`,
+没有 `XMLHttpRequest`,没有文件系统,没有网络。`Date` 能用。输入进去,输出出来。
 
-## The nine points
+## 九个点
 
-Each section says when the point fires, what your function receives, and what
-it may return. Every fixture quoted here lives in `tests/fixtures/scripts/`
-and is exercised end to end by `tests/runner/tests/script_carrier.rs`.
+每一节讲这个点什么时候触发、你的函数收到什么、能返回什么。这里引用的每一个 fixture
+都在 `tests/fixtures/scripts/` 下,由 `tests/runner/tests/script_carrier.rs` 端到端
+跑过一遍。
 
-### `prompt.assemble` — the whole system prompt, last
+### `prompt.assemble` — 整个系统提示词,最后一道
 
-Once per turn, after every block has been assembled. Receives the blocks in
-order, returns the list it wants:
+一轮一次,在所有块都装配完之后。收到的是按顺序排好的块,返回它想要的那份清单:
 
 ```json
 [{ "name": "scene.skeleton", "content": "…" }, { "name": "rules", "content": "…" }]
 ```
 
-The returned list is **diffed** against what you were given, name by name:
+返回的清单会拿去跟给你的那份**逐个名字比对**:
 
-- a name that was not there is **added**, as a new block at the end;
-- a name whose content changed is a **modification**;
-- a name you were given and did not return is a **removal**;
-- a block handed back unchanged is not an edit at all, so returning the whole
-  list to change one line costs you nothing.
+- 原来没有的名字是**新增**,作为新块放在末尾;
+- 名字在、内容变了的是**修改**;
+- 给了你、你没还回来的名字是**删除**;
+- 原样交回来的块根本不算一次编辑,所以为了改一行而把整份清单返回,不花你任何代价。
 
-Blocks without a name are ignored in both directions. Reordering is not
-expressible here — position comes from the block's registered order, not from
-where it sits in your array.
+没有名字的块两个方向上都被忽略。重排在这里表达不出来——位置来自块注册时的顺序,
+不是来自它在你数组里的位置。
 
-Which of those you may do depends on where your file is; see
-[Authority](#authority) below.
+这几件事里你能做哪些,取决于你的文件在哪儿;见下面的[权限](#权限)。
 
 ```js
 // tests/fixtures/scripts/prompt_assemble.js
@@ -173,15 +157,12 @@ function onAssemble(blocks) {
 }
 ```
 
-A throw, a timeout, an exhausted quota or a return value that is not a list of
-blocks leaves the prompt exactly as it was — a half-edited prompt is worse
-than an unedited one, because nothing downstream can tell which it is looking
-at.
+抛异常、超时、配额耗尽,或者返回一个根本不是块清单的东西,提示词就原封不动
+——一份改了一半的提示词比一份没改的更糟,因为下游没人分得清自己看的是哪一种。
 
-### `prompt.block` — one fixed block
+### `prompt.block` — 一个固定的块
 
-Called **once**, when the binding is bound, with `null`. It answers with the
-block, text included:
+绑定的时候调用**一次**,参数是 `null`。它把块连同正文一起答回来:
 
 ```js
 // tests/fixtures/scripts/prompt_block.js
@@ -194,26 +175,23 @@ function onBlock() {
 }
 ```
 
-`name` is required. `order` is optional and defaults to 500, which puts the
-block after everything the engine contributes; the kernel's own stages sit at
-0 (`scene.*`), 100 (`skills.catalog`), 200 (`memory.session`), 300 (`rules`),
-400 (`mcp.instructions`) and 500 (`config.prompt_append`). `content` must be a
-string — text that depends on the session belongs at `prompt.context`.
+`name` 必填。`order` 可选,默认 500,也就是排在引擎自己贡献的所有东西之后;内核
+自身的几级分别在 0(`scene.*`)、100(`skills.catalog`)、200(`memory.session`)、
+300(`rules`)、400(`mcp.instructions`)和 500(`config.prompt_append`)。`content`
+必须是字符串——正文要随会话变的,该去 `prompt.context`。
 
-A name that already belongs to a kernel block — anything starting `scene.`, or
-`skills.catalog`, `memory.session`, `rules`, `mcp.instructions`,
-`config.prompt_append`, `config.prompt_override` — is refused. Blocks are
-addressed by name and the first match wins, so a contribution squatting on a
-kernel name would quietly absorb edits meant for the real block.
+已经属于内核块的名字——`scene.` 开头的任何一个,以及 `skills.catalog`、
+`memory.session`、`rules`、`mcp.instructions`、`config.prompt_append`、
+`config.prompt_override`——会被拒绝。块是按名字寻址的,先匹配到的那个赢,所以一个
+占了内核名字的贡献会悄悄把本该落在真块上的编辑吸走。
 
-If this call fails, or answers without a usable `name`, or gives an `order`
-that is not a number, nothing is registered and a warning says so.
+这次调用要是失败了,或者答出来的东西没有能用的 `name`,或者 `order` 不是数字,
+那就什么都不注册,并且给出一条警告说明。
 
-### `prompt.context` — a block computed every assembly
+### `prompt.context` — 每次装配都重算的块
 
-Two kinds of call. The first, at bind time, passes `null` and asks for the
-block's identity — the same `{ name, order }` as above. Every call after that
-passes the session context and expects the block's text:
+两种调用。第一种在绑定时发生,传 `null`,问的是这个块的身份——跟上面一样的
+`{ name, order }`。此后每一次调用都传会话上下文,要的是块的正文:
 
 ```js
 // tests/fixtures/scripts/prompt_context.js
@@ -225,8 +203,7 @@ function onContext(ctx) {
 }
 ```
 
-The context is where the session is running, and nothing that is already a
-prompt block:
+上下文讲的是这个会话跑在哪儿,以及所有还不是提示词块的东西:
 
 ```json
 {
@@ -237,22 +214,19 @@ prompt block:
 }
 ```
 
-The skills inventory, the MCP instructions, the session memory and the output
-style are deliberately absent: each is already a block, so a script that wants
-to read or rewrite one binds to `prompt.assemble`. They are also the four
-largest strings around, and they would be serialized into a fresh interpreter
-once per turn for a script that wanted `cwd`. `gitStatus` is absent for its
-size, and because an uncommitted diff is the one thing here a script that
-arrived from outside the project has no business reading.
+技能清单、MCP 指令、会话记忆和输出风格是刻意不给的:它们每一个都已经是一个块了,
+想读或者想改写其中一个的脚本,该去绑 `prompt.assemble`。它们同时也是这附近最大的
+四个字符串,而一个只想要 `cwd` 的脚本,会让它们每轮往一个全新的解释器里序列化一遍。
+`gitStatus` 不给,一是因为它的体积,二是因为一份未提交的 diff 恰恰是这里唯一一样
+从项目外面来的脚本没有理由读的东西。
 
-Anything but a string — including `null` — contributes no block that turn,
-which is also what a failed or timed-out call contributes.
+除字符串以外的任何东西——`null` 也算——这一轮都不贡献块,调用失败或超时的结果
+也是这个。
 
-### `prompt.variable` — what `{{name}}` expands to
+### `prompt.variable` — `{{name}}` 展开成什么
 
-Same two-call shape. The identity call names the variable; `order` and
-`content` mean nothing here. Later calls get the same context object as
-`prompt.context` and answer with the value:
+同样是两段式。身份那次调用给出变量的名字;`order` 和 `content` 在这里没有意义。
+之后的调用拿到跟 `prompt.context` 一样的上下文对象,答出值:
 
 ```js
 // tests/fixtures/scripts/prompt_variable.js
@@ -264,23 +238,21 @@ function onVariable(ctx) {
 }
 ```
 
-**Only a string is a value.** `null`, a number, an object, a throw, a timeout
-and an exhausted quota all leave `{{script_trace_var}}` in the prompt exactly
-as written: an unresolved variable is a bug to see, not a hole to hide. A
-script that does want the placeholder to disappear returns `""`.
+**只有字符串才是值。** `null`、数字、对象、抛异常、超时、配额耗尽,全都让
+`{{script_trace_var}}` 原样留在提示词里:一个没解析的变量是个该被看见的 bug,
+不是个该被藏起来的洞。真想让占位符消失的脚本,返回 `""`。
 
-A variable nobody mentions expands nowhere — something has to put
-`{{script_trace_var}}` in a block first.
+没人提过的变量哪儿也不展开——得先有谁把 `{{script_trace_var}}` 放进某个块里。
 
-### `tool.around` — one decision before a tool call
+### `tool.around` — 一次工具调用前的一个决定
 
-Once per tool call, before dispatch and outside the permission gate.
+一次工具调用一次,在派发之前、权限闸门之外。
 
 ```json
 { "tool": "Read", "input": { "file_path": "/etc/hosts" } }
 ```
 
-Return one of these, or anything else to mean "carry on":
+返回下面之一,返回别的都表示"照常来":
 
 ```json
 { "action": "deny", "reason": "reads outside the project are not allowed" }
@@ -288,14 +260,12 @@ Return one of these, or anything else to mean "carry on":
 { "action": "proceed", "timeoutMs": 2000 }
 ```
 
-- **deny** — the call is not dispatched and the tool reports `reason` as its
-  error. A `deny` with no `reason` has nothing to tell the model, so the call
-  proceeds instead.
-- **respond** — the call is not dispatched and `text` is the result the model
-  sees. Without a `text` string it proceeds, because answering with an empty
-  result would hand the model a tool that silently produced nothing.
-- **proceed** — dispatch normally. `timeoutMs`, on this or on any decision
-  that dispatches, stops the call after that long.
+- **deny** —— 调用不派发,工具把 `reason` 当成自己的错误报出去。一个没有 `reason`
+  的 `deny` 没什么可告诉模型的,所以那次调用改为照常进行。
+- **respond** —— 调用不派发,`text` 就是模型看到的结果。没有 `text` 字符串就照常
+  进行,因为拿一个空结果去答,等于给模型一个悄没声儿什么也没产出的工具。
+- **proceed** —— 正常派发。`timeoutMs` 放在这个决定上、或者放在任何一个会派发的
+  决定上,都会让调用在那么长时间之后停下。
 
 ```js
 // tests/fixtures/scripts/tool_around.js
@@ -307,29 +277,25 @@ function onAround(call) {
 }
 ```
 
-You **cannot** rewrite the arguments: `Read(a.txt)` cannot become
-`Read(~/.ssh/id_rsa)` here. You cannot lengthen a deadline either — `timeoutMs`
-installs a child of the turn's signal, so it can fire earlier than the session
-would have given up but never later. And you do not see the outcome; the
-script runs once, before dispatch. What a result looks like is `tool.result`'s
-job.
+你**不能**改写参数:`Read(a.txt)` 在这里变不成 `Read(~/.ssh/id_rsa)`。你也没法把
+期限往后拉——`timeoutMs` 装的是这一轮那个信号的子信号,所以它可以比会话本来放弃的
+时刻更早触发,但绝不会更晚。而且你看不到结果;脚本只在派发前跑那一次。结果长什么样
+是 `tool.result` 的活。
 
-Because this ring sits outside the permission gate, a `deny` refuses a call
-before the user is asked anything, and a `respond` answers without the gate
-being consulted. Neither executes anything, but both decide what the model is
-told a tool did.
+因为这一环坐在权限闸门外面,一个 `deny` 是在问用户任何事之前就把调用拦了,一个
+`respond` 是在闸门根本没被问过的情况下答的。两者都没执行任何东西,但两者都决定了
+模型被告知这个工具干了什么。
 
-### `tool.result` — what one result looks like
+### `tool.result` — 一个结果长什么样
 
-Once per tool result, after every hook, immediately before the model sees it.
+一个工具结果一次,在所有 hook 之后,紧挨着模型看到它之前。
 
 ```json
 { "tool": "ScriptEcho", "input": { "say": "anything" }, "text": "…", "isError": false }
 ```
 
-Return a string and it becomes the result text. Return anything else — a
-number, an object, nothing — and the result is untouched, which is also what a
-script with a bug does.
+返回一个字符串,它就成了结果的正文。返回别的——数字、对象、什么都不返回——结果就
+不动,一个带 bug 的脚本得到的也是这个结果。
 
 ```js
 // tests/fixtures/scripts/tool_result.js
@@ -338,14 +304,13 @@ function onResult(result) {
 }
 ```
 
-Text is the whole vocabulary here. A script cannot drop or replace the images
-riding along with a result, and cannot change whether the result is an error.
+正文就是这里的全部词汇。脚本没法丢掉或替换随结果一起走的图片,也没法改变这个结果
+是不是一个错误。
 
-### `memory.retrieval_hook` — both ends of recall
+### `memory.retrieval_hook` — 召回的两头
 
-The point has two halves and a binding names one function, so the phase
-travels in the input. Called once with `"phase": "before"`, once with
-`"phase": "after"`:
+这个点有两半,而一条绑定只指一个函数,所以阶段是跟着输入走的。调用两次:一次带
+`"phase": "before"`,一次带 `"phase": "after"`:
 
 ```json
 {
@@ -359,13 +324,11 @@ travels in the input. Called once with `"phase": "before"`, once with
 }
 ```
 
-The `"after"` call carries the same fields plus `names`, the list the
-retriever produced, best first.
+`"after"` 那次带的字段一样,外加 `names`——检索器产出的那份清单,最好的在前。
 
-For `"before"`, return an object: `query` (a string) becomes the question,
-`limit` (a positive integer) becomes the ceiling, both optional. For
-`"after"`, return an array of strings — the names to keep, in the order the
-model should see them.
+`"before"` 要返回一个对象:`query`(字符串)成为新的问题,`limit`(正整数)成为
+新的上限,两个都可选。`"after"` 要返回一个字符串数组——要留下的那些名字,按模型
+该看到的顺序排。
 
 ```js
 // tests/fixtures/scripts/memory_retrieval.js
@@ -379,13 +342,13 @@ function onRetrieval(recall) {
 }
 ```
 
-Anything else in either phase leaves recall as it was, and a request is never
-half-moved: an answer with a good `query` and a nonsensical `limit` changes
-neither. A name you invent is dropped downstream rather than being an error.
+两个阶段返回别的东西,召回就保持原样,而且一次请求绝不会只挪了一半:一个 `query`
+没问题、`limit` 荒唐的答复,两样都不改。你自己编出来的名字会在下游被丢掉,而不是
+报错。
 
-### `model.request` — the knobs, just before sending
+### `model.request` — 那几个旋钮,就在发送之前
 
-Once per model call. What you get is the small part of the request:
+一次模型调用一次。你拿到的是这个请求里小的那部分:
 
 ```json
 {
@@ -399,27 +362,24 @@ Once per model call. What you get is the small part of the request:
 }
 ```
 
-**Not the conversation, and not the tool schemas.** Those are tens of
-kilobytes on an ordinary turn, serialized and parsed and thrown away on every
-model call, and message content has two cheaper points of its own —
-`prompt.assemble` on the way out, `model.message` on the way back.
+**不含对话,也不含工具的 schema。** 平常一轮里这两样是几十 KB,每次模型调用都要
+序列化一遍、解析一遍、再扔掉,而消息正文自己有两个更便宜的点——出去的路上是
+`prompt.assemble`,回来的路上是 `model.message`。
 
-Return an object with any subset of the keys; anything absent is left alone.
+返回一个对象,键取哪几个都行;没出现的键保持不动。
 
 ```json
 { "maxTokens": 2048, "model": "claude-haiku-5", "thinkingMode": "off", "tools": ["Read"] }
 ```
 
-- `model`, `maxTokens`, `thinkingMode`, `fallbackModel` replace the request's.
-  `fallbackModel: null` clears it; leaving the key out keeps it.
-  `thinkingMode` is `"auto"`, `"off"`, `"on"` or `{ "on_budget": 4096 }`.
-  `maxTokens: 0` and an empty `model` are refused, because a request built
-  from them cannot be sent and the script's bug would surface as a provider
-  error.
-- `tools` keeps the tools it names and drops the rest, in the order they
-  already had. A name the request does not offer is ignored — a script cannot
-  conjure a tool definition, so this narrows and never widens. `[]` is a
-  legitimate answer.
+- `model`、`maxTokens`、`thinkingMode`、`fallbackModel` 直接替换请求里的那些。
+  `fallbackModel: null` 是清空;把这个键留在外面是保持原样。`thinkingMode` 取
+  `"auto"`、`"off"`、`"on"` 或者 `{ "on_budget": 4096 }`。`maxTokens: 0` 和空的
+  `model` 会被拒绝,因为照这个建出来的请求发不出去,脚本的 bug 会以一个 provider
+  错误的面目冒出来。
+- `tools` 保留它点到名的工具,其余丢掉,顺序还是它们原来的顺序。请求里没提供的
+  名字会被忽略——脚本变不出一个工具定义,所以这里只会收窄,永远不会放宽。`[]`
+  是个正当的答案。
 
 ```js
 // tests/fixtures/scripts/model_request.js
@@ -428,25 +388,23 @@ function onRequest(req) {
 }
 ```
 
-The whole object is read before any of it is applied, so a field of the wrong
-type leaves the request entirely unchanged rather than partly changed.
+整个对象是先读完再动手的,所以某个字段类型不对,请求是完全不变,而不是变了一部分。
 
-### `model.message` — a finished message, before it is recorded
+### `model.message` — 一条写完的消息,在它被记下来之前
 
-On whole messages, never on stream deltas: once for an assistant turn's text,
-once for its batch of tool calls. A few times per model call, not thousands.
+作用在整条消息上,绝不作用在流式增量上:助手这一轮的正文一次,它那批工具调用一次。
+一次模型调用几次,不是几千次。
 
 ```json
 { "role": "assistant", "text": ["Here is what I found."], "toolUses": ["Read"] }
 ```
 
-`text` holds the message's text blocks in order. `toolUses` names the tools
-the message asked for, without their arguments — a single `Write` call carries
-a whole file. A message with no text does not call the script at all, since
-text is the only thing it could change.
+`text` 装的是这条消息的文本块,按顺序。`toolUses` 点出这条消息要用的工具名字,
+不带它们的参数——单单一次 `Write` 调用就能带上一整个文件。一条没有正文的消息压根
+不会调用脚本,因为正文是它唯一能改的东西。
 
-Return an array of strings **exactly as long** as the `text` you were given;
-each entry replaces the block at the same position, and `""` empties one.
+返回一个字符串数组,长度跟给你的 `text` **完全一样**;每一项替换同一位置上的那个
+块,`""` 把一块清空。
 
 ```js
 // tests/fixtures/scripts/model_message.js
@@ -457,108 +415,91 @@ function onMessage(msg) {
 }
 ```
 
-A different length says nothing about which block the extra or missing entry
-belongs to, so it is discarded like every other shape. The message is then
-recorded exactly as the model produced it.
+长度不一样,就说不清多出来或少掉的那一项属于哪个块,所以跟其他形状不对的返回值
+一样被丢掉。然后这条消息就照模型产出的原样记下来。
 
-Out of reach here: **thinking blocks and their signatures**, which must be
-echoed back to the provider verbatim or the next call is rejected; **images**;
-and **tool-use blocks**, whose arguments are what the engine is about to
-dispatch.
+这里够不到的东西:**thinking 块和它们的签名**,那些必须一字不差地回传给 provider,
+否则下一次调用会被拒;**图片**;还有**工具调用块**,它们的参数正是引擎马上要派发
+的东西。
 
-Note that rewriting a message changes what the model sees on the *next*
-request, not the one in flight.
+注意,改写一条消息影响的是模型在*下一次*请求里看到什么,不是正在飞的这一次。
 
-## Budgets
+## 预算
 
-**Time.** One call gets `timeout_ms`, 100 by default. That is enforced twice:
-QuickJS carries the deadline in an interrupt handler that fires between
-bytecode instructions, so even `while (true) {}` stops, and the carrier puts
-its own timeout around the asynchronous path as a second line.
+**时间。** 一次调用有 `timeout_ms`,默认 100。这一条强制了两遍:QuickJS 把这个期限
+带在一个中断处理器里,它在字节码指令之间触发,所以连 `while (true) {}` 都能停下来;
+载体又在异步那条路外面套了自己的超时,作为第二道。
 
-**Calls.** `calls_per_turn`, 1000 by default, counted per binding and reset at
-the start of every user turn. A point that fires per tool call cannot turn a
-pathological turn into a pathological bill.
+**次数。** `calls_per_turn`,默认 1000,按绑定分别计,每个用户轮次开始时重置。一个
+按工具调用触发的点,没法把一个病态的轮次变成一张病态的账单。
 
-**Memory.** Each runtime is capped at 16 MB.
+**内存。** 每个运行时的上限是 16 MB。
 
-Exceeding any of them fails *that call* and nothing else. The turn continues
-with whatever the script would have contributed simply missing.
+任何一项超了,失败的只是*那一次调用*,别的都不受影响。这一轮继续跑,只是脚本本该
+贡献的那点东西没了。
 
-## Failure
+## 失败
 
-The rule everywhere is that **a script that fails changes nothing.** A throw,
-a timeout, an exhausted quota, a return value the point cannot act on — all of
-them leave the point exactly as the adapter found it, and log a warning naming
-the script. Each adapter computes its change fully before applying any of it,
-so there is no half-applied state to reason about.
+所有地方的规矩都是:**失败的脚本什么都改不了。** 抛异常、超时、配额耗尽、返回一个
+这个点没法拿来做事的值——全都让这个点保持适配器发现它时的原样,并打一条点了脚本
+名字的警告。每个适配器都是先把自己的改动完整算出来再动手施加,所以不存在什么施加了
+一半的状态需要你去琢磨。
 
-Two failures happen earlier than that:
+有两种失败发生得比这更早:
 
-- At **bind** time, if the file cannot be read or the point is wrong, no
-  scripts are bound at all and the daemon logs an error.
-- At **registration** time, `prompt.block`, `prompt.context` and
-  `prompt.variable` make their identity call while the binding is being bound.
-  A script that throws there, or that has no function by that name, registers
-  nothing — a block with no name is not addressable and a block at no
-  particular order is not placeable.
+- **绑定**时,文件读不出来或者点写错了,那就一个脚本都不绑,daemon 记一条错误。
+- **注册**时,`prompt.block`、`prompt.context` 和 `prompt.variable` 会在绑定过程中
+  做那次身份调用。在那儿抛异常的脚本,或者根本没有那个名字的函数的脚本,什么都
+  注册不上——一个没有名字的块寻址不到,一个没有确定 order 的块也放不下去。
 
-## Authority
+## 权限
 
-What a script may do is decided by **where its file is**, not by anything it
-or its binding declares — a declaration is exactly what an outside script
-would lie in. The check is on the resolved, canonicalized path:
+一个脚本能做什么,是由**它的文件在哪儿**决定的,不由它自己或者它的绑定声明什么
+决定——因为一个来自外面的脚本要撒谎,撒的正是这种声明。检查的是解析并规范化之后的
+路径:
 
-- **Inside the project root** — the operator wrote it, so it may do anything
-  they could have done by editing the prompt by hand.
-- **Anywhere else**, including a script that arrived with a downloaded
-  plugin — it may **add**, and nothing more. Modifying, removing and
-  reordering all require a capability it has not declared.
+- **在项目根之内** —— 那是操作者自己写的,所以他手动改提示词能做的事,它都能做。
+- **在别的任何地方**,包括随下载来的插件一起到的脚本 —— 它只能**新增**,别的都
+  不行。修改、删除和重排,都需要一项它没有声明过的能力。
 
-This only bites at `prompt.assemble`, the one point with something to
-restrict. A denied edit does not cancel the permitted ones: the rest of the
-pass still applies, and the refusal is reported and counted rather than
-silently dropped, so "this script does nothing" can be told apart from "this
-script is being stopped from doing something".
+这一条只在 `prompt.assemble` 上真正咬人,那是唯一一个有东西可限的点。一次被拒的
+编辑不会把获准的那些一起取消:这一遍的其余部分照常施加,而且这次拒绝是被报出来、
+被计数的,不是被悄悄丢掉的,所以"这个脚本什么也没做"和"这个脚本正在被拦着不让做"
+分得开。
 
 ```
 plugin '/opt/pkg/x.js' may not modify the prompt block 'rules': it did not
 declare that capability at install
 ```
 
-A script from outside the project is recorded as a plugin origin, which is
-why it is named that way in the message: the axis is provenance, not
-packaging.
+一个来自项目外面的脚本会被记成 plugin 来源,消息里那么叫它就是这个缘故:这条轴讲
+的是出身,不是打包方式。
 
-The other eight points do not branch on provenance, because none of them has a
-reduced mode to branch into — there is no "may narrow but not widen" version
-of a recall filter the way prompt assembly has an add-only version of an edit.
+另外八个点不按出身分岔,因为它们没有一个有可以分岔进去的"缩水模式"——召回过滤器
+不存在"可以收窄但不许放宽"的版本,不像提示词装配那样有一个只许新增的编辑版本。
 
-## What scripts are not allowed to bind to
+## 脚本不许绑到哪儿
 
-Four points in the catalog are open to scripts by contract and have no adapter
-on purpose:
+目录里有四个点,契约上对脚本是开放的,而故意不给适配器:
 
-- **`history.append_observer`** fires once per log entry. That is the
-  frequency band closed to scripts deliberately: the cost of a callback there
-  is invisible to whoever writes one.
-- **`history.extension_entry`** is a write capability, not a hook. A script
-  would need an API to emit an entry, not a callback to receive one.
-- **`hooks`** is its own subsystem with its own process model.
-- **`script.carrier`** is the carrier itself.
+- **`history.append_observer`** 每写一条日志就触发一次。那个频段是刻意对脚本关闭
+  的:在那儿放一个回调要花多少代价,写这个回调的人看不见。
+- **`history.extension_entry`** 是一项写能力,不是一个 hook。脚本需要的是一个能
+  发出条目的 API,不是一个接收条目的回调。
+- **`hooks`** 是它自己的子系统,有自己的进程模型。
+- **`script.carrier`** 就是载体本身。
 
-Everything else in the catalog is marked `closed` for scripts — those are Rust
-traits wired at build time, with nothing for a script to register through.
+目录里其余的东西对脚本都标成 `closed` —— 那些是构建期就接好的 Rust trait,没有
+留给脚本注册的口子。
 
-## Where to look next
+## 接下来看哪儿
 
-- `tests/fixtures/scripts/` — one runnable fixture per point, each leaving a
-  mark nothing else in the engine produces.
-- `tests/runner/tests/script_carrier.rs` — drives a real session for every
-  point, twice: once with the script bound and once without.
-- `tests/fixtures/script_project/` — a complete project whose settings bind a
-  script, used by `tests/cases/010.script_carrier.test`.
-- `crates/core/src/interface/script_adapters/` — one adapter per point. The
-  JSON contract each one implements is documented on the adapter itself, which
-  is the version that cannot drift.
-- `docs/extension_points.md` — every point in the engine, and who may use it.
+- `tests/fixtures/scripts/` —— 每个点一个能跑的 fixture,每一个都留下一处引擎里
+  别的地方绝不会产生的痕迹。
+- `tests/runner/tests/script_carrier.rs` —— 每个点都驱动一次真实会话,跑两遍:
+  一遍绑上脚本,一遍不绑。
+- `tests/fixtures/script_project/` —— 一个完整的项目,它的 settings 绑了一个脚本,
+  由 `tests/cases/010.script_carrier.test` 使用。
+- `crates/core/src/interface/script_adapters/` —— 每个点一个适配器。每个适配器实现
+  的 JSON 契约就写在适配器自己身上,那是不会漂移的那一版。
+- `docs/extension_points.md` —— 引擎里的每一个点,以及谁可以用它。

@@ -1,118 +1,109 @@
-# Extension points
+# 扩展点
 
-Everything in this engine that a host, a plugin or a script can plug into,
-what it costs, and who is allowed to use it.
+宿主、插件或脚本能接进这个引擎的所有地方,各自要付什么代价,以及谁有资格用。
 
-Start with the question you actually have:
+从你手上真正的那个问题开始:
 
-- **"I want to replace how the engine does X."** You want a **contract** —
-  implement a trait, hand it to `runtime::agent::Builder`.
-- **"I want to add something to what the engine already does."** You want a
-  **registration** — contribute a named, ordered, revocable thing.
-- **"I want to see or change something in flight."** You want an
-  **interception** — sit in the path of something the engine is doing.
+- **"我想换掉引擎做 X 的方式。"** 你要的是**契约**——实现一个 trait,
+  交给 `runtime::agent::Builder`。
+- **"我想在引擎已经在做的事情上再添点东西。"** 你要的是**注册**——
+  贡献一个具名、有序、可撤销的东西。
+- **"我想看见、或者改掉正在进行中的东西。"** 你要的是**拦截**——
+  坐进引擎正在做的那件事的路径里。
 
-All three are Rust: implement the trait, hand it to `runtime::agent::Builder`.
-To extend a build you are not compiling, use a carrier — a script
-(`extending_quickjs.md`) or a WebAssembly plugin (`extending_wasm.md`). Each
-reaches a subset of what is listed here, and each of those documents says which.
-For how the engine is put together, see `ARCHITECTURE.md`.
+三者都是 Rust:实现那个 trait,交给 `runtime::agent::Builder`。要扩展一个不由你
+编译的构建,就得借助载体——脚本(`extending_quickjs.md`)或者 WebAssembly 插件
+(`extending_wasm.md`)。每种载体只够得着这里列出的一部分,各自那份文档会说清楚是
+哪一部分。引擎本身怎么搭起来的,见 `ARCHITECTURE.md`。
 
-## How to read the table
+## 这张表怎么读
 
-`Config` / `Script` / `Plugin` are the three provenances the engine
-distinguishes, and the axis is not privilege but authorship: did the operator
-write this, or download it. A script in the operator's own project can do what
-they could have done by hand, because it is them. An installed plugin adds
-freely and does more only if it declared the capability at install, where the
-person installing it was shown the declaration.
+`配置` / `脚本` / `插件` 是引擎区分的三种来源,而这条轴线分的不是权限高低,是作者
+身份:这东西是运维者自己写的,还是下载来的。运维者自己项目里的脚本可以做任何他本
+来就能亲手做的事,因为那就是他本人。装上的插件可以随便加,想做得更多则必须在安装
+时声明能力——而装它的人当时看见了那份声明。
 
-`closed` means the point is a Rust trait wired at build time, so there is
-nothing for a script or a plugin to register through — the embedding program
-reaches it, nobody else.
+`不开放` 的意思是:这个点是构建期接好的 Rust trait,脚本和插件根本没有可以注册
+进去的入口——只有嵌入它的那个程序够得着,别人都不行。
 
-**Frequency is a constraint, not trivia.** A point that fires once a session
-can afford a subprocess. One that fires per streamed chunk cannot afford
-anything, which is why those are closed to scripts and plugins outright.
+**频率是一条约束,不是花边。** 一个会话只触发一次的点养得起一个子进程;每个流式
+分片触发一次的点什么都养不起,这就是这类点对脚本和插件干脆全关的原因。
 
 <!-- BEGIN GENERATED TABLE — see base::interface::catalog::render_markdown -->
 
-| Point | Kind | When | May change | Frequency | Config | Script | Plugin |
+| 扩展点 | 类型 | 时机 | 可改什么 | 频率 | 配置 | 脚本 | 插件 |
 |---|---|---|---|---|---|---|---|
-| `tool.registry` | contract | session build, and any time after | which tools exist and what they are | per session (10⁰) | closed | closed | closed |
-| `tool.around` | interception | around dispatch, outside permission and hooks | the cancellation signal, the outcome; never the input | per tool call (10¹) | full | full | declared capability |
-| `tool.result` | interception | after every hook, immediately before the model sees it | the result text and its images | per tool call (10¹) | full | full | declared capability |
-| `prompt.block` | registration | prompt assembly, once per turn | adds only | per turn (10⁰–10¹) | full | full | add only |
-| `prompt.context` | registration | prompt assembly, once per turn | adds only | per turn (10⁰–10¹) | full | full | add only |
-| `prompt.variable` | registration | prompt assembly, after blocks are merged | its own placeholder, nothing else | per turn (10⁰–10¹) | full | full | add only |
-| `prompt.assembler` | contract | prompt assembly, in place of the engine's own | order, cache boundaries, merge strategy — the whole result | per model call (10⁰–10¹) | closed | closed | closed |
-| `prompt.assemble` | interception | prompt assembly, last | block content, order and membership | per turn (10⁰–10¹) | full | full | declared capability |
-| `event.sink` | contract | every emission, on the sink's own task | nothing — observation only | per streamed chunk (10³–10⁴) | closed | closed | closed |
-| `health.check` | registration | whenever something asks for a health report | nothing — a check reports, it does not repair | per process (10⁰) | closed | closed | closed |
-| `elicitation.ask` | contract | whenever a decision needs a human | the answer | per turn (10⁰–10¹) | closed | closed | closed |
-| `permission.check` | contract | before every tool call | permit, deny, or ask | per tool call (10¹) | closed | closed | closed |
-| `scene` | contract | session build | everything about how an agent presents itself | per session (10⁰) | closed | closed | closed |
-| `model` | contract | every model request | the whole exchange | per model call (10⁰–10¹) | closed | closed | closed |
-| `model.factory` | registration | startup, when provider config is read | which protocols can be configured | per process (10⁰) | closed | closed | closed |
-| `model.request` | interception | immediately before each model call | everything in the request | per model call (10⁰–10¹) | full | full | declared capability |
-| `model.message` | interception | after the stream carrying it finishes | the message content | per model call (10⁰–10¹) | full | full | declared capability |
-| `credentials` | contract | startup, when provider config is read | the credential | per process (10⁰) | closed | closed | closed |
-| `config.source` | contract | process start, before anything is built | which layers exist and what JSON is in them; never the merge | per process (10⁰) | closed | closed | closed |
-| `token.count` | contract | every budget check | the number compaction triggers on | per turn (10⁰–10¹) | closed | closed | closed |
-| `history.store` | contract | every append, and on resume | how and where the log persists | per turn (10⁰–10¹) | closed | closed | closed |
-| `history.query` | contract | whenever something asks for sessions rather than for one session | which sessions come back, in what order, and how they are matched | per session (10⁰) | closed | closed | closed |
-| `history.blob` | contract | every append carrying an image or a large payload, and on load | where large content is kept and how it is addressed | per turn (10⁰–10¹) | closed | closed | closed |
-| `history.projection` | contract | every time a transcript is read: resume, fork, search, paging | which entries become messages, and what they say | per session (10⁰) | closed | closed | closed |
-| `history.extension_entry` | registration | any time; ordered with everything else | adds only; the kernel never reads the payload | per turn (10⁰–10¹) | full | full | add only |
-| `memory.storage` | contract | recall, and whenever a memory is written | how and where memories persist | per turn (10⁰–10¹) | closed | closed | closed |
-| `memory.retriever` | contract | once per user message, in the background | the recalled set | per turn (10⁰–10¹) | closed | closed | closed |
-| `memory.retrieval_hook` | interception | around retrieval | the query and the recalled names | per turn (10⁰–10¹) | full | full | declared capability |
-| `history.append_observer` | interception | after each append succeeds | nothing — read-only in the types, not by agreement | per turn (10⁰–10¹) | full | full | add only |
-| `skill.source` | contract | at session build, and whenever an MCP server connects | which skills exist, and the text each one expands to | per session (10⁰) | closed | closed | closed |
-| `instruction.source` | contract | at session build | the AGENTS.md text injected once per session | per session (10⁰) | closed | closed | closed |
-| `rules.source` | contract | while the system prompt is assembled | which rule documents the model is told exist | per model call (10⁰–10¹) | closed | closed | closed |
-| `turn.policy` | contract | before each model call, and after each one returns | whether the loop takes another step, and the reported stop reason | per model call (10⁰–10¹) | closed | closed | closed |
-| `model.recovery` | contract | on an error, and on a response cut off at the output limit | whether to switch model, compact and retry, raise the limit, or fail | per model call (10⁰–10¹) | closed | closed | closed |
-| `model.backoff` | contract | inside the client, below the model contract, per failed attempt | the delay before a retry, and whether there is one | per model call (10⁰–10¹) | closed | closed | closed |
-| `budget` | contract | after each model call, and before each request is assembled | whether the turn continues, what it is told, the compaction ceiling | per model call (10⁰–10¹) | closed | closed | closed |
-| `environment` | contract | whenever an answer is written down rather than measured | log timestamps, entry ids, the date the prompt carries | per turn (10⁰–10¹) | closed | closed | closed |
-| `exec.process` | contract | every command a tool starts | which machine the work happens on | per tool call (10¹) | closed | closed | closed |
-| `exec.filesystem` | contract | every read, write or stat a tool makes | which filesystem the tools see | per tool call (10¹) | closed | closed | closed |
-| `exec.network` | contract | each outbound request; the egress policy binds the ones the model chose | where requests go, whether they go, what answers | per tool call (10¹) | closed | closed | closed |
-| `exec.sandbox` | contract | before a command is started | the command that actually runs, and what it may touch | per tool call (10¹) | closed | closed | closed |
-| `compaction` | contract | once a turn: two aging passes, a predictive one, then the threshold | the message history, and whether it is rewritten at all | per turn (10⁰–10¹) | closed | closed | closed |
-| `script.carrier` | contract | wherever the carrier is bound; governed by a per-turn quota | whatever the bound point allows, under the script's own provenance | per turn (10⁰–10¹) | full | full | declared capability |
-| `hooks` | interception | thirty named moments; see the hook event list | varies by event: block, rewrite input, end the turn | per tool call (10¹) | full | full | declared capability |
+| `tool.registry` | 契约 | 会话构建时,以及之后任何时候 | 有哪些工具、它们各是什么 | 每会话(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `tool.around` | 拦截 | 分发前后,在权限和 hooks 的外侧 | 取消信号和结果;改不了输入 | 每次工具调用(10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `tool.result` | 拦截 | 所有 hook 之后,模型看到它之前的最后一步 | 结果文本和其中的图片 | 每次工具调用(10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `prompt.block` | 注册 | 提示组装时,每轮一次 | 只能新增 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 只能新增 |
+| `prompt.context` | 注册 | 提示组装时,每轮一次 | 只能新增 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 只能新增 |
+| `prompt.variable` | 注册 | 提示组装时,块合并之后 | 只有自己那个占位符,别的都不行 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 只能新增 |
+| `prompt.assembler` | 契约 | 提示组装时,取代引擎自己那套 | 顺序、缓存边界、合并策略——整个结果 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `prompt.assemble` | 拦截 | 提示组装的最后一步 | 块的内容、顺序和取舍 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `event.sink` | 契约 | 每次发射,在 sink 自己的 task 上 | 什么都改不了——只能观察 | 每个流式分片(10³–10⁴ 量级) | 不开放 | 不开放 | 不开放 |
+| `health.check` | 注册 | 每当有人要一份健康报告 | 什么都改不了——检查只汇报,不修复 | 每进程(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `elicitation.ask` | 契约 | 每当一个决定需要人来做 | 答案 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `permission.check` | 契约 | 每次工具调用之前 | 放行、拒绝,或者问人 | 每次工具调用(10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `scene` | 契约 | 会话构建时 | 一个 agent 怎么呈现自己,全部 | 每会话(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `model` | 契约 | 每次模型请求 | 整场交互 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `model.factory` | 注册 | 启动时,读 provider 配置的那一刻 | 哪些协议可以被配置出来 | 每进程(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `model.request` | 拦截 | 每次模型调用之前的最后一刻 | 请求里的一切 | 每次模型调用(10⁰–10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `model.message` | 拦截 | 承载它的那段流结束之后 | 消息内容 | 每次模型调用(10⁰–10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `credentials` | 契约 | 启动时,读 provider 配置的那一刻 | 凭据本身 | 每进程(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `config.source` | 契约 | 进程启动,任何东西被构建之前 | 有哪些层、每层里是什么 JSON;合并本身动不了 | 每进程(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `token.count` | 契约 | 每次预算检查 | 压缩据以触发的那个数字 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `history.store` | 契约 | 每次追加,以及恢复时 | 日志怎么持久化、存到哪 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `history.query` | 契约 | 每当有人要的是若干会话而不是某一个会话 | 返回哪些会话、按什么顺序、怎么算匹配 | 每会话(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `history.blob` | 契约 | 每次追加带图片或大负载时,以及加载时 | 大块内容存在哪、怎么寻址 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `history.projection` | 契约 | 每次读取转录:恢复、分叉、搜索、翻页 | 哪些条目变成消息、它们说了什么 | 每会话(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `history.extension_entry` | 注册 | 任何时候;和其余条目同序 | 只能新增;内核从不解析 payload | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 只能新增 |
+| `memory.storage` | 契约 | 召回时,以及每次写入记忆时 | 记忆怎么持久化、存到哪 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `memory.retriever` | 契约 | 每条用户消息一次,在后台 | 召回的集合 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `memory.retrieval_hook` | 拦截 | 召回前后 | 查询,以及召回的记忆名 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `history.append_observer` | 拦截 | 每次追加成功之后 | 什么都改不了——只读是类型定死的,不是约定的 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 只能新增 |
+| `skill.source` | 契约 | 会话构建时,以及每当有 MCP server 接入 | 有哪些 skill、每个展开成什么文本 | 每会话(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `instruction.source` | 契约 | 会话构建时 | 每会话注入一次的 AGENTS.md 文本 | 每会话(10⁰ 量级) | 不开放 | 不开放 | 不开放 |
+| `rules.source` | 契约 | 系统提示组装期间 | 告诉模型存在哪些规则文档 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `turn.policy` | 契约 | 每次模型调用之前,以及每次返回之后 | 循环还走不走下一步,以及上报的停止原因 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `model.recovery` | 契约 | 出错时,以及响应撞上输出上限被截断时 | 换模型、压缩后重试、抬高上限,还是直接失败 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `model.backoff` | 契约 | 在 client 内部、模型契约之下,每次失败的尝试 | 重试前等多久,以及到底有没有重试 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `budget` | 契约 | 每次模型调用之后,以及每个请求组装之前 | 这轮还继不继续、被告知了什么、压缩的上限 | 每次模型调用(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `environment` | 契约 | 每当一个答案是被写下来而不是被测量出来的 | 日志时间戳、条目 id、提示里带的日期 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `exec.process` | 契约 | 工具启动的每一条命令 | 活儿在哪台机器上干 | 每次工具调用(10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `exec.filesystem` | 契约 | 工具的每一次读、写、stat | 工具看到的是哪个文件系统 | 每次工具调用(10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `exec.network` | 契约 | 每个出站请求;出网策略约束的是模型选的那些 | 请求去哪、去不去、谁来应答 | 每次工具调用(10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `exec.sandbox` | 契约 | 命令启动之前 | 真正跑起来的那条命令,以及它能碰什么 | 每次工具调用(10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `compaction` | 契约 | 每轮一次:两趟老化、一趟预测,最后是阈值 | 消息历史,以及到底要不要重写 | 每轮(10⁰–10¹ 量级) | 不开放 | 不开放 | 不开放 |
+| `script.carrier` | 契约 | 载体被绑到哪就在哪;受每轮配额约束 | 所绑那个点允许的一切,按脚本自己的来源定级 | 每轮(10⁰–10¹ 量级) | 完全 | 完全 | 需声明能力 |
+| `hooks` | 拦截 | 三十个具名时刻;见 hook 事件清单 | 按事件而异:拦截、改写输入、结束这一轮 | 每次工具调用(10¹ 量级) | 完全 | 完全 | 需声明能力 |
 <!-- END GENERATED TABLE -->
 
-The table above is generated from `base::interface::catalog`, and
-`daemon/tests/extension_points_doc.rs` fails if this file drifts from it. Edit
-the catalog, not the table.
+上面这张表由 `base::interface::catalog` 生成,这份文件一旦和它对不上,
+`daemon/tests/extension_points_doc.rs` 就会失败。要改改 catalog,别改表。
 
 ---
 
-## Contracts — replacing a subsystem
+## 契约——换掉一个子系统
 
-Every one of these is a trait you implement and hand to the builder. They are
-`closed` to scripts and plugins because they are wired in Rust at build time.
+下面每一个都是你实现之后交给 builder 的 trait。它们对脚本和插件一律`不开放`,
+因为它们是在构建期用 Rust 接好的。
 
-### The tool set — `tool.registry`
+### 工具集 — `tool.registry`
 
 ```rust
 let tools: Arc<dyn base::tool::ToolRegistry> = Arc::new(MyRegistry::new());
 let (agent, events, input) = Builder::new().tools(tools).model(model).build()?;
 ```
 
-`register` / `replace` / `remove` each return a `Disposer`; disposing takes the
-tool back out and it stops being visible to the model.
-`base::tool::LayeredToolRegistry` is a worked example — it wraps another
-registry and hides tools from it without mutating it.
+`register` / `replace` / `remove` 各自返回一个 `Disposer`;把它 dispose 掉,工具
+就被取回来,模型也就看不见它了。`base::tool::LayeredToolRegistry` 是一个做好的
+范例——它包住另一个 registry,在不改动对方的前提下把工具藏起来。
 
-### The LLM backend — `model`, `model.factory`, `credentials`
+### LLM 后端 — `model`、`model.factory`、`credentials`
 
-`base::interface::model::Model` is one protocol. To make a protocol
-*configurable* — reachable by writing `api_type` in `settings.json` — register
-a `ModelFactory`:
+`base::interface::model::Model` 是一个协议。要让一个协议变得*可配置*——也就是在
+`settings.json` 里写一句 `api_type` 就能用上——得注册一个 `ModelFactory`:
 
 ```rust
 let mut factories = model::factory::builtin_registry();
@@ -122,27 +113,25 @@ let router = daemon::model_router::build_task_router_with(
 )?;
 ```
 
-Registering an existing `api_type` replaces it, which is how a host puts its
-own client behind `anthropic` without inventing a name its users must write
-down.
+注册一个已经存在的 `api_type` 就是替换它。宿主正是这么把自己的 client 塞到
+`anthropic` 背后的:不必另发明一个名字,再逼用户去记。
 
-Credentials come from `CredentialSource`, never from `config.api_key` directly:
+凭据来自 `CredentialSource`,永远不直接读 `config.api_key`:
 
 ```rust
 let factories = model::factory::builtin_registry()
     .with_credentials(Arc::new(MyVaultCredentials));
 ```
 
-The value comes back as `Secret`, which has no `Display`, no `Serialize`, and a
-`Debug` that prints `<redacted>`. Reading it takes `.expose()`.
+拿回来的是 `Secret`:没有 `Display`,没有 `Serialize`,`Debug` 打出来是
+`<redacted>`。要读它得调 `.expose()`。
 
-### Where settings come from — `config.source`
+### 配置从哪来 — `config.source`
 
-`Settings::load` reads six files: `settings.json` and its gitignored
-`settings.local.json` overlay in each of the global, scene and project tiers.
-A deployment whose configuration lives in a config service, a ConfigMap or a
-database implements `base::interface::config_source::ConfigSource` and calls
-`Settings::load_from` instead:
+`Settings::load` 读六个文件:全局、scene、项目三个层级,每级一个 `settings.json`
+和一个进了 gitignore 的 `settings.local.json` 覆盖层。配置存在配置服务、
+ConfigMap 或者数据库里的部署,实现
+`base::interface::config_source::ConfigSource`,改调 `Settings::load_from`:
 
 ```rust
 let source = config_source::Chain(vec![
@@ -152,257 +141,214 @@ let source = config_source::Chain(vec![
 let settings = Settings::load_from(&source, global, scene, project, "code", "opus");
 ```
 
-A source decides only which layers exist, in what order, and what JSON is in
-them. The merge is the same either way — `paths` stripped from every layer, an
-overlay's `permission_rules` held apart, later layers merged recursively over
-earlier ones — so moving configuration off the disk cannot change what a
-configuration file means.
+一个 source 只决定有哪些层、顺序如何、每层里是什么 JSON。合并两边是同一套——每层
+都剥掉 `paths`,覆盖层的 `permission_rules` 单独拎出来,靠后的层递归盖在靠前的
+上面——所以把配置从磁盘上搬走,改不了一个配置文件的含义。
 
-The directory arguments stay even for a source that reads nothing from them:
-they are where the scene's *data* lives, which is not something a settings file
-is ever allowed to decide.
+那几个目录参数即使 source 一个字节都不从里面读也得留着:它们是 scene 的*数据*待
+的地方,而这件事从来轮不到配置文件来决定。
 
-`layers()` returns layers rather than a `Result`, because `Settings::load`
-never fails. A source that cannot reach its store logs why and returns what it
-has: losing a layer is bad, and refusing to start because a remote service is
-slow is worse.
+`layers()` 返回的是层而不是 `Result`,因为 `Settings::load` 从不失败。够不着自己
+那份存储的 source 记下原因,把手上有的交出来:丢一层是坏事,而因为一个远端服务慢
+就拒绝启动,更坏。
 
-### Tool authorization — `permission.check`
+### 工具授权 — `permission.check`
 
-`base::interface::permission::Permission` decides whether a tool call runs.
-Returning `Prompt` puts the question to a human through
-[`elicitation.ask`](#asking-a-person--elicitationask) rather than deciding.
+`base::interface::permission::Permission` 决定一次工具调用跑不跑。返回 `Prompt`
+不是做决定,而是把这个问题经 [`elicitation.ask`](#向人提问--elicitationask)
+交给人。
 
 ```rust
 Builder::new().permission(Arc::new(MyGate));
 ```
 
-Two binding methods exist for handlers that consult state: `bind_tool_registry`
-gives the handler the registry dispatch actually uses (a handler bound to a
-different one cannot see tools registered later, and its unknown-tool branch
-becomes a hole), and `bind_session_state` keeps it seeing mode changes made
-mid-session. Both default to no-ops for handlers that need neither.
+给需要查状态的 handler 准备了两个绑定方法:`bind_tool_registry` 把分发真正在用的
+那个 registry 交给 handler(绑到别的 registry 上的 handler 看不见之后注册的工具,
+它那条"未知工具"的分支就成了一个洞),`bind_session_state` 让它持续看得见会话中途
+的模式切换。两者对不需要它们的 handler 都默认是空实现。
 
-### How an agent presents itself — `scene`
+### 一个 agent 怎么呈现自己 — `scene`
 
-`base::interface::scene::AgentScene` owns the system prompt skeleton, the tool
-whitelist and the budgets:
+`base::interface::scene::AgentScene` 持有系统提示骨架、工具白名单和预算:
 
 ```rust
 Builder::new().scene(Arc::new(MyScene));
 ```
 
-Four scenes ship, three of them written as a copy-from-here ladder: a full
-reference, a compact one, and a minimal skeleton. A scene that names its own
-prompt sections keeps those names under the `scene.` prefix — see the block
-names below.
+引擎自带四个 scene,其中三个写成了照着抄的阶梯:一个完整参考、一个精简的、一个最
+小骨架。自己给提示分节命名的 scene 保住那些名字,收在 `scene.` 前缀下——见下面的
+块名。
 
-### Session storage — `history.store`
+### 会话存储 — `history.store`
 
-`history::store::HistoryStore`. Two implementations ship:
-`JsonlHistoryStore` (files under a project directory) and
-`InMemoryHistoryStore`. The contract's guarantees are in its doc comment;
-`store::contract_tests` runs the same six properties against both, and is the
-place to point a third backend at.
+`history::store::HistoryStore`。自带两个实现:`JsonlHistoryStore`(项目目录下的
+文件)和 `InMemoryHistoryStore`。契约的保证写在它的文档注释里;
+`store::contract_tests` 拿同样六条性质同时压这两个实现,第三个后端也该指到这里来。
 
-### Finding sessions — `history.query`
+### 找会话 — `history.query`
 
-`HistoryStore::find_sessions` takes a `history::query::SessionQuery` — a
-needle, a scope and a ceiling — and answers with summaries, newest first. The
-recency listing and the text search are the same question with and without a
-needle, which is why they are one method: a backend that can answer one
-cheaply can answer both.
+`HistoryStore::find_sessions` 收一个 `history::query::SessionQuery`——一根针、一个
+范围、一个上限——回一串摘要,最新的在前。按时间列表和按文本搜索是同一个问题的有针
+和无针两种情况,所以它们才是一个方法:能便宜地回答其中一个的后端,两个都能便宜地
+回答。
 
-The default reads every session in range to answer, and `JsonlHistoryStore`
-does better only by ordering on file mtime and narrowing by directory. A
-backend with a real index overrides this one method and takes search over
-whole; the guarantees it has to keep — newest first with a total order, at
-most the limit, and never fewer matches than a case-insensitive substring
-scan would find — are in the method's doc comment.
+默认实现要把范围内每个会话都读一遍才答得出来,`JsonlHistoryStore` 也只是靠文件
+mtime 排序、按目录收窄而已。有真索引的后端覆盖这一个方法,就把搜索整个接管过去了;
+它必须守住的保证——最新在前且是全序、不超过 limit、匹配数不少于一次大小写无关的
+子串扫描——写在这个方法的文档注释里。
 
-### Large content — `history.blob`
+### 大块内容 — `history.blob`
 
-`history::blob::BlobStore`. A `User`, `Assistant` or `ToolResult` entry whose
-content is over a kilobyte, or that carries an image at any size, is written
-to the blob store and replaced in the JSONL by a `LogEntry::Blob` naming the
-store and the id. A load with that store attached puts the original entry
-back; everything above `HistoryStore` only ever sees hydrated entries.
+`history::blob::BlobStore`。内容超过一千字节的 `User`、`Assistant` 或
+`ToolResult` 条目,或者任何尺寸下带图片的条目,都会写进 blob store,在 JSONL 里换
+成一条点名 store 和 id 的 `LogEntry::Blob`。带着那个 store 加载会把原条目放回去;
+`HistoryStore` 之上的一切只见得到已经补全的条目。
 
 ```rust
 JsonlHistoryStore::with_roots(cwd, roots).await?.with_blob_store(my_store)
 ```
 
-Two implementations ship: `PasteStore` (content-addressed files under
-`<base>/pastes/`, the default) and `InMemoryBlobStore`. An implementation must
-be content-addressed, must answer `None` rather than an error for content it
-does not have, and must keep its `name` stable — the name is written into the
-log.
+自带两个实现:`PasteStore`(`<base>/pastes/` 下按内容寻址的文件,默认那个)和
+`InMemoryBlobStore`。一个实现必须按内容寻址,对手上没有的内容必须回 `None` 而不是
+报错,而且必须让自己的 `name` 保持稳定——那个名字是写进日志里的。
 
-**An unresolvable reference is inert, never an error.** Uninstall the backend,
-copy a log without its blobs, or let a cleanup run, and the session still
-loads, forks and resumes with a gap where the content was. That is the same
-rule `history.extension_entry` follows, for the same reason: refusing to open
-a conversation because part of it is unreachable trades a degraded session for
-no session.
+**解析不了的引用是惰性的,不是错误。** 卸掉后端、拷一份不带 blob 的日志、或者让
+清理跑一次,会话照样加载、分叉、恢复,只是内容那块留个空。这和
+`history.extension_entry` 是同一条规矩,理由也一样:因为一段对话有一部分够不着就
+拒绝打开它,是拿一个降级的会话换了一个没有的会话。
 
-### Memory — `memory.storage`, `memory.retriever`
+### 记忆 — `memory.storage`、`memory.retriever`
 
-Storage is where memories are; the retriever decides which ones a turn sees.
-The shipped retriever asks the model, which costs a call:
+storage 是记忆待的地方;retriever 决定一轮能看见其中哪些。自带的 retriever 去问
+模型,代价是一次调用:
 
 ```rust
 Builder::new().memory_retriever(Arc::new(MyIndexRetriever))
 ```
 
-`base::interface::memory_contracts::SubstringRetriever` costs nothing and is a
-pure function of the store — what a test asserting recall wants.
+`base::interface::memory_contracts::SubstringRetriever` 不要钱,而且是 store 的
+纯函数——一个断言召回的测试要的正是这个。
 
-### Asking a person — `elicitation.ask`
+### 向人提问 — `elicitation.ask`
 
-One trait for all three questions the engine asks a human: may this tool run,
-what did you mean, shall I import this.
+引擎要问人的三件事共用一个 trait:这个工具能不能跑、你刚才是什么意思、这个要不要
+导入。
 
 ```rust
 Builder::new().elicitation(Arc::new(MyDialogs))
 ```
 
-With nothing registered every question is *declined with a reason*. Silence is
-never consent.
+什么都没注册的时候,每个问题都会*带着理由被拒绝*。沉默从来不等于同意。
 
-### Where events go — `event.sink`
+### 事件去哪 — `event.sink`
 
 ```rust
 Builder::new().event_sink(sink)
 ```
 
-Each sink gets its own queue and task, so a slow one loses its own events and
-nobody else's time. It cannot pace a turn.
+每个 sink 有自己的队列和 task,所以慢的那个只丢自己的事件,不占别人的时间。它拖不
+慢一轮。
 
-### Judging context size — `token.count`
+### 判断上下文有多大 — `token.count`
 
-`base::interface::token_counter::TokenCounter`. The default is a local
-`cl100k_base` estimate that runs 5–15% high because Anthropic publishes no
-tokenizer; a host that can be exact should be.
+`base::interface::token_counter::TokenCounter`。默认是本地的 `cl100k_base` 估算,
+会偏高 5–15%,因为 Anthropic 没有公开 tokenizer;算得准的宿主就该自己算。
 
-### Reaching the machine — `exec.process`, `exec.filesystem`, `exec.network`, `exec.sandbox`
+### 够到机器 — `exec.process`、`exec.filesystem`、`exec.network`、`exec.sandbox`
 
-Four contracts designed as one, because they are entangled: a sandbox
-constrains a process, a process needs files and a network, and the network
-policy has to reach inside the sandbox. `ARCHITECTURE.md` §5 has the
-reasoning; this is the summary.
+四个契约是当成一个设计的,因为它们缠在一起:沙箱约束进程,进程要文件和网络,而网络
+策略又必须伸进沙箱里面去。推理过程在 `ARCHITECTURE.md` §5,这里是摘要。
 
 ```rust
 let mut ctx = /* … */;
 ctx.exec = ExecProviders::in_process();   // switching is this call
 ```
 
-Two provider sets ship. `ExecProviders::local()` is this machine and the
-default everywhere. `ExecProviders::in_process()` is a memory tree, commands
-decided in advance, a network that answers only what it was given, and a
-sandbox that reports it constrains nothing — paired with a `FixedEnvironment`,
-a whole session runs and replays without touching anything.
+自带两套 provider。`ExecProviders::local()` 就是本机,到哪儿都是默认。
+`ExecProviders::in_process()` 是一棵内存里的树、一批事先定好的命令、一个只回答被
+喂过的东西的网络,以及一个如实报告自己什么都没约束的沙箱——配上 `FixedEnvironment`,
+整个会话跑得起来也放得回去,不碰任何东西。
 
-Three shapes are worth knowing before implementing a provider of your own.
+自己写一个 provider 之前,有三个形状值得先知道。
 
-**`Process` streams and `FileSystem` does not.** A long command's output has to
-reach the user while it runs, so the handle yields chunks tagged with which
-pipe they came from; a provider that returned everything at the end would
-remove that silently. Files are whole values because every call site wants one
-and tool results are capped long before a file could need chunking.
+**`Process` 是流式的,`FileSystem` 不是。** 长命令的输出必须在它还在跑的时候就到
+用户眼前,所以 handle 吐的是带管道标记的分片;一个到最后才一次性返回的 provider 会
+把这件事悄悄取消掉。文件是整个值,因为每个调用点要的都是整个文件,而且工具结果的
+上限远在一个文件需要分片之前就已经卡住了。
 
-**Path safety is above the contract, canonicalization is inside it.** Whether a
-path may be written is policy, and a provider deciding its own out-of-bounds
-rules could cancel them. But a remote's symlink graph is the remote's, so the
-order is: canonicalize through the provider, check the resolved path, write
-through the provider.
+**路径安全在契约之上,规范化在契约之内。** 一个路径能不能写是策略,而一个自己定
+越界规则的 provider 可以把这些规则取消掉。但远端的符号链接图是远端的,所以顺序
+是:经 provider 规范化,检查解析出来的那个路径,再经 provider 写。
 
-**The egress policy asks where the *model* may reach.** A request carries who
-chose its destination. `allowed_domains` binds `Origin::Agent` — a WebFetch
-url, a Ping host — and not `Origin::Operator`, which is the model endpoint,
-MCP servers, telemetry. Applying it to everything would cut the agent off from
-its own model.
+**出网策略问的是*模型*能够到哪。** 每个请求都带着"是谁选的目的地"。
+`allowed_domains` 约束 `Origin::Agent`——一个 WebFetch 的 url、一个 Ping 的主机
+——而不约束 `Origin::Operator`,也就是模型端点、MCP server、遥测。把它套到所有东西
+上,agent 就连自己的模型都够不着了。
 
-Operator traffic is built through the same contract, but a host cannot yet
-replace the providers those clients use — the model, OAuth, telemetry and
-registry clients each construct their own. So replacing this point governs
-what the model can reach, and auditing or going offline *as a whole* is not
-something it delivers today.
+运维者自己的流量也是经同一套契约建起来的,但宿主目前还换不掉那些 client 用的
+provider——模型、OAuth、遥测和 registry 的 client 各造各的。所以换掉这个点管得住
+模型能够到哪,而*整体地*审计或者离线,今天它还给不了。
 
-The sandbox has one invariant the engine enforces rather than requests: **a
-policy that asked for constraint never silently becomes an unconstrained
-run.** A backend reports `Full`, `Partial` or `None` and names what it could
-not deliver; `sandbox.require_enforcement` decides whether anything short of
-`Full` is refused. What to constrain and whether to constrain at all stay the
-kernel's — a provider answers only *how*.
+沙箱有一条不变量是引擎强制而不是请求的:**要求过约束的策略,绝不会悄悄变成一次不
+受约束的运行。** 后端报告 `Full`、`Partial` 或 `None`,并说清自己没能兑现什么;
+`sandbox.require_enforcement` 决定不到 `Full` 要不要拒。约束什么、要不要约束,始终
+是内核的事——provider 只回答*怎么*约束。
 
-### Compaction — `compaction`
+### 压缩 — `compaction`
 
-`compaction::compact::Compactor`. Both halves of the question: how a
-conversation is shortened, and when.
+`compaction::compact::Compactor`。这个问题的两半都在:一段对话怎么被缩短,以及什么
+时候缩。
 
-A turn offers four opportunities and the contract answers each — two aging
-passes that clear tool results by age, a predictive pass that fires before the
-budget is reached, and the threshold that forces the transformation. Every one
-has a default that is the engine's own arithmetic, so an implementor who only
-cares about the transformation writes `compact` and nothing else.
-`tool_result_budget` is the numbers-only version of the same idea: change how
-much of a request accumulated tool results may hold without reimplementing
-what is done about it.
+一轮里有四个机会,契约对每一个都作答——两趟按年龄清工具结果的老化、一趟在预算撞上
+之前就开火的预测,以及那个强制变换的阈值。每一个都有默认实现,就是引擎自己那套算术,
+所以只关心变换本身的实现者写一个 `compact` 就完了。`tool_result_budget` 是同一个
+想法的纯数字版:改累积的工具结果最多能占一个请求的多少,不必把"占满了怎么办"重新
+实现一遍。
 
 ```rust
 Builder::new().compactor(Arc::new(OnlyAtThreshold(DefaultCompactor)))
 ```
 
-`OnlyAtThreshold` wraps any compactor and declines everything the budget did
-not force — the shape a deployment wants when it needs its transcript left
-alone until a rewrite is genuinely unavoidable.
+`OnlyAtThreshold` 包住任何一个 compactor,把不是预算逼出来的都推掉——一个部署在
+"除非重写实在避不开,否则别动我的转录"时想要的就是这个形状。
 
-### When a turn has gone on long enough — `turn.policy`
+### 一轮什么时候算走得够久了 — `turn.policy`
 
-`base::interface::turn_policy::TurnPolicy`. Two ceilings — model calls per
-turn, structured-output retries — asked at the two points they are checked
-today, because consolidating them would reorder the loop.
+`base::interface::turn_policy::TurnPolicy`。两个上限——每轮的模型调用数、结构化
+输出的重试数——在今天真正检查它们的那两个点上被问到,因为把它们合并会重排整个循环。
 
 ```rust
 Builder::new().turn_policy(Arc::new(FirstOf(vec![engine_default, mine])))
 ```
 
-Compose rather than replace: `FirstOf` keeps the engine's limits and adds
-yours, and a stop is never overridden by a later policy.
+要组合而不是替换:`FirstOf` 保住引擎的限制再加上你的,而且一个"停"永远不会被后面
+的策略推翻。
 
-Only judgements about *progress* live here. Cancellation is an instruction,
-not an opinion; a `PostToolUse` or `Stop` hook ending a turn is already an
-extension point's output, and letting a policy overrule one would invert the
-trust order; and "the model asked for tools, so there is more to do" is the
-loop's definition rather than a judgement about it.
+只有关于*进展*的判断住在这里。取消是一条指令,不是一个意见;`PostToolUse` 或
+`Stop` hook 结束一轮,本来就已经是某个扩展点的输出,让一个策略去否决它就把信任
+次序颠倒了;而"模型要了工具,所以还有事做"是这个循环的定义,不是对它的判断。
 
-### When a call goes wrong — `model.recovery`, `model.backoff`
+### 一次调用出错的时候 — `model.recovery`、`model.backoff`
 
-`base::interface::recovery_policy::RecoveryPolicy` decides what a failure
-*means for the turn*: switch to the fallback model, compact and retry, raise
-the output limit, or fail. Classification stays with the engine — which errors
-*are* an overload and which *are* a size refusal is a fact about the wire
-protocol. `NeverRecover` is a real configuration rather than a stub: a
-deployment billed per token would rather return a truncated answer than a
-surprise 64K call.
+`base::interface::recovery_policy::RecoveryPolicy` 决定一次失败*对这一轮意味着
+什么*:切到备用模型、压缩后重试、抬高输出上限,还是就此失败。分类归引擎——哪些
+错误*是*过载、哪些*是*尺寸拒绝,是关于线协议的事实。`NeverRecover` 是一份真配置
+而不是占位:按 token 计费的部署宁可返回一个被截断的答案,也不想要一次意外的 64K
+调用。
 
-`base::interface::backoff::BackoffPolicy` sits below the model contract, in
-the clients, and answers the narrower question of whether a failed request is
-sent again and how long to wait first. Both wire protocols go through the same
-one. `retry-after` parsing stays in the Anthropic client, because that is a
-protocol-specific input; what to do with it is the policy's.
+`base::interface::backoff::BackoffPolicy` 坐在模型契约之下、client 之内,回答更窄
+的那个问题:失败的请求还发不发,发之前先等多久。两套线协议走的是同一个。
+`retry-after` 的解析留在 Anthropic client 里,因为那是协议特有的输入;拿它做什么
+则是策略的事。
 
-### What a turn may spend — `budget`
+### 一轮能花多少 — `budget`
 
-`base::interface::budget_policy::BudgetPolicy`. Three judgements that were
-constants: a cumulative token ceiling, an output-volume target with its
-diminishing-returns rule, and the compaction threshold the scene returns.
+`base::interface::budget_policy::BudgetPolicy`。三个本来是常量的判断:累计 token
+上限、带边际递减规则的输出量目标,以及 scene 返回的压缩阈值。
 
-The one that was missing entirely is a ceiling on request *size*. A threshold
-is a trigger — crossing it starts a compaction, and if the compaction cannot
-get far enough the request goes out anyway. `Capped` adds the ceiling, and a
-turn still above it after compaction ends as `context_exceeded` rather than
-sending something the deployment said must never be sent.
+原本完全缺席的那一个,是请求*尺寸*的上限。阈值是一个触发器——越过它就开始压缩,而
+压缩要是压不到位,请求照样发出去。`Capped` 把上限补上了:压缩之后仍然超标的一轮以
+`context_exceeded` 结束,而不是把部署声明过绝不能发的东西发出去。
 
 ```rust
 Builder::new().budget_policy(Arc::new(Capped {
@@ -411,38 +357,32 @@ Builder::new().budget_policy(Arc::new(Capped {
 }))
 ```
 
-### What a log means to the model — `history.projection`
+### 一份日志对模型意味着什么 — `history.projection`
 
-`history::transcript::TranscriptProjection`. Which entries become messages,
-and what they say. It lives on the store rather than the engine because a log
-and the rules for reading it travel together: resume, fork, search and paging
-must all see the same conversation.
+`history::transcript::TranscriptProjection`。哪些条目变成消息,以及它们说什么。它
+挂在 store 上而不是引擎上,因为一份日志和读它的规则是一起走的:恢复、分叉、搜索、
+翻页必须看见同一段对话。
 
 ```rust
 JsonlHistoryStore::with_roots(cwd, roots).await?
     .with_projection(Arc::new(ExtensionsAreVisible { namespaces: vec!["com.acme.deploy".into()] }))
 ```
 
-`ExtensionsAreVisible` is the answer to the question `history.extension_entry`
-raises and cannot settle: an extension's own entries becoming something the
-model reads.
+`ExtensionsAreVisible` 回答的正是 `history.extension_entry` 提得出来、自己却了结
+不了的那个问题:让一个扩展自己的条目变成模型读得到的东西。
 
-Saying yes carries one obligation. **Model-visible content must be
-reconstructible from the log alone** — a projection that renders an entry by
-asking the live extension what it means produces a conversation that cannot be
-reopened once the extension is gone.
-`transcript::model_visible_content_is_reconstructible` makes that checkable
-rather than aspirational.
+答"是"要担一份义务。**模型可见的内容必须能仅凭日志重建出来**——一个靠问活着的扩展
+"这条什么意思"来渲染条目的 projection,产出的是一段扩展一没了就再也打不开的对话。
+`transcript::model_visible_content_is_reconstructible` 让这件事可查,而不是停在
+口号上。
 
-### Kept time and kept identifiers — `environment`
+### 被记下来的时间和标识符 — `environment`
 
-`base::interface::environment::Environment`. Wall-clock now, and fresh ids.
+`base::interface::environment::Environment`。墙上时钟的此刻,和新鲜的 id。
 
-Only the answers that get *kept* come from here: a timestamp written into the
-log, an id naming an entry, the date the prompt tells the model. There is
-deliberately no monotonic clock on the contract — `Instant` cannot be stored
-or transmitted, everything it is used for is measurement, and measurement is
-the category this is not for.
+只有会被*留下来*的答案从这里出:写进日志的时间戳、给条目命名的 id、提示告诉模型的
+日期。契约上刻意没有单调时钟——`Instant` 既存不下也传不出,用它的地方全是测量,而
+测量正是这个契约不管的那一类。
 
 ```rust
 let env = Arc::new(FixedEnvironment::epoch());
@@ -450,42 +390,38 @@ let store = JsonlHistoryStore::with_roots(cwd, roots).await?.with_environment(en
 let agent = Builder::new()./* … */.history_store(store).environment(env).build()?;
 ```
 
-Two places, because the log's half is written by the store and the
-model-visible half by the agent. Configure both, or a replay differs in the
-half you forgot.
+要配两处,因为日志那一半是 store 写的,模型可见那一半是 agent 写的。两个都配上,
+否则重放会在你漏掉的那一半上对不上。
 
-The builder hands the same environment to the memory store it creates, so
-durable memories age against it too — that is what decides which of them are
-offered to the model. A store supplied with `Builder::memory_store` is
-configured by whoever built it: `MemoryStore::new(user, local).with_environment(env)`.
+builder 会把同一个 environment 交给它自己创建的记忆 store,所以长期记忆也是照着它
+变旧的——而这决定了它们中哪些会被端到模型面前。用 `Builder::memory_store` 传进来的
+store 由造它的人自己配:`MemoryStore::new(user, local).with_environment(env)`。
 
-### Where skills come from — `skill.source`
+### skill 从哪来 — `skill.source`
 
-`base::interface::skill_provider::SkillProvider`. Three implementations ship
-and cover the three places skills have always come from:
-`skills::sources::SkillDirectory` (a directory tier), `BundledSkills` (the
-built-ins compiled into the binary), and `McpSkills` (one connected server's
-tools). A fourth is added, not substituted:
+`base::interface::skill_provider::SkillProvider`。自带三个实现,覆盖 skill 一直
+以来的三个来源:`skills::sources::SkillDirectory`(一层目录)、`BundledSkills`
+(编进二进制的内建)和 `McpSkills`(一台连上的 server 的工具)。第四个是加进去,
+不是替掉:
 
 ```rust
 Builder::new().skill_provider(Arc::new(StaticSkills::new("company", entries)))
 ```
 
-A source registered this way defers to what is already loaded. One that means
-to replace a skill the engine ships returns `SkillPrecedence::Override`.
+这样注册的 source 让位给已经加载好的东西。有意要替掉引擎自带某个 skill 的,返回
+`SkillPrecedence::Override`。
 
-`SkillProvider::body` is why this is a source rather than a list: a skill
-whose text lives in the source, not in a file, still expands when it is
-invoked. `base::interface::skill_provider::StaticSkills` is the in-memory
-implementation for a host that already holds both.
+`SkillProvider::body` 是这里为什么是"源"而不是"列表"的原因:一个正文存在源里、不
+在文件里的 skill,被调用时照样展得开。
+`base::interface::skill_provider::StaticSkills` 是给两样都已经攥在手里的宿主准备
+的内存实现。
 
-### Standing instructions and the rule index — `instruction.source`, `rules.source`
+### 常驻指令与规则索引 — `instruction.source`、`rules.source`
 
-`base::interface::instruction_provider::InstructionProvider` decides what the
-`AGENTS.md` / `CLAUDE.md` injection contains; `RuleProvider` decides which
-rule documents the model is told exist. `InstructionFile` and `RuleDirectory`
-are the filesystem implementations, `InlineInstructions` and `StaticRules` the
-in-memory ones.
+`base::interface::instruction_provider::InstructionProvider` 决定 `AGENTS.md` /
+`CLAUDE.md` 注入的是什么;`RuleProvider` 决定告诉模型存在哪些规则文档。
+`InstructionFile` 和 `RuleDirectory` 是文件系统实现,`InlineInstructions` 和
+`StaticRules` 是内存实现。
 
 ```rust
 Builder::new().instruction_provider(Arc::new(InlineInstructions::new(
@@ -494,16 +430,15 @@ Builder::new().instruction_provider(Arc::new(InlineInstructions::new(
 )))
 ```
 
-The three rule tiers — global, scene, project — are a `RuleProvider` each,
-composed by `base::rules::default_rule_sources` and merged last-wins by
-`discover_rules_from`, so a different tier list is a different composition
-rather than a change to the discovery function.
+全局、scene、项目这三层规则各是一个 `RuleProvider`,由
+`base::rules::default_rule_sources` 组合、由 `discover_rules_from` 按后来居上合并,
+所以换一套层级列表是换一个组合,而不是改发现函数。
 
 ---
 
-## Registrations — contributing
+## 注册——贡献一份
 
-### Prompt blocks — `prompt.block`, `prompt.context`, `prompt.variable`
+### 提示块 — `prompt.block`、`prompt.context`、`prompt.variable`
 
 ```rust
 use base::interface::prompt_registry::{orders, InMemoryPromptRegistry, RegisteredBlock};
@@ -517,38 +452,36 @@ Builder::new().prompt_registry(registry.clone());
 handle.dispose();
 ```
 
-Blocks sort by `order`, ascending, ties broken by registration order. The
-kernel's stages sit at round hundreds (`orders::SKILLS_CATALOG` is 100,
-`MEMORY_SESSION` 200, `RULES` 300, `MCP_INSTRUCTIONS` 400,
-`CONFIG_PROMPT_APPEND` 500), so there are ninety-nine places between any two of
-them and negative orders come before the scene.
+块按 `order` 升序排,同序的按注册顺序。内核的各个阶段坐在整百上
+(`orders::SKILLS_CATALOG` 是 100,`MEMORY_SESSION` 200,`RULES` 300,
+`MCP_INSTRUCTIONS` 400,`CONFIG_PROMPT_APPEND` 500),所以任意两个之间都有九十九个
+位置可站,而负数 order 排在 scene 前面。
 
-`register_context` is the same thing with the text computed at assembly time;
-returning `None` contributes no block at all, which is how a contribution stays
-out of the sessions it has nothing to say about. `register_variable` makes
-`{{name}}` expand everywhere — an unregistered placeholder, or one whose
-provider declines, is left exactly as written.
+`register_context` 是同一件事,只不过文本在组装时才算;返回 `None` 就一个块都不
+贡献——一份贡献想在自己没什么可说的会话里彻底闭嘴,就是这么做的。
+`register_variable` 让 `{{name}}` 在所有地方展开;没注册过的占位符,或者提供者
+选择不答的,原样留着,一个字不动。
 
-### The kernel's block names
+### 内核的块名
 
-These are a **published contract**. An extension positioning itself relative to
-one is relying on the name to keep meaning what it means.
+这些是**公开的契约**。一个扩展把自己相对某个块定位的时候,靠的就是这个名字继续是
+这个意思。
 
-| Name | What it is |
+| 名字 | 是什么 |
 |---|---|
-| `scene.skeleton` | the scene's prompt, when the scene names no sections |
-| `scene.<section>` | a scene that names its own sections keeps them, prefixed |
-| `skills.catalog` | the inventory of available skills |
-| `memory.session` | how to use the file-based memory system |
-| `rules` | the discovery index of `.atta/rules/` |
-| `mcp.instructions` | instructions from connected MCP servers |
+| `scene.skeleton` | scene 的提示,在这个 scene 不给分节命名的时候 |
+| `scene.<section>` | 自己给分节命名的 scene 保住那些名字,加上前缀 |
+| `skills.catalog` | 可用 skill 的清单 |
+| `memory.session` | 怎么用基于文件的记忆系统 |
+| `rules` | `.atta/rules/` 的发现索引 |
+| `mcp.instructions` | 来自已连接 MCP server 的指令 |
 | `config.prompt_append` | `settings.prompt_append` |
-| `config.prompt_override` | `settings.prompt_override`, which replaces everything |
+| `config.prompt_override` | `settings.prompt_override`,它把一切都替掉 |
 
-Every block also carries an `origin` — `Kernel`, `Config`, `Plugin(name)` or
-`Script(path)` — which is what the assembly hook's authority rules read.
+每个块还带一个 `origin`——`Kernel`、`Config`、`Plugin(name)` 或 `Script(path)`
+——组装 hook 的权限规则读的就是它。
 
-### Your own state in the session log — `history.extension_entry`
+### 在会话日志里放自己的状态 — `history.extension_entry`
 
 ```rust
 store.append(session, LogEntry::Extension {
@@ -558,11 +491,10 @@ store.append(session, LogEntry::Extension {
 }).await?;
 ```
 
-The kernel never parses the payload. An entry whose namespace nobody claims is
-carried along and otherwise ignored, so uninstalling a plugin leaves its old
-sessions loading, forking and resuming exactly as before.
+内核从不解析 payload。命名空间没人认领的条目会被一路带着走,除此之外不闻不问,所以
+卸掉一个插件之后,它留下的老会话照样加载、分叉、恢复,和以前一模一样。
 
-### Whether things are working — `health.check`
+### 东西是不是正常 — `health.check`
 
 ```rust
 struct QueueDepth(Arc<Metrics>);
@@ -583,52 +515,42 @@ let health = agent.health();          // take this before spawning the engine
 let report = health.report();         // fresh answers, every time
 ```
 
-The report carries every registered check's verdict and the worst of them.
-The engine's own checks are registered by whoever wires it: `daemon` registers
-the settings tiers, provider routing, hooks configuration and the plugin fault
-records, and reports the lot under `daemon.doctor`'s `health` key.
+报告里带着每个已注册检查的判定,以及其中最糟的那个。引擎自己的检查由接线的人注册:
+`daemon` 注册了配置层级、provider 路由、hooks 配置和插件故障记录,整套挂在
+`daemon.doctor` 的 `health` 键下报出去。
 
-Two rules the contract enforces rather than asks for. **A check reports and
-never repairs** — there is no return value that reopens a circuit breaker,
-reloads configuration or restarts anything, because a diagnostic that quietly
-fixed things would describe what it just did rather than what it found. And
-**`check()` is synchronous and expected to answer from state it already
-holds**: a probe that blocks on the subsystem it is probing hangs exactly when
-the answer matters most. A check that needs the network keeps a cached verdict
-updated out of band and reports that.
+有两条规矩是契约强制的,不是请求的。**检查只汇报,绝不修复**——没有任何一个返回值
+能重新合上熔断器、重载配置或者重启什么,因为一个偷偷把事修了的诊断,描述的是它刚
+干了什么,而不是它发现了什么。以及**`check()` 是同步的,而且被要求用它手上已有的
+状态作答**:一个阻塞在自己正在探测的子系统上的探针,恰恰在答案最要紧的时候挂住。
+需要走网络的检查,自己在带外维护一份缓存判定,报那份。
 
-There is no `Err`. A check that cannot determine the answer has determined
-something — it says `Degraded` and puts the reason in its summary, rather than
-leaving every caller to decide for itself whether a failed check means
-unhealthy.
-### Prompt assembly itself — `prompt.assembler`
+没有 `Err`。判定不了的检查其实已经判定了点什么——它说 `Degraded`,把原因写进摘要,
+而不是把"一个失败的检查算不算不健康"甩给每一个调用方各自决定。
+### 提示组装本身 — `prompt.assembler`
 
-`base::interface::prompt_assembler::PromptAssembler`. The registrations above
-open what goes into the prompt and `prompt.assemble` opens what happens to the
-finished result; this opens the part in between — the order the stages are
-placed in, how a contribution's order merges with the kernel's, where the cache
-boundaries fall, whether two blocks stay two blocks.
+`base::interface::prompt_assembler::PromptAssembler`。上面那些注册开的是什么进
+提示,`prompt.assemble` 开的是成品之后怎么办;这一个开的是中间那段——各阶段按什么
+顺序摆、一份贡献的 order 怎么和内核的合到一起、缓存边界落在哪、两个块还算不算两个
+块。
 
 ```rust
 Builder::new().prompt_assembler(Arc::new(MergedSystemPrompt::default()))
 ```
 
-`DefaultAssembler` is the engine's own assembly and the default.
-`MergedSystemPrompt` wraps any assembler and folds its system blocks into one,
-which is what a deployment with more prompt contributors than the four
-`cache_control` breakpoints a request allows wants: one cached prefix rather
-than an arbitrary four.
+`DefaultAssembler` 是引擎自己的组装,也是默认。`MergedSystemPrompt` 包住任何一个
+assembler,把它的系统块折成一个——提示贡献者比一个请求允许的四个 `cache_control`
+断点还多的部署要的正是这个:一个缓存前缀,而不是随便凑出来的四个。
 
-An assembler receives an `AssemblyRequest` — the registry, the scene, the
-settings, the memory store, the scene context, and the already-rendered skills
-inventory and MCP instructions. It is a struct so that an implementation
-reading two of them need not restate the other five.
+assembler 收到的是一个 `AssemblyRequest`——registry、scene、settings、记忆 store、
+scene 上下文,以及已经渲染好的 skill 清单和 MCP 指令。它是个 struct,这样只读其中
+两项的实现不必把另外五项重述一遍。
 
 ---
 
-## Interceptions — sitting in the path
+## 拦截——坐在路径上
 
-### Around a tool call — `tool.around`
+### 围住一次工具调用 — `tool.around`
 
 ```rust
 #[async_trait]
@@ -643,25 +565,24 @@ impl ToolMiddleware for Deadline {
 Builder::new().tool_middleware(Arc::new(Deadline));
 ```
 
-Narrow the signal (a timeout), answer without calling through (a cache), or
-call through more than once (a retry). You cannot rewrite the call's arguments
-— the call arrives behind a shared reference and `run` takes none. `with_timeout`
-derives a *child* of the current token, so a wrapper can end a call earlier
-than the turn would and never later.
+把信号收窄(一个超时)、不往下走直接作答(一个缓存)、或者往下走不止一次(一次
+重试)。你改不了这次调用的参数——调用是以共享引用送到的,而 `run` 一个参数都不收。
+`with_timeout` 派生的是当前 token 的*子* token,所以包装者能让一次调用比整轮更早
+结束,而绝不会更晚。
 
-Wrappers nest in registration order, first outermost.
+包装按注册顺序嵌套,先注册的在最外面。
 
-### What a tool result may look like — `tool.result`
+### 一个工具结果能长什么样 — `tool.result`
 
 ```rust
 Builder::new().tool_result_transformer(Arc::new(RedactLiterals::new([api_key])));
 ```
 
-Runs **last** — after every hook, immediately before the model reads it — which
-is what makes a redacting transformer a guarantee rather than a suggestion.
-`TruncateText` and `RedactLiterals` ship; neither is registered by default.
+跑在**最后**——所有 hook 之后,模型读到它之前——正是这一点让一个做脱敏的
+transformer 成为保证而不是建议。`TruncateText` 和 `RedactLiterals` 自带,但都不
+默认注册。
 
-### The assembled prompt — `prompt.assemble`
+### 组装好的提示 — `prompt.assemble`
 
 ```rust
 impl AssemblyHook for Mine {
@@ -675,77 +596,66 @@ impl AssemblyHook for Mine {
 }
 ```
 
-`push` and `insert_after` are always permitted; `modify`, `remove` and
-`move_before` need authority. A hook registered as
-`Authority::local(BlockOrigin::Script(path))` has all of it. One registered as
-`Authority::plugin(name, caps)` has only what `caps` declared, and a refused
-edit returns `Denied` and is counted on the assembly rather than failing
-silently.
+`push` 和 `insert_after` 永远允许;`modify`、`remove` 和 `move_before` 需要权限。
+以 `Authority::local(BlockOrigin::Script(path))` 注册的 hook 权限全有。以
+`Authority::plugin(name, caps)` 注册的只有 `caps` 声明过的那些,而一次被拒的编辑
+返回 `Denied` 并记在这次组装上,不会无声无息地失败。
 
-### The model request and the finished message — `model.request`, `model.message`
+### 模型请求与成品消息 — `model.request`、`model.message`
 
 ```rust
 Builder::new().model_interceptor(Arc::new(Mine));
 ```
 
-`on_request` sees messages, tools and parameters before anything leaves the
-process. `on_message` sees a complete message after the stream carrying it
-finishes.
+`on_request` 在任何东西离开进程之前看见消息、工具和参数。`on_message` 在承载它的
+那段流结束之后看见一条完整的消息。
 
-**There is no per-chunk hook and there will not be one by default.** A turn
-produces thousands of chunks; a callback there is called thousands of times and
-the cost is invisible to whoever writes it. A hook that could rewrite chunks
-could also produce a message that never existed as a coherent whole. If you
-need to transform a stream as it arrives, ask for a declarative rule the engine
-can execute natively.
+**没有按分片的 hook,默认情况下也不会有。** 一轮产出上千个分片;放在那里的回调会
+被调上千次,而这份代价对写它的人是看不见的。而且一个能改写分片的 hook,也能产出一
+条从来没有作为完整体存在过的消息。要在流到达的同时变换它,请提一条引擎能原生执行
+的声明式规则。
 
-### Around memory recall — `memory.retrieval_hook`
+### 围住一次记忆召回 — `memory.retrieval_hook`
 
-`before_retrieve` changes the question; `after_retrieve` changes the answer. A
-deployment knows things about its own vocabulary the retriever does not, and
-things about its own policy the retriever should not have to.
+`before_retrieve` 改问题,`after_retrieve` 改答案。一个部署知道一些关于自己词汇的
+事,retriever 不知道;也知道一些关于自己策略的事,retriever 本就不该知道。
 
-### Watching the log — `history.append_observer`
+### 看着日志 — `history.append_observer`
 
 ```rust
 let store = Arc::new(ObservedHistoryStore::new(inner, vec![my_observer]));
 ```
 
-Read-only in the types, not by agreement: the entry arrives behind a shared
-reference and nothing is returned. Observers run after the append succeeded, so
-a failed write is never observed.
+只读是类型定死的,不是约定的:条目以共享引用送到,而且什么都不返回。观察者在追加
+成功之后才跑,所以一次失败的写入永远不会被观察到。
 
-`history::observers::AppendCounts` ships as one: a running tally of how many
-entries, of which kind, have gone into each session. The question it answers
-— how big has this session got — otherwise costs a read and a parse of the
-whole log, per asking. Hold the same `Arc` the store holds, and call `forget`
-when a session is done with, or the map grows for the life of the process.
+`history::observers::AppendCounts` 自带一个:每个会话进了多少条、都是什么类型,
+一直记着账。它回答的那个问题——这个会话到底长到多大了——否则每问一次就得把整份日志
+读一遍、解析一遍。持有 store 持有的那同一个 `Arc`,并在一个会话用完时调 `forget`,
+否则那张 map 会一直长到进程结束。
 
-### Lifecycle hooks — `hooks`
+### 生命周期 hook — `hooks`
 
-Thirty named events, five backends (command, prompt, HTTP, agent, wasm),
-configured in `settings.json`. Some events parse and accept configuration but
-nothing fires them yet; `hooks::UNWIRED_EVENTS` is the list, the engine warns
-when you configure one, and `daemon/tests/hook_event_wiring.rs` keeps the list
-honest in both directions.
+三十个具名事件,五种后端(command、prompt、HTTP、agent、wasm),在 `settings.json`
+里配。有些事件能解析、能接受配置,但还没有任何地方触发它们;`hooks::UNWIRED_EVENTS`
+是那份清单,配到这类事件时引擎会告警,而 `daemon/tests/hook_event_wiring.rs` 从两个
+方向盯着这份清单不许说谎。
 
 ---
 
-## Running your own code at a point — `script.carrier`
+## 在一个点上跑自己的代码 — `script.carrier`
 
-`base::interface::script::ScriptEngine` is the cheap tier: a piece of the
-operator's code, in this process, in microseconds, between "recompile the
-engine" and "spawn a subprocess".
+`base::interface::script::ScriptEngine` 是便宜的那一档:运维者自己的一小段代码,
+就在本进程里,以微秒计——夹在"重新编译引擎"和"起一个子进程"之间。
 
-The engine is QuickJS, in `crates/script-host`, behind `daemon`'s `scripts`
-feature. `base` holds only the contract — it has no internal dependencies and a
-JavaScript runtime there would end up in every build of everything.
+引擎是 QuickJS,在 `crates/script-host`,藏在 `daemon` 的 `scripts` feature 后面。
+`base` 只放契约——它没有任何内部依赖,把一个 JavaScript 运行时放在那儿,会让所有
+东西的每一次构建都带上它。
 
-The summary below is enough to decide whether you want this. **`extending_quickjs.md`
-is the guide** — one section per bindable point, with the input and return
-shapes and a working example for each.
+下面这份摘要够你判断要不要用它。**`extending_quickjs.md` 才是指南**——每个可绑定的
+点一节,连输入和返回的形状,外加一个能跑的例子。
 
-Bind a script by writing one in your project and naming it in `settings.json`:
+绑一个脚本:在你的项目里写一个,在 `settings.json` 里点它的名:
 
 ```jsonc
 // .atta/scripts/prompt.js
@@ -764,43 +674,36 @@ function onAssemble(blocks) {
 ]
 ```
 
-Optional `timeout_ms` and `calls_per_turn` narrow the budget. No recompilation
-is involved; the file and the config line are the whole of it.
+可选的 `timeout_ms` 和 `calls_per_turn` 能把预算再收窄。不涉及任何重新编译;一个
+文件加一行配置,就是全部。
 
-**Authority follows the file's location, not the configuration.** A script
-inside the project root is the operator's own and may rewrite anything; one
-anywhere else arrived from outside and may add, like any downloaded extension.
-Nothing in the binding can change that, because a declaration is exactly what
-an outside script would lie in.
+**权限跟着文件的位置走,不跟着配置走。** 项目根目录里面的脚本是运维者自己的,可以
+改写任何东西;在别处的是从外面来的,和任何下载来的扩展一样只能加。绑定里的任何东西
+都改不了这一点,因为"声明"恰恰是一个外来脚本会在上面撒谎的东西。
 
-A binding naming a point that does not exist, or one scripts may not be bound
-to, is refused at startup and named — and one bad binding drops the whole set
-rather than applying half of it. A script that silently never runs sends its
-author looking for a bug in their JavaScript.
+一条绑定点名了一个不存在的点、或者一个脚本不许绑的点,会在启动时被拒绝并点名——而且
+一条坏绑定会让整组绑定全部作废,而不是应用一半。一个悄悄不跑的脚本,会让它的作者跑
+去自己的 JavaScript 里找一个不存在的 bug。
 
-Today the bindable points are `prompt.assemble` and nothing else. The list is
-short on purpose: every entry is a place where a script's cost is bounded and
-its authority is defined, so adding one means answering both questions rather
-than appending a string.
+今天能绑的点是 `prompt.assemble`,再没别的。这份清单短是故意的:每一条都是一个脚本
+的代价有界、权限有定义的地方,所以要加一条,得把这两个问题都回答了,而不是往数组里
+追加一个字符串。
 
-**What a script can reach: nothing.** No filesystem, no network, no host
-bindings, and no state that survives a call — each call gets a fresh runtime,
-so one session's script cannot leave anything for another's.
+**一个脚本能够到什么:什么都够不到。** 没有文件系统,没有网络,没有宿主绑定,也没有
+任何能活过一次调用的状态——每次调用拿到的是一个全新的运行时,所以一个会话的脚本没法
+给另一个会话留下任何东西。
 
-`ScriptCarrier` enforces the per-turn quota and the wall-clock budget from
-outside the engine, because an engine that enforced its own limits could choose
-not to. The engine additionally carries the deadline into QuickJS's interrupt
-handler, which is what actually stops `while(true){}` — a timeout abandons a
-future without stopping a busy loop.
+`ScriptCarrier` 从引擎外面强制每轮配额和墙钟预算,因为一个自己管自己限额的引擎可以
+选择不管。引擎还额外把 deadline 带进 QuickJS 的中断处理器,真正停下 `while(true){}`
+的是它——超时只能丢弃一个 future,停不住一个忙循环。
 
 ---
 
-## What a script can be bound to
+## 一个脚本能绑到哪些点上
 
-The `script` column above says what the *contract* opens. The QuickJS carrier
-has an adapter for nine of those, and a binding to one of the others is
-refused at startup naming the ones that work — a script that quietly never
-runs is worse than one that fails to load.
+上面那张表的`脚本`列说的是*契约*开了什么。QuickJS 载体给其中九个做了适配器,绑到
+别的点上会在启动时被拒绝并列出能用的那些——一个悄悄不跑的脚本,比一个加载失败的脚本
+更糟。
 
 ```jsonc
 "scripts": [
@@ -808,112 +711,97 @@ runs is worse than one that fails to load.
 ]
 ```
 
-| point | when it runs | what a script may do |
+| 点 | 什么时候跑 | 脚本可以做什么 |
 |---|---|---|
-| `prompt.assemble` | after the prompt is assembled | rewrite blocks, subject to its authority |
-| `prompt.block` | at assembly | add a named block |
-| `prompt.context` | at assembly, per turn | add a block whose text it computes |
-| `prompt.variable` | wherever `{{name}}` appears | supply the value |
-| `tool.around` | before dispatch | refuse, answer instead, or shorten the clock |
-| `tool.result` | before the model sees a result | rewrite its text |
-| `memory.retrieval_hook` | both ends of recall | change the query, filter what came back |
-| `model.request` | per model call | change model, ceiling, thinking mode; narrow the tool list |
-| `model.message` | per completed message | rewrite text blocks |
+| `prompt.assemble` | 提示组装完之后 | 改写块,受自己的权限限制 |
+| `prompt.block` | 组装时 | 加一个具名的块 |
+| `prompt.context` | 组装时,每轮一次 | 加一个正文由它算出来的块 |
+| `prompt.variable` | `{{name}}` 出现的任何地方 | 提供那个值 |
+| `tool.around` | 分发之前 | 拒绝、代它作答,或者把时限调短 |
+| `tool.result` | 模型看见一个结果之前 | 改写它的文本 |
+| `memory.retrieval_hook` | 召回的两头 | 改查询,过滤回来的东西 |
+| `model.request` | 每次模型调用 | 换模型、改上限、改 thinking 模式;收窄工具列表 |
+| `model.message` | 每条完成的消息 | 改写文本块 |
 
-Each adapter's own documentation carries the JSON contract — what the script
-is handed and what it may return. That is the only documentation a script
-author has, so it lives beside the code that has to keep it true.
+每个适配器自己的文档带着那份 JSON 契约——脚本收到什么、可以返回什么。那是一个脚本
+作者唯一能看的文档,所以它待在那份必须让它保持为真的代码旁边。
 
-### The four that stay closed, and why
+### 保持关闭的那四个,以及为什么
 
-**`history.append_observer`** fires once per log entry. That is the frequency
-band the catalog closes to scripts deliberately: the cost of a callback there
-is invisible to whoever writes one, and it is per *entry*, not per turn.
+**`history.append_observer`** 每条日志条目触发一次。那正是 catalog 刻意对脚本关闭
+的频率档:放一个回调在那里的代价,对写它的人是看不见的,而且那是按*条目*算,不是按
+轮算。
 
-**`history.extension_entry`** is a write capability, not a hook. A script
-needs an API to *emit* an entry; a callback that receives them is a different
-thing wearing the same name.
+**`history.extension_entry`** 是一项写能力,不是一个 hook。脚本需要的是一个*发出*
+条目的 API;一个接收条目的回调是另一回事,只是顶着同一个名字。
 
-**`hooks`** is its own subsystem with its own process model. A script engine
-bound there would be a second way to do what that subsystem already does.
+**`hooks`** 是自成一体的子系统,有自己的进程模型。把脚本引擎绑到那儿,等于给那个
+子系统已经在做的事再开一条路。
 
-**`script.carrier`** is the carrier.
+**`script.carrier`** 就是那个载体本身。
 
-### What every adapter guarantees
+### 每个适配器保证什么
 
-**A script that fails changes nothing.** Times out, throws, exhausts its
-quota, returns the wrong shape — all one outcome, and it is the outcome of
-having done nothing. A point half-changed by a script that died mid-pass is
-worse than an unchanged one, because nothing downstream can tell which it is
-looking at. "Returned nonsense" and "has a bug" get the same harmless answer
-on purpose.
+**一个失败的脚本什么都改不了。** 超时、抛异常、耗光配额、返回错的形状——全是同一个
+结果,而那个结果就是"什么也没做"。一个被半途死掉的脚本改了一半的点,比一个没被改过
+的点更糟,因为下游没有任何东西分得清自己看的是哪一种。"返回了胡话"和"有 bug"拿到
+同一个无害的答复,是故意的。
 
-**A script never widens its own authority.** Provenance travels with the
-carrier: a script the operator wrote may rewrite, one that arrived with a
-downloaded plugin may add. An adapter reads that and does not decide it.
+**一个脚本永远不会把自己的权限撑大。** 来源跟着载体走:运维者自己写的脚本可以改写,
+跟着下载来的插件一起到的只能加。适配器读这件事,不决定这件事。
 
-**A script never gets more of the engine than the point needs.** A model
-request is handed its knobs and not its messages; a prompt contribution is
-handed the environment and not the other blocks; a message is handed its text
-and not its thinking signatures. Each exclusion is argued where it is made,
-because the tempting version of every one of these is "pass the whole struct".
+**一个脚本拿到的引擎,永远不超过那个点需要的。** 一次模型请求交给它的是旋钮而不是
+消息;一份提示贡献交给它的是环境而不是别的块;一条消息交给它的是文本而不是它的
+thinking 签名。每一条排除都在它被做出的地方给出理由,因为这里面每一条的诱人写法都是
+"把整个结构体传过去"。
 
-**A quota is per turn, and a turn says so.** Carriers are reset at the top of
-each turn; without that the budget would be per session, and a script bound to
-a per-tool-call point would go quiet partway through a long one.
+**配额是按轮算的,而且是一轮真的说了算。** 载体在每轮开头被重置;没有这一条,预算
+就成了按会话算,而绑在按工具调用触发的点上的脚本,会在一轮长活干到一半时哑掉。
 
-## Carrier invariants
+## 载体不变量
 
-Whatever loads an extension — WebAssembly today, a script engine next to it —
-four things hold, and `daemon/tests/carrier_invariants.rs` fails if they stop
-holding:
+无论是什么在加载扩展——今天是 WebAssembly,旁边还会有一个脚本引擎——四件事成立,
+`daemon/tests/carrier_invariants.rs` 会在它们不再成立时失败:
 
-1. **One capability table, one authorization function.** Both live in
-   `base::interface::capabilities`. A carrier converts its manifest into
-   `CapabilityDeclaration` and asks; it does not answer.
-2. **Carriers do not call each other.** They reach each other through host
-   contracts, never a direct call across memory models.
-3. **Every carrier is a compile-time feature, and a build carries at most
-   one.** `scripts` brings QuickJS and is the default; `plugins` brings the
-   WebAssembly tier and needs `--no-default-features` to get it, because
-   asking for both is refused by a `compile_error!` rather than quietly
-   accepted. `cargo build -p daemon --no-default-features` links neither.
+1. **一张能力表,一个授权函数。** 两者都在 `base::interface::capabilities`。载体把
+   自己的清单转成 `CapabilityDeclaration` 然后去问;它不作答。
+2. **载体之间不互相调用。** 它们通过宿主契约互相够到,绝不跨内存模型直接调。
+3. **每个载体都是一个编译期 feature,而且一个构建最多带一个。** `scripts` 带来
+   QuickJS,是默认;`plugins` 带来 WebAssembly 那一档,要拿它得加
+   `--no-default-features`——因为两个都要会被一个 `compile_error!` 拒掉,而不是被
+   悄悄接受。`cargo build -p daemon --no-default-features` 一个都不链。
 
-   Exclusive because carrying both is twice the attack surface for a
-   capability nobody asked for twice, and because cargo's feature unification
-   makes "both" somewhere you arrive by accident rather than by choice —
-   `--features plugins` without `--no-default-features` is enough to do it.
-4. **Disclosure covers every carrier.** It is about what an extension *says*,
-   so it names no carrier at all.
+   互斥是因为:两个都带,就为一个没人要过两遍的能力付两倍的攻击面;还因为 cargo 的
+   feature 合并让"两个都带"成为一个你踩进去而不是选进去的地方——`--features plugins`
+   不加 `--no-default-features` 就足以踩进去。
+4. **披露覆盖每一个载体。** 它管的是一个扩展*声明*了什么,所以它压根不点任何载体
+   的名。
 
-Nothing is granted by omission: an extension that declares no capabilities can
-compute and no more.
+什么都不会因为没提就被授予:一个不声明任何能力的扩展,能计算,仅此而已。
 
-**`extending_wasm.md`** is the guide for the WebAssembly carrier — the world a
-component implements, `plugin.toml`, the capability model, install-time
-disclosure, and what a plugin can contribute.
+**`extending_wasm.md`** 是 WebAssembly 载体的指南——一个组件要实现的 world、
+`plugin.toml`、能力模型、安装期披露,以及一个插件能贡献什么。
 
 ---
 
-## What is not open
+## 什么不开放
 
-Eleven things stay in the kernel. Making any of them replaceable would hand
-away the property it exists to guarantee.
+有十一样东西留在内核里。把其中任何一样变成可替换的,都等于把它存在所要保证的那条
+性质交出去。
 
-| # | Kernel-only | Why it cannot open |
+| # | 只在内核 | 为什么不能开 |
 |---|---|---|
-| 1 | Capability authorization and module resolution | The function that decides whether `import 'host:fs'` resolves. Replaceable means unauthorized |
-| 2 | Permission rule evaluation order | The order of the eight stages *is* the security property — a tool's own Allow must come after deny rules and path checks |
-| 3 | Resource limits and interrupts | The only way to stop a runaway extension |
-| 4 | Scheduling and quota accounting | Replaceable accounting is bypassable quota |
-| 5 | Whether a sandbox policy is applied | The backend is swappable; the decision to apply it is not |
-| 6 | Append-only log semantics and their invariant checks | "Model-visible means logged" is held by runtime assertions; replaceable assertions mean no principle |
-| 7 | The turn skeleton's step order | The order carries every invariant. The *decisions* at each step are open — see §2 of `ARCHITECTURE.md` |
-| 8 | Install-time disclosure | A restriction that only warns is one every auto-installer steps straight over |
-| 9 | Permission rule source precedence | Plugin rules must always rank below user settings and org policy |
-| 10 | Scene composition and inheritance | The combination surface grows exponentially, and it contradicts the one-scene-per-session replay invariant |
-| 11 | The number of plugin contribution points | The plugin subsystem can be compiled out; that depends on the contribution points staying countable |
+| 1 | 能力授权与模块解析 | 决定 `import 'host:fs'` 解不解析得开的那个函数。可替换就等于没授权 |
+| 2 | 权限规则的求值顺序 | 那八个阶段的顺序*就是*那条安全性质——一个工具自己的 Allow 必须排在 deny 规则和路径检查之后 |
+| 3 | 资源限额与中断 | 停下一个失控扩展的唯一手段 |
+| 4 | 调度与配额记账 | 可替换的记账就是可绕开的配额 |
+| 5 | 一条沙箱策略要不要施加 | 后端可以换;施不施加这个决定不能换 |
+| 6 | 只追加日志的语义,以及它们的不变量检查 | "模型可见即已记录"靠运行期断言撑着;断言可替换,原则就不存在 |
+| 7 | 一轮骨架的步骤顺序 | 顺序承载着每一条不变量。每一步上的*决定*是开放的——见 `ARCHITECTURE.md` §2 |
+| 8 | 安装期披露 | 一条只会告警的限制,任何自动安装器都会径直跨过去 |
+| 9 | 权限规则的来源优先级 | 插件规则必须永远排在用户设置和组织策略之下 |
+| 10 | scene 的组合与继承 | 组合面指数级膨胀,而且它和"每会话一个 scene"这条重放不变量相冲 |
+| 11 | 插件贡献点的数量 | 插件子系统可以被整个编译掉;这依赖于贡献点的数量始终数得过来 |
 
-The first six are not only safety requirements — they are what distinguishes
-this kernel from a general-purpose framework. A design that needs one of them
-opened is a design to argue about, not a patch to write.
+前六条不只是安全要求——它们是这个内核区别于一个通用框架的地方。一个需要开放其中
+之一的设计,是一个该拿出来争论的设计,不是一个该写的补丁。

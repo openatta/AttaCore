@@ -1,75 +1,63 @@
-# Extending AttaCore with WebAssembly plugins
+# 用 WebAssembly 插件扩展 AttaCore
 
-A plugin is a directory with a `plugin.toml` and, usually, one or more
-WebAssembly components. It is installed from an archive, it runs in a sandbox
-whose reach it had to write down before anyone installed it, and it can be
-uninstalled again without touching the binary.
+一个插件就是一个目录,里面有一份 `plugin.toml`,通常还有一个或多个 WebAssembly
+组件(component)。它从压缩包安装,跑在一个沙箱里——这个沙箱能够到哪里,它在任何人
+安装之前就得先写下来——卸载时也不用碰二进制。
 
-This is the expensive tier. If what you want is a few lines of the operator's
-own code at one point in the turn, that is the QuickJS carrier
-(`docs/extending_quickjs.md`) — it costs about a megabyte, where this costs
-twenty, and it needs no packaging. Reach for a plugin when the thing you are
-adding is a *package*: someone else's code, distributed, versioned, installed
-and removed by name.
+这是贵的那一档。如果你要的只是在轮次的某一个点上插几行运维方自己的代码,那是 QuickJS
+载体(`docs/extending_quickjs.md`)的活:它大约花一兆,而这里要花二十兆,而且它不需要
+打包。当你要加的东西是一个**包**的时候才用插件——别人的代码,分发出去,带版本,按名字
+安装、按名字卸载。
 
-The overview of every extension point, and which of them a plugin may reach at
-all, is `docs/extension_points.md`.
+所有扩展点的总揽,以及其中哪些是插件够得着的,在 `docs/extension_points.md`。
 
 ---
 
-## Before anything else: the build carries one carrier
+## 在别的之前:一个构建只带一个载体
 
-The plugin subsystem is **not** in the default build. `daemon`'s default
-feature is `scripts` (QuickJS), and the two carriers are mutually exclusive —
-`daemon/src/lib.rs` refuses a build carrying both with a `compile_error!`
-rather than accepting it quietly, because cargo's feature unification makes
-"both" somewhere you arrive by accident.
+插件子系统**不在**默认构建里。`daemon` 的默认 feature 是 `scripts`(QuickJS),
+两个载体互斥——`daemon/src/lib.rs` 碰上同时带两个的构建会 `compile_error!` 直接拒掉,
+而不是默不作声地接受,因为 cargo 的 feature 合并会让"两个都带"成为一个人误打误撞就
+走到的地方。
 
 ```bash
-cargo build -p daemon                                            # QuickJS scripts (default)
-cargo build -p daemon --no-default-features --features plugin-compile   # plugins, compiler in-process
-cargo build -p daemon --no-default-features --features plugins          # plugins, no compiler linked
-cargo build -p daemon --no-default-features                       # neither carrier
+cargo build -p daemon                                            # QuickJS 脚本(默认)
+cargo build -p daemon --no-default-features --features plugin-compile   # 插件,编译器在进程内
+cargo build -p daemon --no-default-features --features plugins          # 插件,不链接编译器
+cargo build -p daemon --no-default-features                       # 两个载体都不带
 ```
 
-`--no-default-features` is required: `--features plugins` on its own unions
-`scripts` back in and the guard rejects the build.
+`--no-default-features` 是必须的:单独给 `--features plugins`,`scripts` 会被并回来,
+守卫会拒掉这个构建。
 
-The second flag is about *where a component gets compiled*:
+第二个 flag 决定的是**组件在哪里被编译**:
 
-- **`plugin-compile`** links Cranelift into the daemon. Installing a plugin
-  compiles its components in-process.
-- **`plugins`** alone links no WebAssembly compiler at all. `Component::new`
-  does not exist in that build, so the daemon can only load artifacts
-  something else produced — it shells out to the `atta-plugin-compile` binary
-  at install, found by searching upward from the running executable, and a
-  cache miss at load is a refusal rather than a quiet recompile. Two thirds
-  of the carrier's size is the compiler, so this is the build for a deployment
-  that runs plugins but does not want a code generator in the serving process.
+- **`plugin-compile`** 把 Cranelift 链进 daemon。安装插件时,它的组件在进程内编译。
+- 单独的 **`plugins`** 不链接任何 WebAssembly 编译器。那个构建里根本没有
+  `Component::new`,所以 daemon 只能加载别人产出的产物——安装时它 shell 出去调
+  `atta-plugin-compile` 这个二进制,从正在运行的可执行文件往上找;加载时缓存没命中
+  就是拒绝,而不是悄悄重编一遍。载体三分之二的体积是编译器,所以这是给那种"要跑插件、
+  但不想让服务进程里带一个代码生成器"的部署用的构建。
 
-`tests/scripts/locked_build.sh` checks all of this against a real dependency
-graph: that both carriers together fail, that the no-carrier build has no
-plugin machinery in `cargo tree`, and that the `plugins`-without-`plugin-compile`
-build links no Cranelift.
+`tests/scripts/locked_build.sh` 拿真实的依赖图把这些逐条验过:两个载体一起上会失败;
+不带载体的构建 `cargo tree` 里没有任何插件机器;带 `plugins` 而不带 `plugin-compile`
+的构建不链接 Cranelift。
 
-A running daemon answers the question about itself — `daemon.doctor` reports
-`plugins.status` as `compiled-out`, `enabled` or `disabled-by-policy`, and the
-`plugin.*` RPCs return `PLUGINS_DISABLED` (`-32016`) rather than an empty list
-when the subsystem is not there.
+一个跑着的 daemon 会自己回答关于自己的这个问题——`daemon.doctor` 把 `plugins.status`
+报成 `compiled-out`、`enabled` 或 `disabled-by-policy`;子系统不在时,`plugin.*` 这些
+RPC 返回 `PLUGINS_DISABLED`(`-32016`),而不是一个空列表。
 
 ---
 
-## From zero: a plugin that works
+## 从零开始:一个能跑的插件
 
-The repository ships the component half of one at
-`tests/fixtures/wasm_echo_plugin/` — small on purpose, and what
-`crates/wasm-host/tests/component_roundtrip.rs` builds and provokes. Everything
-below is that fixture with a manifest around it.
+仓库里带了这么一个插件的组件那一半,在 `tests/fixtures/wasm_echo_plugin/`——故意做得很小,
+`crates/wasm-host/tests/component_roundtrip.rs` 构建并折腾的就是它。下面这些就是那个
+fixture 加一份 manifest。
 
-### 1. The world your component implements
+### 1. 你的组件要实现的 world
 
-The contract is one WIT world, `crates/wasm-host/wit/plugin.wit`, published as
-`atta:plugin@0.1.0`:
+契约就是一个 WIT world,`crates/wasm-host/wit/plugin.wit`,发布为 `atta:plugin@0.1.0`:
 
 ```wit
 world plugin {
@@ -80,13 +68,13 @@ world plugin {
 }
 ```
 
-`tools` and `events` are both required exports of the world. A component that
-does not participate in events still exports `on-event` and answers `proceed`.
+`tools` 和 `events` 都是这个 world 必须导出的。不参与事件的组件照样要导出 `on-event`,
+答 `proceed`。
 
-### 2. The component
+### 2. 组件
 
-A Rust guest, outside the workspace (it builds for `wasm32-wasip2`, and a
-member that only compiles for another target breaks `cargo build --workspace`):
+一个 Rust guest,放在 workspace 之外(它编译到 `wasm32-wasip2`,而一个只能编到别的
+target 的成员会让 `cargo build --workspace` 挂掉):
 
 ```toml
 # Cargo.toml
@@ -95,7 +83,7 @@ name = "wasm-echo-plugin"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]            # deliberately its own workspace
+[workspace]            # 故意让它自成一个 workspace
 
 [lib]
 crate-type = ["cdylib"]
@@ -117,8 +105,8 @@ impl ToolsGuest for Component {
     fn list_tools() -> Vec<ToolDef> {
         vec![ToolDef {
             name: "echo".into(),
-            description: "Echo the `text` argument back".into(),   // ships every turn
-            doc: Some("Returns `text` verbatim, plus a structured copy.".into()), // fetched on demand
+            description: "Echo the `text` argument back".into(),   // 每轮都发出去
+            doc: Some("Returns `text` verbatim, plus a structured copy.".into()), // 按需取
             input_schema: r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#.into(),
             read_only: true,
             concurrency_safe: true,
@@ -126,7 +114,7 @@ impl ToolsGuest for Component {
     }
 
     fn call_tool(_name: String, input_json: String, call_id: String) -> ToolOutput {
-        atta::plugin::host::progress(&call_id, "echoing");   // streamed to the user
+        atta::plugin::host::progress(&call_id, "echoing");   // 流式推给用户
         ToolOutput { content: input_json, structured: None, is_error: false }
     }
 }
@@ -144,7 +132,7 @@ impl Guest for Component {
 export!(Component);
 ```
 
-Build it:
+构建它:
 
 ```bash
 rustup target add wasm32-wasip2
@@ -152,10 +140,10 @@ cargo build --release --target wasm32-wasip2
 # → target/wasm32-wasip2/release/wasm_echo_plugin.wasm
 ```
 
-### 3. The manifest
+### 3. manifest
 
 ```toml
-# plugin.toml, at the root of the plugin directory
+# plugin.toml,放在插件目录的根上
 [plugin]
 name = "echo-plugin"
 version = "1.0.0"
@@ -166,22 +154,20 @@ description = "Echoes things back"
 component = "echo.wasm"
 ```
 
-`api_version` has no default. A manifest that omits it fails to parse, and one
-naming a version this build does not implement is refused with the supported
-set in the message — the WIT world, the capability semantics and the event
-whitelist move together, so there is no partial contract to fall back to.
+`api_version` 没有默认值。漏掉它的 manifest 解析不过;写了一个这个构建没实现的版本,
+会被拒掉,并在消息里给出支持的版本集合——WIT world、能力语义和事件白名单是一起动的,
+没有"退一步用半个契约"这种事。
 
-### 4. Package and install
+### 4. 打包与安装
 
-A plugin archive is a plain zip of the plugin directory, with `plugin.toml` at
-the archive root. Nothing about the layout is special; `tests/runner/src/plugin_fixture.rs`
-is the whole packaging step.
+插件压缩包就是插件目录的一个普通 zip,`plugin.toml` 在压缩包根上。布局上没有任何特别
+之处;`tests/runner/src/plugin_fixture.rs` 就是完整的打包步骤。
 
 ```bash
 cd my-plugin && zip -r ../my-plugin.zip . && shasum -a 256 ../my-plugin.zip
 ```
 
-Install over the daemon's JSON-RPC socket:
+通过 daemon 的 JSON-RPC socket 安装:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"plugin.install",
@@ -191,263 +177,235 @@ Install over the daemon's JSON-RPC socket:
            "scope":"global"}}
 ```
 
-- `download_url` accepts `https://`/`http://` and `file://`. A **checksum is
-  required for network sources** and refused-before-fetching if absent;
-  `file://` is a local sideload path and may omit it.
-- `scope` is `"global"` (default) or `"scene"`, picking which tier's cache the
-  plugin lands in.
-- Install extracts, then **compiles every declared component immediately**. A
-  component that cannot be compiled fails the install and the plugin is removed
-  again — discovering that while the user is standing there beats discovering
-  it mid-session.
-- Zip entries with `..` or absolute paths are skipped, not extracted.
+- `download_url` 接受 `https://`/`http://` 和 `file://`。**网络来源必须带 checksum**,
+  没有就在下载之前先拒掉;`file://` 是本地旁路安装,可以不带。
+- `scope` 是 `"global"`(默认)或 `"scene"`,决定插件落进哪一层的 cache。
+- 安装会先解压,然后**立刻编译每一个声明的组件**。有组件编不过就整个安装失败,插件被
+  删掉——趁用户还站在旁边的时候发现,比会话跑到一半才发现强。
+- zip 里带 `..` 或绝对路径的条目会被跳过,不解压。
 
-The response carries `success`, `message`, and a `disclosure` object — see
-[Install-time disclosure](#install-time-disclosure).
+响应里带 `success`、`message`,还有一个 `disclosure` 对象——见[安装期披露](#安装期披露)。
 
-The rest of the lifecycle: `plugin.list` (every installed plugin with its
-enable state, including disabled ones), `plugin.enable` / `plugin.disable`
-(persisted per tier in `enabled.json`; scene setting wins over global, and an
-unset plugin is enabled), `plugin.uninstall` (optional `version`, omit to
-remove all), `plugin.reload`.
+生命周期的其余部分:`plugin.list`(每一个已安装插件连同它的启用状态,包括被禁用的),
+`plugin.enable` / `plugin.disable`(按层持久化在 `enabled.json` 里;scene 层的设置压过
+global,没设过的插件算启用),`plugin.uninstall`(`version` 可选,不给就全删),
+`plugin.reload`。
 
-### 5. See it work
+### 5. 看它工作
 
-A plugin's tools reach a model through a scene the plugin owns, so give it one:
+插件的工具是经由插件自己拥有的场景到达模型的,所以先给它一个:
 
 ```toml
-# plugin.toml, continued
+# plugin.toml,接着上面
 [scene.own]
 name = "Echo"
 prompt = "scene/prompt.md"
 ```
 
-Reinstall, then create a session in it:
+重装,然后在这个场景里建一个会话:
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"session.create","params":{"scene":"plugin:echo-plugin"}}
 ```
 
-`scene.list` shows `plugin:echo-plugin` as active, and the session's tool
-registry now carries `plugin__echo-plugin__echo` — deferred, so the model finds
-it through `ToolSearch` rather than in every request's tool array.
+`scene.list` 里 `plugin:echo-plugin` 显示为 active,会话的工具注册表里现在有
+`plugin__echo-plugin__echo`——它是延后暴露的(deferred),所以模型是靠 `ToolSearch`
+找到它,而不是在每次请求的工具数组里看到它。
 
-### 6. Where it lands
+### 6. 它落在哪
 
 ```
-~/.atta/plugins/cache/<name>/<version>/                   # global tier
-~/.atta/scenes/<scope>/plugins/cache/<name>/<version>/    # scene tier, overrides global by name
+~/.atta/plugins/cache/<name>/<version>/                   # global 层
+~/.atta/scenes/<scope>/plugins/cache/<name>/<version>/    # scene 层,同名时压过 global
     plugin.toml
     echo.wasm
-    config.json          # optional, user-supplied (see [plugin.config])
-    .aot/<hash>.cwasm    # compiled artifact, content-addressed by component bytes
+    config.json          # 可选,用户提供(见 [plugin.config])
+    .aot/<hash>.cwasm    # 编译产物,按组件字节内容寻址
 ```
 
-The scene tier overrides the global one for the same plugin name; among several
-installed versions of one name, the highest semver wins. A manifest that fails
-to load is skipped with a warning, and the other plugins still load.
+同一个插件名下,scene 层压过 global 层;同一个名字装了好几个版本时,semver 最高的赢。
+加载不了的 manifest 会带一条警告被跳过,其他插件照常加载。
 
 ---
 
 ## `plugin.toml`
 
-Every section below is one the loader actually reads. Anything else in the file
-is ignored silently.
+下面每一节都是加载器真的会读的。文件里别的东西一律被静默忽略。
 
 ```toml
 [plugin]
-name = "github-tools"          # required
-version = "1.2.0"              # required
-api_version = "0.1"            # required; must be one this build implements
-description = "GitHub tools"   # reaches the model — disclosed at install
+name = "github-tools"          # 必填
+version = "1.2.0"              # 必填
+api_version = "0.1"            # 必填;必须是这个构建实现了的版本
+description = "GitHub tools"   # 会到达模型——安装时披露
 author = ""
 homepage = ""
 
 [plugin.config]
-schema = "config.schema.json"  # JSON Schema, validated against config.json before init
+schema = "config.schema.json"  # JSON Schema,init 之前拿它校验 config.json
 
-# ── WebAssembly payloads ──
+# ── WebAssembly 载荷 ──
 [[wasm]]
-component = "gh.wasm"                     # relative to the plugin root
-tools = ["diff"]                          # install-time visibility only
-events = ["PreToolUse", "PostToolUse"]    # must be in the subscribable whitelist
+component = "gh.wasm"                     # 相对插件根目录
+tools = ["diff"]                          # 只在安装时展示
+events = ["PreToolUse", "PostToolUse"]    # 必须在可订阅白名单里
 
 [wasm.capabilities]
 fs_read  = ["${workspace}/src"]
 fs_write = ["${plugin}/scratch"]
 net      = ["api.github.com"]
 env      = ["GITHUB_TOKEN"]
-max_memory_mb = 128            # default 64
-timeout_ms    = 5000           # default 30000
+max_memory_mb = 128            # 默认 64
+timeout_ms    = 5000           # 默认 30000
 
-# ── MCP payloads ──
+# ── MCP 载荷 ──
 [[mcp]]
 name = "github"
-kind = "native"                # `config` required for native
+kind = "native"                # native 必须给 `config`
 config = "mcp/github.json"
 
 [[mcp]]
 name = "pr-helper"
-kind = "dsh"                   # `entry` required for dsh
+kind = "dsh"                   # dsh 必须给 `entry`
 entry = "dist/index.js"
 env = ["GITHUB_TOKEN"]
 
-# ── A scene the plugin owns ──
+# ── 插件自己拥有的场景 ──
 [scene.own]
 name = "GitHub workflow"
 description = "PR review and issue triage"
-prompt = "scene/prompt.md"     # required; markdown system prompt
-reminder = "scene/reminder.md" # optional per-turn reminder
+prompt = "scene/prompt.md"     # 必填;markdown 系统提示词
+reminder = "scene/reminder.md" # 可选;每轮的提醒
 tools = ["Read", "Grep"]
 disallowed_tools = ["Bash"]
 deferred_tools = []
 
 [scene.own.budget]
-compact_threshold = 120000     # default 150000
-compact_keep_recent = 20       # default 20
-max_api_calls_per_turn = 40    # default unbounded
+compact_threshold = 120000     # 默认 150000
+compact_keep_recent = 20       # 默认 20
+max_api_calls_per_turn = 40    # 默认不设上限
 
-# ── Agent types the plugin declares ──
+# ── 插件声明的 agent 类型 ──
 [[agent]]
 name = "pr-reviewer"
-description = "Reviews PRs"    # reaches the model — disclosed
-prompt = "agents/reviewer.md"  # reaches the model — disclosed
+description = "Reviews PRs"    # 会到达模型——披露
+prompt = "agents/reviewer.md"  # 会到达模型——披露
 allowed_tools = ["Read"]
 disallowed_tools = []
 model = "claude-opus-5"
 permission_mode = "plan"
 effort = "high"
 max_turns = 30
-scene = "plugin:github-tools"  # run this agent's sub-agents in the plugin's scene
+scene = "plugin:github-tools"  # 让这个 agent 的子代理跑在插件的场景里
 ```
 
-Two validation rules are worth knowing before you hit them:
+有两条校验规则值得在撞上之前就知道:
 
-- **At most one `[[wasm]]` component may declare `events`.** The host resolves
-  an event to a plugin *by name*, so a second subscribing component would give
-  one name two possible answers and one subscription would be silently ignored.
-  Several components are fine as long as only one subscribes.
-- `tools = [...]` under `[[wasm]]` is documentation for the installer. At
-  runtime the component's own `list-tools` is the authority — that is what gets
-  registered.
+- **最多只有一个 `[[wasm]]` 组件可以声明 `events`。** 宿主是**按名字**把事件解析到插件
+  的,所以第二个订阅的组件会让一个名字有两个可能的答案,其中一个订阅就会被悄悄忽略。
+  多个组件没问题,只要只有一个订阅。
+- `[[wasm]]` 下的 `tools = [...]` 是写给安装器看的文档。运行时以组件自己的 `list-tools`
+  为准——真正被注册的是那个。
 
-### The subscribable events
+### 可订阅的事件
 
 ```
 PreToolUse   PostToolUse   PostToolUseFailure
 PermissionRequested   SessionStart   SessionEnd
 ```
 
-A deliberate subset of the engine's thirty hook events. Two rules put an event
-on it: it has to be low-frequency (each call builds a fresh WASM store), and
-its payload has to be small enough to cross the sandbox boundary by value.
-Naming anything else is a manifest error listing what is allowed.
+这是引擎那三十个 hook 事件里刻意挑出的一个子集。两条规则决定一个事件能不能进来:它得是
+低频的(每次调用都要新建一个 WASM store),而且它的载荷得小到能按值穿过沙箱边界。写别的
+名字是 manifest 错误,消息里会列出允许的那些。
 
-A subscribed component answers one of three things, and the host narrows it to
-what a downloaded package may say:
+订阅了的组件会答三件事之一,而宿主把它收窄到"一个下载来的包可以说的话":
 
-| answer | what happens |
+| 答案 | 会发生什么 |
 |---|---|
-| `proceed` | nothing |
-| `block(reason)` | the event is refused, with the reason shown to the user |
-| `add-context(text)` | an attributable note joins the conversation |
+| `proceed` | 什么也不发生 |
+| `block(reason)` | 事件被拒,理由展示给用户 |
+| `add-context(text)` | 一条可归属的备注加进对话 |
 
-Each subscription is registered with the component's own `timeout_ms` as its
-deadline — a hook runs inside a turn that is waiting on it, so it gets no more
-time than it asked for. A hook whose component has not loaded is not registered
-at all, so an event it claimed does not pay a dispatch for nothing.
+每个订阅都拿组件自己的 `timeout_ms` 当期限来注册——hook 跑在一个正等着它的轮次里,所以
+它拿不到比自己要的更多的时间。组件没加载成功的 hook 根本不会被注册,所以它认领过的事件
+不会白白付一次分发。
 
-There is deliberately no "rewrite the input" variant. The engine's own
-`HookResponse` can carry `updated_input`, and the plugin path cannot reach it:
-refusing a tool call and quietly changing what it does are different powers,
-and only the first is one a downloaded package gets.
+这里刻意没有"改写输入"这一档。引擎自己的 `HookResponse` 可以带 `updated_input`,插件这条
+路够不着它:拒掉一次工具调用,和悄悄改掉它要做的事,是两种不同的权力,而一个下载来的包
+只拿得到第一种。
 
-### User configuration
+### 用户配置
 
-If `[plugin.config] schema` is set, `config.json` in the plugin's installed
-directory is validated against that JSON Schema before the component is loaded,
-and **all** violations are reported at once. A plugin with no `config.json` gets
-`{}` — absent is not the same as wrong. The validated JSON is then handed to the
-component's `init`, and the plugin gets the last word: an `init` that returns
-`Err` means the plugin does not load. A schema that is itself malformed is an
-error, not a silent "no validation".
+如果 `[plugin.config]` 的 `schema` 设了,插件安装目录里的 `config.json` 会在组件加载之前
+拿这份 JSON Schema 校验,而且**所有**违规一次性全报出来。没有 `config.json` 的插件拿到
+`{}`——没有不等于写错了。校验过的 JSON 接着交给组件的 `init`,最后一句话归插件说:`init`
+返回 `Err` 就意味着这个插件不加载。schema 本身写坏了是错误,不是悄悄变成"不校验"。
 
 ---
 
-## The capability model
+## 能力模型
 
-**Nothing is granted by omission.** A component that declares no capabilities
-can compute and no more: no files, no network, no environment. Whatever a plugin
-wants has to be written down, and what is written down is what the installer
-shows the user.
+**什么都不会因为没写而被授予。** 一个不声明任何能力(capability)的组件只能算,别的都
+做不了:没有文件,没有网络,没有环境变量。插件想要什么就得写下来,而写下来的东西就是
+安装器给用户看的东西。
 
-The table and every predicate over it live in `base::interface::capabilities`,
-above the carrier and shared with every other one. A carrier converts its
-manifest into the kernel's `CapabilityDeclaration` and asks; it does not answer.
-`daemon/tests/carrier_invariants.rs` fails if a carrier grows its own
-`allows_url` / `allows_env` / `allows_read` / `allows_write`.
+这张表以及所有基于它的判定都住在 `base::interface::capabilities` 里,在载体之上,与其他
+每一个载体共享。载体把自己的 manifest 转成内核的 `CapabilityDeclaration` 然后去问;它不
+负责回答。`daemon/tests/carrier_invariants.rs` 会在某个载体长出自己的 `allows_url` /
+`allows_env` / `allows_read` / `allows_write` 时失败。
 
-### `fs_read`, `fs_write`
+### `fs_read`、`fs_write`
 
-Paths **must** be anchored to `${workspace}` (the daemon's working directory) or
-`${plugin}` (the plugin's installed directory). An unanchored or absolute path
-is refused at load — a bare `/` in `fs_read` reads as a grant of the machine,
-which is exactly the line a reviewer skims past. `..` anywhere in the expanded
-path is refused too.
+路径**必须**锚在 `${workspace}`(daemon 的工作目录)或 `${plugin}`(插件的安装目录)上。
+没锚的、或者绝对路径的,加载时就拒——`fs_read` 里一个光秃秃的 `/` 读起来就是把整台机器
+交出去,而这恰恰是审阅的人一眼扫过去会漏掉的那一行。展开后的路径里任何位置出现 `..`,
+同样拒。
 
-Expansion happens once, at load, so no call-time decision depends on state a
-plugin could change between the check and the use. What survives becomes WASI
-preopens and nothing else — there is no file API in the host interface, because
-re-implementing path checks as host functions is how those checks get subtly
-wrong.
+展开只在加载时做一次,所以没有任何调用时的判断依赖于插件能在"检查"和"使用"之间改动的
+状态。活下来的那些变成 WASI 的预打开目录(preopen),仅此而已——宿主接口里没有文件 API,
+因为把路径检查用宿主函数再实现一遍,正是那些检查出微妙错误的方式。
 
-Inside the component, a preopened directory appears under its **last path
-segment**: `/Users/me/secret/project` is `/project` to the guest. A plugin has
-no business learning where on the machine its workspace lives.
+在组件内部,一个预打开目录以它**路径的最后一段**出现:`/Users/me/secret/project` 在 guest
+眼里是 `/project`。插件没有必要知道自己的 workspace 在这台机器的哪个位置。
 
-A capability naming a directory that does not exist fails the load with the path
-in the message, rather than failing mysteriously the first time a file is
-touched.
+一个能力指向的目录不存在,会让加载失败并把那个路径写进消息里,而不是等第一次碰文件时
+莫名其妙地挂掉。
 
 ### `net`
 
-Exact host matches, checked in `host.http-request`:
+精确的 host 匹配,在 `host.http-request` 里检查:
 
-- case-insensitive on the host, port not part of the match
-- **not** a suffix rule — `api.github.com` does not admit `evil.api.github.com.attacker.test`
-- userinfo cannot disguise the host: `https://allowed.example@evil.example/` points at `evil.example` and is refused
-- non-`http(s)` URLs are denied rather than parsed — `file:///etc/passwd` never reaches a resolver
+- host 大小写不敏感,端口不参与匹配
+- **不是**后缀规则——`api.github.com` 不放行 `evil.api.github.com.attacker.test`
+- userinfo 伪装不了 host:`https://allowed.example@evil.example/` 指向的是
+  `evil.example`,拒
+- 非 `http(s)` 的 URL 直接拒,不解析——`file:///etc/passwd` 根本到不了解析器
 
-A refusal names the *host*, never the URL: the message is returned to the guest,
-which typically hands it straight back as a tool result, into the model's
-context and the transcript.
+拒绝时报的是那个 **host**,绝不是整个 URL:这条消息会返回给 guest,而 guest 通常原样把它
+当工具结果交出去,于是进了模型的上下文和会话记录。
 
 ### `env`
 
-Exact, case-sensitive names, readable only through `host.secret`. `GITHUB_TOKEN`
-does not admit `github_token` or `GITHUB_TOKEN_2`. An undeclared key returns
-`none` and logs that the plugin asked.
+精确、区分大小写的名字,只能通过 `host.secret` 读。`GITHUB_TOKEN` 不放行 `github_token`,
+也不放行 `GITHUB_TOKEN_2`。没声明的 key 返回 `none`,并记一条"插件问过"的日志。
 
-### `max_memory_mb`, `timeout_ms`
+### `max_memory_mb`、`timeout_ms`
 
-Enforced by the store's resource limiter and by the call deadline. Defaults are
-64 MB and 30 s.
+由 store 的资源限制器和调用期限来执行。默认是 64 MB 和 30 秒。
 
-### What the host lends back
+### 宿主借回去什么
 
-`log`, `progress` (streamed to the user for the in-flight call), `now-ms`,
-`http-request`, `secret`, `kv-get`, `kv-set`. The key-value namespace is
-per-plugin, in the host's memory, and it exists because a component gets a
-**fresh store on every call** and therefore has no memory of its own. The host
-can see it, clear it, and drop it with the plugin — which is the point. It does
-not survive a daemon restart or a plugin reload.
+`log`、`progress`(为正在进行的这次调用流式推给用户)、`now-ms`、`http-request`、
+`secret`、`kv-get`、`kv-set`。键值命名空间是每插件一份,在宿主的内存里;它之所以存在,
+是因为组件**每次调用都拿到一个全新的 store**,因此自己没有任何记忆。宿主看得见它、能清空
+它、能随插件一起把它丢掉——这正是重点。它不跨 daemon 重启,也不跨插件 reload。
 
 ---
 
-## Install-time disclosure
+## 安装期披露
 
-`plugin.install` returns a `disclosure` object, and an installer is expected to
-put it in front of the person installing:
+`plugin.install` 返回一个 `disclosure`(披露)对象,安装器应该把它摆到正在安装的那个人
+面前:
 
 ```json
 {"plugin":"github-tools","version":"1.2.0",
@@ -462,181 +420,139 @@ put it in front of the person installing:
  "inert":false}
 ```
 
-The reason `model_visible` exists: the sandbox handles what a plugin *executes*
-and does nothing about what it *says*. A tool description, an agent description
-and a scene's system prompt all reach the model verbatim, and text reaching the
-model is the one attack the isolation model cannot address. The only defence is
-a person reading it, so the install response carries all of it, each piece
-labelled with where it came from. Capability lines are shown as the manifest
-wrote them, `${workspace}` and all.
+`model_visible` 之所以存在:沙箱管的是插件**执行**什么,对它**说**什么毫无办法。工具描述、
+agent 描述、场景的系统提示词,都会一字不差地到达模型,而"文本到达模型"是这套隔离模型
+唯一解决不了的攻击。唯一的防线是有人去读它,所以安装响应把这些全带上,每一段都标明它从
+哪来。能力那几行按 manifest 写的原样展示,`${workspace}` 也照原样留着。
 
-Two limits are refusals, not warnings — a limit that only warns is one every
-automated installer walks straight past:
+有两个上限是拒绝,不是警告——只会警告的上限,每一个自动安装器都会径直走过去:
 
-- a one-line description over **500 characters** (a label that long is either a
-  mistake or an attempt to smuggle instructions into a field a reviewer skims)
-- a prompt or long tool guide over **40 000 characters**
+- 单行描述超过 **500 字符**(这么长的标签要么是写错了,要么是想把指令塞进一个审阅者只会
+  扫一眼的字段里)
+- 提示词或长工具指南超过 **40 000 字符**
 
-Note that the tool text can only come from a *loaded component* — the manifest
-does not contain it — so a disclosure produced without the WASM host simply
-lists no tools. `inert: true` means the plugin declares no capabilities, no
-events, no scene, no MCP servers and no model-visible text: nothing to scrutinise
-beyond its name.
+注意工具那部分文本只可能来自一个**已加载的组件**——manifest 里没有它——所以在没有 WASM
+宿主的情况下产出的披露就是不列任何工具。`inert: true` 意味着这个插件不声明能力、不声明
+事件、没有场景、没有 MCP server,也没有任何对模型可见的文本:除了名字之外没什么可审的。
 
-Disclosure is deliberately carrier-neutral. It is about what an extension *says*,
-so `crates/plugin/src/disclosure.rs` names no runtime at all, and the invariant
-test fails if it starts to.
+披露刻意与载体无关。它讲的是一个扩展**说**了什么,所以 `crates/plugin/src/disclosure.rs`
+里不提任何运行时,一旦它开始提,不变量测试就会失败。
 
 ---
 
-## What a plugin can contribute
+## 插件能贡献什么
 
-Everything installed plugins present to the engine goes through one trait,
-`runtime::plugin_host::PluginHost`, held by the host as an `Option` — which is
-what lets the whole subsystem compile out with no `#[cfg]` scattered through the
-engine.
+已安装插件呈给引擎的一切都走同一个 trait,`runtime::plugin_host::PluginHost`,宿主以
+`Option` 持有它——正是这一点让整个子系统能被编译掉,而不必在引擎里到处撒 `#[cfg]`。
 
-| contribution | how it reaches a session |
+| 贡献 | 怎么到达一个会话 |
 |---|---|
-| **Tools** | Adapted from a component's `list-tools` into ordinary engine tools named `plugin__<plugin>__<tool>` |
-| **MCP servers** | Merged into the daemon's configured server set, keyed `<plugin>-mcp-<name>` |
-| **Hook subscriptions** | Registered into the session's `HookRunner`, backed by the component's `on-event` |
-| **A scene** | Registered and activated as `plugin:<name>`; enterable with `session.create {"scene": "plugin:<name>"}` |
-| **Agent types** | Discoverable through `Agent`'s `subagent_type` |
+| **工具** | 从组件的 `list-tools` 适配成普通的引擎工具,名字是 `plugin__<plugin>__<tool>` |
+| **MCP server** | 并进 daemon 已配置的 server 集合,key 为 `<plugin>-mcp-<name>` |
+| **Hook 订阅** | 注册进会话的 `HookRunner`,背后是组件的 `on-event` |
+| **一个场景** | 以 `plugin:<name>` 注册并激活;用 `session.create {"scene": "plugin:<name>"}` 进入 |
+| **Agent 类型** | 通过 `Agent` 的 `subagent_type` 被发现 |
 
-Two things about that table are worth stating plainly.
+这张表里有两件事值得挑明。
 
-**Tools reach a session through the plugin's own scene.** `PluginScene` carries
-its plugin's tools as the scene's `extra_tools`, and `Builder::build` registers
-those into the session's registry — which is why owning a scene is how a plugin
-puts its tools in front of a model. A session in a built-in scene does not pick
-them up.
+**工具是经由插件自己的场景到达会话的。** `PluginScene` 把它所属插件的工具当作场景的
+`extra_tools` 带着,`Builder::build` 把这些注册进会话的注册表——所以"拥有一个场景"就是
+插件把工具摆到模型面前的方式。一个处在内建场景里的会话不会拿到它们。
 
-**A plugin shapes behaviour only in a scene it owns.** Rewriting the prompt of a
-scene the user chose for other reasons is hijacking; owning a scene the user
-explicitly enters is the plugin doing its job. So a plugin gets its own scene and
-never anyone else's. A plugin scene's `max_api_calls_per_turn` cannot *raise* the
-real ceiling either — the turn loop resolves the budget as `min(settings, scene)`,
-so a scene may only ever tighten.
+**插件只能在自己拥有的场景里塑造行为。** 改写用户为别的原因选中的场景的提示词,是劫持;
+拥有一个用户明确进入的场景,是插件在干自己的活。所以插件拿到自己的场景,永远拿不到别人
+的。插件场景的 `max_api_calls_per_turn` 也**抬不高**真正的上限——轮次循环把预算解析成
+`min(settings, scene)`,所以场景只可能收紧。
 
-Some consequences of the tool adapter that surprise people:
+工具适配器有几个后果常常出乎人意料:
 
-- Plugin tools are **deferred** by default. A third-party schema shipped in every
-  request's tool array is a fixed token cost for something the model usually
-  ignores; the model fetches the long `doc` with `ToolSearch` when it wants the
-  tool. `description` is the one-liner that ships every turn.
-- `check_permissions` always answers **Ask**. A plugin asserting its own call is
-  fine is not evidence of anything, and `read_only` / `concurrency_safe` from the
-  component are used for scheduling only.
-- The `plugin__<name>__<tool>` shape mirrors `mcp__<server>__<tool>`, but a
-  permission rule has to name the **whole tool** — `plugin__github-tools__diff`.
-  The prefix form that lets one rule cover a whole MCP server is special-cased to
-  `mcp__` in `permissions::ruleset::matches_tool_name`, so `plugin__github-tools`
-  on its own matches nothing today.
-- A component shipping an input schema that will not parse still registers; it
-  advertises an open object, because refusing would punish the user for the
-  author's typo.
+- 插件工具默认是**延后暴露**的。一个第三方 schema 出现在每次请求的工具数组里,是在为模型
+  通常不看的东西付固定的 token;模型想用这个工具的时候,会用 `ToolSearch` 去取那份长的
+  `doc`。`description` 才是每轮都发出去的那一行。
+- `check_permissions` 永远答 **Ask**。插件自己断言这次调用没问题,不构成任何证据;组件
+  给的 `read_only` / `concurrency_safe` 只用于调度。
+- `plugin__<name>__<tool>` 这个形状照着 `mcp__<server>__<tool>` 来,但权限规则必须写
+  **完整的工具名**——`plugin__github-tools__diff`。那种用一条规则覆盖整个 MCP server 的
+  前缀写法,在 `permissions::ruleset::matches_tool_name` 里是专门为 `mcp__` 开的特例,
+  所以今天单独写 `plugin__github-tools` 什么也匹配不到。
+- 组件给的输入 schema 解析不了,照样注册;它对外宣称一个开放对象,因为拒绝等于让用户为
+  作者的笔误买单。
 
-Plugins do **not** contribute skills or slash commands, and they cannot be bound
-to the interception points a script can reach (`prompt.assemble`, `model.request`
-and the rest). `docs/extension_points.md`'s `Plugin` column describes what each
-*contract* opens; the WebAssembly carrier's actual surface is the five rows above.
+插件**不**贡献 skill 和斜杠命令,也不能绑到脚本够得着的那些拦截点上(`prompt.assemble`、
+`model.request` 以及其余)。`docs/extension_points.md` 里的「插件」列讲的是每个**契约**
+开放了什么;WebAssembly 载体实际的表面就是上面那五行。
 
 ---
 
-## Boundaries
+## 边界
 
-### The sandbox
+### 沙箱
 
-One wasmtime `Engine` per process — it owns the compiler and the code cache, so
-one per plugin would pay that repeatedly for no isolation benefit. **Isolation
-comes from the store, not the engine**: a component gets a fresh `Store` for
-every single call, and a store owns its linear memory, its tables and its
-resource limits. A trap, a runaway loop and an allocation blow-up all end the
-same way — the store is dropped, the call returns an error, the engine carries
-on.
+每进程一个 wasmtime `Engine`——它持有编译器和代码缓存,所以每插件一个只会把这份开销重复
+付一遍,换不来任何隔离上的好处。**隔离来自 store,不来自 engine**:组件每一次调用都拿到
+一个全新的 `Store`,而一个 store 拥有自己的线性内存、自己的表、自己的资源上限。一次 trap、
+一个跑飞的循环、一次分配爆炸,收场是同一个——store 被丢掉,调用返回错误,engine 接着跑。
 
-The deadline is enforced with epoch interruption, not fuel: "has this outlived
-its budget" and "has the user pressed Ctrl-C" are wall-clock questions. A
-dedicated OS thread advances the epoch every 10 ms — a timer task would not do,
-because "every async worker is busy" is precisely the situation a runaway guest
-creates. The epoch makes the guest yield, which turns an uninterruptible loop
-into a future the host can drop, so a timeout and a cancellation are the same
-operation rather than two mechanisms with two failure modes.
+期限用 epoch 中断来执行,不用 fuel:"这东西是不是已经超出预算了"和"用户是不是按了
+Ctrl-C",都是挂钟时间的问题。一个专用的 OS 线程每 10 ms 推进一次 epoch——定时任务不行,
+因为"每个异步 worker 都忙着"恰恰就是一个跑飞的 guest 造出来的局面。epoch 让 guest 交出
+执行权,于是一个不可中断的循环变成一个宿主可以丢掉的 future,超时和取消因此是同一个操作,
+而不是两套机制配两种失败模式。
 
-What that buys, as the round-trip test asserts against a real component: a
-plugin whose tool loops forever is stopped at its declared timeout and the next
-call to the same plugin succeeds; a trapping tool is an error result and the
-next call succeeds; an undeclared host is unreachable from inside the guest and
-the error says which capability would have allowed it.
+这换来什么,round-trip 测试拿一个真组件断言过:一个工具死循环的插件会在它自己声明的超时
+上被停住,而对同一个插件的下一次调用成功;一个 trap 的工具是一个错误结果,下一次调用成功;
+一个没声明的 host 从 guest 内部够不着,而且错误里会说清哪个能力本来可以放行它。
 
-How failures surface to the caller:
+失败怎么呈现给调用方:
 
-| what happened | what the model sees |
+| 发生了什么 | 模型看到什么 |
 |---|---|
-| timeout | an error *result* — this tool failed, not the turn |
-| trap | an error result naming the plugin and tool |
-| cancellation | the engine's own `Cancelled` error, never a result the model would read as an answer |
+| 超时 | 一个错误**结果**——是这个工具失败了,不是这一轮失败了 |
+| trap | 一个错误结果,点名插件和工具 |
+| 取消 | 引擎自己的 `Cancelled` 错误,绝不是一个会被模型读成答案的结果 |
 
-### The health breaker
+### 健康熔断
 
-Per-call isolation makes it *safe* to keep calling a broken plugin, not useful.
-A component that traps on every invocation turns each of the model's attempts
-into an error result and the model keeps trying. So after **3 consecutive
-faults** (`wasm_host::health::FAULT_LIMIT`) the plugin is set aside: every tool
-it exports refuses with a message naming the plugin, not just the tool that
-failed.
+每次调用都隔离,让"继续调一个坏掉的插件"变得**安全**,但没变得有用。一个每次调用都 trap
+的组件,会把模型的每一次尝试都变成一个错误结果,而模型会一直试下去。所以连续 **3 次故障**
+(`wasm_host::health::FAULT_LIMIT`)之后,这个插件被搁置:它导出的每一个工具都拒绝执行,
+消息里点的是插件的名字,而不只是那个失败的工具。
 
-Three rather than one, because a fault can come from an input the plugin
-mishandles, and one bad argument should not cost the user the tool. A single
-success resets the streak, so a plugin failing at its edges is not penalised.
+是 3 次而不是 1 次,因为一次故障可能来自插件没处理好的某个输入,而一个坏参数不该让用户
+赔上整个工具。一次成功就把连续计数清零,所以一个只在边角上失败的插件不会被罚。
 
-**Only faults count.** A timeout or a cancellation says something about the work
-or the user, not about the plugin's soundness — a plugin doing something
-genuinely slow would otherwise disable itself for being used as intended.
+**只有故障计数。** 超时或取消说的是这份工作或这个用户的事,不是插件本身健不健全——否则
+一个确实做着慢活的插件,会因为被按预期使用而把自己禁掉。
 
-Fault records live in a registry keyed by plugin name, so they outlive the
-component instances — which are rebuilt on every install, uninstall, enable and
-disable. In practice a set-aside plugin comes back at the next reload anyway:
-reloading asks every component for its tool list again, and a `list-tools` that
-answers is a success that clears the streak. So `plugin.reload` is the way to
-give a plugin another chance after its author has shipped a fix.
+故障记录住在一个以插件名为 key 的注册表里,所以它们活得比组件实例长——而组件实例在每一次
+安装、卸载、启用、禁用时都会重建。实际上一个被搁置的插件在下一次 reload 时就回来了:
+reload 会再问每个组件要一遍工具列表,而一次答得上来的 `list-tools` 就是一次成功,连续计数
+被清零。所以在插件作者发布修复之后,`plugin.reload` 就是给它再来一次机会的方式。
 
-The records are reported as the `plugins.breakers` health check (`degraded`,
-with the per-plugin fault counts in `details`), so a decision the carrier was
-otherwise making invisibly — the tool stops being offered, the model stops
-asking, and whoever installed it gets no signal — is something an operator can
-act on.
+这些记录以 `plugins.breakers` 这个健康检查上报(`degraded`,每插件的故障数在 `details`
+里),这样一个本来会被载体无声做掉的决定——工具不再被提供,模型不再问,而装了它的人得不到
+任何信号——就变成运维方可以处置的东西。
 
-### Load
+### 加载
 
-Plugins load at most 4 at a time, and the whole load phase has a 30-second
-budget. Loading runs a plugin's `init`, so it is not merely I/O. The daemon
-awaits this before it serves; a plugin still loading when the budget expires is
-dropped with a warning, because starting without it is recoverable and never
-starting is not. One plugin failing any step is dropped and the others still
-load.
+插件最多 4 个并发加载,整个加载阶段有 30 秒预算。加载会跑插件的 `init`,所以它不只是 I/O。
+daemon 在开始服务之前会等它;预算到期时还没加载完的插件会被丢掉并留一条警告,因为少了它
+还能起来是可以恢复的,而起不来不是。一个插件在任何一步失败都会被丢掉,其他插件照常加载。
 
-### The trust model
+### 信任模型
 
-- Capabilities are **declaration ∩ user rules**, never a union. A declared
-  capability is what the plugin *may ask for*; the user's permission rules still
-  decide each call, and plugin tools default to `Ask`.
-- An agent type a plugin declares carries `AgentTypeSource::Plugin`, which is
-  what clamps its `permission_mode` / `max_turns` overrides — a definition that
-  arrived over the network must not hand its sub-agent more than the session
-  already had.
-- `settings.json`'s `plugins` section is the deployment-level switch:
-  `{"plugins": {"enabled": false}}` loads none, and a non-empty
-  `{"plugins": {"allow": ["a", "b"]}}` is an allow-list — a name not on it is
-  refused rather than merely unmentioned. A deployment that wants no plugins at
-  all should prefer the build flag, which leaves nothing to switch back on.
-- Plugin names are checked against a blocklist at install, and against homograph
-  confusion with official names when a marketplace index is configured.
-- AOT artifacts are keyed by the component's content hash alone, so a rebuilt
-  plugin never reads back the previous build's machine code. Compatibility is not
-  the key's job: `Component::deserialize` validates the artifact's own header and
-  rejects one from a foreign toolchain, so the wrong artifact produces wasmtime's
-  own message rather than a silent miss. In a build with the compiler, a
-  rejection demotes to a recompile; in a runtime-only build it is where loading
-  stops, which is the whole point of removing the compiler.
+- 能力是**声明 ∩ 用户规则**,永远不是并集。声明的能力是插件**可以去要**的东西;每一次调用
+  仍然由用户的权限规则决定,而插件工具默认是 `Ask`。
+- 插件声明的 agent 类型带 `AgentTypeSource::Plugin`,正是这个东西在钳制它对
+  `permission_mode` / `max_turns` 的覆盖——一个从网上来的定义,不能给它的子代理比会话本身
+  已经拥有的更多。
+- `settings.json` 的 `plugins` 段是部署级的开关:`{"plugins": {"enabled": false}}` 一个都
+  不加载;非空的 `{"plugins": {"allow": ["a", "b"]}}` 是一份白名单——不在上面的名字是被
+  拒绝,而不只是没被提到。一个完全不想要插件的部署应该优先用构建 flag,那样根本没有东西
+  可以再打开。
+- 插件名在安装时会对照一份黑名单检查;配置了市场索引时,还会检查与官方名字之间的同形混淆。
+- AOT 产物只以组件的内容哈希为 key,所以重新构建过的插件永远不会读回上一次构建的机器码。
+  兼容性不是这个 key 的活:`Component::deserialize` 会校验产物自己的头,拒掉来自异种工具链
+  的那一个,所以拿错产物得到的是 wasmtime 自己的消息,而不是一次无声的错过。在带编译器的
+  构建里,一次拒绝会降级成重编;在只有运行时的构建里,这里就是加载停下的地方——而这正是
+  拿掉编译器的全部意义。

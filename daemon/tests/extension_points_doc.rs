@@ -145,10 +145,10 @@ fn every_point_names_a_module_that_exists() {
 fn the_bindable_points_and_the_table_that_lists_them_agree() {
     let doc = std::fs::read_to_string(doc_path()).expect("the extension point index exists");
     let section = doc
-        .split("## What a script can be bound to")
+        .split("## 一个脚本能绑到哪些点上")
         .nth(1)
         .expect("the section listing what a script can be bound to")
-        .split("### The four that stay closed")
+        .split("### 保持关闭的那四个")
         .next()
         .expect("the closed-points subsection ends it");
 
