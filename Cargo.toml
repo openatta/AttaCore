@@ -125,3 +125,20 @@ team       = { path = "crates/team" }
 task       = { path = "crates/task" }
 daemon     = { path = "daemon" }
 rpc-client = { path = "tests/rpc_client" }
+
+# The release artifact was 54 MB of which 14 MB was symbols nobody ships and
+# reads, and the rest was compiled without any cross-crate inlining. Three
+# lines take it to 33 MB and cost about fifteen seconds of build time.
+#
+# `panic` is deliberately left at `unwind`. Aborting would be smaller and
+# faster, and it would also mean a panic inside one tool takes the whole
+# daemon down with every session on it — `spawn_blocking` join errors are
+# handled in several places precisely because that is not the wanted outcome.
+#
+# `lto` is `thin` rather than `fat` on purpose: fat reaches 30.6 MB and nearly
+# doubles the build, which is a poor trade for 2.4 MB on a profile people
+# build locally.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
