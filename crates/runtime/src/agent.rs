@@ -2283,6 +2283,32 @@ impl Builder {
             tools.register(t);
         }
 
+        // Tools installed plugins export.
+        //
+        // After the scene, because a plugin that owns a scene hands that scene
+        // its own tools (`PluginScene::from_plugin`) and they arrive here a
+        // second time, as the same `Arc`s. Identity is what separates that
+        // from a real collision: the same allocation means the scene already
+        // contributed this exact tool, and a different one under the same name
+        // means two things are claiming it, which is refused for the same
+        // reason a scene's collision is.
+        if let Some(host) = self.plugin_host.as_ref() {
+            for t in host.tools() {
+                match tools.get(t.name()) {
+                    Some(existing) if Arc::ptr_eq(&existing, &t) => continue,
+                    Some(_) => {
+                        return Err(EngineError::Internal(format!(
+                            "a plugin contributes a tool named {:?}, which is already                              registered by something else",
+                            t.name()
+                        )));
+                    }
+                    None => {
+                        tools.register(t);
+                    }
+                }
+            }
+        }
+
         // The scene's deferred policy, applied once over the complete set.
         //
         // It has to run here rather than on the registry the caller handed in:
@@ -2807,6 +2833,69 @@ mod tests {
         assert!(
             agent.tools.get("mcp__test-server__do-thing").is_some(),
             "MCP tool adapter should be registered in the executable tool registry, found: {:?}",
+            agent.tools.names()
+        );
+    }
+
+    /// Regression: `PluginHost::tools()` had no production caller at all.
+    /// Plugin tools reached a session only through `PluginScene::extra_tools`,
+    /// so a plugin that shipped tools without owning a scene — which the
+    /// manifest fully allows — registered them nowhere and the model never
+    /// saw them.
+    #[tokio::test]
+    async fn build_registers_the_tools_installed_plugins_export() {
+        struct OnePluginTool(Arc<dyn base::tool::Tool>);
+        impl crate::plugin_host::PluginHost for OnePluginTool {
+            fn tools(&self) -> Vec<Arc<dyn base::tool::Tool>> {
+                vec![self.0.clone()]
+            }
+            fn mcp_servers(&self) -> Vec<(String, serde_json::Value)> {
+                Vec::new()
+            }
+            fn hook_configs(&self) -> Vec<(hooks::config::HookEvent, hooks::config::HookConfig)> {
+                Vec::new()
+            }
+            fn scenes(&self) -> Vec<Arc<dyn AgentScene>> {
+                Vec::new()
+            }
+            fn agent_types(&self) -> Vec<crate::agent_tool::AgentTypeDefinition> {
+                Vec::new()
+            }
+        }
+
+        struct Exported;
+        #[async_trait::async_trait]
+        impl base::tool::Tool for Exported {
+            fn name(&self) -> &str {
+                "plugin__demo__do_thing"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn call(
+                &self,
+                _: serde_json::Value,
+                _: base::tool::ToolContext,
+                _: base::tool::ProgressSender,
+            ) -> Result<base::tool::ToolResult, base::error::ToolError> {
+                Ok(base::tool::ToolResult::text("done"))
+            }
+        }
+
+        let exported: Arc<dyn base::tool::Tool> = Arc::new(Exported);
+        let (agent, _event_rx, _input_tx) = Builder::new()
+            .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+            .model(Arc::new(DummyModel) as Arc<dyn Model>)
+            .settings(Arc::new(test_settings()))
+            .plugin_host(Arc::new(OnePluginTool(exported)))
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        assert!(
+            agent.tools.get("plugin__demo__do_thing").is_some(),
+            "a plugin's exported tool must be in the registry the turn loop \
+             dispatches against, found: {:?}",
             agent.tools.names()
         );
     }
