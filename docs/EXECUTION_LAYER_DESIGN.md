@@ -208,6 +208,15 @@ SSE 流，一个只会交出完整 body 的出口承载不了引擎发得最多�
 `Origin::Operator` 仍然走同一个契约，因为可审计、可限速、可离线这三件事对它同样成立
 （一次离线运行要能把遥测和市场也断掉），只是不受 `allowed_domains` 约束。
 
+> **兑现程度，如实记录（2026-08-31 复核）**：契约这一侧做完了——十一个客户端构造点
+> 全部收敛，`Origin` 分流生效，工具侧的 provider 由宿主经 `ExecProviders` 注入。
+> **但运维流量那一侧还缺注入点**：`HttpAnthropicClient` / `OAuth2Client` /
+> `RegistryResolver` / 遥测各自的 `with_network` 在生产里**没有调用方**，它们各建一个
+> `LocalNetwork::default()`。行为是对的（`Operator` 一律放行），但宿主换不掉它们，
+> 所以"可审计 / 可限速 / 可离线"目前只对 `Origin::Agent` 成立。
+> 补齐要把宿主的 `Network` 从 `Builder` 一路传到 `ModelFactory` 与各客户端构造器 ——
+> 见 `PHASE_4_TASKS.md` §3 的 L-7。
+
 **超时不进 `HttpRequest`。** 按 §0.1 它属于 `tool.around`，而且 provider 给流
 加一个整体超时就等于把 SSE 回答拦腰截断。各调用点保留自己原有的超时。
 
