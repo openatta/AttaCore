@@ -25,6 +25,33 @@ pub enum Verdict {
     Skipped,
 }
 
+/// How much of one tool's answer to show the judge.
+///
+/// A `Read` of a large file is tens of kilobytes of content that says nothing
+/// about whether the turn was right, and a prompt that carries several of them
+/// pushes the part that matters — the expectation — out of the judge's
+/// attention. The head of an answer is where the verdict lives: an error
+/// message, a refusal, the first lines of a file.
+const RESULT_BUDGET: usize = 600;
+
+fn render_results(results: &[crate::api_runner::ToolAnswer]) -> String {
+    if results.is_empty() {
+        return "(没有工具返回)".to_string();
+    }
+    results
+        .iter()
+        .map(|r| {
+            let mut body: String = r.content.chars().take(RESULT_BUDGET).collect();
+            if body.chars().count() < r.content.chars().count() {
+                body.push_str("…(已截断)");
+            }
+            let tag = if r.is_error { "错误" } else { "成功" };
+            format!("- {} [{tag}]: {body}", r.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Compare actual output against expected description using a comparison LLM.
 pub async fn compare_output(
     model: &dyn Model,
@@ -56,6 +83,9 @@ pub async fn compare_output(
 ### 调用的工具
 {tools}
 
+### 工具返回了什么
+{results}
+
 ## 判定规则
 - 如果实际行为与预期描述一致，判定为 pass
 - 如果部分一致但有偏差，判定为 partial
@@ -80,6 +110,7 @@ pub async fn compare_output(
                 .collect::<Vec<_>>()
                 .join("\n")
         },
+        results = render_results(&actual.tool_results),
     );
 
     let messages = vec![ModelMessage {

@@ -43,6 +43,20 @@ pub struct AgentRunnerConfig {
 pub struct TurnOutput {
     pub text: String,
     pub tool_uses: Vec<(String, serde_json::Value)>,
+    /// What each tool call answered, in order.
+    ///
+    /// Half of what a case is usually about lives here rather than in the
+    /// text: whether a hook rewrote a result, whether a ring refused a call,
+    /// whether a tool errored and the model recovered. A comparison that is
+    /// shown only the calls and the final prose is being asked to judge a turn
+    /// with half the turn withheld.
+    pub tool_results: Vec<ToolAnswer>,
+}
+
+pub struct ToolAnswer {
+    pub name: String,
+    pub content: String,
+    pub is_error: bool,
 }
 
 /// A working directory unique to this run.
@@ -383,11 +397,22 @@ async fn send_and_collect(
     let collect = async {
         let mut text = String::new();
         let mut tool_uses: Vec<(String, serde_json::Value)> = vec![];
+        let mut tool_results: Vec<ToolAnswer> = vec![];
         while let Some(event) = event_rx.recv().await {
             match event {
                 AgentEvent::TextDelta { text: t, .. } => text.push_str(&t),
                 AgentEvent::ToolUse { name, input, .. } => tool_uses.push((name, input)),
-                AgentEvent::TurnComplete { .. } => return Ok((text, tool_uses)),
+                AgentEvent::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                    ..
+                } => tool_results.push(ToolAnswer {
+                    name,
+                    content,
+                    is_error: is_error.unwrap_or(false),
+                }),
+                AgentEvent::TurnComplete { .. } => return Ok((text, tool_uses, tool_results)),
                 AgentEvent::Error { code, message, .. } => {
                     return Err(anyhow::anyhow!(
                         "turn {} failed: [{code}] {message}",
@@ -409,7 +434,7 @@ async fn send_and_collect(
         );
     };
 
-    let (text, tool_uses) = match tokio::time::timeout(turn_timeout, collect).await {
+    let (text, tool_uses, tool_results) = match tokio::time::timeout(turn_timeout, collect).await {
         Ok(result) => result?,
         Err(_) => {
             cancel.cancel();
@@ -423,7 +448,11 @@ async fn send_and_collect(
         }
     };
 
-    Ok(TurnOutput { text, tool_uses })
+    Ok(TurnOutput {
+        text,
+        tool_uses,
+        tool_results,
+    })
 }
 
 /// Turn a dead agent task into a diagnosis: panic (with its message), external

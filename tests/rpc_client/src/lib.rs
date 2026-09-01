@@ -139,6 +139,12 @@ impl TurnStream<'_> {
 pub struct TurnEvents {
     pub text: String,
     pub tool_uses: Vec<(String, Value)>,
+    /// What each tool answered — name, content, and whether it was an error.
+    ///
+    /// A turn's text says what the model concluded; this says what it was
+    /// working from. A caller that has only the calls and the prose cannot
+    /// tell a tool that failed from one that succeeded and was ignored.
+    pub tool_results: Vec<(String, String, bool)>,
     pub turn_complete: bool,
     pub response: Option<RpcResponse>,
 }
@@ -355,6 +361,23 @@ impl DaemonRpcClient {
                             .to_string();
                         out.tool_uses
                             .push((name, event.get("input").cloned().unwrap_or_default()));
+                    }
+                    Some("tool_result") => {
+                        let name = event
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let content = event
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let is_error = event
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        out.tool_results.push((name, content, is_error));
                     }
                     Some("turn_complete") => out.turn_complete = true,
                     _ => {}

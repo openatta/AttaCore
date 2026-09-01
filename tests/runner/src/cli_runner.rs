@@ -230,6 +230,15 @@ pub async fn run_test_case(
         results.push(TurnOutput {
             text: events.text,
             tool_uses: events.tool_uses,
+            tool_results: events
+                .tool_results
+                .into_iter()
+                .map(|(name, content, is_error)| crate::api_runner::ToolAnswer {
+                    name,
+                    content,
+                    is_error,
+                })
+                .collect(),
         });
     }
 
