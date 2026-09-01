@@ -45,7 +45,7 @@ use test_runner::scripted_model::{Reply, ScriptedModel};
 use tokio_util::sync::CancellationToken;
 
 /// What the session needs beyond a model and a tool for the point to fire.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Needs {
     Nothing,
     /// A memory store with something in it, and recall switched on. Applied
@@ -292,6 +292,8 @@ struct Ran {
     requests: Vec<String>,
     /// The tools each of those requests offered.
     tools: Vec<Vec<String>>,
+    /// The transcript the run left, if it was asked to keep one.
+    log: String,
     ledger: Arc<ScriptLedger>,
 }
 
@@ -314,11 +316,75 @@ impl Ran {
     }
 }
 
+/// One session to drive: what is bound, what the user says, what the model
+/// answers.
+///
+/// Separate from [`ScriptCase`] because the crossing cases below are not rows
+/// in a table — each is a specific pair of points arranged a specific way —
+/// and they need the same session, driven the same way, or they are testing a
+/// different engine from the one the table tests.
+struct Session {
+    bindings: Vec<(String, String, String)>,
+    turns: Vec<String>,
+    replies: Vec<Reply>,
+    needs: Needs,
+    keep_log: bool,
+}
+
+impl Session {
+    fn new(turns: &[&str], replies: Vec<Reply>) -> Self {
+        Self {
+            bindings: Vec::new(),
+            turns: turns.iter().map(|t| (*t).to_string()).collect(),
+            replies,
+            needs: Needs::Nothing,
+            keep_log: false,
+        }
+    }
+
+    /// Bind `path` (under `tests/fixtures/scripts/`) at `point`. Order is the
+    /// order of these calls, which is what decides which of two scripts on one
+    /// point is the outer one.
+    fn bind(mut self, path: &str, point: &str, entry: &str) -> Self {
+        self.bindings
+            .push((path.into(), point.into(), entry.into()));
+        self
+    }
+
+    fn recall(mut self) -> Self {
+        self.needs = Needs::Recall;
+        self
+    }
+
+    /// Attach a history store, so the run leaves a transcript to read back.
+    fn logged(mut self) -> Self {
+        self.keep_log = true;
+        self
+    }
+}
+
+fn from_case(case: &ScriptCase, bind: Bind) -> Session {
+    let mut session = Session::new(case.turns, (case.replies)());
+    session.needs = case.needs;
+    for (path, point, entry) in case.also {
+        session = session.bind(path, point, entry);
+    }
+    match bind {
+        Bind::Fixture => session.bind(case.script, case.point, case.entry),
+        Bind::Throwing => session.bind("broken/throws.js", case.point, "boom"),
+        Bind::Nothing => session,
+    }
+}
+
 async fn run(case: &ScriptCase, bind: Bind) -> Ran {
+    drive(from_case(case, bind)).await
+}
+
+async fn drive(session: Session) -> Ran {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
 
-    let model_arc = ScriptedModel::new((case.replies)());
+    let model_arc = ScriptedModel::new(session.replies);
     let model: Arc<dyn Model> = model_arc.clone();
 
     let mut settings = Settings::defaults_for("script-model");
@@ -331,28 +397,18 @@ async fn run(case: &ScriptCase, bind: Bind) -> Ran {
         local_data_dir: root.join("local"),
         scope: "code".into(),
     };
-    settings.memory_enabled = case.needs == Needs::Recall;
-    let binding = |path: &str, point: &str, entry: &str| ScriptBinding {
-        path: path.into(),
-        point: point.into(),
-        entry: entry.into(),
-        timeout_ms: None,
-        calls_per_turn: None,
-    };
-    settings.scripts = case
-        .also
+    settings.memory_enabled = session.needs == Needs::Recall;
+    settings.scripts = session
+        .bindings
         .iter()
-        .map(|(p, pt, e)| binding(p, pt, e))
+        .map(|(path, point, entry)| ScriptBinding {
+            path: path.into(),
+            point: point.clone(),
+            entry: entry.clone(),
+            timeout_ms: None,
+            calls_per_turn: None,
+        })
         .collect();
-    match bind {
-        Bind::Fixture => settings
-            .scripts
-            .push(binding(case.script, case.point, case.entry)),
-        Bind::Throwing => settings
-            .scripts
-            .push(binding("broken/throws.js", case.point, "boom")),
-        Bind::Nothing => {}
-    }
     let settings = Arc::new(settings);
 
     let registry = Arc::new(InMemoryToolRegistry::new());
@@ -366,7 +422,17 @@ async fn run(case: &ScriptCase, bind: Bind) -> Ran {
         .settings(settings.clone())
         .skip_warmup(true);
 
-    if case.needs == Needs::Recall {
+    if session.keep_log {
+        let store = history::store::JsonlHistoryStore::with_roots(
+            &root.join("workdir"),
+            history::path::HistoryRoots::under(&root.join("global")),
+        )
+        .await
+        .expect("history store");
+        builder = builder.history_store(Arc::new(store));
+    }
+
+    if session.needs == Needs::Recall {
         let store = Arc::new(MemoryStore::new(
             root.join("mem-user"),
             root.join("mem-local"),
@@ -386,7 +452,7 @@ async fn run(case: &ScriptCase, bind: Bind) -> Ran {
     // The same call the daemon makes. Installing adapters is `Builder`'s job
     // precisely so this test cannot bind a point the session would not.
     let ledger = match script_host::bindings::bind_quickjs(&settings.scripts, &fixtures())
-        .unwrap_or_else(|e| panic!("case `{}`: {e}", case.point))
+        .unwrap_or_else(|e| panic!("a binding in this session is invalid: {e}"))
     {
         Some(bound) => {
             let ledger = bound.ledger.clone();
@@ -402,7 +468,7 @@ async fn run(case: &ScriptCase, bind: Bind) -> Ran {
     let run_cancel = cancel.clone();
     let join = tokio::spawn(async move { agent.run(run_cancel).await });
 
-    for (i, turn) in case.turns.iter().enumerate() {
+    for (i, turn) in session.turns.iter().enumerate() {
         input_tx
             .send(InputMessage::User {
                 content: turn.to_string(),
@@ -415,8 +481,8 @@ async fn run(case: &ScriptCase, bind: Bind) -> Ran {
         loop {
             let ev = tokio::time::timeout_at(deadline, event_rx.recv())
                 .await
-                .unwrap_or_else(|_| panic!("case `{}`: the turn never finished", case.point))
-                .unwrap_or_else(|| panic!("case `{}`: event channel closed early", case.point));
+                .expect("the turn never finished")
+                .expect("event channel closed early");
             if matches!(
                 ev,
                 base::event::AgentEvent::TurnComplete { .. }
@@ -434,8 +500,32 @@ async fn run(case: &ScriptCase, bind: Bind) -> Ran {
     Ran {
         requests: model_arc.request_texts(),
         tools: model_arc.request_tools(),
+        log: read_log(root),
         ledger,
     }
+}
+
+/// The transcript this run left, or empty if it kept none.
+fn read_log(root: &std::path::Path) -> String {
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect(&p, out);
+            } else if p.extension().is_some_and(|x| x == "jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    let mut logs = Vec::new();
+    collect(&root.join("global"), &mut logs);
+    logs.iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -553,6 +643,287 @@ async fn a_script_that_throws_leaves_its_point_alone_and_the_turn_finishes() {
             case.point
         );
     }
+}
+
+// ── crossings ───────────────────────────────────────────────────────────
+//
+// The table above proves each adapter works on its own. These are about what
+// two of them do to each other, which is where a refactor breaks something no
+// single-point case can see. A case belongs here only if taking one of its two
+// points away would leave nothing to assert — otherwise it is a table row.
+
+/// One tool call the scripted model makes, and the answer to it.
+fn calls_the_echo_tool() -> Vec<Reply> {
+    vec![
+        Reply::Tool {
+            id: "call-1",
+            name: "ScriptEcho",
+            input: serde_json::json!({"say": "anything"}),
+        },
+        Reply::Text("done"),
+    ]
+}
+
+/// `tool.around` answering in place of the tool means `tool.result` never
+/// sees that answer.
+///
+/// Neither document says which way this goes, and both readings are
+/// defensible: the result point is "the last thing before the model sees it",
+/// which argues for running; the ring answered instead of dispatching, so
+/// there is no dispatch whose result could be transformed, which argues
+/// against. What matters is that it is decided rather than incidental — a
+/// script that sanitizes every tool result would otherwise have a hole in it
+/// that only appears when some other script starts answering from a cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_from_the_around_ring_skips_the_result_point() {
+    let ran = drive(
+        Session::new(&["use the tool"], calls_the_echo_tool())
+            .bind("tool_around.js", "tool.around", "onAround")
+            .bind("tool_result.js", "tool.result", "onResult"),
+    )
+    .await;
+
+    assert!(
+        ran.holds("SCRIPT-TRACE-AROUND"),
+        "the ring's answer never reached the model"
+    );
+    assert!(
+        !ran.holds("SCRIPT-TRACE-RESULT"),
+        "the result point ran on an answer that was never dispatched"
+    );
+    assert!(
+        ran.outcomes_at("tool.result").is_empty(),
+        "the result point was called, so it was reached and chose to do \
+         nothing — a different thing from not being reached: {:?}",
+        ran.outcomes_at("tool.result")
+    );
+}
+
+/// And a refusal is not rewritten either. A denial travels as the tool's own
+/// error, and the result point is not offered it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denial_from_the_around_ring_reaches_the_model_unrewritten() {
+    let ran = drive(
+        Session::new(&["use the tool"], calls_the_echo_tool())
+            .bind("tool_around_deny.js", "tool.around", "onAround")
+            .bind("tool_result.js", "tool.result", "onResult"),
+    )
+    .await;
+
+    assert!(
+        ran.holds("SCRIPT-TRACE-DENY"),
+        "the model was not told why the call was refused"
+    );
+    assert!(
+        !ran.holds("SCRIPT-TRACE-RESULT"),
+        "the result point rewrote a denial it should never have been offered"
+    );
+    assert!(
+        !ran.holds("echo: anything"),
+        "the tool ran despite the refusal"
+    );
+}
+
+/// Two rings on one point: the first binding is the outer one.
+///
+/// The carrier's document says so, and the order is not something a reader can
+/// check from the settings file — a session that installed them the other way
+/// round would look identical until the day two scripts disagree.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_rings_on_one_point_run_in_the_order_they_were_bound() {
+    let ran = drive(
+        Session::new(&["use the tool"], calls_the_echo_tool())
+            .bind("tool_around.js", "tool.around", "onAround")
+            .bind("tool_around_second.js", "tool.around", "onAround"),
+    )
+    .await;
+
+    assert!(
+        ran.holds("SCRIPT-TRACE-AROUND:"),
+        "the first binding did not decide, so it is not the outer ring"
+    );
+    assert!(
+        !ran.holds("SCRIPT-TRACE-AROUND-SECOND"),
+        "the second binding answered, which means the first never got the call"
+    );
+}
+
+/// A block one script registers, another script removes.
+///
+/// The registering points and the assembly point are different mechanisms —
+/// one contributes before the session runs, the other edits every turn — and
+/// this is the only case where the order between them is observable. A script
+/// that could not remove a script-registered block would leave every
+/// contribution permanent for the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_block_one_script_registered_can_be_removed_by_another() {
+    let with_both = drive(
+        Session::new(&["hello"], vec![Reply::Text("hi")])
+            .bind("prompt_block.js", "prompt.block", "onBlock")
+            .bind("prompt_assemble_delete.js", "prompt.assemble", "onAssemble"),
+    )
+    .await;
+    assert!(
+        !with_both.holds("SCRIPT-TRACE-BLOCK"),
+        "the block survived the removal"
+    );
+
+    // Without the remover the block is there, so the assertion above is about
+    // the removal and not about the block never having been registered.
+    let registered_only = drive(
+        Session::new(&["hello"], vec![Reply::Text("hi")])
+            .bind("prompt_block.js", "prompt.block", "onBlock"),
+    )
+    .await;
+    assert!(
+        registered_only.holds("SCRIPT-TRACE-BLOCK"),
+        "the block was never in the prompt to begin with"
+    );
+}
+
+/// A variable one script provides, expanded inside a block another
+/// contributed.
+///
+/// The table's row for `prompt.variable` proves the value appears somewhere in
+/// the request. This is the stronger statement, and the one the point is for:
+/// it appears *where the placeholder was*, in text a different script wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variable_expands_inside_a_block_another_script_contributed() {
+    let ran = drive(
+        Session::new(&["hello"], vec![Reply::Text("hi")])
+            .bind("prompt_block_var.js", "prompt.block", "onBlock")
+            .bind("prompt_variable.js", "prompt.variable", "onVariable"),
+    )
+    .await;
+
+    assert!(
+        ran.holds("trace slot: SCRIPT-TRACE-VARIABLE("),
+        "the placeholder was not replaced in the block that held it. \
+         Requests:\n{}",
+        ran.requests.join("\n---\n")
+    );
+    assert!(
+        !ran.holds("{{script_trace_var}}"),
+        "the placeholder is still in the prompt"
+    );
+}
+
+/// Narrowing the tools a request offers does not gate what may be dispatched.
+///
+/// `model.request` edits the request; the registry decides what exists. A
+/// model that asks for a tool it was not offered — a stale conversation, a
+/// second script, a provider that ignored the list — still gets it. Written
+/// down because the opposite is the natural assumption, and a script author
+/// who reaches for this point as a permission mechanism has picked the wrong
+/// one: that is what `tool.around` and the permission gate are for.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
+    let ran = drive(
+        Session::new(
+            &["use the skill"],
+            vec![
+                Reply::Tool {
+                    id: "call-1",
+                    name: "Skill",
+                    input: serde_json::json!({"skill": "no-such-skill"}),
+                },
+                Reply::Text("done"),
+            ],
+        )
+        .bind(
+            "model_request_drop_skill.js",
+            "model.request",
+            "onRequest",
+        ),
+    )
+    .await;
+
+    assert!(
+        !ran.offers("Skill"),
+        "the script did not withdraw the tool, so the case is not set up: {:?}",
+        ran.tools
+    );
+    assert!(
+        ran.requests.len() >= 2,
+        "the call never came back with a result, so the withdrawn tool was \
+         not dispatched"
+    );
+}
+
+/// The message the model is shown next turn and the message in the transcript
+/// are the same message.
+///
+/// `model.message` rewrites an assistant message on its way back. If the
+/// rewrite reached only the next request, a resumed or forked session would
+/// replay a conversation that never happened — the model would see the
+/// original where the live session saw the rewrite, and nothing in either
+/// place would say so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewritten_message_is_the_one_that_gets_logged() {
+    let ran = drive(
+        Session::new(
+            &["hello", "and again"],
+            vec![Reply::Text("first answer"), Reply::Text("second answer")],
+        )
+        .bind("model_message.js", "model.message", "onMessage")
+        .logged(),
+    )
+    .await;
+
+    assert!(
+        ran.holds("SCRIPT-TRACE-MESSAGE first answer"),
+        "the next request did not carry the rewrite"
+    );
+    assert!(
+        !ran.log.trim().is_empty(),
+        "the run kept no transcript, so this proves nothing"
+    );
+    assert!(
+        ran.log.contains("SCRIPT-TRACE-MESSAGE first answer"),
+        "the transcript kept the original while the model was shown the \
+         rewrite. Log:\n{}",
+        ran.log
+    );
+}
+
+/// Recall's two halves run on every turn, not once for the session.
+///
+/// The hook is per user message by contract, and the failure it guards against
+/// is subtle: a hook installed once and consulted once would look correct on a
+/// one-turn case, which every other case about this point is. The turn number
+/// in the ledger is what makes the difference visible.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_recall_hook_runs_on_every_turn() {
+    let ran = drive(
+        Session::new(
+            &["when can I ship this?", "and after that?"],
+            // Spare answers: memory work makes model calls of its own, and
+            // running out of scripted replies would fail this case for a
+            // reason that has nothing to do with the hook.
+            vec![
+                Reply::Text("on tuesday"),
+                Reply::Text("on wednesday"),
+                Reply::Text("spare"),
+                Reply::Text("spare"),
+            ],
+        )
+        .bind("memory_retrieval.js", "memory.retrieval_hook", "onRetrieval")
+        .recall(),
+    )
+    .await;
+
+    let turns: Vec<u32> = ran
+        .ledger
+        .records()
+        .into_iter()
+        .filter(|r| r.point == "memory.retrieval_hook")
+        .map(|r| r.turn)
+        .collect();
+    assert_eq!(
+        turns,
+        vec![1, 1, 2, 2],
+        "expected `before` and `after` on each of two turns, got {turns:?}"
+    );
 }
 
 /// Echoes its argument, so a `tool.result` script has a result to rewrite.
