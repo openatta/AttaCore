@@ -3767,6 +3767,7 @@ dependencies = [
  "base",
  "clap",
  "compaction",
+ "daemon",
  "futures",
  "hex",
  "history",
