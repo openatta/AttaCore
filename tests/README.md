@@ -9,6 +9,11 @@
 | `tests/cases/*.test` + `tests/runner` | 行为测试：真的驱动 Agent 跑一个任务，录制/回放模型交互 | `tests/run_api.sh <用例号>` / `tests/run_cli.sh <用例号>` |
 | `tests/scripts/*.sh` | 构建面的断言（无插件构建里没有插件依赖等） | `tests/scripts/locked_build.sh` |
 
+脚本载体（QuickJS）的那一张网横跨其中三层，单独有一份设计说明：
+`docs/testing_scripts.md`。要点是它为什么需要一本账——脚本每次调用拿到全新运行时、
+没有文件系统，所以「这个点被触发了吗」只能从外面回答，而「失败的脚本什么都改不了」
+意味着失败和从没绑上在外面长得一模一样。
+
 ## 几个约定
 
 **daemon e2e 不打网络。** `session_lifecycle.rs` 用一个脚本化的

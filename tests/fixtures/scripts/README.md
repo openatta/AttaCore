@@ -12,3 +12,8 @@ Each one leaves a mark no other part of the engine produces. That is the
 whole design constraint: a fixture that logged, or that made a change the
 engine would have made anyway, would let the test pass with the script never
 running.
+
+`broken/` holds the ones that misbehave on purpose — throwing, never
+returning, allocating without bound, answering in a shape its point cannot
+act on, asking for a name the engine owns. They are how the carrier's promises
+about failure get checked instead of believed; see `docs/testing_scripts.md`.

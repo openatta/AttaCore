@@ -494,10 +494,15 @@ declare that capability at install
 
 ## 接下来看哪儿
 
+- `docs/testing_scripts.md` —— 这九个点怎么被测,以及一条用例要满足什么才算数。
 - `tests/fixtures/scripts/` —— 每个点一个能跑的 fixture,每一个都留下一处引擎里
-  别的地方绝不会产生的痕迹。
-- `tests/runner/tests/script_carrier.rs` —— 每个点都驱动一次真实会话,跑两遍:
-  一遍绑上脚本,一遍不绑。
+  别的地方绝不会产生的痕迹;`broken/` 下面是各种坏法。
+- `tests/runner/tests/script_carrier.rs` —— 每个点都驱动一次真实会话,跑三遍:
+  绑上、不绑、绑一个抛异常的。后面还有八条交叉用例,问的是两个点放在一起会怎样。
+- `tests/runner/tests/script_boundaries.rs` —— 上面「预算」「失败」「权限」三节写的
+  承诺,逐条对着跑起来的会话验一遍。
+- `tests/runner/tests/script_task_profiles.rs` —— 九个点一起绑上,做一件真活儿,
+  看工作目录还是不是原来那个。
 - `tests/fixtures/script_project/` —— 一个完整的项目,它的 settings 绑了一个脚本,
   由 `tests/cases/010.script_carrier.test` 使用。
 - `crates/core/src/interface/script_adapters/` —— 每个点一个适配器。每个适配器实现

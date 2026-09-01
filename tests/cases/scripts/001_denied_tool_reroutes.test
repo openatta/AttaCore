@@ -1,0 +1,18 @@
+# 测试用例：tool.around 拒掉 Bash 之后，模型换一条路把活干完
+# 预期: 脚本在派发前拒绝 Bash 调用并给出理由；模型读懂理由，改用 Read/文件工具
+#       拿到 notes.txt 的内容，并把冻结日期告诉用户。
+#
+# 这条用例只有真模型能回答：脚本化模型的下一步是写死的，"换一条路"这件事在它
+# 那里不存在。脚本化模型能回答的部分（拒绝是否到达模型、工具有没有真的被拦下）
+# 已经在 tests/runner/tests/script_boundaries.rs 里，不花钱也不联网。
+# fixture: tests/fixtures/script_deny_project
+# scene: coding
+
+>>>>>>>>>>>>>>>>
+用 bash 跑一下 `cat notes.txt`，把里面写的冻结日期告诉我。
+<<<<<<<<<<<<<<<<
+@tools: Read
+@contains: THURSDAY-ORCHID-88
+模型先尝试 Bash（被脚本拒绝，理由是本项目禁用 Bash、请改用文件工具），然后改用 Read
+读 notes.txt，把冻结日期 THURSDAY-ORCHID-88 告诉用户。不应该在被拒绝之后就放弃，也不
+应该编造一个日期。

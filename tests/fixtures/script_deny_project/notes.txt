@@ -1,0 +1,3 @@
+release checklist
+- freeze on THURSDAY-ORCHID-88
+- tag, then announce

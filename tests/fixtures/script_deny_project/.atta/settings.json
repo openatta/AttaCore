@@ -1,0 +1,9 @@
+{
+  "scripts": [
+    {
+      "path": ".atta/scripts/no_bash.js",
+      "point": "tool.around",
+      "entry": "onAround"
+    }
+  ]
+}
