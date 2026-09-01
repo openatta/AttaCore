@@ -363,9 +363,6 @@ fn linux_wrap(opts: SandboxOptions<'_>) -> Confined {
     }
 
     args.push("--".into());
-    args.push("bash".into());
-    args.push("-c".into());
-    args.push(opts.command.to_string());
 
     // bwrap has no domain-level network filter, so an allowlist arrives here
     // as the same whole-network cut `DenyAll` gets. Stricter than asked for in
@@ -487,6 +484,32 @@ mod tests {
             disable: false,
             policy: SandboxPolicy::default(),
         }
+    }
+
+    /// The command reaches the shell once, on whichever backend runs.
+    ///
+    /// It reached it twice on Linux for a while: generalizing the backends to
+    /// take a process spec added a generic tail without removing the hardcoded
+    /// one, so the argv ended `-- bash -c CMD bash -c CMD`. That runs, and
+    /// looks right, and quietly sets `$0`/`$1`/`$2` to `bash`, `-c` and the
+    /// command itself — so anything reading a positional parameter is wrong.
+    /// Asserted as a count rather than a position because a second copy is
+    /// exactly what a position-based assertion cannot see.
+    #[test]
+    fn the_command_reaches_the_shell_exactly_once() {
+        let c = wrap(opts("echo hi", Path::new("/tmp/work")));
+        assert_eq!(
+            c.spec.args.iter().filter(|a| a.as_str() == "echo hi").count(),
+            1,
+            "argv: {:?}",
+            c.spec.args
+        );
+        assert_eq!(
+            c.spec.args.iter().filter(|a| a.as_str() == "-c").count(),
+            1,
+            "argv: {:?}",
+            c.spec.args
+        );
     }
 
     #[test]

@@ -45,6 +45,15 @@ pub struct RuleSetPermission {
     /// a freshly-bound session starts in — `Builder::build()` seeds
     /// `SessionState` from the same `Settings` value.
     permission_mode: PermissionMode,
+    /// The sandbox settings a tool's own `check_permissions` reads.
+    ///
+    /// This is the only path that reaches a tool's own judgement in
+    /// production, so a setting that governs one — `sandbox.deny_write` and
+    /// `sandbox.allow_write` do — is inert unless it is carried here. The
+    /// context built below is otherwise a bare one, which is how the write
+    /// control list came to be configurable everywhere except where it is
+    /// consulted.
+    sandbox: base::tool::SandboxSettings,
 }
 
 impl RuleSetPermission {
@@ -58,6 +67,7 @@ impl RuleSetPermission {
             tools: RwLock::new(tools),
             session: RwLock::new(None),
             permission_mode,
+            sandbox: Default::default(),
         }
     }
 
@@ -89,6 +99,22 @@ impl RuleSetPermission {
             tools,
             mode,
         )
+        .with_sandbox(base::tool::SandboxSettings {
+            allow_read: settings.sandbox.allow_read.clone(),
+            deny_read: settings.sandbox.deny_read.clone(),
+            allowed_domains: settings.sandbox.allowed_domains.clone(),
+            network_mode: settings.sandbox.network_mode,
+            deny_write: settings.sandbox.deny_write.clone(),
+            allow_write: settings.sandbox.allow_write.clone(),
+            state_root: None,
+            require_enforcement: settings.sandbox.require_enforcement,
+        })
+    }
+
+    /// The sandbox settings the tools' own checks are judged against.
+    pub fn with_sandbox(mut self, sandbox: base::tool::SandboxSettings) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// The registry currently bound — snapshot of the `Arc`, so a concurrent
@@ -136,6 +162,7 @@ impl Permission for RuleSetPermission {
 
         let mut ctx = ToolContext::from_engine_ctx(cwd.to_path_buf(), CancellationToken::new());
         ctx.session_id = session_id.to_string();
+        ctx.sandbox = self.sandbox.clone();
         // Prefer the session's live state (so a runtime `set_permission_mode`
         // — plan mode — is honored); fall back to a throwaway carrying the
         // construction-time mode when nothing was bound.

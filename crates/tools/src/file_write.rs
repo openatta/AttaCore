@@ -110,14 +110,15 @@ impl Tool for FileWriteTool {
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
         // 1. 路径安全：cwd 子树 / additional 之外、`.env*` / 系统目录 → 拒
         if let Ok(parsed) = serde_json::from_value::<FileWriteInput>(input.clone()) {
-            let path = match std::path::PathBuf::from(&parsed.file_path).is_absolute() {
+            let requested = std::path::PathBuf::from(&parsed.file_path);
+            let path = match requested.is_absolute() {
                 true => std::path::PathBuf::from(parsed.file_path),
                 false => ctx.cwd.join(parsed.file_path),
             };
             let path = crate::security::normalize_path_lexically(&path);
             let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
             let policy = crate::security::write_policy(ctx).await;
-            match permissions::path_safety::check_write(&path, &policy) {
+            match permissions::path_safety::check_write_for(&requested, &path, &policy) {
                 Ok(()) => {
                     return PermissionDecision::Allow {
                         decision_reason: Some("project_write".into()),

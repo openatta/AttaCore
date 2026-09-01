@@ -23,21 +23,22 @@ const DEFAULT_FILENAME_BLACKLIST: &[&str] = &[
 
 /// Not secrets — files a tool should not casually rewrite.
 ///
-/// `.atta` and `.claude` hold the settings a tool is judged by, so a tool that
-/// can rewrite them can rewrite its own rules. The lockfiles and `.gitignore`
-/// are here because they are generated or curated, and a model editing one
-/// directly is nearly always doing it the wrong way round.
+/// Generated or curated, and a model editing one directly is nearly always
+/// doing it the wrong way round. Denied like the credential list, and
+/// exempted the same way: a deployment whose agent is supposed to maintain a
+/// `.gitignore` says so in `sandbox.allow_write`.
+const GUARDED_FILENAMES: &[&str] = &[".gitignore", "package-lock.json", "Cargo.lock"];
+
+/// The engine's own configuration, wherever it lives.
 ///
-/// Denied like the credential list, and exempted the same way — a deployment
-/// whose agent is supposed to maintain a `.gitignore` says so in
-/// `sandbox.allow_write`.
-const GUARDED_FILENAMES: &[&str] = &[
-    ".atta",
-    ".claude",
-    ".gitignore",
-    "package-lock.json",
-    "Cargo.lock",
-];
+/// A tool that can rewrite these can rewrite the rules it is judged by, so
+/// they are guarded — but by *name and location*, not by directory. `.atta`
+/// is also where a sub-agent's git worktree lives, and denying the directory
+/// denies every write the sub-agent was created to make.
+const SETTINGS_FILENAMES: &[&str] = &["settings.json", "settings.local.json"];
+
+/// Directories those settings files live in.
+const SETTINGS_DIRS: &[&str] = &[".atta", ".claude"];
 
 /// 不论 cwd 在哪，下面这些系统目录都拒写。
 const ABSOLUTE_DENY_PREFIXES: &[&str] = &[
@@ -212,31 +213,50 @@ impl std::error::Error for PathSafetyError {}
 /// - 文件**不存在**（要新建）：传**绝对**路径；本函数会用 parent 目录判断 root 隶属
 /// - 文件**已存在**：建议先 `tokio::fs::canonicalize` 再调；本函数会拒绝含 `..` 的非规范化路径
 pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafetyError> {
+    check_write_for(target, target, policy)
+}
+
+/// The same, with the two questions told apart.
+///
+/// Steps 1–3 and 5 are about the path someone *asked for*: an unexpanded `~`,
+/// a UNC share, a shell substitution, a name whose normalization differs from
+/// what it displays as. Steps 4 and 6–8 are about the file it *resolves to*.
+///
+/// Running the first group on a resolved path is wrong, and expensively so on
+/// macOS: `realpath` hands back the name as the filesystem stores it, which
+/// for anything created through Cocoa is NFD — so `café.txt` came back
+/// decomposed, failed the normalization check, and an ordinary file the user
+/// asked to edit was refused as an attack.
+pub fn check_write_for(
+    requested: &Path,
+    target: &Path,
+    policy: &WritePolicy,
+) -> Result<(), PathSafetyError> {
     // 1. Tilde 展开阻断：路径以 `~` 开头说明未展开家目录
     //    必须在绝对路径检查之前，因为 `~/foo` 不是绝对路径（shell 未展开）
     {
-        let path_str = target.to_string_lossy();
+        let path_str = requested.to_string_lossy();
         if path_str == "~" || path_str.starts_with("~/") || path_str.starts_with("~\\") {
-            return Err(PathSafetyError::TildeExpansion(target.to_path_buf()));
+            return Err(PathSafetyError::TildeExpansion(requested.to_path_buf()));
         }
     }
 
     // 2. UNC / 远程路径检测：`\\server\share\...`
     //    必须在绝对路径检查之前，因为 `\\host\share` 只在 Windows 上是绝对路径
     {
-        let path_str = target.to_string_lossy();
+        let path_str = requested.to_string_lossy();
         if path_str.starts_with("\\\\") {
-            return Err(PathSafetyError::UncPathDetected(target.to_path_buf()));
+            return Err(PathSafetyError::UncPathDetected(requested.to_path_buf()));
         }
     }
 
     // 3. Unicode normalization attack detection (NFC round-trip check)
     {
-        let path_str = target.to_string_lossy();
+        let path_str = requested.to_string_lossy();
         let nfc_normalized: String = path_str.chars().nfc().collect();
         if nfc_normalized != path_str.as_ref() {
             return Err(PathSafetyError::UnicodeNormalizationAttack {
-                path: target.to_path_buf(),
+                path: requested.to_path_buf(),
                 normalized: PathBuf::from(nfc_normalized),
             });
         }
@@ -256,17 +276,17 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
 
     // 5. Shell 展开阻断：`$(...)` 与 `` ` `` 可能是注入
     {
-        let path_str = target.to_string_lossy();
+        let path_str = requested.to_string_lossy();
         if path_str.contains("$(") {
             return Err(PathSafetyError::ShellExpansion {
                 matched: "$(".into(),
-                path: target.to_path_buf(),
+                path: requested.to_path_buf(),
             });
         }
         if path_str.contains('`') {
             return Err(PathSafetyError::ShellExpansion {
                 matched: "`".into(),
-                path: target.to_path_buf(),
+                path: requested.to_path_buf(),
             });
         }
     }
@@ -282,7 +302,20 @@ pub fn check_write(target: &Path, policy: &WritePolicy) -> Result<(), PathSafety
             }
         }
 
-        // 7. 文件名黑名单（任意 component 命中即拒）
+        // 7a. The engine's own settings, by name and location.
+        if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
+            let under_settings_dir = target.components().any(|c| {
+                matches!(c, Component::Normal(d) if SETTINGS_DIRS.iter().any(|s| d == *s))
+            });
+            if under_settings_dir && SETTINGS_FILENAMES.contains(&name) {
+                return Err(PathSafetyError::BlacklistedFilename {
+                    path: target.to_path_buf(),
+                    matched: format!("{name} under an engine settings directory"),
+                });
+            }
+        }
+
+        // 7b. 文件名黑名单（任意 component 命中即拒）
         for c in target.components() {
             if let Component::Normal(name) = c {
                 let s = name.to_string_lossy();

@@ -103,8 +103,9 @@ impl Tool for NotebookEditTool {
         let Ok(p) = parsed else {
             return PermissionDecision::allow();
         };
+        let requested = std::path::PathBuf::from(&p.file_path);
         let path = {
-            let raw = std::path::PathBuf::from(&p.file_path);
+            let raw = requested.clone();
             let resolved = if raw.is_absolute() {
                 raw
             } else {
@@ -114,7 +115,7 @@ impl Tool for NotebookEditTool {
         };
         let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
         let policy = crate::security::write_policy(ctx).await;
-        match permissions::path_safety::check_write(&path, &policy) {
+        match permissions::path_safety::check_write_for(&requested, &path, &policy) {
             Ok(_) => PermissionDecision::allow(),
             Err(permissions::path_safety::PathSafetyError::OutsideAllowedRoots { .. }) => {
                 PermissionDecision::Ask {

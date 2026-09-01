@@ -179,3 +179,142 @@ async fn a_project_reached_through_a_symlink_is_still_the_project() {
         "both sides have to be resolved by the same filesystem: {d:?}"
     );
 }
+
+// ── the layer above: the gate that actually asks the tool ──
+//
+// Everything above builds its own `ToolContext`. Production does not: the
+// permission gate builds one, and for a long time it built a bare one — so a
+// control list configured in settings was read, carried, and dropped one call
+// short of the decision it governs. Which is the same shape as the defect
+// this whole file exists for, one layer up.
+
+use base::interface::permission::{Permission, PermissionOutcome};
+
+fn settings_allowing(paths: Vec<PathBuf>) -> base::interface::settings::Settings {
+    let mut s = base::interface::settings::Settings::defaults_for("test-model");
+    s.sandbox.allow_write = paths;
+    s
+}
+
+async fn gate_decision(
+    settings: &base::interface::settings::Settings,
+    cwd: &std::path::Path,
+    path: &std::path::Path,
+) -> PermissionOutcome {
+    let registry = std::sync::Arc::new(base::interface::tool::InMemoryToolRegistry::new());
+    registry.register(std::sync::Arc::new(tools::file_write::FileWriteTool));
+    let gate = permissions::rule_set_permission::RuleSetPermission::from_settings(
+        settings,
+        base::permission::PermissionMode::Default,
+        registry,
+        [],
+    );
+    gate.check(
+        "Write",
+        &serde_json::json!({ "file_path": path.display().to_string(), "content": "x" }),
+        cwd,
+        "s1",
+    )
+    .await
+}
+
+/// The default list reaches the real decision.
+#[tokio::test]
+async fn the_gate_refuses_a_credential_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = gate_decision(
+        &settings_allowing(vec![]),
+        dir.path(),
+        &dir.path().join(".env"),
+    )
+    .await;
+    assert!(
+        matches!(outcome, PermissionOutcome::Deny { .. }),
+        "{outcome:?}"
+    );
+}
+
+/// And so does the exemption. Without this the control list is configurable
+/// everywhere except where it is consulted.
+#[tokio::test]
+async fn the_gate_honours_a_configured_exemption() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(".env.example");
+    let outcome = gate_decision(
+        &settings_allowing(vec![target.clone()]),
+        dir.path(),
+        &target,
+    )
+    .await;
+    assert!(
+        !matches!(outcome, PermissionOutcome::Deny { .. }),
+        "a setting that never reaches the gate is a setting that does nothing: {outcome:?}"
+    );
+}
+
+// ── the two review findings that broke real work ──
+
+/// A sub-agent's worktree lives at `<repo>/.atta/worktrees/<slug>` and is its
+/// cwd. Guarding the `.atta` directory by name denied every write the
+/// sub-agent was created to make — while the thing actually worth guarding is
+/// the settings file, which is one name in that directory rather than all of
+/// them.
+#[tokio::test]
+async fn a_sub_agent_can_write_inside_its_worktree() {
+    let repo = tempfile::tempdir().unwrap();
+    let worktree = repo.path().join(".atta/worktrees/feature");
+    std::fs::create_dir_all(&worktree).unwrap();
+
+    let d = write_decision(&ctx_in(&worktree), &worktree.join("src/main.rs")).await;
+    assert!(
+        matches!(d, PermissionDecision::Allow { .. }),
+        "the worktree is the sub-agent's project: {d:?}"
+    );
+}
+
+/// And the thing that guarding `.atta` was for still holds.
+#[tokio::test]
+async fn the_engines_own_settings_stay_guarded() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".atta")).unwrap();
+    for name in [".atta/settings.json", ".atta/settings.local.json"] {
+        let d = write_decision(&ctx_in(repo.path()), &repo.path().join(name)).await;
+        assert!(denied(&d), "{name}: {d:?}");
+    }
+    // A file that merely lives beside them is not the settings.
+    assert!(matches!(
+        write_decision(&ctx_in(repo.path()), &repo.path().join(".atta/notes.md")).await,
+        PermissionDecision::Allow { .. }
+    ));
+}
+
+/// macOS hands back the name as the filesystem stores it, and anything
+/// created through Cocoa is stored decomposed. Running the normalization
+/// check on that answer refuses an ordinary file for being an attack; it
+/// belongs on the path the model asked for.
+#[tokio::test]
+async fn a_file_whose_name_is_decomposed_on_disk_is_still_editable() {
+    let dir = tempfile::tempdir().unwrap();
+    // On disk decomposed, which is how anything created through Cocoa is
+    // stored; asked for composed, which is how it displays and therefore how
+    // the model refers to it. macOS resolves one to the other, so the check
+    // sees a composed request and a decomposed answer.
+    std::fs::write(dir.path().join("cafe\u{301}.txt"), b"x").unwrap();
+    let composed = dir.path().join("caf\u{e9}.txt");
+
+    let d = write_decision(&ctx_in(dir.path()), &composed).await;
+    assert!(
+        matches!(d, PermissionDecision::Allow { .. }),
+        "an ordinary file the user asked to edit: {d:?}"
+    );
+}
+
+/// The protection it was there for is on the request, where it belongs: a
+/// path the model supplies whose normalization differs from what it displays
+/// as is still refused.
+#[tokio::test]
+async fn a_decomposed_path_the_model_supplies_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = write_decision(&ctx_in(dir.path()), &dir.path().join("nue\u{301}vo.txt")).await;
+    assert!(denied(&d), "{d:?}");
+}

@@ -199,7 +199,8 @@ impl Tool for FileEditTool {
     async fn check_permissions(&self, input: &Value, ctx: &ToolContext) -> PermissionDecision {
         // 1. 路径安全（与 Write 同款）
         if let Ok(parsed) = serde_json::from_value::<FileEditInput>(input.clone()) {
-            let path = if PathBuf::from(&parsed.file_path).is_absolute() {
+            let requested = PathBuf::from(&parsed.file_path);
+            let path = if requested.is_absolute() {
                 PathBuf::from(parsed.file_path)
             } else {
                 ctx.cwd.join(parsed.file_path)
@@ -207,7 +208,7 @@ impl Tool for FileEditTool {
             let path = crate::security::normalize_path_lexically(&path);
             let path = ctx.exec.filesystem.canonicalize_best_effort(&path).await;
             let policy = crate::security::write_policy(ctx).await;
-            match permissions::path_safety::check_write(&path, &policy) {
+            match permissions::path_safety::check_write_for(&requested, &path, &policy) {
                 Ok(()) => {
                     return PermissionDecision::Allow {
                         decision_reason: Some("project_write".into()),
