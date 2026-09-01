@@ -22,6 +22,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          # The wasm-host tests build a real component from
+          # `tests/fixtures/wasm_echo_plugin` — the claims they check are about
+          # the whole path to a guest, so there is no version of them that does
+          # not need the target.
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
 
       # Both are clean today, and the gate is the only thing that keeps them
