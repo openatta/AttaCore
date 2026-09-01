@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 rpc-client    = { workspace = true }
+daemon        = { workspace = true }
 base          = { workspace = true }
 runtime       = { workspace = true }
 model         = { workspace = true }

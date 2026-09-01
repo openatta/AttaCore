@@ -235,14 +235,21 @@ mod tests {
             ),
         )
         .await;
-        // 两种可接受结果：ping 内部超时 / 请求 5s 内 abort
+        // 三种可接受结果：外层超时 / ping 自己返错 / 被中间人接管后回了个
+        // 5xx——最后这种在装了代理的机器上是常态，而一个 5xx 同样说明那个
+        // 地址没被真的连通，把它当失败会让这个用例在这类机器上必红。
         match r {
             Err(_) => {}     // outer timeout — 一定算"未成功联通"
             Ok(Err(_)) => {} // ping 自己返错
-            Ok(Ok(res)) => panic!(
-                "expected ToolError or outer timeout, got success: {:?}",
-                res
-            ),
+            Ok(Ok(res)) => {
+                let text = format!("{res:?}");
+                let hijacked = (500..600).any(|code| text.contains(&format!("HTTP {code}")));
+                assert!(
+                    hijacked,
+                    "expected ToolError, an outer timeout, or a 5xx from whatever \
+                     intercepted the request, got: {text}"
+                );
+            }
         }
     }
 }

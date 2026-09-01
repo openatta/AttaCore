@@ -4,6 +4,18 @@
 //! + 提交的插件源码目录，不是 daemon crate 内部直接调用 + 内联现造的 zip。
 //!
 //! `#[ignore]`：拉子进程，比纯单测慢；`cargo test -- --ignored` 显式跑。
+//!
+//! **要一个带插件载体的 daemon。** `scripts` 和 `plugins` 是互斥 feature，而
+//! `scripts` 是默认的——所以默认构建出来的 `attacored` 会把 `plugin.*` 全部回
+//! 成「compiled-out」，这个用例在那种构建上不可能通过。碰到这种情况它会说清楚
+//! 怎么跑然后停下，而不是报一个和插件毫无关系的红：
+//!
+//! ```sh
+//! cargo build -p daemon --no-default-features --features plugins \
+//!   --target-dir target/plugins
+//! ATTA_PLUGIN_DAEMON=target/plugins/debug/attacored \
+//!   cargo test -p test-runner --test plugin_lifecycle_smoke -- --ignored
+//! ```
 
 use rpc_client::DaemonRpcClient;
 use std::path::PathBuf;
@@ -12,15 +24,25 @@ use std::process::Stdio;
 #[tokio::test]
 #[ignore]
 async fn plugin_install_list_uninstall_round_trips() {
-    let status = std::process::Command::new("cargo")
-        .args(["build", "-p", "daemon", "--quiet"])
-        .status()
-        .expect("failed to invoke cargo build -p daemon");
-    assert!(status.success(), "cargo build -p daemon failed");
-    let daemon_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/attacored")
-        .canonicalize()
-        .expect("attacored binary should exist after build");
+    // A daemon built somewhere else, when the caller has one with the plugin
+    // carrier compiled in. Building it here instead would overwrite the
+    // default-featured binary every other test uses.
+    let daemon_binary = match std::env::var("ATTA_PLUGIN_DAEMON") {
+        Ok(path) => PathBuf::from(path)
+            .canonicalize()
+            .expect("ATTA_PLUGIN_DAEMON does not point at a binary"),
+        Err(_) => {
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "daemon", "--quiet"])
+                .status()
+                .expect("failed to invoke cargo build -p daemon");
+            assert!(status.success(), "cargo build -p daemon failed");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/debug/attacored")
+                .canonicalize()
+                .expect("attacored binary should exist after build")
+        }
+    };
 
     let tmp = std::env::temp_dir().join(format!("atta_plugin_smoke_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -81,6 +103,17 @@ async fn plugin_install_list_uninstall_round_trips() {
         )
         .await
         .expect("plugin.install RPC");
+    if install_resp
+        .error
+        .as_ref()
+        .is_some_and(|e| e.code == daemon::rpc::codes::PLUGINS_DISABLED)
+    {
+        eprintln!(
+            "skipping: this `attacored` carries no plugin subsystem. See this \
+             file's header for how to build one and point ATTA_PLUGIN_DAEMON at it."
+        );
+        return;
+    }
     assert!(
         install_resp.error.is_none(),
         "plugin.install failed: {:?}",

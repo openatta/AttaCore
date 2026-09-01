@@ -25,9 +25,9 @@ Thumbs.db
 # Test output (generated, not committed)
 tests/output/
 
-# VCR cassette cache (local/CI-only; see docs/TESTING_GUIDE.md — request hashes bake
-# in exact model name + prompt + tool set, so committed cassettes would go stale on
-# every prompt/model change and produce unreviewable binary-ish diffs)
+# VCR cassette cache (local/CI-only; see tests/README.md — a recording bakes in
+# the exact model name, prompt and tool table, so a committed one goes stale on
+# every prompt/model change and produces unreviewable binary-ish diffs)
 tests/fixtures/cassettes/
 
 # Environment
