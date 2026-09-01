@@ -575,6 +575,7 @@ mod tests {
                 assert!(cmd.spec.args.iter().any(|a| a == "--ro-bind"));
                 assert!(cmd.spec.args.iter().any(|a| a == "/tmp/work"));
                 let bash_pos = cmd
+                    .spec
                     .args
                     .iter()
                     .position(|a| a == "bash")
@@ -600,6 +601,7 @@ mod tests {
         }
         let needle = "/tmp/work/.atta/settings.json".to_string();
         let pos = cmd
+            .spec
             .args
             .iter()
             .position(|a| a == &needle)
@@ -608,6 +610,7 @@ mod tests {
         // Source == dest for a self-remount, and settings.local.json gets the same treatment.
         assert_eq!(cmd.spec.args[pos + 1], needle);
         assert!(cmd
+            .spec
             .args
             .iter()
             .any(|a| a == "/tmp/work/.atta/settings.local.json"));
@@ -625,6 +628,7 @@ mod tests {
         };
         let home_str = std::path::Path::new(&home).display().to_string();
         assert!(cmd
+            .spec
             .args
             .iter()
             .any(|a| a == &format!("{home_str}/.atta/settings.json")));
@@ -1071,6 +1075,7 @@ mod tests {
     /// writable — which is a sandbox escape, since settings.json is where the
     /// permission rules live.
     #[test]
+    #[cfg(target_os = "macos")]
     fn the_profile_protects_the_instance_root_it_was_given() {
         let policy = SandboxPolicy {
             state_root: Some(PathBuf::from("/srv/atta-state")),
@@ -1100,6 +1105,7 @@ mod tests {
     /// No root given: fall back to the conventional location rather than
     /// protecting nothing.
     #[test]
+    #[cfg(target_os = "macos")]
     fn without_a_root_it_falls_back_to_the_conventional_home_path() {
         let Some(home) = std::env::var_os("HOME") else {
             return;
