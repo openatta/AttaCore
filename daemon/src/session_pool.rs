@@ -2610,9 +2610,14 @@ impl SessionPool {
     /// they're sub-agent/team-member transcripts, not something a user
     /// browsing their conversation list should see. `parent_session_id`,
     /// when given, ignores `include_children` entirely and instead returns
-    /// exactly that session's sidechains (delegating to
+    /// every session recording that one as its parent (delegating to
     /// `HistoryStore::child_sessions`, the same path `agent.list`'s
     /// post-restart fallback uses).
+    ///
+    /// Each child reports its own recorded `session_kind`. Both a sidechain
+    /// and a fork name a parent, and answering `sidechain` for all of them
+    /// makes a fork look like something the parent's `session.close` is about
+    /// to delete.
     pub async fn list_all(
         &self,
         include_children: bool,
@@ -2633,7 +2638,8 @@ impl SessionPool {
             for sid in children {
                 let sid_str = sid.to_string();
                 let active = active_ids.contains(&sid_str);
-                let (_, _, resumable) = self.session_kind_parent_and_resumable(&sid_str).await;
+                let (session_kind, _, resumable) =
+                    self.session_kind_parent_and_resumable(&sid_str).await;
                 out.push(SessionInfo {
                     session_id: sid_str,
                     name: None,
@@ -2646,7 +2652,7 @@ impl SessionPool {
                     } else {
                         SessionStatus::Inactive
                     },
-                    session_kind: history::entry::SessionKind::Sidechain,
+                    session_kind,
                     parent_session_id: Some(parent.to_string()),
                     resumable,
                 });
@@ -2775,12 +2781,22 @@ impl SessionPool {
         result
     }
 
-    /// `parent_session_id`'s children, or `[]` if there's no history store
-    /// or the scan itself fails — logged either way so `session.close`/
-    /// `.delete` reporting "0 sidechains" is distinguishable in the daemon
-    /// log from "there genuinely were none" instead of silently looking the
-    /// same as the empty case.
-    async fn fetch_child_sessions(&self, parent_session_id: &str) -> Vec<base::session::SessionId> {
+    /// `parent_session_id`'s **sidechains**, or `[]` if there's no history
+    /// store or the scan itself fails — logged either way so
+    /// `session.close`/`.delete` reporting "0 sidechains" is distinguishable
+    /// in the daemon log from "there genuinely were none" instead of silently
+    /// looking the same as the empty case.
+    ///
+    /// Children are filtered by `session_kind`, not taken whole.
+    /// `parent_session_id` records two different relationships: a sidechain,
+    /// which the parent spawned and which cannot outlive it, and a fork,
+    /// which merely records where it was copied from. Cascading over the raw
+    /// child list deletes the forks too, which is the opposite of what a fork
+    /// is for.
+    async fn fetch_child_sidechains(
+        &self,
+        parent_session_id: &str,
+    ) -> Vec<base::session::SessionId> {
         let Some(ref store) = self.history_store else {
             return Vec::new();
         };
@@ -2792,7 +2808,7 @@ impl SessionPool {
         // whether the session actually has any. Accepted as-is: `delete_session`
         // (this function's other caller) shares this one scan rather than
         // running it twice, which was the fixable half of the cost.
-        match store.child_sessions(parent_session_id).await {
+        let children = match store.child_sessions(parent_session_id).await {
             Ok(children) => children,
             Err(e) => {
                 warn!(
@@ -2800,9 +2816,19 @@ impl SessionPool {
                     error = %e,
                     "failed to scan for child sessions; reporting no sidechains"
                 );
-                Vec::new()
+                return Vec::new();
+            }
+        };
+        let mut sidechains = Vec::with_capacity(children.len());
+        for child in children {
+            let (kind, _, _) = self
+                .session_kind_parent_and_resumable(&child.to_string())
+                .await;
+            if matches!(kind, history::entry::SessionKind::Sidechain) {
+                sidechains.push(child);
             }
         }
+        sidechains
     }
 
     /// Cancel (if live) and delete each of `children`, one `with_session_lock`
@@ -2885,7 +2911,7 @@ impl SessionPool {
     /// is logged and left for the startup GC to clean up later (N1) — it
     /// never fails `session.close` itself.
     pub async fn shutdown_session(&self, session_id: &str) -> usize {
-        let children = self.fetch_child_sessions(session_id).await;
+        let children = self.fetch_child_sidechains(session_id).await;
         self.shutdown_session_with_children(session_id, children)
             .await
     }
@@ -2913,7 +2939,7 @@ impl SessionPool {
         // takes this same `Vec` instead of re-scanning, which used to mean
         // a second full `child_sessions` pass (and a window where the two
         // scans could disagree) on every non-dry-run delete.
-        let children = self.fetch_child_sessions(session_id).await;
+        let children = self.fetch_child_sidechains(session_id).await;
         let sidechain_ids: Vec<String> = children.iter().map(|id| id.to_string()).collect();
 
         if dry_run {
@@ -3100,6 +3126,11 @@ impl SessionPool {
     /// `Meta` line is replaced with a fresh one recording
     /// `parent_session_id`, which is what makes the lineage queryable via
     /// `HistoryStore::child_sessions`.
+    ///
+    /// The fork records `session_kind: Primary`, and everything that walks
+    /// the child list has to honour that. `parent_session_id` answers "where
+    /// did this come from", which a sidechain and a fork answer the same way
+    /// while meaning opposite things about who may delete whom.
     pub async fn fork_session(
         &self,
         session_id: &str,

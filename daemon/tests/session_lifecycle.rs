@@ -755,6 +755,80 @@ async fn forked_session_records_its_parent_on_disk() {
     srv.stop().await;
 }
 
+#[tokio::test]
+async fn closing_a_session_does_not_delete_what_was_forked_from_it() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("a")], ask_settings(), Duration::ZERO).await;
+    let original = run_turn(&srv.sock, None, "root").await;
+
+    let fork = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.fork","params":{{"session_id":"{original}"}},"id":2}}"#
+        ),
+    )
+    .await;
+    let fork_id = fork["result"]["session_id"].as_str().unwrap().to_string();
+
+    // A fork records its source in `parent_session_id` so the lineage stays
+    // queryable, but it is nobody's sidechain: closing the source must leave
+    // it alone, which is the whole point of forking.
+    let closed = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.close","params":{{"session_id":"{original}"}},"id":3}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        closed["result"]["sidechains_deleted"], 0,
+        "a fork is not a sidechain: {closed}"
+    );
+
+    let sid = base::session::SessionId::parse(&fork_id).unwrap();
+    assert!(
+        srv.store.load(sid).await.is_ok(),
+        "the fork's transcript must survive its source being closed"
+    );
+
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn listing_by_parent_reports_each_child_as_what_it_is() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("a")], ask_settings(), Duration::ZERO).await;
+    let original = run_turn(&srv.sock, None, "root").await;
+
+    let fork = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.fork","params":{{"session_id":"{original}"}},"id":2}}"#
+        ),
+    )
+    .await;
+    let fork_id = fork["result"]["session_id"].as_str().unwrap().to_string();
+
+    let listed = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.list","params":{{"parent_session_id":"{original}"}},"id":3}}"#
+        ),
+    )
+    .await;
+    let sessions = listed["result"]["sessions"].as_array().unwrap();
+    let entry = sessions
+        .iter()
+        .find(|s| s["session_id"] == fork_id.as_str())
+        .unwrap_or_else(|| panic!("the fork should be listed under its source: {listed}"));
+    assert_eq!(
+        entry["session_kind"], "primary",
+        "a fork listed under its source must not be reported as a sidechain: {listed}"
+    );
+
+    srv.stop().await;
+}
+
 // ── session.resume ──────────────────────────────────────────────────────
 
 #[tokio::test]
