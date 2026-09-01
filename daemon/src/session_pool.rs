@@ -1616,6 +1616,12 @@ impl SessionPool {
             for h in &bound.retrieval_hooks {
                 builder = builder.retrieval_hook(h.clone());
             }
+            for m in &bound.tool_middleware {
+                builder = builder.tool_middleware(m.clone());
+            }
+            for i in &bound.model_interceptors {
+                builder = builder.model_interceptor(i.clone());
+            }
             builder = builder.script_carriers(bound.carriers);
         }
         #[cfg(not(feature = "scripts"))]

@@ -417,8 +417,11 @@ pub mod bindings {
         "prompt.block",
         "prompt.context",
         "prompt.variable",
+        "tool.around",
         "tool.result",
         "memory.retrieval_hook",
+        "model.request",
+        "model.message",
     ];
 
     /// What a set of bindings produced, sorted by where each piece has to be
@@ -446,6 +449,11 @@ pub mod bindings {
         pub tool_results: Vec<Arc<dyn base::interface::tool_result::ToolResultTransformer>>,
         /// Both ends of memory recall.
         pub retrieval_hooks: Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>,
+        /// A ring in front of every tool call.
+        pub tool_middleware: Vec<Arc<dyn base::interface::tool_middleware::ToolMiddleware>>,
+        /// The request on its way out and the message on its way back.
+        pub model_interceptors:
+            Vec<Arc<dyn base::interface::model_interceptor::ModelInterceptor>>,
         /// Every carrier that was built, so a turn can reset their quotas.
         ///
         /// Without this the per-turn budget is a per-session one: nothing
@@ -462,6 +470,8 @@ pub mod bindings {
                 .field("prompt_variables", &self.prompt_variables.len())
                 .field("tool_results", &self.tool_results.len())
                 .field("retrieval_hooks", &self.retrieval_hooks.len())
+                .field("tool_middleware", &self.tool_middleware.len())
+                .field("model_interceptors", &self.model_interceptors.len())
                 .finish()
         }
     }
@@ -471,6 +481,8 @@ pub mod bindings {
             !self.registers_on_prompt_registry()
                 && self.tool_results.is_empty()
                 && self.retrieval_hooks.is_empty()
+                && self.tool_middleware.is_empty()
+                && self.model_interceptors.is_empty()
         }
 
         /// Whether [`apply_to_registry`](Self::apply_to_registry) has anything
@@ -647,6 +659,24 @@ pub mod bindings {
                         &binding.entry,
                     ),
                 ),
+                "tool.around" => out.tool_middleware.push(Arc::new(
+                    base::interface::script_adapters::ToolAroundScript::new(
+                        carrier,
+                        &binding.entry,
+                    ),
+                )),
+                "model.request" => out.model_interceptors.push(Arc::new(
+                    base::interface::script_adapters::ModelRequestScript::new(
+                        carrier,
+                        &binding.entry,
+                    ),
+                )),
+                "model.message" => out.model_interceptors.push(Arc::new(
+                    base::interface::script_adapters::ModelMessageScript::new(
+                        carrier,
+                        &binding.entry,
+                    ),
+                )),
                 "memory.retrieval_hook" => out.retrieval_hooks.push(Arc::new(
                     base::interface::script_adapters::RetrievalHookScript::new(
                         carrier,
@@ -1146,6 +1176,173 @@ mod binding_tests {
         let mut names = vec!["kept".to_string()];
         bound.retrieval_hooks[0].after_retrieve(&request, &mut names);
         assert_eq!(names, ["kept"]);
+    }
+
+
+
+    /// The ring around a tool call, end to end. A script refuses a call and
+    /// the tool never runs — the acceptance case for a point whose whole
+    /// value is deciding before dispatch rather than after.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_refuses_a_tool_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("guard.js"),
+            "function onTool(c) {\n\
+               if (c.input.file_path.indexOf('id_rsa') >= 0) {\n\
+                 return { action: 'deny', reason: 'not that file' };\n\
+               }\n\
+               return null;\n\
+             }",
+        )
+        .unwrap();
+
+        let mut b = binding("guard.js");
+        b.point = "tool.around".into();
+        b.entry = "onTool".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding is valid");
+        assert_eq!(bound.tool_middleware.len(), 1);
+
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let outcome = |path: &str| {
+            let chain = bound.tool_middleware.clone();
+            let call = base::interface::tool_middleware::ToolCall {
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": path}),
+            };
+            let dispatched = dispatched.clone();
+            async move {
+                base::interface::tool_middleware::dispatch_through(
+                    &chain,
+                    call,
+                    tokio_util::sync::CancellationToken::new(),
+                    move |_| {
+                        let dispatched = dispatched.clone();
+                        async move {
+                            dispatched.fetch_add(1, Ordering::SeqCst);
+                            Ok(("the file".to_string(), None))
+                        }
+                    },
+                )
+                .await
+            }
+        };
+
+        assert_eq!(
+            outcome("~/.ssh/id_rsa").await,
+            Err("not that file".to_string())
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome("a.txt").await, Ok(("the file".to_string(), None)));
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+
+    /// The request point, end to end and through the blocking path: a script
+    /// takes the tool set down to what it wants and leaves everything it did
+    /// not name.
+    #[test]
+    fn a_script_narrows_a_request() {
+        let project = tempdir();
+        std::fs::write(
+            project.join("request.js"),
+            "function onRequest(r) {\n\
+               return { maxTokens: 512, tools: r.tools.filter(function (t) { return t === 'Read'; }) };\n\
+             }",
+        )
+        .unwrap();
+
+        let mut b = binding("request.js");
+        b.point = "model.request".into();
+        b.entry = "onRequest".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding is valid");
+        assert_eq!(bound.model_interceptors.len(), 1);
+
+        let mut request = base::interface::model_interceptor::ModelRequestView {
+            prompt_blocks: Vec::new(),
+            tool_defs: ["Read", "Write", "Bash"]
+                .into_iter()
+                .map(|name| base::interface::model::ToolDef {
+                    name: name.into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                    source: None,
+                })
+                .collect(),
+            messages: Vec::new(),
+            params: base::interface::model::StreamParams {
+                model: "claude-opus-5".into(),
+                max_tokens: 8192,
+                thinking_mode: base::settings::ThinkingMode::Auto,
+                fallback_model: None,
+                cache_edits: Vec::new(),
+                origin: None,
+                input_map: None,
+            },
+        };
+        bound.model_interceptors[0].on_request(&mut request);
+
+        assert_eq!(request.params.max_tokens, 512);
+        assert_eq!(request.params.model, "claude-opus-5");
+        let names: Vec<&str> = request.tool_defs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Read"]);
+    }
+
+
+    /// The message point, end to end. A script redacts the text and the
+    /// thinking block beside it — signature and all — is not its to touch.
+    #[test]
+    fn a_script_redacts_a_message_without_reaching_its_thinking() {
+        use base::interface::model::{MessageRole, ModelContentBlock, ModelMessage};
+
+        let project = tempdir();
+        std::fs::write(
+            project.join("message.js"),
+            "function onMessage(m) {\n\
+               return m.text.map(function (t) { return t.replace('hunter2', '[redacted]'); });\n\
+             }",
+        )
+        .unwrap();
+
+        let mut b = binding("message.js");
+        b.point = "model.message".into();
+        b.entry = "onMessage".into();
+
+        let engine: Arc<dyn ScriptEngine> = Arc::new(QuickJsEngine::new());
+        let bound = bind(engine, &[b], &project).expect("the binding is valid");
+        assert_eq!(bound.model_interceptors.len(), 1);
+
+        let mut message = ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![
+                ModelContentBlock::Thinking {
+                    text: "the key is hunter2".into(),
+                    signature: "sig-abc".into(),
+                },
+                ModelContentBlock::Text {
+                    text: "the key is hunter2".into(),
+                },
+            ],
+        };
+        bound.model_interceptors[0].on_message(&mut message);
+
+        match &message.content[0] {
+            ModelContentBlock::Thinking { text, signature } => {
+                assert_eq!(text, "the key is hunter2", "thinking is not reachable");
+                assert_eq!(signature, "sig-abc");
+            }
+            other => panic!("the thinking block was replaced: {other:?}"),
+        }
+        match &message.content[1] {
+            ModelContentBlock::Text { text } => assert_eq!(text, "the key is [redacted]"),
+            other => panic!("the text block was replaced by something else: {other:?}"),
+        }
     }
 
 }

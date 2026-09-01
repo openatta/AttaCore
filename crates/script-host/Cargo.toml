@@ -18,4 +18,5 @@ tracing     = { workspace = true }
 rquickjs    = { workspace = true }
 
 [dev-dependencies]
+tokio-util  = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

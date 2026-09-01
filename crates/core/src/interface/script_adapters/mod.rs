@@ -32,10 +32,16 @@
 //! process model. And `script.carrier` is the carrier itself.
 
 mod memory_retrieval;
+mod model_message;
+mod model_request;
 mod prompt_contributions;
+mod tool_around;
 mod tool_result;
 
 pub use memory_retrieval::RetrievalHookScript;
+pub use model_message::ModelMessageScript;
+pub use model_request::ModelRequestScript;
+pub use tool_around::ToolAroundScript;
 pub use prompt_contributions::{
     prompt_block_from_script, prompt_context_from_script, prompt_variable_from_script,
 };
