@@ -3,9 +3,13 @@
 //! 向用户发送桌面通知。在 macOS 上通过 osascript 的 `display notification` 实
 //! 现；其他平台回退到 stderr 输出。如果 Remote Control 连接，也推送到手机。
 
-use crate::exec_capture::capture;
 use async_trait::async_trait;
 use base::error::ToolError;
+// Only the macOS path runs a program; elsewhere the notification goes to
+// stderr, and importing these unconditionally makes them unused there.
+#[cfg(target_os = "macos")]
+use crate::exec_capture::capture;
+#[cfg(target_os = "macos")]
 use base::interface::exec::ProcessSpec;
 use base::tool::{
     PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext, ToolResult,
