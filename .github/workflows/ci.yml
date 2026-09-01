@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Incremental caching buys nothing on a fresh runner and costs disk, which
+  # is the resource this workspace is short of — a clean build is ~13 GB
+  # because every integration test file links the whole dependency graph.
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Clean today, and the only way it stays that way.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      # The ignored set is where the slow cases live — a real daemon, a real
+      # MCP server over stdio, the schema the documents are generated from.
+      # They are ignored because they are slow, not because they are optional,
+      # and nothing else runs them.
+      #
+      # `--all-targets` excludes doc tests, which is the point: a ```ignore
+      # block in a doc comment is illustration, not a test somebody forgot to
+      # switch on, and it does not compile on its own.
+      - name: test (ignored)
+        run: cargo test --workspace --all-targets -- --ignored
+
+  carriers:
+    # A build carries one extension carrier, or none. Each configuration is a
+    # build nobody makes by accident, so each is one nobody would notice
+    # breaking.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: no carrier
+        run: cargo check -p daemon --no-default-features
+
+      - name: plugin carrier
+        run: cargo check -p daemon --no-default-features --features plugins
+
+      - name: both carriers must not compile
+        run: |
+          if cargo check -p daemon --features plugins 2>/dev/null; then
+            echo "the two carriers compiled together; the guard in daemon/src/lib.rs is gone"
+            exit 1
+          fi
+
+# Formatting is deliberately not gated. `cargo fmt --check` currently reports
+# 245 differences across 75 files, and reformatting them in one commit would
+# rewrite the blame of most of the repository to settle a question nobody has
+# asked. Gate it the day the tree is clean, not before.
