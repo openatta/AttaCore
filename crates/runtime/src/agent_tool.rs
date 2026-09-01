@@ -1380,6 +1380,37 @@ impl Inner {
     /// "code-reviewer", etc. — a different axis entirely), so the lookup
     /// key here is always the literal `"subagent"` task type regardless of
     /// which `subagent_type` was requested.
+    /// Everything a delegated session inherits from the one that spawned it.
+    ///
+    /// Written once because the list is not derivable from anything: each item
+    /// is on it because somebody noticed it was missing, and the noticing
+    /// happened once per item — a transcript that was not persisted, telemetry
+    /// dropped on the floor, a policy that stopped at the first delegation. A
+    /// fifth spawn site copying three of the four is the shape every one of
+    /// those had.
+    ///
+    /// Deliberately not here: what a delegate decides for itself — its scene,
+    /// its model, its tool set, its depth, its own settings. Those differ per
+    /// spawn site, which is why they stay at the call sites.
+    fn inherited_by_a_delegate(&self, mut builder: Builder) -> Builder {
+        // A policy that stops at the first delegation is not a policy; the
+        // prompt contributions stay behind. See `BoundScripts::for_delegate`.
+        if let Some(scripts) = &self.delegate_scripts {
+            builder = builder.bound_scripts(scripts.for_delegate());
+        }
+        // Its own session id keeps a delegate's transcript in a file of its
+        // own rather than mixed into the parent's.
+        if let Some(store) = self.history_store() {
+            builder = builder.history_store(store);
+        }
+        // Without this, every event a delegate produces — tool timings,
+        // permission decisions, cost — goes to `Builder::build()`'s noop.
+        if let Some(handle) = self.telemetry_handle() {
+            builder = builder.telemetry_handle(handle);
+        }
+        builder
+    }
+
     fn model_for_subagent(&self) -> Arc<dyn Model> {
         match &self.task_router {
             Some(router) => router.model_for("subagent"),
@@ -2295,25 +2326,10 @@ impl AgentTool {
             .settings(settings.clone())
             .agent_depth(child_depth)
             .permission(perm);
-        // The operator's policy scripts follow the delegate — see
-        // `BoundScripts::for_delegate`. Without this, spawning is a way
-        // around every rule they wrote, chosen by the model.
-        if let Some(scripts) = &self.inner.delegate_scripts {
-            builder = builder.bound_scripts(scripts.for_delegate());
-        }
         // S-4: persist the sub-agent's transcript. Its own fresh session id
         // keeps it in a separate JSONL file from the parent's.
         let history_store = self.inner.history_store();
-        if let Some(store) = history_store.clone() {
-            builder = builder.history_store(store);
-        }
-        // §5.5: inherit the parent's telemetry handle instead of falling
-        // back to Builder::build()'s noop default — otherwise every event
-        // this sub-agent produces (tool timings, permission decisions,
-        // cost) is silently dropped.
-        if let Some(handle) = self.inner.telemetry_handle() {
-            builder = builder.telemetry_handle(handle);
-        }
+        builder = self.inner.inherited_by_a_delegate(builder);
         let (mut agent, mut event_rx, input_tx) = builder
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
@@ -2539,18 +2555,8 @@ impl AgentTool {
         // The operator's policy scripts follow the delegate — see
         // `BoundScripts::for_delegate`. Without this, spawning is a way
         // around every rule they wrote, chosen by the model.
-        if let Some(scripts) = &self.inner.delegate_scripts {
-            builder = builder.bound_scripts(scripts.for_delegate());
-        }
-        // S-4/§5.2: persist team members' transcripts too — same rationale
-        // as `run_sub_tagged`/`run_sub_inner`, previously missing here.
         let history_store = self.inner.history_store();
-        if let Some(store) = history_store.clone() {
-            builder = builder.history_store(store);
-        }
-        if let Some(handle) = self.inner.telemetry_handle() {
-            builder = builder.telemetry_handle(handle);
-        }
+        builder = self.inner.inherited_by_a_delegate(builder);
         let built = builder
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
@@ -2858,19 +2864,8 @@ impl AgentTool {
             .settings(settings.clone())
             .agent_depth(child_depth)
             .permission(perm);
-        // The operator's policy scripts follow the delegate — see
-        // `BoundScripts::for_delegate`. Without this, spawning is a way
-        // around every rule they wrote, chosen by the model.
-        if let Some(scripts) = &inner.delegate_scripts {
-            builder = builder.bound_scripts(scripts.for_delegate());
-        }
         let history_store = inner.history_store();
-        if let Some(store) = history_store.clone() {
-            builder = builder.history_store(store);
-        }
-        if let Some(handle) = inner.telemetry_handle() {
-            builder = builder.telemetry_handle(handle);
-        }
+        builder = inner.inherited_by_a_delegate(builder);
         let (mut agent, mut event_rx, input_tx) = builder
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
@@ -3006,15 +3001,7 @@ impl AgentTool {
         // The operator's policy scripts follow the delegate — see
         // `BoundScripts::for_delegate`. Without this, spawning is a way
         // around every rule they wrote, chosen by the model.
-        if let Some(scripts) = &self.inner.delegate_scripts {
-            builder = builder.bound_scripts(scripts.for_delegate());
-        }
-        if let Some(store) = self.inner.history_store() {
-            builder = builder.history_store(store);
-        }
-        if let Some(handle) = self.inner.telemetry_handle() {
-            builder = builder.telemetry_handle(handle);
-        }
+        builder = self.inner.inherited_by_a_delegate(builder);
         let (mut agent, mut event_rx, input_tx) = builder
             .build()
             .map_err(|e| base::error::ToolError::Execution(anyhow!("build: {e}")))?;
