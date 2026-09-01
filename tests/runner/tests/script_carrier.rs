@@ -61,7 +61,17 @@ struct ScriptCase {
     /// to take something away: the mark above proves the script ran, this
     /// proves the removing half of it did.
     absent: Option<&'static str>,
-    turn: &'static str,
+    /// Bindings beyond the one under test, bound in both runs.
+    ///
+    /// A variable is only visible once some block references it, so proving
+    /// one expanded takes a second script to put `{{name}}` somewhere. Bound
+    /// in the unbound run too, so the two runs still differ in exactly the
+    /// script being tested.
+    also: &'static [(&'static str, &'static str, &'static str)],
+    /// One entry per user message, sent in order. More than one when the
+    /// mark only reaches the model as history — a script that rewrites an
+    /// assistant message changes the *next* request, not the one in flight.
+    turns: &'static [&'static str],
     replies: fn() -> Vec<Reply>,
     needs: Needs,
 }
@@ -74,7 +84,8 @@ fn cases() -> Vec<ScriptCase> {
             entry: "onAssemble",
             trace: "SCRIPT-TRACE-ASSEMBLE",
             absent: None,
-            turn: "hello",
+            also: &[],
+            turns: &["hello"],
             replies: || vec![Reply::Text("hi")],
             needs: Needs::Nothing,
         },
@@ -86,7 +97,8 @@ fn cases() -> Vec<ScriptCase> {
             // script was told which call it was looking at.
             trace: "SCRIPT-TRACE-RESULT(ScriptEcho)",
             absent: None,
-            turn: "use the tool",
+            also: &[],
+            turns: &["use the tool"],
             replies: || {
                 vec![
                     Reply::Tool {
@@ -110,9 +122,86 @@ fn cases() -> Vec<ScriptCase> {
             // Which the `after` half then dropped, though the rewritten
             // query found it too.
             absent: Some("secret-key-rotation"),
-            turn: "when can I ship this?",
+            also: &[],
+            turns: &["when can I ship this?"],
             replies: || vec![Reply::Text("on tuesday")],
             needs: Needs::Recall,
+        },
+        ScriptCase {
+            point: "prompt.block",
+            script: "prompt_block.js",
+            entry: "onBlock",
+            trace: "SCRIPT-TRACE-BLOCK",
+            absent: None,
+            also: &[],
+            turns: &["hello"],
+            replies: || vec![Reply::Text("hi")],
+            needs: Needs::Nothing,
+        },
+        ScriptCase {
+            point: "prompt.context",
+            script: "prompt_context.js",
+            entry: "onContext",
+            // The mark carries `cwd`, which the identity call cannot see —
+            // so a block that was registered with static text at bind time
+            // would arrive without it and this would fail.
+            trace: "SCRIPT-TRACE-CONTEXT: working in",
+            absent: None,
+            also: &[],
+            turns: &["hello"],
+            replies: || vec![Reply::Text("hi")],
+            needs: Needs::Nothing,
+        },
+        ScriptCase {
+            point: "prompt.variable",
+            script: "prompt_variable.js",
+            entry: "onVariable",
+            trace: "SCRIPT-TRACE-VARIABLE(",
+            absent: None,
+            // A variable nothing mentions expands nowhere, so a block that
+            // mentions it comes along.
+            also: &[("prompt_block_var.js", "prompt.block", "onBlock")],
+            turns: &["hello"],
+            replies: || vec![Reply::Text("hi")],
+            needs: Needs::Nothing,
+        },
+        ScriptCase {
+            point: "tool.around",
+            script: "tool_around.js",
+            entry: "onAround",
+            // The tool's own answer never appears, because the ring answered
+            // instead of dispatching — but `absent` means "in neither run",
+            // and the unbound run is exactly where the tool does answer. So
+            // the mark carries the proof on its own: nothing but this script
+            // produces it, and the model still got a result.
+            trace: "SCRIPT-TRACE-AROUND",
+            absent: None,
+            also: &[],
+            turns: &["use the tool"],
+            replies: || {
+                vec![
+                    Reply::Tool {
+                        id: "call-1",
+                        name: "ScriptEcho",
+                        input: serde_json::json!({"say": "anything"}),
+                    },
+                    Reply::Text("done"),
+                ]
+            },
+            needs: Needs::Nothing,
+        },
+        ScriptCase {
+            point: "model.message",
+            script: "model_message.js",
+            entry: "onMessage",
+            trace: "SCRIPT-TRACE-MESSAGE",
+            absent: None,
+            also: &[],
+            // Two turns: the mark is put on the *first* turn's reply, and
+            // only reaches the model as history on the second.
+            turns: &["hello", "and again"],
+            replies: || vec![Reply::Text("first answer"), Reply::Text("second answer")],
+            needs: Needs::Nothing,
         },
     ]
 }
@@ -171,14 +260,20 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
         scope: "code".into(),
     };
     settings.memory_enabled = case.needs == Needs::Recall;
+    let binding = |path: &str, point: &str, entry: &str| ScriptBinding {
+        path: path.into(),
+        point: point.into(),
+        entry: entry.into(),
+        timeout_ms: None,
+        calls_per_turn: None,
+    };
+    settings.scripts = case
+        .also
+        .iter()
+        .map(|(p, pt, e)| binding(p, pt, e))
+        .collect();
     if bind_scripts {
-        settings.scripts = vec![ScriptBinding {
-            path: case.script.into(),
-            point: case.point.into(),
-            entry: case.entry.into(),
-            timeout_ms: None,
-            calls_per_turn: None,
-        }];
+        settings.scripts.push(binding(case.script, case.point, case.entry));
     }
     let settings = Arc::new(settings);
 
@@ -210,26 +305,14 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
         ));
     }
 
-    // Mirrors `daemon/src/session_pool.rs`: each pile of adapters goes where
-    // that kind of extension lives. If a point is added there and not here,
-    // its case fails rather than quietly proving nothing.
+    // The same call the daemon makes. Installing adapters is `Builder`'s job
+    // precisely so this test cannot bind a point the session would not.
     if !settings.scripts.is_empty() {
         let engine: Arc<dyn base::interface::script::ScriptEngine> =
             Arc::new(script_host::QuickJsEngine::new());
         let bound = script_host::bindings::bind(engine, &settings.scripts, &fixtures())
             .unwrap_or_else(|e| panic!("case `{}`: {e}", case.point));
-        if !bound.assembly_hooks.is_empty() {
-            let prompts = base::interface::prompt_registry::InMemoryPromptRegistry::new();
-            bound.apply_to_registry(prompts.as_ref());
-            builder = builder.prompt_registry(prompts);
-        }
-        for t in &bound.tool_results {
-            builder = builder.tool_result_transformer(t.clone());
-        }
-        for h in &bound.retrieval_hooks {
-            builder = builder.retrieval_hook(h.clone());
-        }
-        builder = builder.script_carriers(bound.carriers);
+        builder = builder.bound_scripts(bound);
     }
 
     let (mut agent, mut event_rx, input_tx) = builder.build().expect("agent builds");
@@ -238,25 +321,28 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
     let run_cancel = cancel.clone();
     let join = tokio::spawn(async move { agent.run(run_cancel).await });
 
-    input_tx
-        .send(InputMessage::User {
-            content: case.turn.to_string(),
-            attachments: vec![],
-            turn_id: "t0".into(),
-        })
-        .expect("send turn");
+    for (i, turn) in case.turns.iter().enumerate() {
+        input_tx
+            .send(InputMessage::User {
+                content: turn.to_string(),
+                attachments: vec![],
+                turn_id: format!("t{i}"),
+            })
+            .expect("send turn");
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let ev = tokio::time::timeout_at(deadline, event_rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("case `{}`: the turn never finished", case.point))
-            .unwrap_or_else(|| panic!("case `{}`: event channel closed early", case.point));
-        if matches!(
-            ev,
-            base::event::AgentEvent::TurnComplete { .. } | base::event::AgentEvent::Error { .. }
-        ) {
-            break;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, event_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("case `{}`: the turn never finished", case.point))
+                .unwrap_or_else(|| panic!("case `{}`: event channel closed early", case.point));
+            if matches!(
+                ev,
+                base::event::AgentEvent::TurnComplete { .. }
+                    | base::event::AgentEvent::Error { .. }
+            ) {
+                break;
+            }
         }
     }
 

@@ -31,6 +31,7 @@
 //! a callback to receive one. `hooks` is its own subsystem with its own
 //! process model. And `script.carrier` is the carrier itself.
 
+mod bound;
 mod memory_retrieval;
 mod model_message;
 mod model_request;
@@ -38,6 +39,7 @@ mod prompt_contributions;
 mod tool_around;
 mod tool_result;
 
+pub use bound::BoundScripts;
 pub use memory_retrieval::RetrievalHookScript;
 pub use model_message::ModelMessageScript;
 pub use model_request::ModelRequestScript;

@@ -1601,28 +1601,9 @@ impl SessionPool {
         if let Some(host) = self.plugins.host() {
             builder = builder.plugin_host(host);
         }
-        // Each pile of adapters goes where that kind of extension lives: the
-        // prompt ones on a registry, the rest on the builder.
         #[cfg(feature = "scripts")]
         if let Some(bound) = bind_scripts(&settings_snapshot, &self.cwd) {
-            if bound.registers_on_prompt_registry() {
-                let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
-                bound.apply_to_registry(registry.as_ref());
-                builder = builder.prompt_registry(registry);
-            }
-            for t in &bound.tool_results {
-                builder = builder.tool_result_transformer(t.clone());
-            }
-            for h in &bound.retrieval_hooks {
-                builder = builder.retrieval_hook(h.clone());
-            }
-            for m in &bound.tool_middleware {
-                builder = builder.tool_middleware(m.clone());
-            }
-            for i in &bound.model_interceptors {
-                builder = builder.model_interceptor(i.clone());
-            }
-            builder = builder.script_carriers(bound.carriers);
+            builder = builder.bound_scripts(bound);
         }
         #[cfg(not(feature = "scripts"))]
         let _ = bind_scripts(&settings_snapshot, &self.cwd);

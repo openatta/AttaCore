@@ -1425,6 +1425,41 @@ impl Builder {
         self
     }
 
+    /// Install everything a set of script bindings produced.
+    ///
+    /// The adapters belong in three places — a prompt registry, this builder,
+    /// and the list a turn resets — and getting one of them wrong looks
+    /// exactly like a script that was never bound. So the knowledge of which
+    /// goes where lives here, once, rather than in every caller that has a
+    /// `BoundScripts` in hand.
+    ///
+    /// A registry is created only if something needs one: a session with no
+    /// prompt contributions should not acquire an empty registry that
+    /// overrides whatever else was going to provide it.
+    pub fn bound_scripts(
+        mut self,
+        bound: base::interface::script_adapters::BoundScripts,
+    ) -> Self {
+        if bound.registers_on_prompt_registry() {
+            let registry = base::interface::prompt_registry::InMemoryPromptRegistry::new();
+            bound.apply_to_registry(registry.as_ref());
+            self = self.prompt_registry(registry);
+        }
+        for t in &bound.tool_results {
+            self = self.tool_result_transformer(t.clone());
+        }
+        for h in &bound.retrieval_hooks {
+            self = self.retrieval_hook(h.clone());
+        }
+        for m in &bound.tool_middleware {
+            self = self.tool_middleware(m.clone());
+        }
+        for i in &bound.model_interceptors {
+            self = self.model_interceptor(i.clone());
+        }
+        self.script_carriers(bound.carriers)
+    }
+
     /// The script carriers bound in this session.
     ///
     /// A carrier counts calls against a *per-turn* quota, and a quota only
