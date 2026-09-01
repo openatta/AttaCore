@@ -307,11 +307,9 @@ async fn requests(case: &ScriptCase, bind_scripts: bool) -> Vec<String> {
 
     // The same call the daemon makes. Installing adapters is `Builder`'s job
     // precisely so this test cannot bind a point the session would not.
-    if !settings.scripts.is_empty() {
-        let engine: Arc<dyn base::interface::script::ScriptEngine> =
-            Arc::new(script_host::QuickJsEngine::new());
-        let bound = script_host::bindings::bind(engine, &settings.scripts, &fixtures())
-            .unwrap_or_else(|e| panic!("case `{}`: {e}", case.point));
+    if let Some(bound) = script_host::bindings::bind_quickjs(&settings.scripts, &fixtures())
+        .unwrap_or_else(|e| panic!("case `{}`: {e}", case.point))
+    {
         builder = builder.bound_scripts(bound);
     }
 

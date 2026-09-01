@@ -1,6 +1,6 @@
 //! `tool.result` — what one tool result looks like before the model sees it.
 
-use crate::interface::script::ScriptCarrier;
+use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 use crate::interface::tool_middleware::ToolCall;
 use crate::interface::tool_result::{ToolResultDraft, ToolResultTransformer};
 
@@ -35,13 +35,15 @@ impl ToolResultTransformer for ToolResultScript {
 
         let returned = match self.carrier.call_blocking(&self.entry, input) {
             Ok(v) => v,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     script = %self.carrier.script().id,
                     tool = %call.name,
-                    error = %e,
+                    error = %error,
                     "tool-result script did not run; the result is unchanged"
                 );
+                self.carrier
+                    .record(&self.entry, ScriptOutcome::Failed { error });
                 return;
             }
         };
@@ -49,8 +51,17 @@ impl ToolResultTransformer for ToolResultScript {
         // A string is the whole vocabulary. A script that wants to say "leave
         // it alone" returns anything else, which is also what a script with a
         // bug does — and those two should have the same, harmless outcome.
-        if let Some(text) = returned.as_str() {
-            draft.text = text.to_string();
+        match returned.as_str() {
+            Some(text) => {
+                draft.text = text.to_string();
+                self.carrier.record(&self.entry, ScriptOutcome::Applied);
+            }
+            None => self.carrier.record(
+                &self.entry,
+                ScriptOutcome::NoChange {
+                    detail: Some("returned something that is not a string".into()),
+                },
+            ),
         }
     }
 }

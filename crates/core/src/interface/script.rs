@@ -195,26 +195,174 @@ where
     }
 }
 
+/// What one script call did, once the point it was bound to had its say.
+///
+/// The distinction the outcomes exist to draw: a script that ran and asked for
+/// nothing, a script that never ran, and a script that asked for something it
+/// may not do all leave the engine in the same state. Only a record can tell
+/// them apart, and "the extension is inert" versus "the extension is being
+/// held back" is exactly the question an operator asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptOutcome {
+    /// The script ran and the point took its answer.
+    ///
+    /// Taken, not necessarily different: a script that answers with the value
+    /// a field already holds still gets this. What a point can honestly report
+    /// is whether it acted on what it was told, and an observer script that
+    /// deliberately changes nothing should still read as having run.
+    Applied,
+    /// The script ran and the point is as it was — because the script asked
+    /// for no change, or because it answered in a shape this point cannot act
+    /// on. Those two are one outcome on purpose: most points define them to
+    /// mean the same thing, and `detail` says which it was where the point
+    /// can tell.
+    NoChange { detail: Option<String> },
+    /// The call itself did not complete.
+    Failed { error: ScriptError },
+    /// The script asked for something its origin does not permit. One record
+    /// per refused edit, so a pass that was half permitted reads as one.
+    Refused { detail: String },
+}
+
+/// One line of the ledger.
+#[derive(Debug, Clone)]
+pub struct ScriptRecord {
+    pub point: String,
+    /// The script's id — its path, normally.
+    pub script: String,
+    pub entry: String,
+    /// Which user turn this call belongs to. Zero is before the first turn
+    /// began, which is when the registering points make their identity calls.
+    pub turn: u32,
+    pub outcome: ScriptOutcome,
+}
+
+/// Every script call, in the order the points made them.
+///
+/// A script cannot keep a record of its own: each call gets a fresh runtime
+/// with no filesystem and nothing carried over, so the only thing it can say
+/// is its return value at its own point. Whether it ran at all — and if it did
+/// not, why — is only answerable from out here.
+///
+/// Bounded, because a long session at a per-tool-call point would otherwise
+/// grow one forever, and the count of what was dropped is kept: a record that
+/// fell off the end and a call that never happened must not read the same.
+pub struct ScriptLedger {
+    entries: std::sync::Mutex<std::collections::VecDeque<ScriptRecord>>,
+    dropped: std::sync::atomic::AtomicUsize,
+    capacity: usize,
+}
+
+impl Default for ScriptLedger {
+    fn default() -> Self {
+        Self::with_capacity(4096)
+    }
+}
+
+impl ScriptLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            dropped: std::sync::atomic::AtomicUsize::new(0),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn append(&self, record: ScriptRecord) {
+        let mut entries = match self.entries.lock() {
+            Ok(e) => e,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while entries.len() >= self.capacity {
+            entries.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        entries.push_back(record);
+    }
+
+    pub fn records(&self) -> Vec<ScriptRecord> {
+        match self.entries.lock() {
+            Ok(e) => e.iter().cloned().collect(),
+            Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+        }
+    }
+
+    /// How many records fell off the front. Non-zero means [`records`] is a
+    /// tail, not the whole story.
+    ///
+    /// [`records`]: Self::records
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
 /// One script bound to a hook point, with its budget enforced around it.
 pub struct ScriptCarrier {
     engine: Arc<dyn ScriptEngine>,
     script: ScriptSource,
+    /// The catalog id of the point this is bound to. Held here rather than
+    /// passed in at each call so it is written down once, where the binding
+    /// was checked against the catalog, and cannot be mistyped by an adapter.
+    point: String,
     limits: ScriptLimits,
     calls_this_turn: AtomicU32,
+    turn: AtomicU32,
+    ledger: Option<Arc<ScriptLedger>>,
 }
 
 impl ScriptCarrier {
-    pub fn new(engine: Arc<dyn ScriptEngine>, script: ScriptSource, limits: ScriptLimits) -> Self {
+    pub fn new(
+        engine: Arc<dyn ScriptEngine>,
+        script: ScriptSource,
+        point: impl Into<String>,
+        limits: ScriptLimits,
+    ) -> Self {
         Self {
             engine,
             script,
+            point: point.into(),
             limits,
             calls_this_turn: AtomicU32::new(0),
+            turn: AtomicU32::new(0),
+            ledger: None,
         }
+    }
+
+    /// Record every call this carrier's point makes decisions about.
+    pub fn with_ledger(mut self, ledger: Arc<ScriptLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Write down what the point did with this call.
+    ///
+    /// Called by the adapter rather than by [`call`](Self::call), because the
+    /// carrier can only see whether the script answered — whether the answer
+    /// was usable, and whether it was allowed, is the point's own verdict.
+    pub fn record(&self, entry: &str, outcome: ScriptOutcome) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        ledger.append(ScriptRecord {
+            point: self.point.clone(),
+            script: self.script.id.clone(),
+            entry: entry.to_string(),
+            turn: self.turn.load(Ordering::Relaxed),
+            outcome,
+        });
     }
 
     pub fn script(&self) -> &ScriptSource {
         &self.script
+    }
+
+    /// The catalog id of the point this is bound to.
+    pub fn point(&self) -> &str {
+        &self.point
     }
 
     /// Whose code this is, which is what decides its authority at a point.
@@ -225,6 +373,7 @@ impl ScriptCarrier {
     /// A new turn has started; the quota resets.
     pub fn begin_turn(&self) {
         self.calls_this_turn.store(0, Ordering::Relaxed);
+        self.turn.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Run the script, within its budget.
@@ -296,6 +445,7 @@ mod tests {
         ScriptCarrier::new(
             engine,
             script(BlockOrigin::Script("./.atta/scripts/prompt.js".into())),
+            "prompt.assemble",
             limits,
         )
     }
@@ -386,6 +536,64 @@ mod tests {
         );
     }
 
+    /// The ledger is a tail, not a log, and it says so. A record that fell
+    /// off the front and a call that never happened must not read alike.
+    #[test]
+    fn a_full_ledger_drops_the_oldest_and_counts_what_it_dropped() {
+        let ledger = ScriptLedger::with_capacity(2);
+        for i in 0..5 {
+            ledger.append(ScriptRecord {
+                point: "tool.result".into(),
+                script: "s.js".into(),
+                entry: format!("call{i}"),
+                turn: 1,
+                outcome: ScriptOutcome::Applied,
+            });
+        }
+        let kept: Vec<String> = ledger.records().into_iter().map(|r| r.entry).collect();
+        assert_eq!(kept, vec!["call3", "call4"]);
+        assert_eq!(ledger.dropped(), 3);
+    }
+
+    /// The turn a call belongs to comes from the carrier, so a record can say
+    /// "this fired on the second turn" — which is the only way to check a
+    /// quota that resets per turn, or a point that must fire once per turn.
+    #[tokio::test]
+    async fn a_record_carries_the_turn_the_call_belonged_to() {
+        let ledger = Arc::new(ScriptLedger::new());
+        let c = ScriptCarrier::new(
+            Arc::new(RefusingEngine),
+            script(BlockOrigin::Script("./.atta/scripts/prompt.js".into())),
+            "tool.result",
+            ScriptLimits::default(),
+        )
+        .with_ledger(ledger.clone());
+
+        c.record("onResult", ScriptOutcome::Applied);
+        c.begin_turn();
+        c.record("onResult", ScriptOutcome::Applied);
+
+        let turns: Vec<u32> = ledger.records().into_iter().map(|r| r.turn).collect();
+        assert_eq!(
+            turns,
+            vec![0, 1],
+            "zero is before the first turn, where the registering points make \
+             their identity calls"
+        );
+        let first = &ledger.records()[0];
+        assert_eq!(first.point, "tool.result");
+        assert_eq!(first.script, "./.atta/scripts/prompt.js");
+    }
+
+    /// A carrier nobody asked to record is not an error and not a panic — the
+    /// ledger is an observation the host opts into, not a dependency of the
+    /// carrier working.
+    #[test]
+    fn a_carrier_with_no_ledger_records_into_nothing() {
+        let c = carrier(Arc::new(RefusingEngine), ScriptLimits::default());
+        c.record("onResult", ScriptOutcome::Applied);
+    }
+
     /// Provenance rides with the script, because it is what a hook point uses
     /// to decide what the script may do — see `prompt_assembly::Authority`.
     #[test]
@@ -396,6 +604,7 @@ mod tests {
         let downloaded = ScriptCarrier::new(
             Arc::new(RefusingEngine),
             script(BlockOrigin::Plugin("example".into())),
+            "prompt.assemble",
             ScriptLimits::default(),
         );
         assert!(!downloaded.origin().is_local());
@@ -465,14 +674,29 @@ impl crate::interface::prompt_assembly::AsyncAssemblyHook for PromptAssemblyScri
         _ctx: &crate::interface::scene::ScenePromptContext<'_>,
     ) -> Result<(), String> {
         let before = Self::encode(assembly.blocks());
-        let returned = self
-            .carrier
-            .call(&self.entry, before)
-            .await
-            .map_err(|e| e.to_string())?;
+        let returned = match self.carrier.call(&self.entry, before).await {
+            Ok(v) => v,
+            Err(error) => {
+                let message = error.to_string();
+                self.carrier
+                    .record(&self.entry, ScriptOutcome::Failed { error });
+                return Err(message);
+            }
+        };
 
-        let returned: Vec<ReturnedBlock> = serde_json::from_value(returned)
-            .map_err(|e| format!("script returned something that is not a block list: {e}"))?;
+        let returned: Vec<ReturnedBlock> = match serde_json::from_value(returned) {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                let message = format!("script returned something that is not a block list: {e}");
+                self.carrier.record(
+                    &self.entry,
+                    ScriptOutcome::NoChange {
+                        detail: Some(message.clone()),
+                    },
+                );
+                return Err(message);
+            }
+        };
 
         // Diffed rather than replaced wholesale, so every change goes through
         // the authority checks one at a time. Handing back a list and swapping
@@ -489,6 +713,7 @@ impl crate::interface::prompt_assembly::AsyncAssemblyHook for PromptAssemblyScri
         // the alternative punishes an author for a single overreach by
         // silently dropping the rest of their pass.
         let mut refused = Vec::new();
+        let mut edits = 0usize;
         for block in &returned {
             let Some(name) = block.name.as_deref() else {
                 continue;
@@ -498,16 +723,18 @@ impl crate::interface::prompt_assembly::AsyncAssemblyHook for PromptAssemblyScri
                 // be charged as one: a script that returns the whole list to
                 // change one line would otherwise need `modify` for all of it.
                 Some((_, content)) if *content == block.content => {}
-                Some(_) => {
-                    if let Err(e) = assembly.modify(name, block.content.clone()) {
-                        refused.push(e.to_string());
-                    }
+                Some(_) => match assembly.modify(name, block.content.clone()) {
+                    Ok(_) => edits += 1,
+                    Err(e) => refused.push(e.to_string()),
+                },
+                None => {
+                    assembly.push(
+                        crate::prompt::PromptBlock::system(block.content.clone())
+                            .named(name)
+                            .from_origin(self.carrier.origin().clone()),
+                    );
+                    edits += 1;
                 }
-                None => assembly.push(
-                    crate::prompt::PromptBlock::system(block.content.clone())
-                        .named(name)
-                        .from_origin(self.carrier.origin().clone()),
-                ),
             }
         }
         for (name, _) in &existing {
@@ -515,11 +742,30 @@ impl crate::interface::prompt_assembly::AsyncAssemblyHook for PromptAssemblyScri
                 .iter()
                 .any(|b| b.name.as_deref() == Some(name.as_str()))
             {
-                if let Err(e) = assembly.remove(name) {
-                    refused.push(e.to_string());
+                match assembly.remove(name) {
+                    Ok(_) => edits += 1,
+                    Err(e) => refused.push(e.to_string()),
                 }
             }
         }
+
+        for denial in &refused {
+            self.carrier.record(
+                &self.entry,
+                ScriptOutcome::Refused {
+                    detail: denial.clone(),
+                },
+            );
+        }
+        self.carrier.record(
+            &self.entry,
+            if edits > 0 {
+                ScriptOutcome::Applied
+            } else {
+                ScriptOutcome::NoChange { detail: None }
+            },
+        );
+
         if refused.is_empty() {
             Ok(())
         } else {
@@ -595,6 +841,7 @@ mod prompt_hook_tests {
                     origin,
                     code: String::new(),
                 },
+                "prompt.assemble",
                 ScriptLimits::default(),
             )),
             "onAssemble",
@@ -700,6 +947,7 @@ mod prompt_hook_tests {
                     origin: BlockOrigin::Script("./.atta/scripts/slow.js".into()),
                     code: String::new(),
                 },
+                "prompt.assemble",
                 ScriptLimits {
                     timeout: Duration::from_millis(20),
                     ..Default::default()

@@ -27,6 +27,13 @@ use crate::interface::prompt_registry::PromptRegistry;
 /// owns those three places and puts each pile where it belongs.
 #[derive(Default)]
 pub struct BoundScripts {
+    /// What every script call did, in the order the points made them.
+    ///
+    /// Kept here rather than left to the caller because a script cannot keep
+    /// a record of its own — a fresh runtime per call, nothing carried over —
+    /// so whether one ran, and why it did not, is only answerable from
+    /// outside. Every carrier below writes into this one.
+    pub ledger: Arc<crate::interface::script::ScriptLedger>,
     /// Passes over the assembled prompt, with the authority each was
     /// granted by where its file lives.
     pub assembly_hooks: Vec<(
@@ -65,6 +72,7 @@ impl std::fmt::Debug for BoundScripts {
             .field("retrieval_hooks", &self.retrieval_hooks.len())
             .field("tool_middleware", &self.tool_middleware.len())
             .field("model_interceptors", &self.model_interceptors.len())
+            .field("ledger", &self.ledger.records().len())
             .finish()
     }
 }

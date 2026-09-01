@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::interface::model::{ModelContentBlock, ModelMessage};
 use crate::interface::model_interceptor::ModelInterceptor;
-use crate::interface::script::ScriptCarrier;
+use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 
 /// A script bound to the model-message point.
 ///
@@ -101,25 +101,44 @@ impl ModelInterceptor for ModelMessageScript {
 
         let returned = match self.carrier.call_blocking(&self.entry, input) {
             Ok(v) => v,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     script = %self.carrier.script().id,
-                    error = %e,
+                    error = %error,
                     "model-message script did not run; the message is unchanged"
                 );
+                self.carrier
+                    .record(&self.entry, ScriptOutcome::Failed { error });
                 return;
             }
         };
 
         let Ok(rewritten) = serde_json::from_value::<Vec<String>>(returned) else {
+            self.carrier.record(
+                &self.entry,
+                ScriptOutcome::NoChange {
+                    detail: Some("returned something that is not a list of strings".into()),
+                },
+            );
             return;
         };
         if rewritten.len() != text_at.len() {
+            self.carrier.record(
+                &self.entry,
+                ScriptOutcome::NoChange {
+                    detail: Some(format!(
+                        "returned {} block(s) for a message with {}",
+                        rewritten.len(),
+                        text_at.len()
+                    )),
+                },
+            );
             return;
         }
         for (at, t) in text_at.into_iter().zip(rewritten) {
             message.content[at] = ModelContentBlock::Text { text: t };
         }
+        self.carrier.record(&self.entry, ScriptOutcome::Applied);
     }
 }
 
@@ -170,6 +189,7 @@ mod tests {
                     origin: BlockOrigin::Script("./.atta/scripts/message.js".into()),
                     code: String::new(),
                 },
+                "model.message",
                 ScriptLimits::default(),
             )),
             "onMessage",

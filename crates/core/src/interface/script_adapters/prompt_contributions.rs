@@ -79,7 +79,7 @@ use crate::interface::prompt_registry::{
     orders, ContextProvider, PromptContent, RegisteredBlock, VariableProvider,
 };
 use crate::interface::scene::ScenePromptContext;
-use crate::interface::script::ScriptCarrier;
+use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 use crate::prompt::{names, BlockRole};
 
 /// A script bound to `prompt.block`: one fixed block of the system prompt.
@@ -106,8 +106,15 @@ pub fn prompt_block_from_script(
             "a prompt.block script must answer with `content`; for text that depends on the \
              session, bind to prompt.context"
         );
+        carrier.record(
+            entry,
+            ScriptOutcome::NoChange {
+                detail: Some("answered without `content`; nothing was registered".into()),
+            },
+        );
         return None;
     };
+    carrier.record(entry, ScriptOutcome::Applied);
     Some(RegisteredBlock {
         name: identity.name,
         role: BlockRole::System,
@@ -134,6 +141,7 @@ pub fn prompt_context_from_script(
     entry: &str,
 ) -> Option<RegisteredBlock> {
     let identity = identity(&carrier, entry)?;
+    carrier.record(entry, ScriptOutcome::Applied);
     let origin = carrier.origin().clone();
     let entry = entry.to_string();
     let provider: ContextProvider =
@@ -167,6 +175,7 @@ pub fn prompt_variable_from_script(
     entry: &str,
 ) -> Option<(String, VariableProvider)> {
     let identity = identity(&carrier, entry)?;
+    carrier.record(entry, ScriptOutcome::Applied);
     let entry = entry.to_string();
     let provider: VariableProvider =
         Arc::new(move |ctx: &ScenePromptContext<'_>| answer(&carrier, &entry, ctx, "variable"));
@@ -183,12 +192,13 @@ struct Identity {
 fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
     let returned = match carrier.call_blocking(entry, serde_json::Value::Null) {
         Ok(v) => v,
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
                 script = %carrier.script().id,
-                error = %e,
+                error = %error,
                 "script did not say what it contributes; nothing was registered"
             );
+            carrier.record(entry, ScriptOutcome::Failed { error });
             return None;
         }
     };
@@ -199,6 +209,12 @@ fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
             script = %carrier.script().id,
             "script did not answer its first call with a `name`; nothing was registered"
         );
+        carrier.record(
+            entry,
+            ScriptOutcome::NoChange {
+                detail: Some("answered its first call without a `name`; nothing was registered".into()),
+            },
+        );
         return None;
     }
     if is_taken(name) {
@@ -207,6 +223,12 @@ fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
             name = %name,
             "that name already belongs to a prompt block the engine contributes; \
              nothing was registered"
+        );
+        carrier.record(
+            entry,
+            ScriptOutcome::NoChange {
+                detail: Some("asked for a name the engine already contributes; nothing was registered".into()),
+            },
         );
         return None;
     }
@@ -221,7 +243,13 @@ fn identity(carrier: &ScriptCarrier, entry: &str) -> Option<Identity> {
                     name = %name,
                     "`order` is not a number the prompt can be sorted by; nothing was registered"
                 );
-                return None;
+                carrier.record(
+            entry,
+            ScriptOutcome::NoChange {
+                detail: Some("answered with an `order` the prompt cannot be sorted by; nothing was registered".into()),
+            },
+        );
+        return None;
             }
         },
     };
@@ -244,14 +272,29 @@ fn answer(
     kind: &'static str,
 ) -> Option<String> {
     match carrier.call_blocking(entry, encode(ctx)) {
-        Ok(v) => v.as_str().map(str::to_string),
-        Err(e) => {
+        Ok(v) => match v.as_str() {
+            Some(text) => {
+                carrier.record(entry, ScriptOutcome::Applied);
+                Some(text.to_string())
+            }
+            None => {
+                carrier.record(
+                    entry,
+                    ScriptOutcome::NoChange {
+                        detail: Some("answered with something that is not a string".into()),
+                    },
+                );
+                None
+            }
+        },
+        Err(error) => {
             tracing::warn!(
                 script = %carrier.script().id,
                 kind,
-                error = %e,
+                error = %error,
                 "script did not run; it contributes nothing to this prompt"
             );
+            carrier.record(entry, ScriptOutcome::Failed { error });
             None
         }
     }
@@ -360,6 +403,7 @@ mod tests {
                 origin,
                 code: String::new(),
             },
+            "prompt.block",
             ScriptLimits::default(),
         ))
     }

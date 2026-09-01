@@ -324,6 +324,7 @@ mod tests {
         let stuck = ScriptCarrier::new(
             engine.clone(),
             script("function f() { while (true) {} }"),
+            "prompt.assemble",
             ScriptLimits {
                 timeout: Duration::from_millis(50),
                 ..Default::default()
@@ -332,6 +333,7 @@ mod tests {
         let fine = ScriptCarrier::new(
             engine,
             script("function f(x) { return x; }"),
+            "prompt.assemble",
             ScriptLimits::default(),
         );
 
@@ -494,6 +496,28 @@ pub mod bindings {
         }
     }
 
+    /// Everything a host does to honor a `scripts` section: pick the engine,
+    /// register the bindings, hand back the answer.
+    ///
+    /// `Ok(None)` means nothing was configured — the overwhelming case, and
+    /// the one where a session should pay for neither an interpreter nor a
+    /// prompt registry of its own.
+    ///
+    /// One place rather than one per host, because the copies are where a
+    /// harness and the daemon drift apart: a test binding a point production
+    /// does not (or the reverse) is a test that stays green while saying
+    /// nothing about the thing it names.
+    pub fn bind_quickjs(
+        bindings: &[ScriptBinding],
+        project_root: &Path,
+    ) -> Result<Option<BoundScripts>, BindingError> {
+        if bindings.is_empty() {
+            return Ok(None);
+        }
+        let engine: Arc<dyn ScriptEngine> = Arc::new(crate::QuickJsEngine::new());
+        bind(engine, bindings, project_root).map(Some)
+    }
+
     /// Register every binding, or say which one is wrong.
     ///
     /// All-or-nothing: a partially applied script configuration is a
@@ -549,7 +573,10 @@ pub mod bindings {
 
         let mut out = BoundScripts::default();
         for (binding, source, limits, authority) in prepared {
-            let carrier = Arc::new(ScriptCarrier::new(engine.clone(), source, limits));
+            let carrier = Arc::new(
+                ScriptCarrier::new(engine.clone(), source, &binding.point, limits)
+                    .with_ledger(out.ledger.clone()),
+            );
             out.carriers.push(carrier.clone());
             match binding.point.as_str() {
                 "prompt.assemble" => out.assembly_hooks.push((

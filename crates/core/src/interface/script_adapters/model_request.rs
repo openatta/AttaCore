@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::interface::model_interceptor::{ModelInterceptor, ModelRequestView};
-use crate::interface::script::ScriptCarrier;
+use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 use crate::settings::ThinkingMode;
 
 /// A script bound to the model-request point.
@@ -109,6 +109,19 @@ struct Changes {
     tools: Option<Vec<String>>,
 }
 
+impl Changes {
+    /// Whether the script asked for anything at all. An answer that names a
+    /// field the request already holds still counts: what the ledger records
+    /// is that the point took the script's answer, not that the bytes moved.
+    fn names_a_field(&self) -> bool {
+        self.model.is_some()
+            || self.max_tokens.is_some()
+            || self.thinking_mode.is_some()
+            || self.fallback_model.is_some()
+            || self.tools.is_some()
+    }
+}
+
 fn read(returned: serde_json::Value) -> Option<Changes> {
     let requested: Requested = serde_json::from_value(returned).ok()?;
 
@@ -154,19 +167,36 @@ impl ModelInterceptor for ModelRequestScript {
 
         let returned = match self.carrier.call_blocking(&self.entry, input) {
             Ok(v) => v,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     script = %self.carrier.script().id,
-                    error = %e,
+                    error = %error,
                     "model-request script did not run; the request is unchanged"
                 );
+                self.carrier
+                    .record(&self.entry, ScriptOutcome::Failed { error });
                 return;
             }
         };
 
         let Some(changes) = read(returned) else {
+            self.carrier.record(
+                &self.entry,
+                ScriptOutcome::NoChange {
+                    detail: Some("returned a shape a request cannot be built from".into()),
+                },
+            );
             return;
         };
+
+        self.carrier.record(
+            &self.entry,
+            if changes.names_a_field() {
+                ScriptOutcome::Applied
+            } else {
+                ScriptOutcome::NoChange { detail: None }
+            },
+        );
 
         if let Some(model) = changes.model {
             request.params.model = model;
@@ -237,6 +267,7 @@ mod tests {
                     origin: BlockOrigin::Script("./.atta/scripts/model.js".into()),
                     code: String::new(),
                 },
+                "model.request",
                 ScriptLimits::default(),
             )),
             "onRequest",

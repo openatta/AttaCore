@@ -262,14 +262,10 @@ async fn build_agent(
     // harness would read a `scripts` block and quietly run without it — which
     // is the failure the carrier refuses to make anywhere else, and it would
     // make a case about a script pass by proving nothing.
-    if !settings.scripts.is_empty() {
-        let engine: std::sync::Arc<dyn base::interface::script::ScriptEngine> =
-            std::sync::Arc::new(script_host::QuickJsEngine::new());
-        let project_root = tmp.join("workdir");
-        match script_host::bindings::bind(engine, &settings.scripts, &project_root) {
-            Ok(bound) => builder = builder.bound_scripts(bound),
-            Err(e) => anyhow::bail!("a script binding in the fixture is invalid: {e}"),
-        }
+    match script_host::bindings::bind_quickjs(&settings.scripts, &tmp.join("workdir")) {
+        Ok(Some(bound)) => builder = builder.bound_scripts(bound),
+        Ok(None) => {}
+        Err(e) => anyhow::bail!("a script binding in the fixture is invalid: {e}"),
     }
 
     // Connect any MCP servers the fixture's settings.json configured — without

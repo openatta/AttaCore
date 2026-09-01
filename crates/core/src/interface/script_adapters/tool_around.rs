@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::interface::script::ScriptCarrier;
+use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 use crate::interface::tool_middleware::{
     NextDispatch, ToolCall, ToolExec, ToolMiddleware, ToolOutcome,
 };
@@ -122,6 +122,19 @@ fn read(returned: serde_json::Value) -> Directed {
     }
 }
 
+/// A plain `proceed` is what the call would have done anyway, so only a
+/// denial, an answer, or a narrowed deadline counts as this ring having done
+/// something.
+fn outcome_of(directed: &Directed) -> ScriptOutcome {
+    match directed {
+        Directed::Deny(_) | Directed::Respond(_) => ScriptOutcome::Applied,
+        Directed::Dispatch { timeout: Some(_) } => ScriptOutcome::Applied,
+        Directed::Dispatch { timeout: None } => ScriptOutcome::NoChange {
+            detail: Some("dispatched as it would have been".into()),
+        },
+    }
+}
+
 #[async_trait]
 impl ToolMiddleware for ToolAroundScript {
     async fn around(
@@ -136,14 +149,20 @@ impl ToolMiddleware for ToolAroundScript {
         });
 
         let directed = match self.carrier.call(&self.entry, input).await {
-            Ok(returned) => read(returned),
-            Err(e) => {
+            Ok(returned) => {
+                let directed = read(returned);
+                self.carrier.record(&self.entry, outcome_of(&directed));
+                directed
+            }
+            Err(error) => {
                 tracing::warn!(
                     script = %self.carrier.script().id,
                     tool = %call.name,
-                    error = %e,
+                    error = %error,
                     "tool-around script did not run; the call is dispatched unchanged"
                 );
+                self.carrier
+                    .record(&self.entry, ScriptOutcome::Failed { error });
                 Directed::Dispatch { timeout: None }
             }
         };
@@ -192,6 +211,7 @@ mod tests {
                     origin: BlockOrigin::Script("./.atta/scripts/tool.js".into()),
                     code: String::new(),
                 },
+                "tool.around",
                 ScriptLimits::default(),
             )),
             "onTool",
@@ -306,6 +326,7 @@ mod tests {
                     origin: BlockOrigin::Script("./.atta/scripts/slow.js".into()),
                     code: String::new(),
                 },
+                "tool.around",
                 ScriptLimits {
                     timeout: Duration::from_millis(20),
                     ..Default::default()

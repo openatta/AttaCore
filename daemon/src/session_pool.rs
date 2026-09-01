@@ -4248,15 +4248,15 @@ fn bind_scripts(
     if settings.scripts.is_empty() {
         return None;
     }
-    let engine: Arc<dyn base::interface::script::ScriptEngine> =
-        Arc::new(script_host::QuickJsEngine::new());
-    match script_host::bindings::bind(engine, &settings.scripts, project_root) {
+    match script_host::bindings::bind_quickjs(&settings.scripts, project_root) {
         Ok(bound) => {
-            info!(
-                scripts = bound.carriers.len(),
-                "bound scripts to extension points"
-            );
-            Some(bound)
+            if let Some(bound) = &bound {
+                info!(
+                    scripts = bound.carriers.len(),
+                    "bound scripts to extension points"
+                );
+            }
+            bound
         }
         Err(e) => {
             error!(error = %e, "a script binding is invalid; no scripts were bound");

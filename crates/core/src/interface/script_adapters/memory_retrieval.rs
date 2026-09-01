@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::interface::memory_contracts::{RetrievalHook, RetrievalRequest};
-use crate::interface::script::ScriptCarrier;
+use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 
 /// A script bound to both ends of recall.
 ///
@@ -105,16 +105,30 @@ impl RetrievalHookScript {
         }
         match self.carrier.call_blocking(&self.entry, input) {
             Ok(v) => Some(v),
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     script = %self.carrier.script().id,
                     phase,
-                    error = %e,
+                    error = %error,
                     "retrieval-hook script did not run; recall is unchanged"
                 );
+                self.carrier
+                    .record(&self.entry, ScriptOutcome::Failed { error });
                 None
             }
         }
+    }
+
+    /// This point calls one entry twice per recall, so its two records are
+    /// told apart by their order — `before` then `after` — rather than by
+    /// anything in the record itself.
+    fn unusable(&self, detail: &str) {
+        self.carrier.record(
+            &self.entry,
+            ScriptOutcome::NoChange {
+                detail: Some(detail.to_string()),
+            },
+        );
     }
 }
 
@@ -124,6 +138,7 @@ impl RetrievalHook for RetrievalHookScript {
             return;
         };
         let Some(obj) = returned.as_object() else {
+            self.unusable("`before` returned something that is not an object");
             return;
         };
 
@@ -133,23 +148,36 @@ impl RetrievalHook for RetrievalHookScript {
         let query = match obj.get("query") {
             Some(v) => match v.as_str() {
                 Some(s) => Some(s.to_string()),
-                None => return,
+                None => {
+                    self.unusable("`before` returned a query that is not a string");
+                    return;
+                }
             },
             None => None,
         };
         let limit = match obj.get("limit") {
             Some(v) => match v.as_u64().filter(|n| *n > 0) {
                 Some(n) => Some(n as usize),
-                None => return,
+                None => {
+                    self.unusable("`before` returned a limit that is not a positive number");
+                    return;
+                }
             },
             None => None,
         };
 
+        let asked = query.is_some() || limit.is_some();
         if let Some(query) = query {
             request.query = query;
         }
         if let Some(limit) = limit {
             request.limit = limit;
+        }
+        if asked {
+            self.carrier.record(&self.entry, ScriptOutcome::Applied);
+        } else {
+            self.carrier
+                .record(&self.entry, ScriptOutcome::NoChange { detail: None });
         }
     }
 
@@ -164,16 +192,21 @@ impl RetrievalHook for RetrievalHookScript {
             return;
         };
         let Some(items) = returned.as_array() else {
+            self.unusable("`after` returned something that is not an array");
             return;
         };
         let mut kept = Vec::with_capacity(items.len());
         for item in items {
             match item.as_str() {
                 Some(s) => kept.push(s.to_string()),
-                None => return,
+                None => {
+                    self.unusable("`after` returned a name that is not a string");
+                    return;
+                }
             }
         }
         *names = kept;
+        self.carrier.record(&self.entry, ScriptOutcome::Applied);
     }
 }
 
@@ -218,6 +251,7 @@ mod tests {
                     origin: BlockOrigin::Script("./recall.js".into()),
                     code: String::new(),
                 },
+                "memory.retrieval_hook",
                 ScriptLimits::default(),
             )),
             "onRetrieval",
