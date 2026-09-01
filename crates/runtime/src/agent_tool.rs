@@ -1198,6 +1198,10 @@ struct Inner {
     /// default) means every sub-agent spawn inherits `model` unchanged,
     /// exactly matching behavior before multi-provider routing existed.
     task_router: Option<Arc<base::provider::TaskRouter>>,
+    /// The operator's scripts that follow a delegate into its own session —
+    /// the rings around tool and model calls, never the prompt contributions.
+    /// See `BoundScripts::for_delegate` for where that line is drawn and why.
+    delegate_scripts: Option<Arc<base::interface::script_adapters::BoundScripts>>,
     /// The parent session's `SkillManager`, when known — used to resolve
     /// the `skills:` preload field on `AgentTypeDefinition`. Set via
     /// `AgentTool::set_skill_manager` *after* construction (interior
@@ -1761,6 +1765,7 @@ impl AgentTool {
                 description,
                 parent_settings: None,
                 task_router: None,
+            delegate_scripts: None,
                 skill_manager: Arc::new(std::sync::RwLock::new(None)),
                 mcp_tool_adapters: Arc::new(std::sync::RwLock::new(Vec::new())),
                 team_registry: Arc::new(std::sync::RwLock::new(None)),
@@ -1822,6 +1827,7 @@ impl AgentTool {
                 description,
                 parent_settings: None,
                 task_router: None,
+            delegate_scripts: None,
                 skill_manager: Arc::new(std::sync::RwLock::new(None)),
                 mcp_tool_adapters: Arc::new(std::sync::RwLock::new(Vec::new())),
                 team_registry: Arc::new(std::sync::RwLock::new(None)),
@@ -1859,6 +1865,17 @@ impl AgentTool {
     pub fn with_depth(mut self, depth: u32) -> Self {
         let mut inner = (*self.inner).clone();
         inner.depth = depth;
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// The scripts every agent this tool spawns inherits.
+    pub fn with_delegate_scripts(
+        mut self,
+        scripts: Arc<base::interface::script_adapters::BoundScripts>,
+    ) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.delegate_scripts = Some(scripts);
         self.inner = Arc::new(inner);
         self
     }
@@ -2278,6 +2295,12 @@ impl AgentTool {
             .settings(settings.clone())
             .agent_depth(child_depth)
             .permission(perm);
+        // The operator's policy scripts follow the delegate — see
+        // `BoundScripts::for_delegate`. Without this, spawning is a way
+        // around every rule they wrote, chosen by the model.
+        if let Some(scripts) = &self.inner.delegate_scripts {
+            builder = builder.bound_scripts(scripts.for_delegate());
+        }
         // S-4: persist the sub-agent's transcript. Its own fresh session id
         // keeps it in a separate JSONL file from the parent's.
         let history_store = self.inner.history_store();
@@ -2513,6 +2536,12 @@ impl AgentTool {
             .settings(settings.clone())
             .agent_depth(child_depth)
             .permission(perm);
+        // The operator's policy scripts follow the delegate — see
+        // `BoundScripts::for_delegate`. Without this, spawning is a way
+        // around every rule they wrote, chosen by the model.
+        if let Some(scripts) = &self.inner.delegate_scripts {
+            builder = builder.bound_scripts(scripts.for_delegate());
+        }
         // S-4/§5.2: persist team members' transcripts too — same rationale
         // as `run_sub_tagged`/`run_sub_inner`, previously missing here.
         let history_store = self.inner.history_store();
@@ -2829,6 +2858,12 @@ impl AgentTool {
             .settings(settings.clone())
             .agent_depth(child_depth)
             .permission(perm);
+        // The operator's policy scripts follow the delegate — see
+        // `BoundScripts::for_delegate`. Without this, spawning is a way
+        // around every rule they wrote, chosen by the model.
+        if let Some(scripts) = &inner.delegate_scripts {
+            builder = builder.bound_scripts(scripts.for_delegate());
+        }
         let history_store = inner.history_store();
         if let Some(store) = history_store.clone() {
             builder = builder.history_store(store);
@@ -2968,6 +3003,12 @@ impl AgentTool {
             .agent_depth(child_depth)
             .permission(perm)
             .history_store(history_store.clone());
+        // The operator's policy scripts follow the delegate — see
+        // `BoundScripts::for_delegate`. Without this, spawning is a way
+        // around every rule they wrote, chosen by the model.
+        if let Some(scripts) = &self.inner.delegate_scripts {
+            builder = builder.bound_scripts(scripts.for_delegate());
+        }
         if let Some(store) = self.inner.history_store() {
             builder = builder.history_store(store);
         }

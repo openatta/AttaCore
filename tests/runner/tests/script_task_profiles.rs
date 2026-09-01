@@ -395,6 +395,99 @@ async fn scripts_that_all_throw_leave_the_work_exactly_as_it_was() {
     }
 }
 
+/// A policy script follows the work into a sub-agent; a prompt script does
+/// not.
+///
+/// Delegation is where a rule quietly stops applying. The model asks for a
+/// sub-agent, that sub-agent builds a session of its own, and every ring the
+/// operator put around tool calls is gone from it — so "no edits in this
+/// project" becomes "no edits unless you ask someone else to do it", decided
+/// by the model rather than by anyone.
+///
+/// The other half of the case is the line itself: a prompt contribution is
+/// written against the prompt of the session that bound it, and a delegate has
+/// its own scene and its own prompt. So the assembly mark must reach the
+/// parent's request and not the delegate's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegate_inherits_the_policy_scripts_and_not_the_prompt_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let workdir = root.join("workdir");
+    std::fs::create_dir_all(workdir.join("src")).expect("src");
+    std::fs::create_dir_all(workdir.join(".atta")).expect(".atta");
+    std::fs::write(workdir.join(FILE), BEFORE).expect("write the file");
+    let path = workdir.join(FILE).to_string_lossy().to_string();
+
+    let registry = Arc::new(InMemoryToolRegistry::new());
+    tools::register_builtin_tools(&registry);
+
+    // The queue is shared, and the sub-agent's calls land inside the parent's
+    // `Agent` call — so this is the order the two sessions consume it in.
+    let replies = vec![
+        Reply::Tool {
+            id: "spawn-1",
+            name: "Agent",
+            input: serde_json::json!({
+                "prompt": "DELEGATED-TASK: fix the typo in src/main.py",
+                "subagent_type": "general-purpose",
+            }),
+        },
+        Reply::Tool {
+            id: "edit-1",
+            name: "Edit",
+            input: serde_json::json!({
+                "file_path": path,
+                "old_string": "wrold",
+                "new_string": "world",
+            }),
+        },
+        Reply::Text("I could not edit the file"),
+        Reply::Text("the delegate reported back"),
+        Reply::Text("(background)"),
+    ];
+
+    let mut session = Session::new(fixtures(), &["delegate the typo fix"], replies)
+        .scene(Arc::new(scene::scene::coding::CodingScene) as Arc<dyn AgentScene>)
+        .in_project(&workdir)
+        .bind("tool_around_deny_edit.js", "tool.around", "onAround")
+        .bind("prompt_assemble.js", "prompt.assemble", "onAssemble");
+    for tool in registry.list() {
+        session = session.tool(tool);
+    }
+
+    let ran = drive(root, session).await;
+
+    assert!(
+        std::fs::read_to_string(workdir.join(FILE))
+            .expect("read the file")
+            .contains("wrold"),
+        "the delegate's edit went through, so the ring around tool calls did \
+         not follow it"
+    );
+
+    let delegate_requests: Vec<&String> = ran
+        .requests
+        .iter()
+        .filter(|r| r.contains("DELEGATED-TASK"))
+        .collect();
+    assert!(
+        !delegate_requests.is_empty(),
+        "no request carried the delegated task, so no sub-agent ran and this \
+         case proves nothing"
+    );
+    assert!(
+        delegate_requests
+            .iter()
+            .all(|r| !r.contains("SCRIPT-TRACE-ASSEMBLE")),
+        "the parent's prompt pass was applied to the delegate's own prompt"
+    );
+    assert!(
+        ran.holds("SCRIPT-TRACE-ASSEMBLE"),
+        "the prompt pass did not reach the parent either, so the case is not \
+         set up"
+    );
+}
+
 /// The file names in a snapshot, without their contents.
 fn paths(disk: &str) -> Vec<&str> {
     disk.split("\n----\n")

@@ -1030,6 +1030,9 @@ pub struct Builder {
     /// Recall — see [`Builder::memory_retriever`].
     memory_retriever: Option<Arc<dyn base::interface::memory_contracts::MemoryRetriever>>,
     retrieval_hooks: Vec<Arc<dyn base::interface::memory_contracts::RetrievalHook>>,
+    /// The scripts a delegated agent inherits — see
+    /// [`BoundScripts::for_delegate`](base::interface::script_adapters::BoundScripts::for_delegate).
+    delegate_scripts: Option<Arc<base::interface::script_adapters::BoundScripts>>,
     /// Extra destinations for this session's events, beyond the `event_rx`
     /// `build()` returns — see [`Builder::event_sink`].
     event_sinks: Vec<Arc<dyn base::interface::event_sink::EventSink>>,
@@ -1240,6 +1243,7 @@ impl Builder {
             model_interceptors: Vec::new(),
             memory_retriever: None,
             retrieval_hooks: Vec::new(),
+            delegate_scripts: None,
             event_sinks: Vec::new(),
             agent_depth: 0,
         }
@@ -1457,6 +1461,9 @@ impl Builder {
         for i in &bound.model_interceptors {
             self = self.model_interceptor(i.clone());
         }
+        // Held so the `Agent` tool can hand it to whatever it spawns. A policy
+        // that stops at the first delegation is not a policy.
+        self.delegate_scripts = Some(Arc::new(bound.for_delegate()));
         self.script_carriers(bound.carriers)
     }
 
@@ -1982,6 +1989,9 @@ impl Builder {
             .with_depth(agent_depth);
             if let Some(router) = self.task_router.clone() {
                 agent_tool = agent_tool.with_task_router(router);
+            }
+            if let Some(scripts) = self.delegate_scripts.clone() {
+                agent_tool = agent_tool.with_delegate_scripts(scripts);
             }
             Arc::new(agent_tool)
         };

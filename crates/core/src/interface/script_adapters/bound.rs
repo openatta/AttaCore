@@ -95,6 +95,43 @@ impl BoundScripts {
             || !self.prompt_variables.is_empty()
     }
 
+    /// The half of this that a delegated agent inherits.
+    ///
+    /// A sub-agent, a team member and a background task each run their own
+    /// session, and the question is which of the operator's scripts follow
+    /// them there. The line is drawn between what *constrains* the engine and
+    /// what *writes* a prompt:
+    ///
+    /// - the rings around tool calls and model calls travel, because a policy
+    ///   that stops at the first delegation is not a policy. A script that
+    ///   refuses `Bash` in this project, or redacts what a tool returns, would
+    ///   otherwise be one `Agent` call away from being bypassed — by the
+    ///   model, without anyone deciding it.
+    /// - the prompt contributions stay, because they were written against the
+    ///   prompt of the session that bound them. A delegate has its own scene
+    ///   and its own prompt, and a block or an assembly pass aimed at one is
+    ///   not aimed at the other.
+    ///
+    /// The carriers are left behind too, which is what makes the delegate's
+    /// calls count against the *parent turn's* quota rather than getting a
+    /// budget of their own: the delegate runs inside that turn, and
+    /// `calls_per_turn` is supposed to bound the whole of it, delegated work
+    /// included. Nothing calls `begin_turn` on a carrier the delegate does not
+    /// hold, so its turns cannot reset a budget the parent is still spending.
+    pub fn for_delegate(&self) -> Self {
+        Self {
+            assembly_hooks: Vec::new(),
+            prompt_blocks: Vec::new(),
+            prompt_variables: Vec::new(),
+            tool_results: self.tool_results.clone(),
+            retrieval_hooks: self.retrieval_hooks.clone(),
+            tool_middleware: self.tool_middleware.clone(),
+            model_interceptors: self.model_interceptors.clone(),
+            carriers: Vec::new(),
+            ledger: self.ledger.clone(),
+        }
+    }
+
     /// Install the prompt-side pieces on a registry.
     pub fn apply_to_registry(&self, registry: &dyn PromptRegistry) {
         for (hook, authority) in &self.assembly_hooks {
