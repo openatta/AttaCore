@@ -243,6 +243,10 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
 }
 
 /// macOS sandbox-exec 的 TinyScheme 字符串里 `\` 和 `"` 要转义。
+///
+/// 只有 macOS 的配置生成器调用它，但函数本身和平台无关——它的测试在哪个平台上
+/// 都该跑，所以这里没有跟着调用方一起 `cfg` 掉，而是只在别的平台上豁免"未使用"。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn sandbox_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
