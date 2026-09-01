@@ -1,450 +1,60 @@
 # AttaCore
 
-> **AI Agent Orchestration Engine** — a Rust workspace delivering production-grade infrastructure for building AI coding assistants and intelligent agent runtimes.
+[![CI](https://github.com/openatta/AttaCore/actions/workflows/ci.yml/badge.svg)](https://github.com/openatta/AttaCore/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/openatta/AttaCore?display_name=tag&sort=semver)](https://github.com/openatta/AttaCore/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](#prerequisites)
+
+**An agent engine you build products on, not an assistant you talk to.**
+
+AttaCore is the runtime underneath a coding assistant: the turn loop, the tool
+surface, permissions, context compaction, sub-agents, MCP, and the seams to
+change any of it. Ship it as a Rust library inside your app, or run it as a
+JSON-RPC daemon your IDE plugin talks to. Both are the same engine.
+
+What makes it worth looking at is the last part — **44 extension points**, three
+different ways to reach them, and a rule that runs through all of them: an
+extension that fails costs its own contribution and nothing else.
 
 ---
 
-AttaCore is **not** an end-user AI assistant. It is a **developer-facing agent engine** — the same class of infrastructure that powers Claude Code. It provides a behavior-aligned tool system, session management, permission control, context compaction, multi-agent coordination, MCP protocol support, and more. Build your own IDE plugin, desktop GUI, CLI tool, or server-side agent product on top of it.
-
-## Why AttaCore
-
-| Concern | What You Get |
-|---|---|
-| **Behavior Fidelity** | 40 built-in tools whose behavior is verified against Claude Code's TypeScript reference implementation — every function, every edge case, every compression strategy |
-| **Context Is Hard** | Multi-strategy compaction (snip → micro-compact → collapse → LLM summarize), reactive triggers, circuit breakers, cache-aware edit generation — the system that keeps 200k+ token conversations coherent |
-| **Concurrency** | v2 streaming tool executor pipelines safe-parallel tools while the model is still generating tokens — GPU-pipeline thinking applied to LLM tool calls |
-| **Safety** | Three-tier permission model (allow/ask/deny), glob-based rule engine, Unicode-normalized path safety, sandboxed execution, LLM-assisted classification |
-| **Multi-Agent** | First-class team coordination: Coordinator, Mailbox, shared memory — compose agents like microservices |
-| **Multi-Provider Routing** | Declare several LLM providers in `settings.json` and route by task type — sub-agent spawns, compaction and memory extraction can each run on a cheaper/different model than the main conversation, resolved and validated at daemon startup. Two wire protocols implemented: Anthropic Messages and OpenAI Chat Completions |
-| **Scene Customization** | Agent behavior — system prompt, tool whitelist, execution limits — lives behind the `AgentScene` trait, not hardcoded. Four built-in scenes, three of which double as a copy-from-here ladder: full reference, compact reference, minimal skeleton |
-| **Observability** | 37 structured telemetry event types, OpenTelemetry export, LLM interaction recording and deterministic replay, cost tracking |
-| **Sandboxed Plugins** | WebAssembly component-model plugins with capability declarations that default to nothing, install-time disclosure of every model-visible string, and a build that can drop the entire plugin subsystem from the dependency graph |
-| **Embeddable** | Library mode (Rust API) or Daemon mode (JSON-RPC 2.0 over Unix socket / TCP, token-handshake authenticated) — same engine, your choice of integration surface |
-
-## Architecture
-
-AttaCore is a strictly-layered Rust workspace. Dependencies only flow upward — each layer builds on the one below it. No cycles. No shortcuts.
-
-```
-                          ┌──────────────────────────┐
-                          │     Your Application      │
-                          │  IDE · CLI · GUI · Server │
-                          └──────────┬───────────────┘
-                                     │
-                          ┌──────────▼───────────────┐
-                          │  L5  plugin-host         │  ← optional, compile-time
-                          │  plugin-compiler         │     removable
-                          ├──────────────────────────┤
-                          │  L4  runtime             │
-                          │  Agent loop · Builder    │
-                          │  Streaming executor      │
-                          │  Commands (/help, …)     │
-                          ├──────────────────────────┤
-                          │  L3  tools · skills      │
-                          │  scene · team · task     │
-                          │  40 built-in tools       │
-                          │  Skill system · MCP      │
-                          ├──────────────────────────┤
-                          │  L2  model · history     │
-                          │  permissions · mcp       │
-                          │  compaction · session    │
-                          ├──────────────────────────┤
-                          │  L1  core · wasm-host    │
-                          │  traits · types · ID     │
-                          │  EngineConfig · Context  │
-                          ├──────────────────────────┤
-                          │  L0  auth · hooks        │
-                          │  plugin · telemetry      │
-                          └──────────────────────────┘
-```
-
-`plugin-host` sits above `runtime` because it wires plugin contributions into the
-engine's registries; that is why the whole plugin tier can be dropped without the
-layers below it noticing. See [Plugin System](#plugin-system).
-
-### The Layers
-
-**L0 — Cross-Cutting Services** (zero internal deps)
-`auth` (OAuth 2.0 PKCE), `hooks` (lifecycle callbacks — 30 event types; five hook backends: command / prompt / HTTP / agent / WASM), `plugin` (marketplace + dependency resolution + version cache + install-time disclosure), `telemetry` (37 structured event types, OpenTelemetry export, LLM interaction recording and replay).
-
-**L1 — Foundation** (`core` / `base` crate, plus `wasm-host`)
-Shared types and traits for the entire system: `Model` (LLM backend abstraction), `AgentScene` (agent behavior), `Permission` (tool authorization), `Tool` (unified tool interface v7). Plus `Id` (BASE58 UUIDv4), `EngineConfig`, `SessionState`, `FrozenContext`, `ToolContext`, and the message/content block types. `wasm-host` — the WebAssembly component runtime and capability resolver, depending only on `core` and `plugin`.
-
-**L2 — Infrastructure**
-`model` — two protocol adapters (Anthropic Messages, OpenAI Chat Completions) with streaming, tokenization, fallback routing. `history` — JSONL persistence with path sanitization and transcript chunking. `permissions` — glob-based rule engine with allow/deny/ask matching, path safety (Unicode NFC/NFD normalization), YOLO mode, LLM classifier. `mcp` — full MCP client: stdio / SSE / Streamable HTTP / WebSocket / in-process transports, tool adaptation, OAuth bearer tokens. `compaction` — multi-strategy context compression with reactive triggers and circuit breakers. `session` — in-memory session state and auto-naming.
-
-**L3 — Domain Logic**
-`tools` — 40 built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, CronCreate, TaskCreate, Skill, NotebookEdit, Monitor, PushNotification, …). `skills` — skill resolver + loader + watcher over filesystem, bundled and MCP-derived sources. `scene` — built-in scenes: Coding, Chat, Demo, Research. `team` — multi-agent coordination: Coordinator, TeamCreate/List/Delete tools, Mailbox. `task` — background task lifecycle: running, cron, store, delete.
-
-**L4 — Runtime**
-`agent` — core Agent struct and Builder pattern. `turn` — the turn loop (~4000 lines excluding tests; the main loop function alone is ~1200), all orchestration logic. `streaming` — v2 streaming tool executor: `FuturesUnordered` batches of concurrency-safe tools dispatched during model generation, with sibling abort on error. `agent_tool` — sub-agent spawning and agent-type resolution. `commands` — slash command routing (/help, /skills, /clear, /compact, /cost, + custom).
-
-**L5 — Plugins** (optional)
-`plugin-host` — loads installed plugins and wires their five contribution points into the engine. `plugin-compiler` — ahead-of-time component compilation at install. Both vanish from the dependency graph in the locked build; see [Plugin System](#plugin-system).
-
-## Core Capabilities
-
-### Tool System (40 built-in tools, Claude Code behavior-aligned)
-
-| Category | Tools |
-|---|---|
-| **Filesystem** | `Read`, `Write`, `Edit`, `Glob`, `Grep` |
-| **Shell** | `Bash` (sandboxed, path-safe, timeout-controlled) |
-| **Web** | `WebFetch`, `WebSearch` |
-| **Task** | `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskStop`, `TaskOutput` |
-| **Planning** | `EnterPlanMode`, `ExitPlanMode`, `VerifyPlanExecution`, `TodoWrite` |
-| **Scheduling** | `CronCreate`, `CronDelete`, `CronList`, `ScheduleWakeup` |
-| **Workspace** | `EnterWorktree`, `ExitWorktree` (isolated git worktree per session) |
-| **Editor** | `NotebookEdit` |
-| **Interaction** | `PushNotification`, `Monitor`, `AskUserQuestion`, `StructuredOutput` |
-| **Collaboration** | `Skill` (skill invocation), `Agent` (sub-agent spawning), `TeamCreate`, `TeamList`, `TeamDelete` |
-| **Protocol** | `MCP` (server introspection), `ListMcpResources`, `ReadMcpResource`, plus one `mcp__<server>__<tool>` adapter per discovered MCP tool |
-| **Meta** | `ToolSearch` (on-demand schema lookup for deferred tools) |
-| **Diagnostics** | `Ping`, `Sleep` |
-
-Every tool implements the unified `Tool` trait — consistent error handling, permission gating, and telemetry instrumentation.
-
-Registration happens in two places, and the split is deliberate. `tools::register_builtin_tools` installs the 24 self-contained tools. The rest need per-session state, so `runtime::agent::Builder::build()` registers them into a registry it creates fresh for that session: `Skill`, `WebSearch`, `Cron*`, `*Worktree` and `TaskStop`/`TaskOutput` always; `Agent` only while under the sub-agent depth limit; the three MCP tools and the `mcp__*` adapters only when MCP clients are configured; `Team*` only when `execution.team_enabled` **and** the scene's `supports_team()` both say yes — a scene that does not do teamwork never shows the model tools it would then be refused.
-
-That is what gets *registered*. What the model actually sees is narrower still: the scene's `tools()` whitelist and `disallowed_tools()` filter the registry, and `deferred_tools()` decides which survive as name-only entries.
-
-**Deferred tools.** A scene can mark tools as deferred via `AgentScene::deferred_tools()`: they stay allowed and callable, but are advertised to the model by name and one-line description only. The model pulls the full JSON schema on demand with `ToolSearch`, so rarely-used tools stop costing schema tokens on every API call.
-
-### Scene Customization
-
-Agent behavior — system prompt, tool whitelist, token budget, execution limits — is defined by the [`AgentScene`](crates/core/src/interface/scene.rs) trait, not hardcoded into the engine. Four scenes ship built in; three of them double as a learning ladder, each at a different depth:
-
-| Scene | Depth | Use it as… |
-|---|---|---|
-| `CodingScene` | Full reference (~850 lines) — cache-optimized, multi-section system prompt, behavior aligned with Claude Code | The production-depth example |
-| `ChatScene` | Complete but compact — every method implemented, each with a "why this design" comment | The template to copy when writing your own scene |
-| `DemoScene` | Minimal skeleton — only the 6 required trait methods; every optional extension point left at its default | The "what happens if I don't override this" example |
-| `ResearchScene` | A working non-coding scene — different tool surface and budget, same trait | Evidence the trait is not coding-shaped |
-
-Implement `AgentScene` yourself to ship a scene tailored to your product — a support-bot scene, a data-analysis scene, whatever your domain needs — then register it in a `SceneRegistry` and select it via `--scene` (daemon mode) or `Builder::scene(...)` (library mode). See [Customizing Behavior](#customizing-behavior) below for the full trait-injection picture.
-
-**One process, several scenes.** `--scene` sets the daemon's default and `--scenes chat,research` activates more alongside it; `scene.activate` / `scene.deactivate` add and remove them at runtime, and `session.create {"scene": "chat"}` picks one per session. Each session resolves its own settings, skills, agents and plugins under `~/.atta/scenes/<id>/`, and a request that touches a session belonging to another scene is refused with `SCENE_MISMATCH` rather than executed across the boundary.
-
-### Multi-Provider LLM & Task-Level Routing
-
-Beyond a single hardcoded Anthropic client, `settings.json` can declare several providers and route requests to them by task type instead of one model for the whole engine:
-
-```json
-{
-  "providers": {
-    "anthropic": { "api_type": "anthropic", "api_key": "sk-ant-...", "default_model": "claude-sonnet-4-6" },
-    "deepseek":  { "api_type": "anthropic", "base_url": "https://api.deepseek.com", "api_key": "sk-...",
-                   "default_model": "deepseek-pro", "models": ["deepseek-pro", "deepseek-flash"] }
-  },
-  "default_provider": "anthropic",
-  "task_models": { "subagent": "deepseek", "compact": "deepseek" }
-}
-```
-
-- **Resolved and validated at startup** — an unknown provider, a missing `default_model`, or an unsupported `api_type` fails the daemon at boot with a clear error, not mid-session.
-- **Both `api_type` values have a protocol implementation.** `anthropic` (also the default when the field is absent) builds an Anthropic Messages client; `openai_compatible` builds `model::OpenAICompatibleModel`, speaking `POST <base_url>/v1/chat/completions` — which is what reaches OpenAI, vLLM, Ollama and the many gateways that only expose the OpenAI shape. `openai_compatible` requires an explicit `base_url`. Any other value is still a hard startup error, not a silent fall back to Anthropic.
-- **Four task keys are wired**: `main` (the conversation itself), `subagent` (`Agent` tool spawns), `compact` (LLM summarization) and `memory` (memory extraction). Anything with no `task_models` entry falls back to `default_provider`.
-- **`team` has no key of its own**: team coordination is handed the model resolved for `main`, and members it spawns route as `subagent`. Give `team` its own model by routing `subagent`.
-- Inspect resolved routing anytime via the `daemon.doctor` RPC; read/write provider config without hand-editing JSON via `config.getProvider`/`config.setProvider` — both hot-reload the router (no daemon restart), and `config.reload` picks up a hand-edited settings.json the same way. Already-running sessions catch up lazily, on their next turn.
-
-The authoritative schema for the whole `settings.json` surface, `providers` included, is [`docs/schemas/settings.schema.json`](docs/schemas/settings.schema.json). *(A prose config reference for providers does not exist yet.)*
-
-### Context Compaction
-
-The hardest problem in LLM agents, solved in production:
-
-```
-Budget Warning (80%) → Reactive Trigger → Micro-Compact (cache-aware)
-     ↓                                         ↓
-  Circuit Breaker ← Collapse (full) ← LLM Summarize (cost-aware)
-                                           ↓
-                                   Post-Compact Recovery
-                        (re-inject files, skills, plan state, task summaries)
-```
-
-- **Micro-compact**: removes stale tool results while preserving prompt cache
-- **Collapse**: merges consecutive user/assistant blocks
-- **LLM Summarize**: delegates to a cheaper model for aggressive compression
-- **Reactive**: predicts budget exhaustion from token velocity, triggers preemptively
-- **Circuit breaker**: detects compression loops, falls back to safe defaults
-- **Cache-aware edits**: generates `cache_edits` to avoid Anthropic prompt cache invalidation
-
-### Permission & Safety
-
-```
-RuleSet { allow: [Glob], ask: [Glob], deny: [Glob] }
-        ↓
-Path Safety (Unicode NFC/NFD normalization, system directory blocklist)
-        ↓
-LLM Classifier (optional: delegate ambiguous cases to a fast model)
-        ↓
-YOLO Mode (auto-approve for CI/automation)
-```
-
-Three-tier decisions: **Permit** / **AskUser** / **Deny**. Rules match by glob pattern with directory-aware semantics. Path safety normalizes Unicode to prevent homograph attacks and blocks writes to system directories.
-
-### Multi-Agent Team
-
-Spawn sub-agents as naturally as calling a function:
-
-```
-Coordinator → [Agent A] [Agent B] [Agent C]
-     ↕            ↕         ↕         ↕
-  Mailbox  ← messages →  Mailbox  ←→  Mailbox
-     ↕
-  Shared Memory (file-based, wikilink cross-references)
-```
-
-- **Agent spawning**: `Agent` tool with type selection, worktree isolation, background execution
-- **Mailbox**: typed message passing between agents
-- **Shared memory**: file-based persistent knowledge with YAML frontmatter, `[[wikilink]]` cross-references, staleness scoring, LLM-based extraction and relevance selection
-- **Coordinator**: task decomposition and result synthesis
-
-### MCP Integration
-
-Full Model Context Protocol support across five transports:
-
-| Transport | Status |
-|---|---|
-| **stdio** | subprocess lifecycle, auto-restart |
-| **SSE** | long-lived HTTP streaming |
-| **Streamable HTTP** | stateless request/response |
-| **WebSocket** | persistent bidirectional connection |
-| **in-process** | resolves a pre-registered `McpClient` from a process-local registry — no subprocess, no socket |
-
-The in-process transport is the one that matters for embedders: register your own `McpClient` implementation with `register_in_process_service`, name it in `mcp_servers`, and its tools reach the model over the same path as any external server, with no IPC in between.
-
-MCP tools are adapted to the native `Tool` trait and injected into the system prompt. MCP servers can also register as skills for user invocation. Per-server `scope` limits which tools, resources and prompts a server may expose.
-
-**OAuth**: the disk-backed token store and the PKCE flow live in `mcp::oauth`, and a server config can name an `oauth_provider`. The token *source* is a seam — `McpOAuthResolver`, installed by the host with `set_oauth_resolver`. **No implementation ships in this workspace**: with no resolver installed, OAuth is skipped and the connection proceeds without a bearer token. Embedders that need it implement the trait against the `auth` crate.
-
-### Telemetry & Recorder
-
-37 structured event types covering the full agent lifecycle: turn start/complete, tool execution, API errors, permission decisions, compaction operations, memory snapshots, MCP connect/disconnect, session lifecycle, startup timing, model routing, hook execution, slash command usage.
-
-**Recorder**: wrap any `Model` with `RecorderModel` to record every LLM call — the assembled system blocks, the full tool table, every message, and the response stream down to token boundaries — then replay it deterministically. Zero API cost for integration tests, and a recording is a self-contained directory you can hand to someone. Implementation: `crates/telemetry/src/recorder/`.
-
-### Plugin System
-
-Plugins are **WebAssembly components** (component model, WIT world `atta:plugin@0.1.0`), not dynamic libraries and not scripts. A component imports a small host interface and exports its tools:
-
-```wit
-world plugin {
-  import host;      // log, progress, now-ms, http-request, secret, kv-get, kv-set
-  export tools;     // list-tools, call-tool
-  export events;    // on-event — optional
-  export init: func(config-json: string) -> result<_, string>;
-}
-```
-
-**Capabilities default to nothing.** A component that declares no capabilities can compute and nothing else — no files, no network, no environment:
-
-```toml
-[wasm.capabilities]
-fs_read  = ["./data"]     # WASI preopens, read-only
-fs_write = []             # default: none
-net      = ["api.example.com"]
-env      = ["EXAMPLE_TOKEN"]   # reachable through host `secret`, nothing else
-max_memory_mb = 64
-timeout_ms    = 30000
-```
-
-`host.http-request` is checked against `net`; `host.secret` against `env`. There is one capability table and one authorization function — not a second whitelist per call path.
-
-**Install-time disclosure is not skippable.** Sandboxing governs what a plugin *executes*; it does nothing about what a plugin *says*, and text reaching the model is the one attack isolation cannot address. So every model-visible string — tool descriptions, agent descriptions, a scene's system prompt — is presented for review at install, under hard caps (500 chars per description, 40 000 per prompt). Over the cap **refuses the install**; it does not warn and continue.
-
-**Five contribution points, and the number is the point.** A plugin may add tools, MCP servers, hook subscriptions, scenes, and agent types. That is the entire surface, and adding a sixth is a decision to argue for. Within it:
-
-- **Hook subscriptions are a whitelist of 6 events** (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequested`, `SessionStart`, `SessionEnd`), enforced when the manifest is parsed — not the full 30 available to local hooks. Plugins reach the lifecycle through the hook dispatcher that already exists, so they add no new call site to the turn loop.
-- **Permission rules a plugin contributes carry `RuleSource::Plugin`**, the lowest of the eight priorities — below user settings and organization policy, always. Uninstalling withdraws them in one call.
-- **A plugin gets its own scene, never anyone else's.** Rewriting the prompt of a scene the user picked for other reasons is hijacking; owning a scene the user explicitly enters is the plugin doing its job.
-- **Agent types a plugin declares cannot widen their own permissions** — `AgentTypeSource::Plugin` clamps the `permission_mode` and `max_turns` overrides.
-
-**Faults cost one call.** Per-call isolation means a trapping component fails that invocation rather than the process. A component that traps three times consecutively is set aside — timeouts and cancellations do not count, since those say something about the work, not the plugin.
-
-**The whole subsystem compiles out.** Two feature levels, both verified by checking the dependency graph rather than trusting the flag:
+## Sixty seconds
 
 ```sh
-cargo build -p daemon --no-default-features                   # no plugin crates, no wasmtime
-cargo build -p daemon --no-default-features --features plugins # plugins, no WebAssembly compiler
-tests/scripts/locked_build.sh                                 # asserts both, then runs the suite
+git clone https://github.com/openatta/AttaCore && cd AttaCore
+export ANTHROPIC_AUTH_TOKEN=sk-...          # or ANTHROPIC_API_KEY
+cargo run --release -p daemon               # listens on ~/.atta/coding/daemon.sock
 ```
-
-Build the locked artifact for that one package — never `--workspace`, since cargo unifies features across the graph and any other member enabling `plugins` turns it back on. With the feature off, `PluginHost` is `None` and every call site is an `if let Some(..)` that does nothing; there is no `#[cfg]` scattered through the engine and no behavior to reason about beyond "there are no plugins".
-
-Full guide: [`docs/extending_wasm.md`](docs/extending_wasm.md).
-
-### Script Carrier
-
-The tier between "recompile the engine" and "spawn a process". A script is a
-`.js` file and one line of configuration; the engine reads it when the session
-is built, calls the function you named at the point you named, and hands the
-result back to whichever part of the engine asked. No build step, no
-subprocess, no network — QuickJS is embedded in the daemon and a call costs
-microseconds.
-
-```json
-{ "scripts": [
-  { "path": ".atta/scripts/house_style.js", "point": "prompt.assemble", "entry": "onAssemble" }
-] }
-```
-
-**Nine points today**: the four that write a prompt (`prompt.assemble`,
-`prompt.block`, `prompt.context`, `prompt.variable`), the two rings around a
-tool call (`tool.around`, `tool.result`), the two around a model call
-(`model.request`, `model.message`), and both ends of memory recall
-(`memory.retrieval_hook`).
-
-**A failing script changes nothing.** Throwing, running past its clock,
-exhausting its quota, or answering in a shape the point cannot use all leave
-that point exactly as the adapter found it — a prompt half-edited by a script
-that died mid-pass is worse than an unedited one, because nothing downstream
-can tell which it is looking at. Every call is written down: which point, which
-turn, and whether the point took the answer, found nothing to take, never got
-one, or refused it.
-
-**What a script may do follows the file, not the declaration.** A script inside
-the project is the operator's own code and may rewrite the prompt; one that
-arrived from anywhere else may add to it and no more — because a declaration is
-exactly what a script from outside would lie in.
-
-**Policy follows the work.** The rings around tool and model calls travel into
-sub-agents, team members and background tasks; the prompt contributions stay
-with the session that bound them. A rule that stopped at the first delegation
-would be one `Agent` call away from being bypassed, by the model, without
-anyone deciding it.
-
-**Budgets are per binding, per turn**: 100 ms and 1000 calls by default, both
-configurable, with the clock enforced inside the interpreter so a `while (true)`
-stops too. Memory is capped at 16 MB per runtime.
-
-The carrier is the `scripts` feature of `daemon`, on by default, and mutually
-exclusive with `plugins` — a build carries one extension carrier or none.
-
-Full guide: [`docs/extending_quickjs.md`](docs/extending_quickjs.md).
-
-## Crate Map
-
-| Layer | Crate | Responsibility | Key Exports |
-|---|---|---|---|
-| L0 | `auth` | OAuth 2.0 PKCE client | `OAuth2Client`, `TokenStore`, `PkceVerifier` |
-| L0 | `hooks` | Lifecycle hook runner | `HookRunner`, `HookConfig` (5 backends), `HookEvent` (30 types) |
-| L0 | `plugin` | Plugin marketplace, resolution, disclosure | `Plugin`, `PluginManifest`, `PluginResolver`, `DependencyGraph`, `Disclosure`, `Capabilities` |
-| L0 | `telemetry` | Telemetry + Recorder | `TelemetryHandle`, `TelemetryRecorder`, `TelemetryEvent` + `EventPayload` (37 variants), `RecorderModel`, `FileRecorder` |
-| L1 | `core` (base) | Shared types, traits, ID | `Model`, `AgentScene`, `Permission`, `Tool`, `Id`, `EngineConfig`, `FrozenContext` |
-| L1 | `wasm-host` | WASM component runtime | `API_VERSION`, capability resolver, per-plugin health tracking |
-| L2 | `model` | Anthropic + OpenAI adapters | `AnthropicModel`, `OpenAICompatibleModel`, `AnthropicClient`, `ModelEvent`, `Usage` |
-| L2 | `history` | JSONL session persistence | `HistoryStore`, `JsonlHistoryStore`, `LogEntry`, `project_messages` |
-| L2 | `permissions` | Permission engine | `RuleSet`, `PermissionGate`, `AutoClassifier`, `LlmClassifier`, `WritePolicy` + `check_write` |
-| L2 | `mcp` | MCP protocol client | `McpManager`, `McpClient`, `McpToolAdapter`, `McpOutputCache`, `McpOAuthResolver` |
-| L2 | `compaction` | Context compression | `Compactor`, `DefaultCompactor`, `SessionMemoryCompactor`, reactive/cached/time-based strategies |
-| L2 | `session` | In-memory session state | `SessionManager`, `SessionSummary` |
-| L3 | `tools` | 40 built-in tools | `BashTool`, `FileReadTool`, `FileWriteTool`, `WebFetchTool`, `SearchProvider`, … |
-| L3 | `skills` | Skill loader + manager | `SkillManager`, `SkillWatcher`, `build_skills_from_mcp` |
-| L3 | `scene` | Built-in agent scenes | `SceneRegistry`, `CodingScene`, `ChatScene`, `DemoScene`, `ResearchScene` |
-| L3 | `team` | Multi-agent coordination | `Coordinator`, `TeamCreateTool`, `TeamRegistry`, `Mailbox` |
-| L3 | `task` | Background task lifecycle | `TaskStore`, `RunningTaskStore`, `RunningTaskData`, `DreamTask` |
-| L4 | `runtime` | Agent runtime + turn loop | `Agent`, `Builder`, `PluginHost`, `AgentTypeDefinition`, `CommandRegistry` |
-| L5 | `plugin-host` | Loads plugins, wires contributions | `InstalledPlugins`, `PluginScene` |
-| L5 | `plugin-compiler` | Ahead-of-time component compile | `atta-plugin-compile` binary |
-| — | `daemon` | JSON-RPC 2.0 server | `DaemonServer`, `SessionPool` (LRU + idle eviction), `build_task_router`, `run_doctor` |
-| — | `test-runner` | .test scenario runner | API runner, CLI runner, LLM comparator, reporter |
-
-20 crates under `crates/`, plus `daemon/` and the test-runner members — 24 workspace members in total.
-
-## Quick Start
-
-### Prerequisites
-
-- **Rust** 1.80+
-- **Anthropic API Key** (or compatible endpoint)
-
-### Build & Test
 
 ```sh
-# Full workspace build
-cargo build --workspace
-
-# Run all tests
-cargo test --workspace
-
-# Single crate
-cargo test -p tools
-
-# Daemon tests
-cargo test -p daemon
+echo '{"jsonrpc":"2.0","id":1,"method":"session.run_turn",
+       "params":{"message":"Write a TCP echo server in Rust"}}' \
+  | socat - UNIX-CONNECT:$HOME/.atta/coding/daemon.sock
 ```
 
-### Run the Daemon
+Tokens stream back as `session.event` frames while the turn runs; the response
+arrives when it ends. Thirty-five methods are documented in
+[`docs/daemon_rpc_protocol.md`](docs/daemon_rpc_protocol.md), and every
+documented shape is compared against a real daemon's answer by a test — the
+document cannot drift from the code.
 
-```sh
-export ANTHROPIC_API_KEY=sk-...
-cargo run -p daemon
-# Listens on $HOME/.atta/<scene>/daemon.sock (--scene defaults to "coding"; must be a registered scene — coding/chat/demo/research — or the daemon fails to start)
-# Writes discovery lock file → clients auto-discover
-```
-
-### Run Integration Tests
-
-```sh
-# Prerequisite: .env file at repo root (gitignored) with API key — see tests/README.md
-# API mode (direct Agent construction)
-./tests/run_api.sh 000.c_project
-
-# CLI mode (daemon → JSON-RPC)
-./tests/run_cli.sh 000.c_project
-```
-
-## Usage Modes
-
-### Daemon Mode (JSON-RPC 2.0)
-
-For IDE plugins, multi-process architectures, remote clients. The engine runs as a standalone process communicating over Unix domain sockets or TCP.
-
-```sh
-# Start the daemon
-export ANTHROPIC_API_KEY=sk-...
-cargo run -p daemon --release
-
-# Send a turn via socat
-echo '{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"Write hello world in Rust"},"id":1}' \
-  | socat - UNIX-CONNECT:$HOME/.atta/coding/daemon.sock  # default scene; use $HOME/.atta/<scene>/daemon.sock if you passed --scene
-```
-
-Daemon features:
-- **Session pool** with configurable capacity, LRU eviction, and idle timeout
-- **Discovery** via PID lock file + Unix socket — clients find the daemon automatically
-- **Graceful shutdown** with in-flight turn completion
-- **TCP mode** requires a `daemon.auth` handshake (constant-time token comparison) as the first message on every connection before any other method is dispatched — Unix sockets skip this and rely on filesystem permissions instead
-
-### Library Mode (Embedded Rust API)
-
-For desktop apps, custom CLIs, server-side agents. Direct control over every aspect of the engine.
+Or skip the process boundary entirely:
 
 ```rust
-use runtime::agent::Builder;
-use scene::scene::coding::CodingScene;
-use model::adapter::AnthropicModel;
-
-// One Agent = one session
-let (mut agent, event_rx, input_tx) = Builder::new()
-    .scene(Arc::new(CodingScene))
+let (mut agent, mut events, input) = runtime::agent::Builder::new()
+    .scene(Arc::new(scene::scene::coding::CodingScene))
     .model(model)
     .settings(settings)
-    .session_id(session_id)
     .build()?;
 
-// Run the event loop in background
 tokio::spawn(async move { agent.run(cancel).await });
 
-// Send messages, receive streaming events
-input_tx.send(InputMessage::User {
+input.send(InputMessage::User {
     content: "Write a TCP echo server".into(),
     attachments: vec![],
     turn_id,
 })?;
-
-while let Some(event) = event_rx.recv().await {
+while let Some(event) = events.recv().await {
     match event {
         AgentEvent::TextDelta { text, .. } => print!("{text}"),
         AgentEvent::TurnComplete { .. } => break,
@@ -453,120 +63,505 @@ while let Some(event) = event_rx.recv().await {
 }
 ```
 
-`scene`, `model` and `settings` are required — `build()` returns `Err(EngineError::Internal("… required"))` when one is missing, so it is a startup check, not a compile-time one. Everything else gets a sensible default: `AllowAll` permissions, an in-memory tool registry, `DefaultCompactor`, and a hook runner with no hooks configured.
+Three things are required — a scene, a model, settings. Everything else has a
+working default, and every default is a trait you can replace.
 
-### Customizing Behavior
+---
 
-Inject your own implementations at build time:
+## Why this one
 
-```rust
-Builder::new()
-    .scene(my_scene)              // Arc<dyn AgentScene>  — system prompt, tool surface, budgets
-    .model(my_model)              // Arc<dyn Model>       — any LLM backend
-    .permission(my_permission)    // Arc<dyn Permission>  — your authorization logic
-    .compactor(my_compactor)      // Arc<dyn Compactor>   — custom compaction strategy
-    .history_store(my_store)      // Arc<dyn HistoryStore> — session persistence backend
-    .plugin_host(my_plugin_host)  // Arc<dyn PluginHost>  — plugin contributions
-    .task_router(my_router)       // Arc<TaskRouter>      — per-task model routing
-    .tools(my_registry)           // Arc<InMemoryToolRegistry> — concrete type, see below
-    .hooks(my_hook_runner)        // Arc<HookRunner>           — concrete type, see below
-    .build()?;
-```
+| | |
+|---|---|
+| **Extend it without forking it** | 44 points in a published catalog, each with its cost and its trust rules. A `.js` file and one line of config reaches nine of them; a WebAssembly plugin reaches five; a Rust trait reaches all of them. |
+| **A failing extension is a non-event** | Every adapter computes its change fully before applying any of it. A script that throws, times out, exhausts its quota or answers in the wrong shape leaves its point exactly as it found it — a prompt half-edited by something that died mid-pass is worse than an unedited one. |
+| **Policy survives delegation** | The rings around tool and model calls follow sub-agents, team members and background tasks. A rule that stopped at the first `Agent` call would be one model decision away from being bypassed. |
+| **Context is handled, not hoped about** | Four compaction strategies behind a predictive trigger and a circuit breaker, with cache-aware edits so compaction does not invalidate the prompt cache it just paid for. |
+| **Tools run while the model is still typing** | The streaming executor dispatches concurrency-safe tools during generation, with sibling abort on failure. |
+| **Every call is recordable and replayable** | Wrap any `Model` in the recorder and a session becomes a self-contained directory — system blocks, tool table, messages, response down to token boundaries. Replay is byte-exact and needs no network. |
+| **Safe by default, not by discipline** | Three-tier permissions, Unicode-normalized path safety, sandboxed execution, capability-gated plugins that default to nothing. You opt into less. |
+| **One engine, two integrations** | Library mode or JSON-RPC daemon over Unix socket / TCP / WebSocket. Same turn loop underneath. |
 
-Seven of these take a trait object, so an external crate can supply the implementation. Two do not, and it is worth knowing which:
+---
 
-- **`.tools(...)` takes `Arc<InMemoryToolRegistry>`, a concrete type.** A `ToolRegistry` trait exists in `base::tool`, but it carries only `all()` and `find()` — `register`/`replace` are inherent methods on the concrete type, and there is no `remove`. An alternative registry implementation cannot currently be substituted here.
-- **`.hooks(...)` takes `Arc<HookRunner>`, a concrete struct, not a trait.** Customization happens through hook *configuration* (five backends: command, prompt, HTTP, agent, WASM) rather than by replacing the runner. The two executor traits the runner delegates to — `PromptHookExecutor` and `AgentHookExecutor` — are injectable; without them, `prompt` and `agent` hooks are skipped with a stated reason rather than failing silently.
+## The extension surface
 
-Note also that `Permission::bind_tool_registry` takes `Arc<InMemoryToolRegistry>` for the same reason, which couples a custom `Permission` implementation to the concrete registry.
+Most engines have a plugin API. This one publishes a **catalog**: every seam,
+what it costs, and who is allowed to use it — generated from the code, so the
+table cannot go stale. Three questions decide which shape you need:
 
-## Configuration
+| You want to… | You need | Example |
+|---|---|---|
+| **replace** how the engine does something | a **contract** — implement a trait, hand it to the builder | your own `Model`, `Permission`, `Compactor`, `HistoryStore` |
+| **add** to what it already does | a **registration** — contribute something named, ordered, withdrawable | a prompt block, a tool, an MCP server, a scene |
+| **see or change** something in flight | an **interception** — sit in the path | rewrite a tool result, refuse a call before dispatch, narrow a recall query |
 
-### Settings Layers (lowest to highest priority)
+And three carriers to reach them from outside a Rust build:
 
-1. Built-in defaults
-2. `$HOME/.atta/<scene>/settings.json` (or `.toml`) — `<scene>` is the daemon's `AgentScene` id (`coding`/`chat`/`demo`/`research`); set via `--scene` (defaults to `coding`)
-3. `<project>/.atta/settings.json` (or `.toml`) — project-level state is flat, no scope segment
-4. CLI arguments
+### Scripts — the cheap tier (default)
+
+A `.js` file and one line of configuration. QuickJS is embedded in the daemon;
+a call costs microseconds, no build step, no subprocess, no network.
 
 ```json
-{
-  "model": "claude-sonnet-4-6",
-  "max_tokens": 4096,
-  "permission": {
-    "mode": "default",
-    "default_mode": "require_user_permission",
-    "yolo": false
-  },
-  "mcp_servers": {}
+{ "scripts": [
+  { "path": ".atta/scripts/house_style.js", "point": "prompt.assemble", "entry": "onAssemble" }
+] }
+```
+
+**Nine points**: four that write the prompt (`prompt.assemble`, `prompt.block`,
+`prompt.context`, `prompt.variable`), two around a tool call (`tool.around`,
+`tool.result`), two around a model call (`model.request`, `model.message`), and
+both ends of memory recall (`memory.retrieval_hook`).
+
+What a script may do follows **where its file is**, not what its binding claims
+— because a declaration is exactly what a script from outside would lie in. One
+inside the project is the operator's own code and may rewrite the prompt; one
+that arrived from elsewhere may add to it and no more, and a refused edit is
+reported and counted rather than dropped, so "being held back" reads differently
+from "doing nothing". Budgets are per binding, per turn: 100 ms and 1000 calls
+by default, with the clock enforced inside the interpreter so a `while (true)`
+stops too.
+
+Full guide: [`docs/extending_quickjs.md`](docs/extending_quickjs.md).
+
+### Plugins — the sandboxed tier
+
+WebAssembly components (component model, WIT world `atta:plugin@0.1.0`), not
+dynamic libraries and not scripts:
+
+```wit
+world plugin {
+  import host;      // log, progress, now-ms, http-request, secret, kv-get, kv-set
+  export tools;     // list-tools, call-tool
+  export events;    // on-event — optional
 }
 ```
 
-### Environment Variables
+- **Capabilities default to nothing.** A manifest declares what it needs; the
+  host resolves the declaration into an actual capability set at load.
+- **Install-time disclosure is not skippable.** Sandboxing governs what a plugin
+  *executes* and does nothing about what it *says* — and text reaching the model
+  is the one attack isolation cannot address. Every model-visible string is
+  presented for review at install, under hard caps. Over the cap **refuses the
+  install**; it does not warn and continue.
+- **Five contribution points, and the number is the point**: tools, MCP servers,
+  hook subscriptions, scenes, agent types. Adding a sixth is a decision to argue
+  for.
+- **Hook subscriptions are a whitelist of 6 events**, not the 30 available to
+  local hooks, enforced when the manifest is parsed.
+- **A plugin gets its own scene, never anyone else's.** Rewriting the prompt of a
+  scene the user picked for other reasons is hijacking.
+- **Faults cost one call.** A component that traps fails that invocation, not the
+  process; three consecutive traps set it aside. Timeouts and cancellations do
+  not count — those say something about the work.
+
+Full guide: [`docs/extending_wasm.md`](docs/extending_wasm.md).
+
+### Hooks — the lifecycle tier
+
+Thirty named moments in a turn, five backends (command, prompt, HTTP, agent,
+WASM). A hook can observe, rewrite an input, block a tool call, or end a turn,
+depending on the event.
+
+### And one more door
+
+Anything that speaks MCP is already an extension. `bridges/atta-dsh-bridge` runs
+an external JavaScript plugin as an MCP server, so a plugin written for a
+framework this engine knows nothing about reaches the model through the same
+path as any other server.
+
+### One carrier per build
+
+`scripts` and `plugins` are mutually exclusive features, and `scripts` is the
+default:
+
+```sh
+cargo build -p daemon                                            # QuickJS
+cargo build -p daemon --no-default-features --features plugins   # WebAssembly
+cargo build -p daemon --no-default-features                      # neither
+```
+
+Both configurations are checked on every push, including that the two still
+refuse to compile together. With plugins off, `PluginHost` is `None` and every
+call site is an `if let Some(..)` that does nothing — no `#[cfg]` scattered
+through the engine, and no behavior to reason about beyond "there are no
+plugins".
+
+The whole catalog, with costs and trust rules per point:
+[`docs/extension_points.md`](docs/extension_points.md).
+
+---
+
+## Architecture
+
+A strictly-layered Rust workspace. Dependencies flow upward only. No cycles.
+
+```
+                          ┌──────────────────────────┐
+                          │     Your Application     │
+                          │  IDE · CLI · GUI · Server│
+                          └──────────┬───────────────┘
+                                     │
+                          ┌──────────▼───────────────┐
+                          │  L5  plugin-host         │  ← optional, compile-time
+                          │      plugin-compiler     │     removable
+                          ├──────────────────────────┤
+                          │  L4  runtime             │
+                          │      Agent loop · Builder│
+                          │      Streaming executor  │
+                          ├──────────────────────────┤
+                          │  L3  tools · skills      │
+                          │      scene · team · task │
+                          ├──────────────────────────┤
+                          │  L2  model · history     │
+                          │      permissions · mcp   │
+                          │      compaction · session│
+                          ├──────────────────────────┤
+                          │  L1  core · wasm-host    │
+                          │      script-host         │
+                          │      traits · types · ID │
+                          ├──────────────────────────┤
+                          │  L0  auth · hooks        │
+                          │      plugin · telemetry  │
+                          └──────────────────────────┘
+```
+
+`plugin-host` sits *above* `runtime` because it wires plugin contributions into
+the engine's registries — which is exactly why the whole tier drops out without
+the layers below it noticing.
+
+**L0 — cross-cutting** (no internal deps): `auth` (OAuth 2.0 PKCE), `hooks` (30
+events, 5 backends), `plugin` (marketplace, dependency resolution, disclosure),
+`telemetry` (37 event types, OpenTelemetry export, recorder).
+**L1 — foundation**: `core` (every shared trait and type: `Model`, `AgentScene`,
+`Permission`, `Tool`, `Id`, `EngineConfig`, `FrozenContext`), and the two
+carriers — `wasm-host` and `script-host` — each depending on `core` and nothing
+else, so a build that wants neither links neither.
+**L2 — infrastructure**: `model` (Anthropic + OpenAI-compatible), `history`
+(JSONL), `permissions`, `mcp`, `compaction`, `session`.
+**L3 — domain**: `tools` (40), `skills`, `scene`, `team`, `task`.
+**L4 — runtime**: the Agent, the Builder, the turn loop, the streaming executor,
+sub-agent spawning, slash commands.
+**L5 — plugins**: loader and ahead-of-time component compiler, both optional.
+
+Concepts and how they fit: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## Capabilities
+
+### Tools — 40 built in
+
+| Category | Tools |
+|---|---|
+| **Filesystem** | `Read` `Write` `Edit` `Glob` `Grep` |
+| **Shell** | `Bash` (sandboxed, path-safe, timeout-controlled) |
+| **Web** | `WebFetch` `WebSearch` |
+| **Task** | `TaskCreate` `TaskList` `TaskGet` `TaskUpdate` `TaskStop` `TaskOutput` |
+| **Planning** | `EnterPlanMode` `ExitPlanMode` `VerifyPlanExecution` `TodoWrite` |
+| **Scheduling** | `CronCreate` `CronDelete` `CronList` `ScheduleWakeup` |
+| **Workspace** | `EnterWorktree` `ExitWorktree` (isolated git worktree per session) |
+| **Collaboration** | `Skill` `Agent` `TeamCreate` `TeamList` `TeamDelete` |
+| **Protocol** | `MCP` `ListMcpResources` `ReadMcpResource`, plus one `mcp__<server>__<tool>` per discovered MCP tool |
+| **Interaction** | `AskUserQuestion` `PushNotification` `Monitor` `StructuredOutput` |
+| **Editor / Meta / Diagnostics** | `NotebookEdit` · `ToolSearch` · `Ping` `Sleep` |
+
+Registration is split on purpose. `tools::register_builtin_tools` installs the
+24 self-contained ones; the rest need per-session state, so the builder
+registers them into a registry it creates fresh for that session — `Agent` only
+under the sub-agent depth limit, the MCP tools only when servers are configured,
+`Team*` only when the setting **and** the scene's `supports_team()` both say yes.
+A scene that does not do teamwork never shows the model tools it would then be
+refused.
+
+**Deferred tools** stay callable but are advertised by name and one line only;
+the model pulls a full schema on demand with `ToolSearch`. On the coding scene
+that is ~17k tokens of schemas that stop shipping on every call.
+
+### Scenes — behavior is a trait, not a constant
+
+System prompt, tool whitelist, token budget, execution limits live behind
+[`AgentScene`](crates/core/src/interface/scene.rs). Four ship, and three of them
+double as a ladder you can copy from:
+
+| Scene | Depth |
+|---|---|
+| `CodingScene` | Full reference (~850 lines) — cache-optimized, multi-section prompt |
+| `ChatScene` | Complete but compact — every method implemented, each with a "why" comment. **Copy this one.** |
+| `DemoScene` | Minimal skeleton — only the 6 required methods; everything optional left at its default |
+| `ResearchScene` | A working non-coding scene — evidence the trait is not coding-shaped |
+
+One process runs several at once: `--scene` sets the default, `--scenes` activates
+more, `scene.activate`/`scene.deactivate` change the set at runtime, and each
+session picks one. A request that touches a session belonging to another scene is
+refused with `SCENE_MISMATCH` rather than executed across the boundary.
+
+### Model routing — per task, not per engine
+
+```json
+{
+  "providers": {
+    "anthropic": { "api_type": "anthropic", "default_model": "claude-sonnet-4-6" },
+    "local":     { "api_type": "openai_compatible", "base_url": "http://localhost:11434",
+                   "default_model": "qwen3" }
+  },
+  "default_provider": "anthropic",
+  "task_models": { "subagent": "local", "compact": "local" }
+}
+```
+
+Four task keys are wired — `main`, `subagent`, `compact`, `memory` — and anything
+unrouted falls back to the default provider. Both `api_type` values have a real
+protocol implementation; `openai_compatible` speaks
+`POST <base_url>/v1/chat/completions`, which is what reaches OpenAI, vLLM, Ollama
+and the gateways that only expose that shape. An unknown provider or a missing
+`default_model` fails the daemon **at boot**, not mid-session. Routing is
+inspectable at runtime via `daemon.doctor`, and editable without touching JSON via
+`config.getProvider` / `config.setProvider` — both hot-reload the router.
+
+### Context compaction
+
+```
+Budget warning (80%) → reactive trigger → micro-compact (cache-aware)
+        ↓                                        ↓
+  circuit breaker ← collapse (full) ← LLM summarize (cost-aware)
+                                            ↓
+                                    post-compact recovery
+                     (re-inject files, skills, plan state, task summaries)
+```
+
+**Micro-compact** drops stale tool results while preserving the prompt cache.
+**Collapse** merges consecutive blocks. **LLM summarize** delegates to a cheaper
+model. **Reactive** predicts exhaustion from token velocity and triggers before
+the wall. **Circuit breaker** detects compression loops and falls back. Edits are
+emitted as `cache_edits` so compaction does not throw away the cache it just
+paid for.
+
+### Permissions
+
+```
+RuleSet { allow: [Glob], ask: [Glob], deny: [Glob] }
+        ↓
+path safety (Unicode NFC/NFD normalization, system-directory blocklist)
+        ↓
+optional LLM classifier for ambiguous cases
+        ↓
+YOLO mode (CI / automation)
+```
+
+Three decisions — **Permit** / **AskUser** / **Deny** — with directory-aware glob
+matching and eight rule priorities. A rule a plugin contributes carries the
+lowest of them, below user settings and organization policy, always.
+
+### Multi-agent
+
+```
+Coordinator → [Agent A] [Agent B] [Agent C]
+     ↕            ↕         ↕         ↕
+  Mailbox  ←  messages  →  Mailbox  ←→ Mailbox
+     ↕
+  Shared memory (files, YAML frontmatter, [[wikilinks]], staleness scoring)
+```
+
+Sub-agents spawn with type selection, optional git-worktree isolation and
+background execution. What a delegate inherits from its parent is **one list** —
+a source scan fails if a spawn site takes some of it and not the rest.
+
+### MCP
+
+Five transports: **stdio** (subprocess lifecycle, auto-restart), **SSE**,
+**Streamable HTTP**, **WebSocket**, and **in-process** — the one that matters for
+embedders: register your own `McpClient`, name it in `mcp_servers`, and its tools
+reach the model over the same path as any external server with no IPC in between.
+MCP tools adapt to the native `Tool` trait; servers can also register as skills.
+
+### Telemetry and the recorder
+
+37 structured event types over the whole lifecycle, with OpenTelemetry export and
+cost tracking. And the recorder: wrap any `Model`, and every call is written to a
+self-contained directory — the assembled system blocks (per block, not joined),
+the full tool table, every message, the response down to token boundaries, and
+failures recorded as failures so an overload that switched to the fallback model
+replays as an overload. Replay matches the k-th live call to the k-th recorded
+one, so a mismatch names the field that moved instead of reporting a hash miss.
+
+---
+
+## Embedding
+
+### Daemon mode
+
+For IDE plugins and multi-process setups. Unix socket, TCP, or WebSocket — the
+transport changes framing and nothing else, which is checked by running one
+exchange over all three.
+
+- **Session pool** with capacity, LRU eviction and idle timeout
+- **Discovery** via PID lock file next to the socket
+- **Graceful shutdown** that lets in-flight turns finish
+- **TCP and WebSocket require a `daemon.auth` handshake** (constant-time token
+  comparison) as the first message on every connection; Unix sockets rely on
+  filesystem permissions instead
+- **Several clients, one session**: every connection watching a session sees the
+  same stream, any of them can answer a permission prompt, and closing one
+  changes nothing for the others
+
+### Library mode
+
+```rust
+Builder::new()
+    .scene(my_scene)              // Arc<dyn AgentScene>    — prompt, tools, budgets
+    .model(my_model)              // Arc<dyn Model>         — any backend
+    .permission(my_permission)    // Arc<dyn Permission>    — your authorization
+    .compactor(my_compactor)      // Arc<dyn Compactor>     — your compaction
+    .history_store(my_store)      // Arc<dyn HistoryStore>  — your persistence
+    .plugin_host(my_host)         // Arc<dyn PluginHost>
+    .task_router(my_router)       // Arc<TaskRouter>
+    .tools(my_registry)           // Arc<InMemoryToolRegistry>  ← concrete
+    .hooks(my_hook_runner)        // Arc<HookRunner>            ← concrete
+    .build()?;
+```
+
+Seven take a trait object, so an external crate can supply the implementation.
+Two do not, and it is worth knowing which: `.tools(...)` takes the concrete
+registry (the `ToolRegistry` trait carries only `all()` and `find()`), and
+`.hooks(...)` takes the concrete runner — customization there happens through
+hook *configuration* rather than by replacing the runner, though the two executor
+traits it delegates to are injectable.
+
+---
+
+## Configuration
+
+Four layers, lowest priority first: built-in defaults → `$HOME/.atta/<scene>/settings.json`
+→ `<project>/.atta/settings.json` → CLI arguments. TOML works anywhere JSON does.
+
+The authoritative surface is the generated
+[JSON Schema](docs/schemas/settings.schema.json) — it is regenerated from the
+Rust types by a test, so it cannot describe a shape the code does not have.
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_AUTH_TOKEN` | **Required** unless `ANTHROPIC_API_KEY` is set — the daemon checks this one first and fails at boot if neither is present |
-| `ANTHROPIC_API_KEY` | Fallback for the above. Still required at boot even when `providers` are configured in `settings.json` |
-| `ANTHROPIC_BASE_URL` | Custom API endpoint (proxies, compatible providers) |
-| `ATTACORE_DAEMON_TOKEN` | TCP mode authentication token |
-| `ATTA_CONFIG_HOME` | Config root directory (default: `$HOME/.atta/<scene>`) |
-| `ATTA_RECORD` | Record mode: `ATTA_RECORD=<recording_name>` (with `ATTA_RECORDINGS_DIR`) |
-| `ATTA_REPLAY` | Replay mode: `ATTA_REPLAY=<recording_name>` (with `ATTA_RECORDINGS_DIR`) |
+| `ANTHROPIC_AUTH_TOKEN` | **Required** unless `ANTHROPIC_API_KEY` is set — checked first, fails at boot if neither is present |
+| `ANTHROPIC_API_KEY` | Fallback for the above |
+| `ANTHROPIC_BASE_URL` | Custom endpoint (proxies, compatible providers) |
+| `ATTACORE_DAEMON_TOKEN` | TCP / WebSocket handshake token |
+| `ATTA_CONFIG_HOME` | Config root (default `$HOME/.atta/<scene>`) |
+| `ATTA_RECORD` / `ATTA_REPLAY` | Recorder mode, with `ATTA_RECORDINGS_DIR` |
 
-## ID System
+**Identifiers** are BASE58(UUID v4) — 22 characters, URL-safe, one generation
+path (`base::id::Id::new()`), a `#[sqlx(transparent)]` newtype over `[u8; 16]`
+that maps to `TEXT` in Postgres and SQLite alike.
 
-All externally-visible identifiers are **BASE58(UUID v4)** — 22 characters, URL-safe:
+---
 
+## Testing
+
+Four layers, each answering a different question. At v0.2.0 the suite is **2,693
+tests**, and all of it runs on every push.
+
+| Layer | What it answers | How |
+|---|---|---|
+| `mod tests` in each crate | one function, one type | `cargo test -p <crate>` |
+| `crates/*/tests` | does this crate keep its promise through its public seam | `cargo test` |
+| `daemon/tests` | a real server, a real socket, real JSON-RPC | `cargo test -p daemon` |
+| `tests/cases/*.test` | a real Agent doing a real task, recorded and replayed | `tests/run_api.sh <case>` |
+
+Three things about it are worth stealing:
+
+**The model is faked at one seam, three different ways.** A recorder for "does
+this run reproduce", a scripted model for "what does the engine decide given
+these answers" — including the 529s and truncations no provider will produce on
+request — and a scripted HTTP client below the adapter for the daemon's own
+tests.
+
+**Documents are tested.** The RPC method list, the response shapes in it, the
+extension-point table, the settings schema: each is compared against the code by
+a test, so a document that drifts fails a build rather than misleading a reader.
+
+**Recorded runs are repeatable on purpose.** A working directory per case and a
+fixed clock, because both appear in the prompt — without that, every replay
+diverges and nobody can tell a real drift from a temp path.
+
+---
+
+## Crate map
+
+| Layer | Crate | Responsibility | Key exports |
+|---|---|---|---|
+| L0 | `auth` | OAuth 2.0 PKCE | `OAuth2Client`, `TokenStore`, `PkceVerifier` |
+| L0 | `hooks` | Lifecycle hooks | `HookRunner`, `HookConfig` (5 backends), `HookEvent` (30) |
+| L0 | `plugin` | Marketplace, resolution, disclosure | `PluginManifest`, `PluginResolver`, `Disclosure`, `Capabilities` |
+| L0 | `telemetry` | Telemetry + recorder | `TelemetryHandle`, `EventPayload` (37), `RecorderModel` |
+| L1 | `core` (`base`) | Shared traits and types | `Model`, `AgentScene`, `Permission`, `Tool`, `Id`, `EngineConfig` |
+| L1 | `wasm-host` | WASM component runtime | `API_VERSION`, capability resolver, health tracking |
+| L1 | `script-host` | QuickJS carrier | `QuickJsEngine`, `bindings::bind_quickjs` |
+| L2 | `model` | Anthropic + OpenAI adapters | `AnthropicModel`, `OpenAICompatibleModel`, `ModelEvent` |
+| L2 | `history` | JSONL persistence | `HistoryStore`, `JsonlHistoryStore`, `LogEntry` |
+| L2 | `permissions` | Rule engine | `RuleSet`, `PermissionGate`, `LlmClassifier`, `WritePolicy` |
+| L2 | `mcp` | MCP client | `McpManager`, `McpClient`, `McpToolAdapter`, `McpOAuthResolver` |
+| L2 | `compaction` | Context compression | `Compactor`, `DefaultCompactor`, reactive/cached strategies |
+| L2 | `session` | Session state | `SessionManager`, `SessionSummary` |
+| L3 | `tools` | 40 built-in tools | `BashTool`, `FileReadTool`, `SearchProvider`, … |
+| L3 | `skills` | Skill loader + watcher | `SkillManager`, `SkillWatcher`, `build_skills_from_mcp` |
+| L3 | `scene` | Built-in scenes | `SceneRegistry`, `CodingScene`, `ChatScene`, `DemoScene`, `ResearchScene` |
+| L3 | `team` | Multi-agent coordination | `Coordinator`, `TeamRegistry`, `Mailbox` |
+| L3 | `task` | Background task lifecycle | `TaskStore`, `RunningTaskStore`, `DreamTask` |
+| L4 | `runtime` | Agent runtime + turn loop | `Agent`, `Builder`, `PluginHost`, `CommandRegistry` |
+| L5 | `plugin-host` | Loads plugins, wires contributions | `InstalledPlugins`, `PluginScene` |
+| L5 | `plugin-compiler` | AOT component compile | `atta-plugin-compile` |
+| — | `daemon` | JSON-RPC 2.0 server | `DaemonServer`, `SessionPool`, `run_doctor` |
+
+21 crates under `crates/`, plus `daemon/` and the test members — 25 workspace
+members in total.
+
+---
+
+## Build and test
+
+### Prerequisites
+
+Rust 1.80+, and an Anthropic-compatible API key for anything that talks to a
+model. The test suite needs neither.
+
+```sh
+cargo build --workspace              # full build
+cargo test  --workspace              # 2,693 tests, no network, no key
+cargo test  -p daemon                # the daemon's own end-to-end suite
+tests/run_api.sh 000.c_project       # a recorded case, replayed
 ```
-Ab12Cd34Ef56Gh78Ij90Kl   ← session_id / turn_id / agent_id / tool_call_id
-```
 
-Single source of truth: `core::id::Id::new()`. Direct UUID generation and manual BASE58 encoding outside this entry point is forbidden. The `Id` type is a `#[sqlx(transparent)]` newtype over `[u8; 16]`, mapping to `TEXT` in both Postgres and SQLite.
+A clean build is ~13 GB, and that is not waste: every integration test file is a
+separate binary statically linking the whole dependency graph. What *is* waste is
+that cargo never reclaims the superseded copy — run `cargo clean` after a version
+bump and `cargo sweep --time 7` weekly. `tests/scripts/disk_report.sh` says what
+is reclaimable and why.
 
-```rust
-use base::id::Id;
-
-let id = Id::new();            // Random allocation — the ONLY generation path
-let id = Id::parse(s)?;        // Validate and decode external input (checks 16-byte length)
-```
-
-## Design Principles
-
-1. **Library-first.** Every capability is exposed through Rust crates. The daemon is a reference application, not the product.
-2. **Trait injection.** `Model`, `Permission`, `AgentScene`, `Compactor`, `HistoryStore`, `PluginHost` — core behaviors are traits you implement. The engine owns no policy.
-3. **Tool alignment.** 40 built-in tools, behavior-verified against Claude Code's TypeScript implementation.
-4. **Safe by default.** Three-tier permission model, Unicode-normalized path safety, sandboxed execution, capability-gated plugins — you opt into less safety, not more.
-5. **Observable everywhere.** 37 structured telemetry event types. Recorded LLM calls replay deterministically. Cost tracking. OpenTelemetry export.
-
-## Project Structure
-
-```
-AttaCore/
-├── crates/           # 21 Rust crates (the engine)
-├── daemon/           # JSON-RPC 2.0 daemon (reference application)
-├── bridges/          # Out-of-process bridges (atta-dsh-bridge)
-├── tests/            # Integration tests + test runner + fixtures
-├── docs/             # Documentation
-├── Cargo.toml        # Workspace root (25 members)
-└── README.md         # You are here
-```
+---
 
 ## Documentation
 
 | Document | Audience |
 |---|---|
-| [README.md](README.md) | **You are here** — project overview, architecture, quick start |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | **The concepts and how they fit** — crates, a turn's skeleton, sessions and scenes, history, the execution layer, locks, disk layout |
-| [daemon_rpc_protocol.md](docs/daemon_rpc_protocol.md) | JSON-RPC method reference — fields, types, error codes, TCP auth handshake. Start here to write a client |
-| [extension_points.md](docs/extension_points.md) | **Every seam in the engine** — what you can replace, contribute to or intercept, what it costs, who is allowed. Start here to build on AttaCore |
-| [extending_quickjs.md](docs/extending_quickjs.md) | Writing script extensions for the QuickJS carrier — bindable points, the API, examples |
-| [extending_wasm.md](docs/extending_wasm.md) | Writing WebAssembly plugins — manifest, capabilities, contribution points, examples |
-| [testing_scripts.md](docs/testing_scripts.md) | How the script carrier's nine points are tested, and what a case has to satisfy to count |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | **The concepts and how they fit** — crates, a turn's skeleton, sessions and scenes, history, execution, locks, disk layout |
+| [extension_points.md](docs/extension_points.md) | **Every seam in the engine** — what you can replace, contribute to or intercept, what it costs, who may. Start here to build on AttaCore |
+| [daemon_rpc_protocol.md](docs/daemon_rpc_protocol.md) | JSON-RPC reference — methods, fields, error codes, auth handshake. Start here to write a client |
+| [extending_quickjs.md](docs/extending_quickjs.md) | Script extensions — the nine points, the API, the budgets, the failure rules |
+| [extending_wasm.md](docs/extending_wasm.md) | WebAssembly plugins — manifest, capabilities, contribution points |
+| [testing_scripts.md](docs/testing_scripts.md) | How the script carrier is tested, and what a case must satisfy to count |
+| [tests/README.md](tests/README.md) | The four test layers, how to run each, why recordings are not committed |
 | [schemas/settings.schema.json](docs/schemas/settings.schema.json) | Generated JSON Schema for `settings.json` |
-| [tests/README.md](tests/README.md) | The four layers of the test system, how to run each, and why recordings are not committed |
 
-There is currently no prose API reference for **Library mode**; the entry points are `runtime::agent::Builder` and [extension_points.md](docs/extension_points.md), which lists every trait the builder accepts along with a minimal example for each.
+There is no prose API reference for library mode yet; the entry points are
+`runtime::agent::Builder` and the extension-point catalog, which lists every
+trait the builder accepts with a minimal example for each.
+
+## Design principles
+
+1. **Library-first.** The daemon is a reference application, not the product.
+2. **Trait injection.** The engine owns mechanism; you own policy.
+3. **Extensions cannot break the engine.** A failure costs its own contribution.
+4. **Safe by default.** You opt into less safety, never into more by accident.
+5. **Nothing is claimed that is not checked** — including by these documents.
 
 ## License
 
