@@ -221,6 +221,11 @@ pub fn assemble_prompt_with(
 
     // 1. Scene skeleton — a scene names its own sections; only fill in for one
     // that doesn't, so a scene's own labels are never overwritten here.
+    // Sections a scene did not name are numbered after the first. They all
+    // used to get the same name, and a name is how everything downstream
+    // addresses a block — an edit or a removal aimed at one of them landed on
+    // whichever came first, which is not a thing anyone can mean.
+    let mut unnamed = 0usize;
     kernel.extend(
         scene
             .build_system_prompt(ctx)
@@ -234,7 +239,13 @@ pub fn assemble_prompt_with(
                     b.named(prefixed)
                 }
                 Some(_) => b,
-                None => b.named(names::SCENE_SKELETON),
+                None => {
+                    unnamed += 1;
+                    match unnamed {
+                        1 => b.named(names::SCENE_SKELETON),
+                        n => b.named(format!("{}.{n}", names::SCENE_SKELETON)),
+                    }
+                }
             })
             .map(|b| (orders::SCENE, b)),
     );
@@ -579,6 +590,62 @@ mod tests {
             "a block the operator wrote is not the kernel's"
         );
         assert!(blocks[0].origin.is_kernel());
+    }
+
+        /// Sections a scene leaves unnamed are numbered, because a name is the
+    /// only handle anything downstream has on a block.
+    ///
+    /// They all used to be `scene.skeleton`. Everything that addresses a block
+    /// by name — a plugin's edit, a script's assembly pass, an operator's
+    /// override — found the first, so an edit meant for the third section
+    /// silently landed on the first, and a removal took the wrong one.
+    #[test]
+    fn unnamed_scene_sections_are_numbered_so_each_can_be_addressed() {
+        struct ThreeSections;
+        impl AgentScene for ThreeSections {
+            fn id(&self) -> &str {
+                "three"
+            }
+            fn name(&self) -> &str {
+                "Three"
+            }
+            fn description(&self) -> &str {
+                "three unnamed sections"
+            }
+            fn build_system_prompt(&self, _ctx: &ScenePromptContext) -> Vec<PromptBlock> {
+                vec![
+                    PromptBlock::system("first"),
+                    PromptBlock::system("second"),
+                    PromptBlock::system("third"),
+                ]
+            }
+            fn tools(&self) -> Vec<String> {
+                vec![]
+            }
+            fn token_budget(&self) -> TokenBudget {
+                TokenBudget {
+                    compact_threshold: 1000,
+                    compact_keep_recent: 5,
+                }
+            }
+        }
+
+        let settings = test_settings();
+        let tmp = TempDir::new().unwrap();
+        let store = MemoryStore::new(tmp.path().join("user"), tmp.path().join("local"));
+        let blocks = assemble_prompt(&ThreeSections, &settings, &store, &test_ctx(), None, None);
+
+        let scene_names: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| b.name.as_deref())
+            .filter(|n| n.starts_with(names::SCENE_SKELETON))
+            .collect();
+        assert_eq!(
+            scene_names,
+            vec!["scene.skeleton", "scene.skeleton.2", "scene.skeleton.3"],
+            "every section must be addressable, and the first keeps the name \
+             the documents use"
+        );
     }
 
     #[test]

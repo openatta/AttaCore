@@ -469,7 +469,7 @@ handle.dispose();
 
 | 名字 | 是什么 |
 |---|---|
-| `scene.skeleton` | scene 的提示,在这个 scene 不给分节命名的时候 |
+| `scene.skeleton` | scene 的提示,在这个 scene 不给分节命名的时候;第二段起依次是 `scene.skeleton.2`、`.3` |
 | `scene.<section>` | 自己给分节命名的 scene 保住那些名字,加上前缀 |
 | `skills.catalog` | 可用 skill 的清单 |
 | `memory.session` | 怎么用基于文件的记忆系统 |
