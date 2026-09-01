@@ -785,6 +785,73 @@ future without stopping a busy loop.
 
 ---
 
+## What a script can be bound to
+
+The `script` column above says what the *contract* opens. The QuickJS carrier
+has an adapter for nine of those, and a binding to one of the others is
+refused at startup naming the ones that work — a script that quietly never
+runs is worse than one that fails to load.
+
+```jsonc
+"scripts": [
+  { "path": ".atta/scripts/prompt.js", "point": "prompt.assemble", "entry": "onAssemble" }
+]
+```
+
+| point | when it runs | what a script may do |
+|---|---|---|
+| `prompt.assemble` | after the prompt is assembled | rewrite blocks, subject to its authority |
+| `prompt.block` | at assembly | add a named block |
+| `prompt.context` | at assembly, per turn | add a block whose text it computes |
+| `prompt.variable` | wherever `{{name}}` appears | supply the value |
+| `tool.around` | before dispatch | refuse, answer instead, or shorten the clock |
+| `tool.result` | before the model sees a result | rewrite its text |
+| `memory.retrieval_hook` | both ends of recall | change the query, filter what came back |
+| `model.request` | per model call | change model, ceiling, thinking mode; narrow the tool list |
+| `model.message` | per completed message | rewrite text blocks |
+
+Each adapter's own documentation carries the JSON contract — what the script
+is handed and what it may return. That is the only documentation a script
+author has, so it lives beside the code that has to keep it true.
+
+### The four that stay closed, and why
+
+**`history.append_observer`** fires once per log entry. That is the frequency
+band the catalog closes to scripts deliberately: the cost of a callback there
+is invisible to whoever writes one, and it is per *entry*, not per turn.
+
+**`history.extension_entry`** is a write capability, not a hook. A script
+needs an API to *emit* an entry; a callback that receives them is a different
+thing wearing the same name.
+
+**`hooks`** is its own subsystem with its own process model. A script engine
+bound there would be a second way to do what that subsystem already does.
+
+**`script.carrier`** is the carrier.
+
+### What every adapter guarantees
+
+**A script that fails changes nothing.** Times out, throws, exhausts its
+quota, returns the wrong shape — all one outcome, and it is the outcome of
+having done nothing. A point half-changed by a script that died mid-pass is
+worse than an unchanged one, because nothing downstream can tell which it is
+looking at. "Returned nonsense" and "has a bug" get the same harmless answer
+on purpose.
+
+**A script never widens its own authority.** Provenance travels with the
+carrier: a script the operator wrote may rewrite, one that arrived with a
+downloaded plugin may add. An adapter reads that and does not decide it.
+
+**A script never gets more of the engine than the point needs.** A model
+request is handed its knobs and not its messages; a prompt contribution is
+handed the environment and not the other blocks; a message is handed its text
+and not its thinking signatures. Each exclusion is argued where it is made,
+because the tempting version of every one of these is "pass the whole struct".
+
+**A quota is per turn, and a turn says so.** Carriers are reset at the top of
+each turn; without that the budget would be per session, and a script bound to
+a per-tool-call point would go quiet partway through a long one.
+
 ## Carrier invariants
 
 Whatever loads an extension — WebAssembly today, a script engine next to it —

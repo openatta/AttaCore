@@ -601,7 +601,7 @@ static POINTS: [ExtensionPoint; 44] = [
         ExtensionPoint {
             id: "script.carrier",
             kind: Kind::Contract,
-            summary: "run the operator's own code at a hook point, in this process (QuickJS)",
+            summary: "run the operator's own code at nine hook points, in this process (QuickJS)",
             timing: "wherever the carrier is bound; governed by a per-turn quota",
             rewrites: "whatever the bound point allows, under the script's own provenance",
             frequency: Frequency::PerTurn,

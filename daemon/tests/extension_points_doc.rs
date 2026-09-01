@@ -132,3 +132,42 @@ fn every_point_names_a_module_that_exists() {
         );
     }
 }
+
+/// The carrier's list and the document's table say the same thing.
+///
+/// These drift the way every pair of hand-maintained lists drifts, and the
+/// consequence is specific: the table is what a script author reads to decide
+/// what to write, so a point missing from it is a capability nobody uses, and
+/// a point in it that the carrier cannot bind is a startup error somebody hits
+/// after writing the script.
+#[cfg(feature = "scripts")]
+#[test]
+fn the_bindable_points_and_the_table_that_lists_them_agree() {
+    let doc = std::fs::read_to_string(doc_path()).expect("the extension point index exists");
+    let section = doc
+        .split("## What a script can be bound to")
+        .nth(1)
+        .expect("the section listing what a script can be bound to")
+        .split("### The four that stay closed")
+        .next()
+        .expect("the closed-points subsection ends it");
+
+    for point in script_host::bindings::BINDABLE_POINTS {
+        assert!(
+            section.contains(&format!("`{point}`")),
+            "`{point}` can be bound and the table does not say so"
+        );
+    }
+
+    let listed = section
+        .lines()
+        .filter(|l| l.starts_with("| `"))
+        .filter_map(|l| l.split('`').nth(1))
+        .count();
+    assert_eq!(
+        listed,
+        script_host::bindings::BINDABLE_POINTS.len(),
+        "the table lists {listed} points and the carrier binds {}",
+        script_host::bindings::BINDABLE_POINTS.len()
+    );
+}
