@@ -298,8 +298,21 @@ impl HookRunner {
     }
 
     /// Send this runner's HTTP hooks out through a given egress.
-    pub fn set_network(&self, net: std::sync::Arc<dyn base::interface::exec::Network>) {
-        let _ = self.net.set(net);
+    ///
+    /// Returns whether it took. The cell fills itself with the default egress
+    /// the first time a hook fires, so a host that installs its own after that
+    /// keeps the default — and a deployment that thinks it configured its
+    /// egress and did not should hear about it rather than find out from a
+    /// request that should not have left.
+    #[must_use = "an egress that did not take is a policy that is not applied"]
+    pub fn set_network(&self, net: std::sync::Arc<dyn base::interface::exec::Network>) -> bool {
+        if self.net.set(net).is_err() {
+            tracing::error!(
+                "the hook runner's egress was already in use; the one just supplied is ignored"
+            );
+            return false;
+        }
+        true
     }
 
     /// True if hooks for event are present.

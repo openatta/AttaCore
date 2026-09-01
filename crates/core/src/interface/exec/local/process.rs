@@ -77,7 +77,11 @@ fn interleave(
         let Some(reader) = reader else {
             return futures::stream::empty().boxed();
         };
-        futures::stream::unfold((reader, Vec::new()), move |(mut reader, mut buf)| async move {
+        // The state goes to `None` after a read error, which ends the stream.
+        // Yielding the error and staying alive would hand a consumer that logs
+        // and continues an endless supply of the same broken pipe.
+        futures::stream::unfold(Some((reader, Vec::new())), move |state| async move {
+            let (mut reader, mut buf) = state?;
             buf.resize(8192, 0);
             match reader.read(&mut buf).await {
                 Ok(0) => None,
@@ -87,9 +91,9 @@ fn interleave(
                         stream,
                         bytes: std::mem::take(&mut buf),
                     };
-                    Some((Ok(chunk), (reader, buf)))
+                    Some((Ok(chunk), Some((reader, buf))))
                 }
-                Err(e) => Some((Err(ExecError::failed(e)), (reader, buf))),
+                Err(e) => Some((Err(ExecError::failed(e)), None)),
             }
         })
         .boxed()

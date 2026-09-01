@@ -33,6 +33,15 @@ pub use crate::interface::exec::{
 };
 use std::path::{Path, PathBuf};
 
+/// The state root to protect: the one the caller named, else the
+/// conventional `$HOME/.atta`.
+fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
+    policy
+        .state_root
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atta")))
+}
+
 /// Fallback set of scenes to protect when a caller doesn't supply
 /// `SandboxPolicy::known_scenes` — this crate deliberately doesn't depend
 /// on the `scene` crate (`tools` sits below it in the dependency graph), so
@@ -44,15 +53,6 @@ use std::path::{Path, PathBuf};
 /// `settings.json` at all. Keep in sync with `daemon::main::resolve_scene`
 /// and `crates/scene/src/scene/*.rs` regardless, since it's still the
 /// default every caller gets today.
-/// The state root to protect: the one the caller named, else the
-/// conventional `$HOME/.atta`.
-fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
-    policy
-        .state_root
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atta")))
-}
-
 const KNOWN_SCENES: &[&str] = &["coding", "chat", "demo", "research"];
 
 /// `policy.known_scenes` if the caller supplied one, else [`KNOWN_SCENES`].

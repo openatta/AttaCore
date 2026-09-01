@@ -117,7 +117,14 @@ fn build_client(no_proxy: bool) -> reqwest::Client {
     if no_proxy {
         b = b.no_proxy();
     }
-    b.build().unwrap_or_default()
+    b.build().unwrap_or_else(|e| {
+        // The fallback is `reqwest`'s default, which is the *proxied* client —
+        // so falling back here would send loopback traffic through the ambient
+        // proxy, the one thing `no_proxy` exists to prevent. Say so rather
+        // than silently inverting the intent.
+        tracing::error!(error = %e, no_proxy, "could not build the HTTP client; falling back to the default one");
+        reqwest::Client::default()
+    })
 }
 
 fn headers_of(map: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
@@ -232,7 +239,10 @@ impl Network for LocalNetwork {
                         method = "GET".into();
                         body = None;
                     }
-                    if next.host_str() != url.host_str() {
+                    // Scheme as well as host: a redirect from `https` to
+                    // `http` on the same host would otherwise put the
+                    // Authorization header on the wire in plaintext.
+                    if next.host_str() != url.host_str() || next.scheme() != url.scheme() {
                         strip_credentials(&mut headers);
                     }
                     url = next;
@@ -259,11 +269,17 @@ impl Network for LocalNetwork {
             Origin::Operator => true,
             Origin::Agent if self.agent_offline => false,
             Origin::Agent => {
+                // Hosts arrive lowercased from the url parser; the list
+                // arrives verbatim from settings.json. Compared as written,
+                // `Example.com` is an allowlist that matches nothing, and the
+                // deployment gets every request refused with no sign that its
+                // configuration is what refused them.
+                let host = host.to_ascii_lowercase();
                 self.allowed_domains.is_empty()
-                    || self
-                        .allowed_domains
-                        .iter()
-                        .any(|d| host == d || host.ends_with(&format!(".{d}")))
+                    || self.allowed_domains.iter().any(|d| {
+                        let d = d.to_ascii_lowercase();
+                        host == d || host.ends_with(&format!(".{d}"))
+                    })
             }
         }
     }
@@ -301,6 +317,19 @@ mod tests {
         let n = LocalNetwork::new(Vec::new(), true);
         assert!(!n.permits("example.com", Origin::Agent));
         assert!(n.permits("example.com", Origin::Operator));
+    }
+
+    /// Hosts arrive lowercased from the parser; a list written by hand does
+    /// not. Compared as written, `Example.com` matches nothing and every
+    /// request is refused with no sign that the configuration is at fault.
+    #[test]
+    fn the_allowlist_is_not_case_sensitive() {
+        let n = LocalNetwork::for_agent_policy(
+            crate::context::config::NetworkModeConfig::Allowlist,
+            vec!["Example.COM".into()],
+        );
+        assert!(n.permits("example.com", Origin::Agent));
+        assert!(n.permits("api.example.com", Origin::Agent));
     }
 
     #[test]
