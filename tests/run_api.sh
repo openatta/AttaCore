@@ -30,16 +30,19 @@ echo ">>> 录制..."
 ATTA_RECORD="$CASE_NUM" cargo run -p test-runner -- \
   --mode api --case "$CASE_FILE" --config "$CONFIG" --round "$ROUND"
 
-RECORDING_DIR="tests/fixtures/cassettes/${CASE_NUM}/api/${ROUND}/${CASE_NUM}"
+# 录像存在 {用例}/{模式}/{轮次}/{用例名末段}/ 下 —— 子目录里的用例
+# （scripts/001_x）的目录名是分开的两段，末段才是录像自己的名字。
+RECORDING_DIR="tests/fixtures/cassettes/${CASE_NUM}/api/${ROUND}/${CASE_NUM##*/}"
 
 # 生成可读日志
 python3 tests/scripts/convert.py "$RECORDING_DIR"
 
-# 回放（MOCK 回归验证，同一轮）
+# 回放：严格比对请求（分歧即失败，而不是一行警告），并让判官看一眼这一轮
+# 到底做没做对——用例里的散文预期不传 --compare 就没有任何东西会读。
 echo ""
 echo ">>> 回放验证..."
-ATTA_REPLAY="$CASE_NUM" cargo run -p test-runner -- \
-  --mode api --case "$CASE_FILE" --config "$CONFIG" --round "$ROUND"
+ATTA_REPLAY="$CASE_NUM" ATTA_REPLAY_STRICT=1 cargo run -p test-runner -- \
+  --mode api --case "$CASE_FILE" --config "$CONFIG" --round "$ROUND" --compare
 
 echo ""
 echo "=== 完成 ==="

@@ -44,10 +44,20 @@ ATTA_RECORD="$CASE_NUM" cargo run -p test-runner -- \
   --mode cli --case "$CASE_FILE" --config "$CONFIG" \
   --daemon-binary "$DAEMON_BIN" --round "$ROUND"
 
-RECORDING_DIR="tests/fixtures/cassettes/${CASE_NUM}/cli/${ROUND}/${CASE_NUM}"
+RECORDING_DIR="tests/fixtures/cassettes/${CASE_NUM}/cli/${ROUND}/${CASE_NUM##*/}"
 
 # 生成可读日志
 python3 tests/scripts/convert.py "$RECORDING_DIR"
+
+# 回放：和 api 模式同一套。这一步以前没有，于是 cli 模式只录不放——
+# 录像录完就没有任何东西再读它，daemon 那条路的回归价值是零。
+echo ""
+echo ">>> 回放验证..."
+rm -f /tmp/attacore-test.sock ~/.atta/code/daemon.lock 2>/dev/null
+killall attacored 2>/dev/null || true
+ATTA_REPLAY="$CASE_NUM" ATTA_REPLAY_STRICT=1 cargo run -p test-runner -- \
+  --mode cli --case "$CASE_FILE" --config "$CONFIG" \
+  --daemon-binary "$DAEMON_BIN" --round "$ROUND" --compare
 
 # 清理
 rm -f /tmp/attacore-test.sock ~/.atta/code/daemon.lock 2>/dev/null
