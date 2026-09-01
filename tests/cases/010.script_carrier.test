@@ -1,3 +1,5 @@
+# fixture: tests/fixtures/script_project
+
 脚本载体 · 真实模型
 
 绑定：`.atta/settings.json` 把 `.atta/scripts/house_style.js` 绑在 `prompt.assemble` 上，
