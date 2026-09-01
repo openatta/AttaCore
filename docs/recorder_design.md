@@ -80,7 +80,7 @@
 {"type":"recording","version":1,
  "name":"…","session_id":"…","parent":"…","agent_type":"code-reviewer",
  "created_at":1755500000123,
- "engine_version":"0.1.9"}
+ "engine_version":"0.2.0"}
 ```
 
 `version` 用于将来真正的破坏性变更。**新增记录类型与新增字段都不动它**——见 §4.5 的兼容约定。
