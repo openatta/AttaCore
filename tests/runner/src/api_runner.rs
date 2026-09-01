@@ -16,6 +16,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::script::TestCase;
 
+/// The clock every recorded run is made under.
+///
+/// A date, not "now": what a case is about never depends on the real one, and
+/// a request that carries today's date can only be replayed today.
+const RECORDED_AT: time::OffsetDateTime = time::macros::datetime!(2026-01-01 00:00:00 UTC);
+
 pub struct AgentRunnerConfig {
     pub model: Arc<dyn Model>,
     pub recorder_mode: RecorderMode,
@@ -59,18 +65,26 @@ pub struct ToolAnswer {
     pub is_error: bool,
 }
 
-/// A working directory unique to this run.
+/// A working directory of this case's own, at the same path every run.
 ///
-/// This used to be a fixed `/tmp/atta_test_runner`, wiped on entry — so two
-/// cases running at once deleted each other's fixtures, and the failure
-/// looked like a flaky test rather than a collision.
-fn run_dir() -> PathBuf {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir =
-        std::env::temp_dir().join(format!("atta-test-runner-{}-{unique}", std::process::id()));
+/// It cannot be shared — two cases running at once would delete each other's
+/// fixtures, which reads as a flaky test rather than as the collision it is —
+/// and it cannot be unique per run either: the path is *in the prompt*, in the
+/// environment block and the scratchpad line, so a new directory each time
+/// means a recording that can never be replayed strictly. Every replay
+/// diverges, which is the same as none of them diverging: nobody can tell a
+/// real drift from a temp path.
+///
+/// Per case, stable across runs, wiped on entry. Two runs of the same case at
+/// the same time would collide — they would also be writing the same
+/// recording, so that is already not a thing to do.
+fn run_dir(scenario: &str) -> PathBuf {
+    let slug: String = scenario
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = std::env::temp_dir().join(format!("atta-test-runner-{slug}"));
+    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -79,7 +93,7 @@ pub async fn run_test_case(
     config: AgentRunnerConfig,
     case: &TestCase,
 ) -> anyhow::Result<Vec<TurnOutput>> {
-    let tmp = run_dir();
+    let tmp = run_dir(&config.recorder_name);
 
     if let Some(fixture) = &config.fixture_dir {
         let workdir = tmp.join("workdir");
@@ -129,7 +143,7 @@ pub async fn run_test_case_same_session(
     case: &TestCase,
     mutations: Option<&crate::mutations::MutationManifest>,
 ) -> anyhow::Result<Vec<TurnOutput>> {
-    let tmp = run_dir();
+    let tmp = run_dir(&config.recorder_name);
 
     if let Some(fixture) = &config.fixture_dir {
         let workdir = tmp.join("workdir");
@@ -263,7 +277,18 @@ async fn build_agent(
 
     let tools_registry = make_tools();
 
+    // A fixed clock, for the same reason the directory is fixed: the date is
+    // in the prompt, and a prompt that moves with the calendar is a recording
+    // that expires overnight. Recording and replay agree because neither is
+    // reading the machine's clock.
+    let environment: std::sync::Arc<dyn base::interface::environment::Environment> =
+        std::sync::Arc::new(base::interface::environment::FixedEnvironment::new(
+            RECORDED_AT,
+            time::Duration::seconds(1),
+        ));
+
     let mut builder = Builder::new()
+        .environment(environment)
         .scene(config.scene.clone())
         .model(recorder_model)
         .tools(tools_registry)
