@@ -28,7 +28,7 @@ use base::interface::tool::{InMemoryToolRegistry, Tool};
 use runtime::agent::{Builder, InputMessage};
 use tokio_util::sync::CancellationToken;
 
-use crate::scripted_model::{Reply, ScriptedModel};
+use crate::scripted_model::{Call, Reply, ScriptedModel};
 
 /// One session to drive: what is bound, what the user says, what the model
 /// answers.
@@ -44,6 +44,7 @@ pub struct Session {
     memory: Option<Arc<MemoryStore>>,
     keep_log: bool,
     project: Option<PathBuf>,
+    scene: Option<Arc<dyn AgentScene>>,
 }
 
 impl Session {
@@ -57,6 +58,7 @@ impl Session {
             memory: None,
             keep_log: false,
             project: None,
+            scene: None,
         }
     }
 
@@ -108,6 +110,13 @@ impl Session {
         self
     }
 
+    /// Which scene to run under. Chat by default, because most cases only
+    /// need a turn loop; a case about tools needs the scene that offers them.
+    pub fn scene(mut self, scene: Arc<dyn AgentScene>) -> Self {
+        self.scene = Some(scene);
+        self
+    }
+
     /// Root the session at a project directory, the way a real one is rooted:
     /// `Settings::load` from its `.atta`, so tools, rules and skills all
     /// resolve against it.
@@ -124,6 +133,8 @@ pub struct Ran {
     pub requests: Vec<String>,
     /// The tools each of those requests offered, by name.
     pub tools: Vec<Vec<String>>,
+    /// The same requests reduced to what a decision can move.
+    pub calls: Vec<Call>,
     /// The transcript the run left, or empty if it kept none.
     pub log: String,
     pub ledger: Arc<ScriptLedger>,
@@ -132,6 +143,15 @@ pub struct Ran {
 impl Ran {
     pub fn holds(&self, needle: &str) -> bool {
         self.requests.iter().any(|r| r.contains(needle))
+    }
+
+    /// How many calls the session's own model answered.
+    ///
+    /// Not every request in a run belongs to the turn: memory work and
+    /// summarization reach for the small model on their own schedule, and a
+    /// case that counted every request would be counting those too.
+    pub fn calls_to(&self, model: &str) -> usize {
+        self.calls.iter().filter(|c| c.model == model).count()
     }
 
     pub fn offers(&self, tool: &str) -> bool {
@@ -184,6 +204,10 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
         scope: "code".into(),
     };
     settings.memory_enabled = session.memory.is_some();
+    // The same choice the daemon makes for a non-interactive host: nothing is
+    // here to answer a prompt, and a case that hung on one would look like a
+    // case whose turn never finished.
+    settings.permission_mode = base::interface::settings::PermissionMode::BypassPermissions;
     settings.scripts = session.bindings;
     let settings = Arc::new(settings);
 
@@ -192,7 +216,9 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
         registry.register(tool);
     }
 
-    let scene: Arc<dyn AgentScene> = Arc::new(scene::scene::chat::ChatScene);
+    let scene: Arc<dyn AgentScene> = session
+        .scene
+        .unwrap_or_else(|| Arc::new(scene::scene::chat::ChatScene));
     let mut builder = Builder::new()
         .scene(scene)
         .model(model)
@@ -267,6 +293,7 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
     Ran {
         requests: model_arc.request_texts(),
         tools: model_arc.request_tools(),
+        calls: model_arc.calls(),
         log: read_log(&root.join("global")),
         ledger,
     }
