@@ -45,6 +45,7 @@ pub struct Session {
     keep_log: bool,
     project: Option<PathBuf>,
     scene: Option<Arc<dyn AgentScene>>,
+    asking: bool,
 }
 
 impl Session {
@@ -59,6 +60,7 @@ impl Session {
             keep_log: false,
             project: None,
             scene: None,
+            asking: false,
         }
     }
 
@@ -110,6 +112,18 @@ impl Session {
         self
     }
 
+    /// Leave the permission mode where a real interactive session has it, so
+    /// a tool that wants approval actually asks for it.
+    ///
+    /// The driver answers every prompt with a denial and writes down that it
+    /// was asked. Denial rather than approval because what these cases are
+    /// about is whether the question was *reached*, and a run that approved
+    /// everything would go on to execute the tool it was asking about.
+    pub fn asking(mut self) -> Self {
+        self.asking = true;
+        self
+    }
+
     /// Which scene to run under. Chat by default, because most cases only
     /// need a turn loop; a case about tools needs the scene that offers them.
     pub fn scene(mut self, scene: Arc<dyn AgentScene>) -> Self {
@@ -137,6 +151,8 @@ pub struct Ran {
     pub calls: Vec<Call>,
     /// The transcript the run left, or empty if it kept none.
     pub log: String,
+    /// The tools this run stopped to ask about, in order.
+    pub prompts: Vec<String>,
     pub ledger: Arc<ScriptLedger>,
 }
 
@@ -207,7 +223,11 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
     // The same choice the daemon makes for a non-interactive host: nothing is
     // here to answer a prompt, and a case that hung on one would look like a
     // case whose turn never finished.
-    settings.permission_mode = base::interface::settings::PermissionMode::BypassPermissions;
+    if !session.asking {
+        settings.permission_mode = base::interface::settings::PermissionMode::BypassPermissions;
+    } else {
+        settings.permission_mode = base::interface::settings::PermissionMode::Default;
+    }
     settings.scripts = session.bindings;
     let settings = Arc::new(settings);
 
@@ -219,12 +239,30 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
     let scene: Arc<dyn AgentScene> = session
         .scene
         .unwrap_or_else(|| Arc::new(scene::scene::chat::ChatScene));
+
+    // The gate the daemon builds for a session that is not bypassing, rather
+    // than the builder's own allow-everything default: a case about the
+    // ordering between a script and the gate needs a gate that really asks.
+    let permission: Option<Arc<dyn base::interface::permission::Permission>> = session
+        .asking
+        .then(|| {
+            Arc::new(permissions::rule_set_permission::RuleSetPermission::from_settings(
+                &settings,
+                base::interface::settings::PermissionMode::Default.into(),
+                registry.clone(),
+                Vec::new(),
+            )) as Arc<dyn base::interface::permission::Permission>
+        });
     let mut builder = Builder::new()
         .scene(scene)
         .model(model)
         .tools(registry)
         .settings(settings.clone())
         .skip_warmup(true);
+
+    if let Some(p) = permission {
+        builder = builder.permission(p);
+    }
 
     if session.keep_log {
         let store = history::store::JsonlHistoryStore::with_roots(
@@ -262,6 +300,7 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
     let run_cancel = cancel.clone();
     let join = tokio::spawn(async move { agent.run(run_cancel).await });
 
+    let mut prompts = Vec::new();
     for (i, turn) in session.turns.iter().enumerate() {
         input_tx
             .send(InputMessage::User {
@@ -277,11 +316,26 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
                 .await
                 .expect("the turn never finished")
                 .expect("event channel closed early");
-            if matches!(
-                ev,
-                base::event::AgentEvent::TurnComplete { .. } | base::event::AgentEvent::Error { .. }
-            ) {
-                break;
+            match ev {
+                base::event::AgentEvent::PermissionPrompt {
+                    prompt_id,
+                    tool_name,
+                    ..
+                } => {
+                    prompts.push(tool_name);
+                    // Nothing here can ask a person, and an unanswered prompt
+                    // is a turn that never ends — which would report as a hang
+                    // rather than as the question it is.
+                    let _ = input_tx.send(InputMessage::PermissionResponse {
+                        prompt_id,
+                        decision: runtime::agent::PermissionDecision::Deny {
+                            reason: "no one is here to approve this".into(),
+                        },
+                    });
+                }
+                base::event::AgentEvent::TurnComplete { .. }
+                | base::event::AgentEvent::Error { .. } => break,
+                _ => {}
             }
         }
     }
@@ -295,6 +349,7 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
         tools: model_arc.request_tools(),
         calls: model_arc.calls(),
         log: read_log(&root.join("global")),
+        prompts,
         ledger,
     }
 }

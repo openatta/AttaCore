@@ -54,6 +54,14 @@ async fn run(session: Session) -> Ran {
     drive(tmp.path(), session).await
 }
 
+fn calls_guarded() -> Reply {
+    Reply::Tool {
+        id: "guarded-1",
+        name: "Guarded",
+        input: serde_json::json!({}),
+    }
+}
+
 fn calls_echo(id: &'static str, say: &'static str) -> Reply {
     Reply::Tool {
         id,
@@ -338,6 +346,61 @@ async fn the_quota_stops_a_turn_and_the_next_turn_starts_over() {
     );
 }
 
+// ── the ring sits outside the gate ──────────────────────────────────────
+
+/// A refusal from the around ring happens before anyone is asked to approve
+/// the call.
+///
+/// The ordering is written down — the ring is outside the permission gate —
+/// and it is the whole reason a script can be used as a policy at all: a
+/// refusal that arrived *after* the question would still have interrupted the
+/// operator to ask about a call that was never going to run, and a `respond`
+/// would have answered from a cache the gate had already approved.
+///
+/// Every other case here runs with permissions bypassed, so this is also the
+/// only one that would notice the ring being moved inside the gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_lands_before_the_permission_question_is_asked() {
+    let refused = run(
+        session(
+            &["use the tool"],
+            vec![calls_guarded(), Reply::Text("done")],
+        )
+        .asking()
+        .tool(Arc::new(Guarded) as Arc<dyn Tool>)
+        .bind("tool_around_deny_guarded.js", "tool.around", "onAround"),
+    )
+    .await;
+
+    assert!(
+        refused.prompts.is_empty(),
+        "the operator was asked about a call the script had already refused: \
+         {:?}",
+        refused.prompts
+    );
+    assert!(
+        refused.holds("SCRIPT-TRACE-DENY-GUARDED"),
+        "the model was not told why the call was refused"
+    );
+
+    // Without the script the same call does reach the gate — so the assertion
+    // above is about the ring and not about a tool that never asks.
+    let asked = run(
+        session(
+            &["use the tool"],
+            vec![calls_guarded(), Reply::Text("done")],
+        )
+        .asking()
+        .tool(Arc::new(Guarded) as Arc<dyn Tool>),
+    )
+    .await;
+    assert_eq!(
+        asked.prompts,
+        vec!["Guarded".to_string()],
+        "the tool did not ask for approval, so the case proves nothing"
+    );
+}
+
 // ── shapes a point cannot act on ────────────────────────────────────────
 
 /// A message rewrite of the wrong length is discarded whole.
@@ -433,6 +496,40 @@ fn binding(path: &str, point: &str, entry: &str) -> base::interface::settings::S
         entry: entry.into(),
         timeout_ms: None,
         calls_per_turn: None,
+    }
+}
+
+/// A tool that always wants approval, so a case can watch for the question.
+#[derive(Debug)]
+struct Guarded;
+
+#[async_trait::async_trait]
+impl Tool for Guarded {
+    fn name(&self) -> &str {
+        "Guarded"
+    }
+    fn description(&self) -> &str {
+        "Does nothing, but insists on being approved first."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn is_read_only(&self, _: &serde_json::Value) -> bool {
+        false
+    }
+    async fn check_permissions(&self, _: &serde_json::Value, _: &ToolContext) -> PermissionDecision {
+        PermissionDecision::ask("this tool always asks")
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        Ok(ToolResult::text("the guarded tool ran"))
     }
 }
 
