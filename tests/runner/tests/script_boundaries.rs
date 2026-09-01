@@ -132,11 +132,13 @@ fn a_binding_whose_file_is_missing_drops_every_other() {
 async fn a_script_from_outside_the_project_may_add_and_may_not_rewrite() {
     let path = outside();
     let ran = run(
-        session(&["hello"], vec![Reply::Text("hi")]).bind(
-            path.to_str().expect("fixture path is utf-8"),
-            "prompt.assemble",
-            "onAssemble",
-        ),
+        session(&["hello"], vec![Reply::Text("hi")])
+            .bind("prompt_block.js", "prompt.block", "onBlock")
+            .bind(
+                path.to_str().expect("fixture path is utf-8"),
+                "prompt.assemble",
+                "onAssemble",
+            ),
     )
     .await;
 
@@ -178,6 +180,7 @@ async fn the_operators_own_script_may_rewrite_what_it_likes() {
 
     let session = Session::new(project, &["hello"], vec![Reply::Text("hi")])
         .tool(Arc::new(Echo) as Arc<dyn Tool>)
+        .bind(fixtures().join("prompt_block.js").to_str().unwrap(), "prompt.block", "onBlock")
         .bind("add_and_modify.js", "prompt.assemble", "onAssemble");
     let ran = drive(project, session).await;
 
@@ -486,6 +489,206 @@ async fn a_contribution_cannot_take_a_kernel_block_name() {
             .iter()
             .any(|o| matches!(o, ScriptOutcome::NoChange { detail: Some(_) })),
         "the ledger does not say why the block is missing: {outcomes:?}"
+    );
+}
+
+// ── when a script is read, and what a binding checks ────────────────────
+
+/// A script is read when the session is built, and not again.
+///
+/// Skills and agent types both watch their files and reload; scripts
+/// deliberately do not, and the difference is the kind of thing that gets
+/// "fixed" by someone who noticed the inconsistency rather than the reason.
+/// The reason is that a binding is a decision about what code runs inside the
+/// agent, and a session that silently picked up an edited file would be
+/// running code nobody chose for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_edited_mid_session_does_not_take_effect_until_the_next_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    let script = project.join("house.js");
+    std::fs::write(
+        &script,
+        r#"function onAssemble(blocks) {
+             blocks.push({ name: "house", content: "SCRIPT-TRACE-FIRST" });
+             return blocks;
+           }"#,
+    )
+    .unwrap();
+
+    let edited = script.clone();
+    let session = Session::new(project, &["one", "two"], vec![Reply::Text("a"), Reply::Text("b")])
+        .tool(Arc::new(Echo) as Arc<dyn Tool>)
+        .bind("house.js", "prompt.assemble", "onAssemble")
+        .between_turns(move |_turn, _root| {
+            std::fs::write(
+                &edited,
+                r#"function onAssemble(blocks) {
+                     blocks.push({ name: "house", content: "SCRIPT-TRACE-SECOND" });
+                     return blocks;
+                   }"#,
+            )
+            .unwrap();
+        });
+    let ran = drive(project, session).await;
+
+    assert!(
+        ran.holds("SCRIPT-TRACE-FIRST"),
+        "the script never ran at all"
+    );
+    assert!(
+        !ran.holds("SCRIPT-TRACE-SECOND"),
+        "an edit to the file changed a session that had already read it"
+    );
+}
+
+/// A file that is not JavaScript binds cleanly and fails at every call.
+///
+/// Binding checks that the point exists and that the file can be read. It does
+/// not evaluate the file, so a syntax error is not one of the failures the
+/// all-or-nothing rule covers: the session starts, every binding is installed,
+/// and each one fails when it is first called. That is a different shape of
+/// bad day from a typo'd path — the operator gets a session that runs and
+/// quietly does none of what they configured — so it is worth having written
+/// down rather than discovered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_that_is_not_javascript_binds_and_then_fails_every_call() {
+    let bindings = vec![
+        binding("broken/syntax_error.js", "prompt.assemble", "boom"),
+        binding("prompt_block.js", "prompt.block", "onBlock"),
+    ];
+    assert!(
+        script_host::bindings::bind_quickjs(&bindings, &fixtures()).is_ok(),
+        "binding reads the file; it does not evaluate it"
+    );
+
+    let ran = run(
+        session(&["hello"], vec![Reply::Text("hi")])
+            .bind("broken/syntax_error.js", "prompt.assemble", "boom")
+            .bind("prompt_block.js", "prompt.block", "onBlock"),
+    )
+    .await;
+
+    assert!(
+        ran.outcomes_at("prompt.assemble")
+            .iter()
+            .any(|o| matches!(o, ScriptOutcome::Failed { .. })),
+        "the broken file did not fail at the point it was bound to: {:?}",
+        ran.outcomes_at("prompt.assemble")
+    );
+    assert!(
+        ran.holds("SCRIPT-TRACE-BLOCK"),
+        "the other binding was dropped along with the broken one, although \
+         binding had already accepted the set"
+    );
+}
+
+/// Two bindings of one file get two budgets.
+///
+/// The quota belongs to a binding, not to a file — one line of configuration
+/// is one thing being budgeted. If they shared, the first point to be called
+/// would spend the whole allowance and the second would look like a script
+/// that had been bound but never ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_bindings_of_one_file_have_budgets_of_their_own() {
+    let ran = run(
+        session(
+            &["twice"],
+            vec![
+                Reply::Tools(vec![
+                    ("c1", "Echo", serde_json::json!({"say": "one"})),
+                    ("c2", "Echo", serde_json::json!({"say": "two"})),
+                ]),
+                Reply::Text("done"),
+            ],
+        )
+        .bind_within("two_points.js", "tool.around", "onAround", None, Some(1))
+        .bind_within("two_points.js", "tool.result", "onResult", None, Some(1)),
+    )
+    .await;
+
+    for point in ["tool.around", "tool.result"] {
+        let outcomes = ran.outcomes_at(point);
+        assert_eq!(
+            outcomes.first(),
+            Some(&ScriptOutcome::Applied),
+            "`{point}` was already out of budget on its first call, so the \
+             two bindings are sharing one: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                ScriptOutcome::Failed {
+                    error: ScriptError::QuotaExhausted { .. }
+                }
+            )),
+            "`{point}` never hit its own quota, so this proves nothing: \
+             {outcomes:?}"
+        );
+    }
+}
+
+/// A binding that names a function the file does not have.
+///
+/// The two halves of the carrier answer this differently, and both are worth
+/// pinning: a registering point makes its identity call while binding, so it
+/// registers nothing at all; an intercepting point only finds out when it is
+/// first called, and then keeps finding out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_that_names_a_function_the_file_does_not_have_fails_at_its_point() {
+    let ran = run(
+        session(
+            &["use the tool"],
+            vec![calls_echo("call-1", "anything"), Reply::Text("done")],
+        )
+        .bind("tool_result.js", "tool.result", "onNoSuchFunction")
+        .bind("prompt_block.js", "prompt.block", "onNoSuchFunction"),
+    )
+    .await;
+
+    assert!(
+        ran.holds("echo: anything"),
+        "the tool result was lost along with the script that could not run"
+    );
+    assert!(
+        ran.outcomes_at("tool.result")
+            .iter()
+            .any(|o| matches!(o, ScriptOutcome::Failed { .. })),
+        "the missing entry did not fail the call: {:?}",
+        ran.outcomes_at("tool.result")
+    );
+    assert!(
+        !ran.holds("SCRIPT-TRACE-BLOCK"),
+        "a block was registered by a function that does not exist"
+    );
+}
+
+/// Reordering is not something this point can express, and asking for it does
+/// not rewrite anything.
+///
+/// A block's position comes from where it was registered, not from where it
+/// sits in the returned array. Handing the same blocks back in another order
+/// therefore asks for nothing — except where several blocks share a name, in
+/// which case the reordering reads as an edit to each of them, and an edit
+/// nothing can address is refused rather than applied to whichever one came
+/// first.
+#[tokio::test(flavor = "multi_thread")]
+async fn handing_the_blocks_back_in_another_order_rewrites_nothing() {
+    let ran = run(
+        session(&["hello"], vec![Reply::Text("hi")])
+            .bind("prompt_block.js", "prompt.block", "onBlock")
+            .bind("prompt_assemble_reverse.js", "prompt.assemble", "onAssemble"),
+    )
+    .await;
+
+    assert!(
+        ran.holds("SCRIPT-TRACE-BLOCK"),
+        "the block is gone, so the pass did more than reorder"
+    );
+    let outcomes = ran.outcomes_at("prompt.assemble");
+    assert!(
+        !outcomes.contains(&ScriptOutcome::Applied),
+        "a reordering pass was charged as an edit: {outcomes:?}"
     );
 }
 

@@ -46,6 +46,8 @@ pub struct Session {
     project: Option<PathBuf>,
     scene: Option<Arc<dyn AgentScene>>,
     asking: bool,
+    #[allow(clippy::type_complexity)]
+    between_turns: Option<Box<dyn Fn(usize, &Path) + Send>>,
 }
 
 impl Session {
@@ -61,6 +63,7 @@ impl Session {
             project: None,
             scene: None,
             asking: false,
+            between_turns: None,
         }
     }
 
@@ -121,6 +124,17 @@ impl Session {
     /// everything would go on to execute the tool it was asking about.
     pub fn asking(mut self) -> Self {
         self.asking = true;
+        self
+    }
+
+    /// Run `f(turn_index, root)` after each turn completes, before the next
+    /// one is sent.
+    ///
+    /// For the cases that are about *when* something is read: a file changed
+    /// between two turns of one session answers a question no amount of
+    /// setup before the session can.
+    pub fn between_turns(mut self, f: impl Fn(usize, &Path) + Send + 'static) -> Self {
+        self.between_turns = Some(Box::new(f));
         self
     }
 
@@ -337,6 +351,10 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
                 | base::event::AgentEvent::Error { .. } => break,
                 _ => {}
             }
+        }
+
+        if let Some(f) = &session.between_turns {
+            f(i, root);
         }
     }
 

@@ -714,15 +714,42 @@ impl crate::interface::prompt_assembly::AsyncAssemblyHook for PromptAssemblyScri
         // silently dropping the rest of their pass.
         let mut refused = Vec::new();
         let mut edits = 0usize;
+
+        // Occurrences are paired in order, not matched by name alone. The
+        // kernel gives every unnamed section of a scene the same name, so a
+        // prompt normally holds several blocks called `scene.skeleton` — and
+        // an edit addressed by name lands on the first of them. Comparing the
+        // k-th returned block against the k-th existing one is what makes
+        // handing the list back unchanged cost nothing; without it, an
+        // identity pass rewrote the first section with the second's text.
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for block in &returned {
             let Some(name) = block.name.as_deref() else {
                 continue;
             };
-            match existing.iter().find(|(n, _)| n == name) {
+            let occurrences: Vec<&String> = existing
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, c)| c)
+                .collect();
+            let nth = seen.entry(name).or_insert(0);
+            let index = *nth;
+            *nth += 1;
+
+            match occurrences.get(index) {
                 // Handing a block back unchanged is not an edit, and must not
                 // be charged as one: a script that returns the whole list to
                 // change one line would otherwise need `modify` for all of it.
-                Some((_, content)) if *content == block.content => {}
+                Some(content) if **content == block.content => {}
+                // An edit to one of several blocks sharing a name cannot be
+                // expressed: the assembly addresses by name and would apply it
+                // to the first. Refused rather than misapplied — a script that
+                // silently edited the wrong section would be worse than one
+                // that was told it could not.
+                Some(_) if occurrences.len() > 1 => refused.push(format!(
+                    "`{name}` names {} blocks, so an edit to one of them cannot be addressed",
+                    occurrences.len()
+                )),
                 Some(_) => match assembly.modify(name, block.content.clone()) {
                     Ok(_) => edits += 1,
                     Err(e) => refused.push(e.to_string()),
@@ -737,15 +764,29 @@ impl crate::interface::prompt_assembly::AsyncAssemblyHook for PromptAssemblyScri
                 }
             }
         }
-        for (name, _) in &existing {
-            if !returned
-                .iter()
-                .any(|b| b.name.as_deref() == Some(name.as_str()))
-            {
-                match assembly.remove(name) {
-                    Ok(_) => edits += 1,
-                    Err(e) => refused.push(e.to_string()),
-                }
+
+        // A name is removed when fewer blocks came back under it than went
+        // out. Which one of several would go is unanswerable for the same
+        // reason an edit to one of them is.
+        for name in existing
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let went_out = existing.iter().filter(|(n, _)| n == name).count();
+            let came_back = seen.get(name).copied().unwrap_or(0);
+            if came_back >= went_out {
+                continue;
+            }
+            if went_out > 1 {
+                refused.push(format!(
+                    "`{name}` names {went_out} blocks, so removing one of them cannot be addressed"
+                ));
+                continue;
+            }
+            match assembly.remove(name) {
+                Ok(_) => edits += 1,
+                Err(e) => refused.push(e.to_string()),
             }
         }
 
@@ -846,6 +887,76 @@ mod prompt_hook_tests {
             )),
             "onAssemble",
         )
+    }
+
+    /// Several blocks can share a name, and handing them all back unchanged
+    /// must leave every one of them alone.
+    ///
+    /// The kernel gives every unnamed section of a scene the same name, so a
+    /// real prompt holds several `scene.skeleton` blocks. Matching a returned
+    /// block to an existing one by name alone finds the first every time: the
+    /// second and third sections then read as edits *to the first*, and a
+    /// script that asked for nothing rewrote the opening of the system prompt
+    /// with the text of a later section. Occurrences are paired in order for
+    /// this reason.
+    #[tokio::test]
+    async fn several_blocks_can_share_a_name_and_an_identity_pass_leaves_them_all() {
+        let mut assembly = crate::interface::prompt_assembly::PromptAssembly::new(
+            vec![
+                PromptBlock::system("first section").named(names::SCENE_SKELETON),
+                PromptBlock::system("second section").named(names::SCENE_SKELETON),
+                PromptBlock::system("third section").named(names::SCENE_SKELETON),
+            ],
+            Authority::local(BlockOrigin::Script("./.atta/scripts/prompt.js".into())),
+        );
+
+        let hook = script_hook(
+            engine_that(|blocks| blocks),
+            BlockOrigin::Script("./.atta/scripts/prompt.js".into()),
+        );
+        hook.on_assemble_async(&mut assembly, &ctx())
+            .await
+            .expect("an identity pass asks for nothing and cannot be refused");
+
+        let contents: Vec<&str> = assembly.blocks().iter().map(|b| b.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["first section", "second section", "third section"],
+            "a pass that changed nothing rewrote the prompt"
+        );
+    }
+
+    /// And an edit to one of them is refused rather than applied to whichever
+    /// came first.
+    #[tokio::test]
+    async fn an_edit_to_one_of_several_blocks_sharing_a_name_is_refused() {
+        let mut assembly = crate::interface::prompt_assembly::PromptAssembly::new(
+            vec![
+                PromptBlock::system("first section").named(names::SCENE_SKELETON),
+                PromptBlock::system("second section").named(names::SCENE_SKELETON),
+            ],
+            Authority::local(BlockOrigin::Script("./.atta/scripts/prompt.js".into())),
+        );
+
+        let hook = script_hook(
+            engine_that(|mut blocks| {
+                blocks[1]["content"] = serde_json::json!("second section, edited");
+                blocks
+            }),
+            BlockOrigin::Script("./.atta/scripts/prompt.js".into()),
+        );
+        let refused = hook
+            .on_assemble_async(&mut assembly, &ctx())
+            .await
+            .expect_err("an edit nothing can address must be reported");
+        assert!(refused.contains("names 2 blocks"), "{refused}");
+
+        let contents: Vec<&str> = assembly.blocks().iter().map(|b| b.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["first section", "second section"],
+            "the edit was applied to a block the script did not name"
+        );
     }
 
     /// The acceptance case: a script rewrites a prompt block, and the prompt
