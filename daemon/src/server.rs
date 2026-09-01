@@ -390,6 +390,12 @@ impl DaemonServer {
     /// accidentally accept a token the others would reject. `Ok` carries the
     /// success response to send; `Err` carries the refusal — both go back to
     /// the client, which is why the caller sends either way.
+    ///
+    /// `result_large_err` is about an error type that costs every caller on the
+    /// happy path. Here both variants are the same type — the value is a
+    /// response either way — so boxing one of them would cost an allocation to
+    /// save nothing.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn check_auth(&self, req: &RpcRequest) -> Result<RpcResponse, RpcResponse> {
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
         if req.method != "daemon.auth" {
@@ -455,7 +461,8 @@ impl DaemonServer {
         self.dispatch(req, client).await
     }
 
-    /// [`Self::check_auth`], for the same reason.
+    /// [`Self::check_auth`], for the same reason — including the lint.
+    #[allow(clippy::result_large_err)]
     pub async fn check_auth_public(&self, req: &RpcRequest) -> Result<RpcResponse, RpcResponse> {
         self.check_auth(req).await
     }
