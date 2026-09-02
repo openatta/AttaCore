@@ -99,6 +99,42 @@ fn text_round(text: &str) -> Vec<StreamEvent> {
     ]
 }
 
+/// The same, reporting what the call cost.
+///
+/// A turn is several calls and a provider reports usage per call, so a round
+/// that always reports zero cannot tell a sum from a last value — which is the
+/// whole question for anyone budgeting on the number.
+fn text_round_costing(text: &str, input_tokens: u64, output_tokens: u64) -> Vec<StreamEvent> {
+    let mut round = text_round(text);
+    if let Some(StreamEvent::MessageDelta { usage, .. }) = round.last_mut() {
+        *usage = Some(WireUsage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        });
+    }
+    round
+}
+
+/// A tool round that reports what it cost, for the same reason.
+fn tool_round_costing(
+    tool: &str,
+    id: &str,
+    input: serde_json::Value,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Vec<StreamEvent> {
+    let mut round = tool_round(tool, id, input);
+    if let Some(StreamEvent::MessageDelta { usage, .. }) = round.last_mut() {
+        *usage = Some(WireUsage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        });
+    }
+    round
+}
+
 /// One assistant turn that calls `tool` with `input` and stops on `tool_use`.
 fn tool_round(tool: &str, id: &str, input: serde_json::Value) -> Vec<StreamEvent> {
     vec![
@@ -1275,6 +1311,58 @@ async fn session_create_binds_to_a_different_project_with_its_own_settings() {
     assert_eq!(
         sent_model, "other-project-model",
         "the turn must have used the project's own settings, not the pool default"
+    );
+
+    srv.stop().await;
+}
+
+/// The `turn_complete` frame carries what the whole turn spent.
+///
+/// This is the number a daemon client budgets on — the engine's `TurnOutcome`
+/// never crosses the socket. The frame is built by hand-copying two fields out
+/// of the event, which is exactly the shape of code that keeps forwarding the
+/// wrong one: it used to forward the last call's usage on an ordinary end and a
+/// hardcoded zero on every other, so a client watching a turn get cancelled was
+/// told it had cost nothing.
+///
+/// Two calls with different costs, because equal ones would let a sum and a
+/// last value pass the same assertion.
+#[tokio::test]
+async fn the_turn_complete_frame_reports_the_whole_turn() {
+    let (srv, _seen) = start_scripted_server(
+        vec![
+            tool_round_costing("Read", "t1", serde_json::json!({"file_path": "x"}), 100, 20),
+            text_round_costing("done", 7, 3),
+        ],
+        ask_settings_no_memory(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let (frames, resp) = rpc_streaming(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.run_turn","params":{"message":"read it"},"id":1}"#,
+    )
+    .await;
+    assert!(resp["result"].is_object(), "turn failed: {resp}");
+
+    let complete = frames
+        .iter()
+        .filter_map(|f| f.get("params").and_then(|p| p.get("event")))
+        .find(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_complete"))
+        .unwrap_or_else(|| panic!("no turn_complete frame in {frames:#?}"));
+
+    assert_eq!(
+        complete["api_calls"], 2,
+        "the case needs a turn of more than one call to mean anything: {complete}"
+    );
+    assert_eq!(
+        complete["usage"]["input_tokens"], 107,
+        "input tokens are the last call's, not the turn's: {complete}"
+    );
+    assert_eq!(
+        complete["usage"]["output_tokens"], 23,
+        "output tokens are the last call's, not the turn's: {complete}"
     );
 
     srv.stop().await;
