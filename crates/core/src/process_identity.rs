@@ -204,7 +204,31 @@ pub fn process_start_time(pid: u32) -> Option<i64> {
     }
     let elapsed_secs = parse_elapsed(String::from_utf8(output.stdout).ok()?.trim())?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-    Some(now - elapsed_secs)
+    plausible(now - elapsed_secs)
+}
+
+/// A start time that could not be one is not a reading.
+///
+/// The value here is derived — `now` minus whatever `ps` said — so a `ps` this
+/// code does not understand produces a number rather than an error. One Linux
+/// host answered `441056556-16:45:20`, four hundred million days, and the
+/// subtraction dutifully placed the process's start a million years before the
+/// epoch. Taken at face value that is not a harmless oddity: every recorded
+/// identity then fails the reuse check, so instance files are deleted out from
+/// under live daemons and locks are reclaimed from processes still holding
+/// them. "Could not verify" is a state this code already has, and it is the
+/// honest one here — `None` becomes `ProcessLiveness::Unknown`, which callers
+/// treat as "leave it alone".
+///
+/// The window is deliberately loose. It is not trying to validate a start
+/// time; it is refusing an answer that is not one.
+#[cfg(unix)]
+fn plausible(start: i64) -> Option<i64> {
+    /// 2000-01-01. No process this code meets started before it.
+    const FLOOR: i64 = 946_684_800;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    // A little slack above `now` for clock adjustment between the two reads.
+    (FLOOR..=now + 60).contains(&start).then_some(start)
 }
 
 #[cfg(not(unix))]
@@ -236,6 +260,30 @@ fn parse_elapsed(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ps` this code cannot read produces a number, not an error, and the
+    /// number is worse than nothing: every identity built on it fails the
+    /// reuse check, so live daemons lose their instance files and running
+    /// processes lose their locks.
+    #[test]
+    fn a_start_time_that_could_not_be_one_is_not_a_reading() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        assert_eq!(
+            plausible(now - 3600),
+            Some(now - 3600),
+            "an hour ago is fine"
+        );
+        assert_eq!(plausible(now), Some(now), "just now is fine");
+
+        // What the Linux host that found this actually produced.
+        assert_eq!(plausible(-38_107_284_710_668), None);
+        assert_eq!(plausible(0), None, "the epoch is not a process start time");
+        assert_eq!(plausible(now + 86_400), None, "nor is tomorrow");
+    }
 
     /// A short-lived child process — gives tests a real, distinct, live pid
     /// (with its own real start time) instead of reusing the test's own,

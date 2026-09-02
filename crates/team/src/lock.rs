@@ -255,8 +255,12 @@ mod tests {
     #[test]
     fn write_rejects_when_another_live_process_holds_the_lock() {
         let child = Child::spawn();
-        let recorded_start = base::process_identity::process_start_time(child.pid())
-            .expect("should read the child's start time");
+        // Same as the daemon's lock case: a confirmed-alive holder is the
+        // premise, and a host that cannot read start times has none.
+        let Some(recorded_start) = base::process_identity::process_start_time(child.pid()) else {
+            eprintln!("skipping: this host cannot read process start times");
+            return;
+        };
         let dir = TempDir::new().unwrap();
         let teams_dir = dir.path().join(".atta/teams");
         fs::create_dir_all(&teams_dir).unwrap();
