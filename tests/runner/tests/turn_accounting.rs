@@ -39,6 +39,7 @@ fn expected_total() -> Usage {
 struct Ran {
     outcome: runtime::turn::TurnOutcome,
     reported: Vec<Usage>,
+    telemetry: Vec<telemetry::TelemetryEvent>,
 }
 
 async fn one_turn_of_two_calls() -> Ran {
@@ -72,11 +73,13 @@ async fn one_turn_of_two_calls() -> Ran {
     let registry = Arc::new(InMemoryToolRegistry::new());
     registry.register(Arc::new(Echo) as Arc<dyn Tool>);
 
+    let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::channel(64);
     let (mut agent, mut event_rx, input_tx) = Builder::new()
         .scene(Arc::new(scene::scene::chat::ChatScene) as Arc<dyn AgentScene>)
         .model(model)
         .tools(registry)
         .settings(Arc::new(settings))
+        .telemetry_handle(telemetry::TelemetryHandle::new(telemetry_tx))
         .skip_warmup(true)
         .build()
         .expect("agent builds");
@@ -97,7 +100,16 @@ async fn one_turn_of_two_calls() -> Ran {
     }
     drop(input_tx);
 
-    Ran { outcome, reported }
+    let mut telemetry = Vec::new();
+    while let Ok(ev) = telemetry_rx.try_recv() {
+        telemetry.push(ev);
+    }
+
+    Ran {
+        outcome,
+        reported,
+        telemetry,
+    }
 }
 
 /// The outcome reports the whole turn, not its last call.
@@ -178,4 +190,53 @@ impl Tool for Echo {
         let say = input.get("say").and_then(|v| v.as_str()).unwrap_or("");
         Ok(ToolResult::text(format!("echo: {say}")))
     }
+}
+
+/// Every call is accounted for on its own, which is what a cost is computed
+/// from.
+///
+/// The payload existed, the OTLP exporter had a branch for it, and nothing in
+/// the engine ever constructed one — so the per-call numbers a cost needs were
+/// measured, used for the budget, and thrown away. A turn-level total cannot
+/// replace them: it cannot say which model the spending went to when a turn
+/// switches models partway through.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_model_call_is_reported_on_its_own() {
+    let ran = one_turn_of_two_calls().await;
+
+    let calls: Vec<&telemetry::ApiRequestPayload> = ran
+        .telemetry
+        .iter()
+        .filter_map(|e| match &e.payload {
+            telemetry::EventPayload::ApiRequest(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        calls.len(),
+        2,
+        "one event per model call, and this turn made two: {:?}",
+        ran.telemetry.iter().map(|e| e.kind()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (calls[0].input_tokens, calls[0].output_tokens),
+        (PER_CALL[0].0 as u64, PER_CALL[0].1 as u64),
+        "the first event carries the first call's usage, not the turn's total"
+    );
+    assert_eq!(
+        (calls[1].input_tokens, calls[1].output_tokens),
+        (PER_CALL[1].0 as u64, PER_CALL[1].1 as u64),
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.model == "accounting-model" && c.default_model),
+        "a call has to name the model it went to, or a cost cannot be priced"
+    );
+    assert_eq!(
+        calls.iter().map(|c| c.input_tokens).sum::<u64>(),
+        ran.outcome.total_usage.input_tokens as u64,
+        "the per-call events and the turn total must not disagree"
+    );
 }

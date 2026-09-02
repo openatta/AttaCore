@@ -895,8 +895,13 @@ impl Agent {
             // (for an overload) the same conversation.
             let tool_defs = request.tool_defs.clone();
             let messages = request.messages.clone();
+            // Counted before either is handed on: the call's own accounting
+            // needs the size of what went out, and both get moved on the way.
+            let sent_message_count = messages.len();
+            let sent_tool_count = tool_defs.len();
 
             // 3. Call model
+            let call_started = std::time::Instant::now();
             let stream_result = self.send(request, cancel.clone()).await;
 
             // 4. The policy classifies the failure and says what to do; the
@@ -1082,6 +1087,28 @@ impl Agent {
             tool_calls += stream_result.tool_calls;
             let stop_reason = stream_result.stop_reason;
             let usage = stream_result.usage;
+
+            // One call, accounted for. Every other number the engine reports is
+            // per turn, and a turn is several calls — so this is the event a
+            // cost can be computed from, and the only one that says which model
+            // the spending went to when a turn switched models partway.
+            let _ = self
+                .telemetry_handle
+                .record(telemetry::TelemetryEvent::api_request(
+                    &self.session.session_id,
+                    self.session.turn_count,
+                    Some(self.current_turn_id.clone()),
+                    telemetry::ApiRequestPayload {
+                        model: effective_model.clone(),
+                        input_tokens: usage.input_tokens as u64,
+                        output_tokens: usage.output_tokens as u64,
+                        latency_ms: call_started.elapsed().as_millis() as u64,
+                        stop_reason: stop_reason.clone(),
+                        input_message_count: sent_message_count,
+                        tool_count: sent_tool_count,
+                        default_model: effective_model == self.settings.model.model_name,
+                    },
+                ));
             // Added here rather than beside the budget's own counter further
             // down: a turn can end between the two, and a call that happened
             // has to be counted whether or not the turn went on to check a

@@ -4,22 +4,41 @@ use serde::Serialize;
 
 use crate::RedactionPolicy;
 
-/// API 请求成功事件的载荷。
+/// One completed model call: what it cost and what it was.
+///
+/// Emitted per call, which is what makes it the event a cost can be computed
+/// from — a turn is several calls, and every other number the engine reports is
+/// per turn.
+///
+/// # What is not on it
+///
+/// It had four more fields and no producer at all. Each of them was a number
+/// nothing could have filled truthfully, and a telemetry field that is always
+/// zero is worse than an absent one: it reads as a measurement.
+///
+/// - `cache_creation` / `cache_read` — the cross-provider [`Usage`] carries
+///   input and output and nothing else. Cache accounting is Anthropic's shape;
+///   OpenAI's chunk usage has no equivalent, so putting it on the shared type
+///   would make every provider answer a question one of them asks.
+/// - `ttfb_ms` — time to first token is measured where the stream is consumed,
+///   which is not where a call is accounted for.
+/// - `retry_count` — retries happen inside the client, under the model
+///   contract, and do not surface through it.
+///
+/// [`Usage`]: base::interface::model::Usage
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiRequestPayload {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_creation: u64,
-    pub cache_read: u64,
+    /// Wall clock for the whole call, request to last event.
     pub latency_ms: u64,
-    pub ttfb_ms: u64,
-    pub retry_count: u32,
     pub stop_reason: String,
     pub input_message_count: usize,
     pub tool_count: usize,
+    /// Whether this call went to the model the session was configured with. A
+    /// fallback or a recovery switch makes it false.
     pub default_model: bool,
-    pub escalated: bool,
 }
 
 /// API 请求失败事件的载荷。
@@ -131,16 +150,11 @@ mod tests {
                 model: "claude-sonnet-5".into(),
                 input_tokens: 1200,
                 output_tokens: 300,
-                cache_creation: 0,
-                cache_read: 800,
                 latency_ms: 2100,
-                ttfb_ms: 400,
-                retry_count: 0,
                 stop_reason: "end_turn".into(),
                 input_message_count: 5,
                 tool_count: 12,
                 default_model: true,
-                escalated: false,
             },
         );
         assert_eq!(event.kind(), "api_request");

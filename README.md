@@ -411,8 +411,12 @@ MCP tools adapt to the native `Tool` trait; servers can also register as skills.
 ### Telemetry and the recorder
 
 37 structured event types over the whole lifecycle, with OpenTelemetry export.
-A turn reports what it spent — the sum over every call it made, not the last
-one — on `TurnOutcome` and on the event a daemon client watches. And the recorder: wrap any `Model`, and every call is written to a
+Spending is reported at both scales: one `api_request` event per model call,
+carrying that call's tokens, latency and the model it went to — which is what a
+cost is priced from, and the only thing that can say where the money went when a
+turn switches models partway — and the turn's total on `TurnOutcome` and on the
+event a daemon client watches. A turn is several calls; the last one is not the
+bill. And the recorder: wrap any `Model`, and every call is written to a
 self-contained directory — the assembled system blocks (per block, not joined),
 the full tool table, every message, the response down to token boundaries, and
 failures recorded as failures so an overload that switched to the fallback model
