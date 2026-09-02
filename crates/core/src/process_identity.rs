@@ -332,16 +332,35 @@ mod tests {
         assert_eq!(ProcessIdentity::check(&identity), ProcessLiveness::Reused);
     }
 
+    /// `Alive` is the verdict for a process whose start time still matches —
+    /// which presumes the host can read one at all. Where it cannot, `check`
+    /// answers `Unknown` by design, and that is a different case with its own
+    /// test rather than a weaker version of this one.
     #[test]
     fn process_identity_check_reports_alive_for_a_real_child_with_matching_start_time() {
         let child = Child::spawn();
-        let recorded_start =
-            process_start_time(child.pid()).expect("should read the child's start time");
+        let Some(recorded_start) = process_start_time(child.pid()) else {
+            eprintln!("skipping: this host cannot read process start times");
+            return;
+        };
         let recorded = ProcessIdentity {
             pid: child.pid(),
             started_at: recorded_start,
         };
         assert_eq!(ProcessIdentity::check(&recorded), ProcessLiveness::Alive);
+    }
+
+    /// And that different case: no readable start time is "cannot verify", not
+    /// "a different process". A host whose `ps` this code cannot read must not
+    /// have its locks reclaimed and its instance files deleted.
+    #[test]
+    fn an_unreadable_start_time_is_unknown_rather_than_reused() {
+        let child = Child::spawn();
+        let recorded = ProcessIdentity {
+            pid: child.pid(),
+            started_at: 0,
+        };
+        assert_eq!(ProcessIdentity::check(&recorded), ProcessLiveness::Unknown);
     }
 
     #[test]
