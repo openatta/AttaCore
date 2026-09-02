@@ -465,7 +465,21 @@ mod tests {
         write_instance_file(&instances_dir, "other-daemon", &file).unwrap();
 
         let found = discover_instances(&instances_dir);
-        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found.len(),
+            1,
+            "the entry was dropped. recorded={recorded_start}, \
+             now={:?}, verdict={:?}, dir_entries={:?}",
+            process_start_time(child.pid()),
+            base::process_identity::ProcessIdentity::check(&ProcessIdentity {
+                pid: child.pid(),
+                started_at: recorded_start,
+            }),
+            std::fs::read_dir(&instances_dir).map(|d| d
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()),
+        );
         assert_eq!(found[0].instance, "other-daemon");
     }
 
@@ -511,7 +525,18 @@ mod tests {
             .map(|f| f.instance)
             .collect();
         found.sort();
-        assert_eq!(found, vec!["ci-runner".to_string(), "desktop".to_string()]);
+        assert_eq!(
+            found,
+            vec!["ci-runner".to_string(), "desktop".to_string()],
+            "recorded={}, now={:?}, verdict={:?}, dir_entries={:?}",
+            identity.started_at,
+            process_start_time(identity.pid),
+            base::process_identity::ProcessIdentity::check(&identity),
+            std::fs::read_dir(&instances_dir).map(|d| d
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()),
+        );
     }
 
     #[test]
