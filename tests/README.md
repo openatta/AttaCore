@@ -1,80 +1,60 @@
 # AttaCore 测试系统
 
-四层，各自回答不同的问题：
+三层，各自回答不同的问题：
 
 | 位置 | 是什么 | 怎么跑 |
 |---|---|---|
 | `crates/*/src/**` 的 `mod tests` | 单元测试：一个函数/一个类型的行为 | `cargo test -p <crate>` |
+| `crates/*/tests/*.rs` | crate 验收：从公开的缝进去，这个 crate 的承诺还成立吗 | `cargo test` |
 | `daemon/tests/*.rs` | daemon 的 e2e：真的起一个 server，走真的 socket 收发 JSON-RPC | `cargo test -p daemon` |
-| `tests/cases/*.test` + `tests/runner` | 行为测试：真的驱动 Agent 跑一个任务，录制/回放模型交互 | `tests/run_api.sh <用例号>` / `tests/run_cli.sh <用例号>` |
+| `tests/runner/tests/*.rs` | 引擎行为网：真的驱动 Agent，模型那端是写死的脚本 | `cargo test -p test-runner` |
 | `tests/scripts/*.sh` | 构建面的断言（无插件构建里没有插件依赖等） | `tests/scripts/locked_build.sh` |
 
-脚本载体（QuickJS）的那一张网横跨其中三层，单独有一份设计说明：
+**全部不联网、不需要凭据**，`cargo test --workspace` 一条命令跑完，CI 每次 push 都跑。
+
+脚本载体（QuickJS）的那一张网横跨其中几层，单独有一份设计说明：
 `docs/testing_scripts.md`。要点是它为什么需要一本账——脚本每次调用拿到全新运行时、
 没有文件系统，所以「这个点被触发了吗」只能从外面回答，而「失败的脚本什么都改不了」
 意味着失败和从没绑上在外面长得一模一样。
 
 ## 几个约定
 
-**daemon e2e 不打网络。** `session_lifecycle.rs` 用一个脚本化的
-`AnthropicClient` 喂预设事件，所以工具循环、权限门、流式帧都是真的在跑，
-只有模型那一端是假的。
+**模型那一端总是假的，但假法有三种，各答一个问题。**
 
-**行为测试用录制回放。** `tests/fixtures/cassettes/<用例号>/` 是录好的模型响应；
-回放模式（默认）不联网也不花钱。要重录用 `ATTA_RECORD=<用例>`，
-需要真的 API key。
+- `test_runner::scripted_model::ScriptedModel` —— 回答写在测试里。问的是「引擎拿到
+  这串回答会怎么决策」，包括 529 过载、`prompt_too_long`、`max_tokens` 续写这些
+  没有哪个 provider 会按需产出的结局。
+- `daemon/tests/session_lifecycle.rs` 的脚本化 `AnthropicClient` —— 扎在 adapter
+  **下面**，所以工具循环、权限门、流式帧都是真的在跑，只有网络那一端是假的。
+- `telemetry` 的 `RecorderModel` —— 录制真实对话再按位置回放。它是**产品能力**
+  （运维者可以录自己的会话拿去排查），不再是测试基础设施：本仓库不再录制、也不再
+  提交任何录像。用它的方式见 `docs/ARCHITECTURE.md` 与 `settings.json` 的
+  `recorder` 段。
 
-**用例自带前置，不靠调用方记得传。** `.test` 的元信息区里写：
-
-```
-# fixture: tests/fixtures/template_project
-# scene: chat
-# session: shared
-```
-
-在此之前前置只写在散文注释里（`# 前置: --fixture … --scene chat`），没有任何东西读它，
-而 `tests/run_api.sh` 从不传这两个参数——于是 `003.fixture_full` 每次都是**在没有 fixture
-的情况下**被录的：MCP server、hooks、skill 一个都没起来，录像看着正常，验的东西一个没验到。
-命令行 `--fixture` / `--scene` 仍然优先，用于临时覆盖。
-
-**回放是逐字节比对的，所以录制的那次跑必须是可重复的。** 每个用例有一个属于它自己、
-每次都一样的工作目录，还有一个固定的时钟——两样都在提示词里（环境块里的路径、日期那
-一行），换一个就意味着录像永远回放不了。`ATTA_REPLAY_STRICT=1` 让分歧从警告变成失败，
-这是验证一份录像有没有过期的方式。
-
-**验录像还成立吗：`--rerun`。** 把录像里的输入原样重发给真模型，看输出是否还是同一个
-意思。工具调用逐参数精确比对（不交判官），文本交语义判官。产出终端摘要 + 
-`tests/output/<用例>/rerun.md`。花钱，人工触发，不进 `cargo test`。实现见
-`crates/telemetry/src/recorder/rerun.rs`。
-
-```sh
-./tests/run_rerun.sh                 # 当前轮次所有有录像的用例
-./tests/run_rerun.sh 000.c_project   # 单个
-```
-
-判定分三档：**一致**（工具与文本都没动）、**措辞漂移**（工具一致、文本判官认为同义）、
-**分歧**（工具调用变了，或文本已非同义）。
-
-每条调用**独立重跑**——发出去的是录像里存的输入，不含本次的任何结果，所以前面有没有分歧
-都不影响后面那条的判定。分歧之后的标 `↓`（本次对话不会走到这里），但判定照给。
-
-**开场调用标 `开` 并单列统计**：那是模型只凭提示词自由选第一步的位置，工具选择的抖动本来
-就大（`Bash` vs `Write`、`TodoWrite` vs 直接作答）。摘要末尾的"开场调用之外的分歧数"才是
-先该看的那个数。
+**黄金轨迹要读 diff 再提交。** `turn_behavior_net.rs` 把事件流和会话日志归一化后比
+对黄金文件，`ATTA_UPDATE_GOLDEN=1` 重新生成——反射式重生成的黄金文件是一种更慢的
+「没有测试」。
 
 **测试进程不碰你的 `~/.atta`。** 每个测试自己拿 tempdir 当状态根；
 `daemon/tests/home_is_never_discovered.rs` 保证没有哪个 crate 会自己去找 `$HOME`。
-跑测试之后 `~/.atta` 里不该多出任何东西——如果多了，那是 bug。
+跑测试之后 `~/.atta` 里不该多出任何东西——如果多了，那是 bug。同理，起子进程的测试
+要自己给子进程一个 cwd：daemon 的「项目」就是它的工作目录，继承下来的那个是仓库本身。
 
-**协议文档不许漂移。** `daemon/tests/protocol_doc_matches_dispatch.rs` 比对
-`docs/daemon_rpc_protocol.md` §6 与 `dispatch` 的分支：文档里写了的必须能调用，
-能调用的必须写进文档。
+**文档不许漂移。** 这些都由测试比对，文档写错了会挂：
+
+| 测试 | 盯住什么 |
+|---|---|
+| `daemon/tests/protocol_doc_matches_dispatch.rs` | `daemon_rpc_protocol.md` §6 与 `dispatch` 的方法集合一致 |
+| `daemon/tests/protocol_doc_examples.rs` | 文档里每个响应示例都和真 daemon 的回答逐字段一致 |
+| `daemon/tests/extension_points_doc.rs` | `extension_points.md` 的表由 `catalog` 生成 |
+| `crates/core` 的 `settings_schema_matches_committed_file` | `docs/schemas/settings.schema.json` 由 `Settings` 类型生成（`#[ignore]`，CI 的 ignored 那一步跑） |
 
 ## fixture 项目
 
-`tests/fixtures/template_project/` 是给行为测试用的模板项目，
-有 `.atta/settings.json`（hooks + MCP）、`.agents/skills/`、`AGENTS.md`。
-用例跑之前会整个拷贝到临时目录，改动不会污染这份原件。
+`tests/fixtures/template_project/` 是模板项目：有 `.atta/settings.json`（hooks +
+MCP）、`.agents/skills/`、`AGENTS.md`。用例跑之前会整个拷贝到临时目录，改动不会污染
+这份原件。`tests/fixtures/scripts/` 是脚本载体九个点各自的 fixture，
+`tests/fixtures/scripts_outside/` 那一个故意放在项目根之外，用来验出身判定。
 
 ## 磁盘
 
@@ -93,8 +73,8 @@
 | 每周 | `cargo sweep --time 7`（`cargo install cargo-sweep`） |
 
 第一条是硬性的：版本号一变，23 个 crate 的指纹全变，整套重编而旧的一份不会被删——
-这就是本仓库反复出现"几十 GB 突然爆掉"的直接原因。全量重建约 1 分 10 秒，比排查磁盘
+这就是本仓库反复出现「几十 GB 突然爆掉」的直接原因。全量重建约 1 分 10 秒，比排查磁盘
 满便宜得多。
 
 `tests/scripts/disk_report.sh` 会报告当前占用、**7 天没被碰过的字节数**（即
-`cargo sweep` 能回收的量），以及每一种"多出一套产物"的成因。
+`cargo sweep` 能回收的量），以及每一种「多出一套产物」的成因。

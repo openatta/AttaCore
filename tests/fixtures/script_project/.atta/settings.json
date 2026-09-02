@@ -1,9 +1,0 @@
-{
-  "scripts": [
-    {
-      "path": ".atta/scripts/house_style.js",
-      "point": "prompt.assemble",
-      "entry": "onAssemble"
-    }
-  ]
-}

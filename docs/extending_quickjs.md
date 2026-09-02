@@ -35,8 +35,7 @@ rebuild with the `scripts` feature or remove the section
 
 ## 从零开始
 
-**1. 写脚本。** 放项目里哪儿都行,`.atta/scripts/` 是惯例。下面这个是
-`tests/fixtures/script_project/.atta/scripts/house_style.js`:
+**1. 写脚本。** 放项目里哪儿都行,`.atta/scripts/` 是惯例:
 
 ```js
 function onAssemble(blocks) {
@@ -73,7 +72,6 @@ bound scripts to extension points  scripts=1
 ```
 
 从此这个会话里每一次回复都以那行 house-style 结尾。
-`tests/cases/010.script_carrier.test` 就是这套配置,而且是拿真模型问出来的。
 
 第 3 步有两件事要知道。文件是**在会话构建时**读的,所以改了脚本,不新起一个会话
 就什么都不会变。还有,一条兑现不了的绑定——文件读不出来、点不存在、点不给脚本用
@@ -539,8 +537,6 @@ declare that capability at install
   承诺,逐条对着跑起来的会话验一遍。
 - `tests/runner/tests/script_task_profiles.rs` —— 九个点一起绑上,做一件真活儿,
   看工作目录还是不是原来那个。
-- `tests/fixtures/script_project/` —— 一个完整的项目,它的 settings 绑了一个脚本,
-  由 `tests/cases/010.script_carrier.test` 使用。
 - `crates/core/src/interface/script_adapters/` —— 每个点一个适配器。每个适配器实现
   的 JSON 契约就写在适配器自己身上,那是不会漂移的那一版。
 - `docs/extension_points.md` —— 引擎里的每一个点,以及谁可以用它。

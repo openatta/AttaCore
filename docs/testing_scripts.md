@@ -46,21 +46,24 @@ outcome ∈ Applied            脚本跑了，改动施加了
 账本随 `BoundScripts` 一起产出，容量有上限，并记录被挤掉的条数：一条读不到的记录
 和一条不存在的记录必须分得开。
 
-## 三层
+## 两层
 
 两个诉求在确定性上是相反的。「插件动作有没有被触发」是确定性事实；「任务完成得
-正不正常」一旦交给真模型判断就不是。所以分开：
+正不正常」一旦交给真模型判断就不是。所以模型那一端一律写死：
 
-| 层 | 驱动 | 进 `cargo test` | 回答什么 |
-|---|---|---|---|
-| L1 契约 | 脚本化模型 | 是 | 每个点单独：绑上生效、不绑不生效、坏掉不害人 |
-| L2 任务 | 脚本化模型 + 真工具 + 真文件系统 | 是 | 九个点同时在场时，一件真活儿的终态 |
-| L3 真模型 | 真模型 + 录像 | 否 | 脚本的效果只有通过模型的自由选择才看得见的那几条 |
+| 层 | 驱动 | 回答什么 |
+|---|---|---|
+| L1 契约 | 脚本化模型 | 每个点单独：绑上生效、不绑不生效、坏掉不害人 |
+| L2 任务 | 脚本化模型 + 真工具 + 真文件系统 | 九个点同时在场时，一件真活儿的终态 |
 
-L2 是这张网的主体。能被脚本化模型演出来的东西，再花钱用真模型跑一遍不增加任何
-信息，只增加抖动——理由与 `test_runner::scripted_model` 模块头写的是同一个：录像
-是 gitignore 的，它烘进了精确的提示词，提示词一改就全挂，因此不能当可提交的回归
-网。L3 的上限是三条。
+**全部进 `cargo test`，全部不联网、不要凭据。** 曾经还有第三层：拿真模型跑几条用例、
+把交互录下来回放。它退休了，理由和 `test_runner::scripted_model` 模块头写的是同一个
+——录像烘进了精确的提示词，提示词一改就全挂，所以它从来不能当可提交的回归网；而不能
+提交、不能在 CI 里跑的那一层，价值取决于有没有人记得手动跑它。
+
+代价要说清楚：**「模型自己会怎么选」这个问题现在没有测试回答。** 脚本化模型的下一步
+是写死的，所以「脚本拒掉 Bash 之后模型会不会换一条路」这类问题，只能靠人手工验。
+知道这个空档在哪儿，比留一批放不了的录像假装它被覆盖了要好。
 
 ## 一条用例要满足什么
 
@@ -173,22 +176,6 @@ L2 的主体。一件小而真实的活儿，终态完全确定：读 `src/main.
 **没有黄金文件。** 基线是在同一次运行里现算的，所以没有会过期的文件，也没有可以被
 反射式重新生成的东西；任务本身由脚本化回复钉住。
 
-### E · 真模型
-
-只收一类：脚本的效果只有通过模型的**自由选择**才能被观察到。
-
-- `tests/cases/010.script_carrier.test`——house rule 落到每一句回答的末尾。
-- `tests/cases/scripts/001_denied_tool_reroutes.test`——脚本拒掉 `Bash`，模型必须
-  读懂拒绝理由、改用文件工具、把活干完。这个「换路」脚本化模型演不出来：它的下一步
-  是写死的。
-
-配 `@tools` / `@contains` 确定性断言——散文预期默认没人验，`run_api.sh` 不传
-`--compare`。**录像要手动录**，需要凭据，且花钱：
-
-```sh
-./tests/run_api.sh scripts/001_denied_tool_reroutes
-```
-
 ## 放在哪
 
 脚本 fixture 全部在 `tests/fixtures/scripts/` 下，每个留一处引擎别处绝不会产生的痕迹：
@@ -200,8 +187,6 @@ tests/fixtures/scripts/
   tool_around_deny_edit.js  干预剖面里唯一真的改行为的那个
   broken/                 抛异常、死循环、吃内存、形状不对、抢内核块名
 tests/fixtures/scripts_outside/   故意放在项目根之外，用来验出身判定
-tests/fixtures/script_project/        真模型用：house rule
-tests/fixtures/script_deny_project/   真模型用：禁用 Bash
 ```
 
 剖面是 Rust 里的一张表，不是磁盘上的配置：绑定组合本来就是用例的一部分，写成 JSON
@@ -212,7 +197,6 @@ sidecar 只会让「这一组为什么这么绑」离断言更远。
 | A、B | `tests/runner/tests/script_carrier.rs` |
 | C | `tests/runner/tests/script_boundaries.rs` |
 | D | `tests/runner/tests/script_task_profiles.rs` |
-| E | `tests/cases/scripts/*.test`、`tests/cases/010.script_carrier.test` |
 | daemon 那条路 | `daemon/tests/session_lifecycle.rs` |
 
 daemon 的两条单独在那边：从 `.atta/settings.json` 到装到会话上的这一段全是 daemon

@@ -484,15 +484,15 @@ that maps to `TEXT` in Postgres and SQLite alike.
 
 ## Testing
 
-Four layers, each answering a different question. At v0.2.0 the suite is **2,693
-tests**, and all of it runs on every push.
+Four layers, each answering a different question, none of them needing a
+network or an API key — and all of it runs on every push.
 
 | Layer | What it answers | How |
 |---|---|---|
 | `mod tests` in each crate | one function, one type | `cargo test -p <crate>` |
 | `crates/*/tests` | does this crate keep its promise through its public seam | `cargo test` |
 | `daemon/tests` | a real server, a real socket, real JSON-RPC | `cargo test -p daemon` |
-| `tests/cases/*.test` | a real Agent doing a real task, recorded and replayed | `tests/run_api.sh <case>` |
+| `tests/runner/tests` | a real Agent doing real work, with the model's answers written down | `cargo test -p test-runner` |
 
 Three things about it are worth stealing:
 
@@ -506,9 +506,9 @@ tests.
 extension-point table, the settings schema: each is compared against the code by
 a test, so a document that drifts fails a build rather than misleading a reader.
 
-**Recorded runs are repeatable on purpose.** A working directory per case and a
-fixed clock, because both appear in the prompt — without that, every replay
-diverges and nobody can tell a real drift from a temp path.
+**Nothing in it needs a network or a key.** The model is faked at one seam and
+the answers are written down, so the whole suite runs anywhere in seconds —
+which is what makes gating on it possible at all.
 
 ---
 
@@ -553,9 +553,9 @@ model. The test suite needs neither.
 
 ```sh
 cargo build --workspace              # full build
-cargo test  --workspace              # 2,693 tests, no network, no key
+cargo test  --workspace              # the whole suite: no network, no key
 cargo test  -p daemon                # the daemon's own end-to-end suite
-tests/run_api.sh 000.c_project       # a recorded case, replayed
+cargo test  -p base --features sandbox   # the OS sandbox backends
 ```
 
 A clean build is ~13 GB, and that is not waste: every integration test file is a

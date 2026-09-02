@@ -7,9 +7,7 @@
 //!
 //! 这里用一个假 Model（不打网络、不需要 cassette）把这件事钉死成一个确定性
 //! 断言：模型每次被调用时检查"消息历史里有没有出现只在第一轮说过的暗号"，
-//! 逐轮隔离时第二轮必然看不到，共享会话时必然看到。真实 LLM 版本的同一件事
-//! 见 `tests/cases/session/001_multi_turn_recall.test`（需要凭证/cassette，
-//! 所以不能在 `cargo test` 里跑，两者是互补的）。
+//! 逐轮隔离时第二轮必然看不到，共享会话时必然看到。
 
 use base::interface::model::{
     Model, ModelError, ModelEvent, ModelMessage, ModelStream, StreamParams, ToolDef, Usage,
@@ -19,7 +17,7 @@ use base::interface::settings::RecorderMode;
 use base::provider::ApiType;
 use std::sync::Arc;
 use test_runner::api_runner::{self, AgentRunnerConfig};
-use test_runner::script::{self, SessionMode};
+use test_runner::script::{self};
 use tokio_util::sync::CancellationToken;
 
 /// 只在第一轮的用户输入里出现的暗号。
@@ -103,9 +101,8 @@ fn runner_config(recordings_dir: &std::path::Path, scenario: &str) -> AgentRunne
 
 /// 两种模式跑同一个用例，断言只有共享会话那次的第二轮看得见第一轮。
 ///
-/// 两次跑放在同一个 `#[test]` 里是有意的：`api_runner` 的两个入口都用同一个
-/// 固定临时目录（`/tmp/atta_test_runner`）并在开头把它删掉重建，并行跑会互相
-/// 掀桌子。
+/// 两次跑放在同一个 `#[test]` 里是有意的：`api_runner` 的两个入口对同一个用例
+/// 名用同一个工作目录，并在开头把它删掉重建，并行跑会互相掀桌子。
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_session_carries_conversation_state_across_turns() {
     let case = two_turn_case();
@@ -152,82 +149,4 @@ async fn shared_session_carries_conversation_state_across_turns() {
          session-memory staleness) is once again untested; got: {}",
         shared[1].text
     );
-}
-
-/// 用例文件里的 `session: shared` 声明是这套机制唯一的开关——它被删掉/改错的
-/// 话，用例会安静地退回逐轮隔离，第二轮的断言就变成了"模型能不能凭空猜出
-/// ORCHID"。这里直接读真实文件把它钉住。
-#[test]
-fn the_multi_turn_case_file_declares_a_shared_session() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../cases/session/001_multi_turn_recall.test");
-    let case = script::parse_test_file(&path)
-        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
-    assert_eq!(
-        case.session_mode,
-        SessionMode::Shared,
-        "{} must keep its `session: shared` directive",
-        path.display()
-    );
-    assert!(
-        case.turns.len() >= 2,
-        "a session-continuity case needs multiple turns"
-    );
-    // 第二轮的断言必须真的依赖第一轮的内容，而不是随便什么话术。
-    let turn2 = &case.turns[1];
-    assert!(
-        turn2.expect_contains.iter().any(|s| s.contains("ORCHID")),
-        "turn 2 must assert on a literal only stated in turn 1"
-    );
-    assert!(
-        !turn2.input.contains("ORCHID"),
-        "turn 2's own input must NOT restate the literal — otherwise it would pass without a \
-         shared session"
-    );
-}
-
-/// 现存用例一律保持逐轮隔离（它们录好的数据依赖这个默认值：共享会话会改变
-/// 消息历史，回放时会被判为分歧）。
-#[test]
-fn existing_cases_keep_the_per_turn_default() {
-    let cases_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cases");
-    let mut checked = 0;
-    for entry in walk_test_files(&cases_dir) {
-        let case = script::parse_test_file(&entry)
-            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", entry.display()));
-        let is_session_case = entry
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n == "session");
-        if !is_session_case {
-            assert_eq!(
-                case.session_mode,
-                SessionMode::PerTurn,
-                "{} unexpectedly opted into a shared session — that invalidates its cassette",
-                entry.display()
-            );
-        }
-        checked += 1;
-    }
-    assert!(
-        checked > 0,
-        "no .test files found under {}",
-        cases_dir.display()
-    );
-}
-
-fn walk_test_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(walk_test_files(&path));
-        } else if path.extension().is_some_and(|e| e == "test") {
-            out.push(path);
-        }
-    }
-    out
 }

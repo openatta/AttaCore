@@ -9,10 +9,6 @@ description = "AttaCore test runner — executes .test scenario files against Ag
 name = "test_runner"
 path = "src/lib.rs"
 
-[[bin]]
-name = "attacore-test"
-path = "src/main.rs"
-
 [dependencies]
 rpc-client    = { workspace = true }
 daemon        = { workspace = true }

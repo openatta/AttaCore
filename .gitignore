@@ -25,10 +25,10 @@ Thumbs.db
 # Test output (generated, not committed)
 tests/output/
 
-# VCR cassette cache (local/CI-only; see tests/README.md — a recording bakes in
-# the exact model name, prompt and tool table, so a committed one goes stale on
-# every prompt/model change and produces unreviewable binary-ish diffs)
+# A recording the recorder made — the product feature, pointed anywhere. Never
+# committed: it holds everything the model saw, in the clear.
 tests/fixtures/cassettes/
+recordings/
 
 # Environment
 .env
