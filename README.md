@@ -170,6 +170,34 @@ an external JavaScript plugin as an MCP server, so a plugin written for a
 framework this engine knows nothing about reaches the model through the same
 path as any other server.
 
+### The OS sandbox — optional, and off
+
+Separate from the three above, and about something else: the carriers sandbox
+*somebody else's code*, this constrains the shell commands **the model itself**
+runs. `Bash` is its only consumer.
+
+```sh
+cargo build -p daemon --features sandbox     # macOS sandbox-exec / Linux bubblewrap
+```
+
+Off by default, deliberately. On a machine whose owner is sitting at it, the
+permission system is the control surface and this is defence in depth; where an
+agent acts for somebody else, it is a boundary worth compiling in. With the
+feature on, a policy denies writes outside the working directory, re-denies
+writes to `settings.json` even inside it — that file is where the permission
+rules live — and refuses reads of the usual credential stores. Windows has no
+backend.
+
+The rule the design turns on: **a policy that asked for constraint must never
+silently become an unconstrained run.** A backend reports how much it could
+deliver, and `sandbox.require_enforcement` decides whether a shortfall refuses
+the command or proceeds with it. A build without the feature reports the
+shortfall the same way, naming the missing feature.
+
+The credential deny-read list is not really sandboxing and stays either way:
+the command classifier uses it to keep `cat ~/.ssh/id_rsa` from being treated
+as a harmless read whose output goes to a model provider.
+
 ### One carrier per build
 
 `scripts` and `plugins` are mutually exclusive features, and `scripts` is the

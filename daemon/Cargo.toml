@@ -103,6 +103,13 @@ plugin-compile = ["plugins", "plugin-host/compile", "wasm-host/compile"]
 
 # ── Everything else ─────────────────────────────────────────────────────
 
+# The OS process sandbox around `Bash` — see `base`'s feature of the same name
+# for what it does and why it is off. Independent of the carriers: it
+# constrains the model's own shell commands, not anybody's extensions.
+#
+#     cargo build -p daemon --features sandbox
+sandbox = ["base/sandbox"]
+
 # Fan session telemetry out to an OTLP collector in addition to the per-session
 # JSONL file. Off by default: the OTLP SDK is a large dependency tree and the
 # file recorder is what makes a run debuggable out of the box.

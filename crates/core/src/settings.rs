@@ -536,12 +536,23 @@ pub struct SandboxConfig {
     /// Outbound network policy for sandboxed `Bash` commands.
     #[serde(default)]
     pub network_mode: crate::context::config::NetworkModeConfig,
-    /// Bypass sandbox entirely.
-    /// Default: false. Only for trusted environments.
+    /// Bypass the sandbox entirely, in a build that has one.
+    ///
+    /// Default: false. Note what that does *not* mean: the backend is behind
+    /// the `sandbox` compile-time feature, which is off by default, so an
+    /// ordinary build has nothing to bypass and this setting changes nothing
+    /// in it. It is the runtime half of a two-part answer — the build decides
+    /// whether a sandbox exists, this decides whether to use the one it has.
     #[serde(default)]
     pub dangerously_disable_sandbox: bool,
-    /// Refuse to run a sandboxed command when the platform cannot actually
-    /// enforce the policy, instead of running it unconstrained.
+    /// Refuse to run a sandboxed command when this build on this platform
+    /// cannot actually enforce the policy, instead of running it
+    /// unconstrained.
+    ///
+    /// Two ways to be unable: the `sandbox` compile-time feature is off, so no
+    /// backend was compiled at all — the default — or it is on and the
+    /// platform's tool is missing. Both refuse here, and the message says
+    /// which.
     ///
     /// Off by default, which is the historical behavior: on Linux without
     /// `bwrap`, and on platforms with no backend at all, a command whose

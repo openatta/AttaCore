@@ -74,3 +74,13 @@ jobs:
             echo "the two carriers compiled together; the guard in daemon/src/lib.rs is gone"
             exit 1
           fi
+
+      # The OS sandbox is optional too, and independent of the carriers. Its
+      # backends and the ~30 tests that drive them are compiled out of every
+      # default build, so this job is the only place they are built at all —
+      # and Linux is the platform whose backend nobody develops on.
+      - name: sandbox backend
+        run: cargo check -p daemon --features sandbox
+
+      - name: sandbox tests
+        run: cargo test -p base --features sandbox

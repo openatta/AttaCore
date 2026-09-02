@@ -13,6 +13,14 @@
 //!   failure goes toward the safer side, and says so through `Enforcement`.
 //! - **Windows**: no backend.
 //!
+//! **The whole file is behind the `sandbox` feature, off by default.** What it
+//! constrains is the commands the *model* runs, which is defence in depth on a
+//! machine whose owner is sitting at it and a boundary only where the agent
+//! acts for someone else. Without the feature the backends are not compiled,
+//! [`PlatformSandbox`] says so, and `sandbox.require_enforcement` refuses every
+//! command rather than running it unconstrained — which is the same promise the
+//! enforcement report always made, kept one step earlier.
+//!
 //! # Known escape paths
 //!
 //! This is a lightweight write restriction, not a security boundary. Known
@@ -35,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 /// The state root to protect: the one the caller named, else the
 /// conventional `$HOME/.atta`.
+#[cfg(feature = "sandbox")]
 fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
     policy
         .state_root
@@ -53,9 +62,11 @@ fn state_root_of(policy: &SandboxPolicy) -> Option<PathBuf> {
 /// `settings.json` at all. Keep in sync with `daemon::main::resolve_scene`
 /// and `crates/scene/src/scene/*.rs` regardless, since it's still the
 /// default every caller gets today.
+#[cfg(feature = "sandbox")]
 const KNOWN_SCENES: &[&str] = &["coding", "chat", "demo", "research"];
 
 /// `policy.known_scenes` if the caller supplied one, else [`KNOWN_SCENES`].
+#[cfg(feature = "sandbox")]
 fn effective_known_scenes(policy: &SandboxPolicy) -> Vec<&str> {
     if policy.known_scenes.is_empty() {
         KNOWN_SCENES.to_vec()
@@ -86,20 +97,42 @@ pub fn wrap(opts: SandboxOptions<'_>) -> Confined {
         return plain(opts.command, SandboxMode::Disabled);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(feature = "sandbox"))]
     {
-        mac_wrap(opts)
+        unavailable(
+            opts.command,
+            "this build has no sandbox backend; rebuild with `--features sandbox`",
+        )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "sandbox")]
     {
-        linux_wrap(opts)
-    }
+        #[cfg(target_os = "macos")]
+        {
+            mac_wrap(opts)
+        }
 
-    // Windows / other unsupported platforms
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        plain(opts.command, SandboxMode::Unavailable)
+        #[cfg(target_os = "linux")]
+        {
+            linux_wrap(opts)
+        }
+
+        // Windows / other unsupported platforms
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            plain(opts.command, SandboxMode::Unavailable)
+        }
+    }
+}
+
+/// A command nothing wrapped, and the reason in words the operator can act on.
+#[cfg(not(feature = "sandbox"))]
+fn unavailable(command: &str, why: &str) -> Confined {
+    Confined {
+        spec: bash_spec(command),
+        unmet: vec![why.to_string()],
+        mode: SandboxMode::Unavailable,
+        enforcement: Enforcement::None,
     }
 }
 
@@ -115,7 +148,7 @@ fn plain(command: &str, mode: SandboxMode) -> Confined {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "sandbox", target_os = "macos"))]
 fn mac_wrap(opts: SandboxOptions<'_>) -> Confined {
     let profile = build_macos_profile(opts.cwd, opts.additional_writable, &opts.policy);
     let inner = bash_spec(opts.command);
@@ -131,7 +164,7 @@ fn mac_wrap(opts: SandboxOptions<'_>) -> Confined {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "sandbox", target_os = "macos"))]
 fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolicy) -> String {
     // 默认放行（所有 file-read / process / network / signal / mach 等），
     // 然后单独 deny file-write*，再 allow 我们指定的几个 subpath。
@@ -246,12 +279,13 @@ fn build_macos_profile(cwd: &Path, additional: &[PathBuf], policy: &SandboxPolic
 ///
 /// 只有 macOS 的配置生成器调用它，但函数本身和平台无关——它的测试在哪个平台上
 /// 都该跑，所以这里没有跟着调用方一起 `cfg` 掉，而是只在别的平台上豁免"未使用"。
+#[cfg(feature = "sandbox")]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn sandbox_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn linux_wrap(opts: SandboxOptions<'_>) -> Confined {
     if !bwrap_available() {
         return plain(opts.command, SandboxMode::Unavailable);
@@ -440,11 +474,15 @@ impl Sandbox for PlatformSandbox {
 /// Linux：bwrap 在 PATH 时 available；否则报 unavailable + 提示装。
 /// 其它平台：unavailable + 平台名。
 pub fn sandbox_status() -> String {
-    #[cfg(target_os = "macos")]
+    #[cfg(not(feature = "sandbox"))]
+    {
+        "unavailable: this build has no sandbox backend (`--features sandbox`)".to_string()
+    }
+    #[cfg(all(feature = "sandbox", target_os = "macos"))]
     {
         "available: sandbox-exec".to_string()
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
     {
         if bwrap_available() {
             "available: bwrap".to_string()
@@ -452,13 +490,16 @@ pub fn sandbox_status() -> String {
             "unavailable: bwrap not in PATH (install bubblewrap)".to_string()
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "sandbox",
+        not(any(target_os = "macos", target_os = "linux"))
+    ))]
     {
         format!("unavailable on {}", std::env::consts::OS)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn bwrap_available() -> bool {
     // 一次性探测；用 sync std::process::Command 走 PATH lookup
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -473,7 +514,56 @@ fn bwrap_available() -> bool {
     })
 }
 
-#[cfg(test)]
+/// What a build without the backend promises.
+///
+/// The gated module below tests the backends; this tests their absence, which
+/// is the state most builds are in. A build that quietly reported `Full` here
+/// would make `require_enforcement` a lie in exactly the configuration where
+/// somebody is relying on it.
+#[cfg(all(test, not(feature = "sandbox")))]
+mod without_the_feature {
+    use super::*;
+
+    fn opts(command: &'static str) -> SandboxOptions<'static> {
+        SandboxOptions {
+            command,
+            cwd: Path::new("/tmp/work"),
+            additional_writable: &[],
+            policy: SandboxPolicy::default(),
+            disable: false,
+        }
+    }
+
+    #[test]
+    fn a_build_without_the_backend_says_so_and_claims_nothing() {
+        let c = wrap(opts("echo hi"));
+        assert_eq!(c.mode, SandboxMode::Unavailable);
+        assert_eq!(c.enforcement, Enforcement::None);
+        assert!(
+            c.unmet.iter().any(|u| u.contains("--features sandbox")),
+            "the shortfall must name what is missing, not just that something is: {:?}",
+            c.unmet
+        );
+    }
+
+    #[test]
+    fn the_command_still_runs_unchanged() {
+        let c = wrap(opts("echo hi"));
+        assert_eq!(c.spec.program, "bash");
+        assert_eq!(c.spec.args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    #[test]
+    fn status_names_the_feature_rather_than_the_platform() {
+        assert!(
+            sandbox_status().contains("--features sandbox"),
+            "{}",
+            sandbox_status()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "sandbox"))]
 mod tests {
     use super::*;
 
