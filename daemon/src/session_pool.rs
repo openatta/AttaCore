@@ -171,6 +171,13 @@ struct LiveSession {
     /// (`SESSION_BUSY.data.current_turn_id`) and `session.get` can report
     /// `turn_state` instead of the caller having to infer it.
     current_turn: Option<String>,
+    /// What this session's bound scripts did, if it bound any.
+    ///
+    /// Kept because a script that quietly does nothing is the failure mode of
+    /// this whole tier, and until now the only account of it was a log line on
+    /// the daemon's stderr — which the person asking "why is my script not
+    /// working" does not have. `session.get` reads it.
+    scripts: Option<Arc<base::interface::script::ScriptLedger>>,
     /// Connections watching this session.
     ///
     /// Every frame the session produces goes to all of them. A turn is not
@@ -1613,11 +1620,19 @@ impl SessionPool {
             .clone()
             .unwrap_or_else(|| self.cwd.clone());
         #[cfg(feature = "scripts")]
-        if let Some(bound) = bind_scripts(&settings_snapshot, &script_root) {
-            builder = builder.bound_scripts(bound);
-        }
+        let script_ledger = match bind_scripts(&settings_snapshot, &script_root) {
+            Some(bound) => {
+                let ledger = bound.ledger.clone();
+                builder = builder.bound_scripts(bound);
+                Some(ledger)
+            }
+            None => None,
+        };
         #[cfg(not(feature = "scripts"))]
-        let _ = bind_scripts(&settings_snapshot, &script_root);
+        let script_ledger = {
+            let _ = bind_scripts(&settings_snapshot, &script_root);
+            None
+        };
 
         // Give this session its own owned `McpManager` built from this
         // project's centrally-connected client handles (cheap `Arc` clones
@@ -1868,6 +1883,7 @@ impl SessionPool {
                 .config_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
             current_turn: None,
+            scripts: script_ledger,
             subscribers: HashMap::new(),
             pending_prompts: HashMap::new(),
         };
@@ -2603,8 +2619,77 @@ impl SessionPool {
                 }),
             );
             obj.insert("current_turn_id".into(), serde_json::json!(current_turn));
+            if let Some(scripts) = self.script_report(session_id).await {
+                obj.insert("scripts".into(), scripts);
+            }
         }
         Ok(detail)
+    }
+
+    /// What this session's scripts have done, for `session.get`.
+    ///
+    /// `None` when the session bound none — a key that is absent says "no
+    /// scripts here", which is a different answer from one that is present and
+    /// empty, and the difference is the first thing somebody debugging a
+    /// script needs.
+    ///
+    /// The counts answer "is it running at all"; `recent` answers "and why
+    /// not". A failed call carries its reason, because "the script threw",
+    /// "it ran out of time" and "it answered in a shape this point cannot use"
+    /// send a reader to three different places.
+    async fn script_report(&self, session_id: &str) -> Option<serde_json::Value> {
+        use base::interface::script::ScriptOutcome;
+
+        let ledger = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id)?.scripts.clone()?
+        };
+        let records = ledger.records();
+
+        let (mut applied, mut no_change, mut failed, mut refused) = (0, 0, 0, 0);
+        for r in &records {
+            match r.outcome {
+                ScriptOutcome::Applied => applied += 1,
+                ScriptOutcome::NoChange { .. } => no_change += 1,
+                ScriptOutcome::Failed { .. } => failed += 1,
+                ScriptOutcome::Refused { .. } => refused += 1,
+            }
+        }
+
+        /// Enough to see a pattern, few enough to read.
+        const RECENT: usize = 20;
+        let recent: Vec<serde_json::Value> = records
+            .iter()
+            .rev()
+            .take(RECENT)
+            .map(|r| {
+                let (outcome, detail) = match &r.outcome {
+                    ScriptOutcome::Applied => ("applied", None),
+                    ScriptOutcome::NoChange { detail } => ("no_change", detail.clone()),
+                    ScriptOutcome::Failed { error } => ("failed", Some(error.to_string())),
+                    ScriptOutcome::Refused { detail } => ("refused", Some(detail.clone())),
+                };
+                serde_json::json!({
+                    "point": r.point,
+                    "script": r.script,
+                    "entry": r.entry,
+                    "turn": r.turn,
+                    "outcome": outcome,
+                    "detail": detail,
+                })
+            })
+            .collect();
+
+        Some(serde_json::json!({
+            "calls": records.len(),
+            "applied": applied,
+            "no_change": no_change,
+            "failed": failed,
+            "refused": refused,
+            // Non-zero means `recent` is a tail of a longer story.
+            "dropped": ledger.dropped(),
+            "recent": recent,
+        }))
     }
 
     /// 列出所有 session（活跃的 + 历史的），合并去重。
@@ -4658,6 +4743,7 @@ mod eviction_tests {
             is_first_turn: true,
             config_generation: 0,
             current_turn: None,
+            scripts: None,
             subscribers: HashMap::new(),
             pending_prompts: HashMap::new(),
         }

@@ -752,6 +752,27 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 `current_turn_id` 四项 —— 前两个要读 transcript,后两个只有内存里的池子知道。
 `turn_state` 就是"发送按钮该不该置灰"的依据。
 
+**`scripts`——这个会话的脚本都干了什么。** 只有绑了脚本的会话才有这个键;没绑的会话
+**没有这个键**,而不是一个空对象——「这儿没有脚本」和「脚本一次都没跑」是两个不同的
+答案。
+
+```jsonc
+"scripts": {
+  "calls": 7, "applied": 5, "no_change": 1, "failed": 1, "refused": 0,
+  "dropped": 0,                    // 非 0 表示 recent 只是尾巴
+  "recent": [                      // 最近 20 条,新的在前
+    { "point": "prompt.assemble", "script": "/proj/.atta/scripts/x.js",
+      "entry": "onAssemble", "turn": 2, "outcome": "failed",
+      "detail": "script exceeded its 100ms budget" }
+  ]
+}
+```
+
+`outcome` 取 `applied`(点采纳了返回值)、`no_change`(跑了但没有可施加的东西)、
+`failed`(调用没完成:抛异常/超时/配额耗尽/没有引擎)、`refused`(要求的事它的出身
+不允许)。**这四个在引擎里的效果完全一样——什么都没变**,所以一个脚本"没生效"到底
+属于哪一种,只有这里说得清。`detail` 在后三种里带着原因。
+
 侧链会话另有 `parent_session_id`;主会话没有这个字段(不是 `null`,是不出现)。
 
 **`preview` 恒为 `null`,`message_count` 恒为 `0`** —— 两个字段在协议里占了位置,

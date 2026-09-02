@@ -74,6 +74,7 @@ working default, and every default is a trait you can replace.
 |---|---|
 | **Extend it without forking it** | 44 points in a published catalog, each with its cost and its trust rules. A `.js` file and one line of config reaches nine of them; a WebAssembly plugin reaches five; a Rust trait reaches all of them. |
 | **A failing extension is a non-event** | Every adapter computes its change fully before applying any of it. A script that throws, times out, exhausts its quota or answers in the wrong shape leaves its point exactly as it found it — a prompt half-edited by something that died mid-pass is worse than an unedited one. |
+| **And you can find out that it did** | Which makes "nothing happened" the failure everyone hits, and the four ways of doing nothing identical from inside the engine. Every call is written down and `session.get` reports it, so "why is my script not working" has an answer that is not a log line on somebody else's stderr. |
 | **Policy survives delegation** | The rings around tool and model calls follow sub-agents, team members and background tasks. A rule that stopped at the first `Agent` call would be one model decision away from being bypassed. |
 | **Context is handled, not hoped about** | Four compaction strategies behind a predictive trigger and a circuit breaker, with cache-aware edits so compaction does not invalidate the prompt cache it just paid for. |
 | **Tools run while the model is still typing** | The streaming executor dispatches concurrency-safe tools during generation, with sibling abort on failure. |
@@ -121,6 +122,10 @@ reported and counted rather than dropped, so "being held back" reads differently
 from "doing nothing". Budgets are per binding, per turn: 100 ms and 1000 calls
 by default, with the clock enforced inside the interpreter so a `while (true)`
 stops too.
+
+Every call a script makes is recorded — which point, which turn, and whether
+the point took the answer, found nothing to take, never got one, or refused it
+— and `session.get` reports it per session.
 
 Full guide: [`docs/extending_quickjs.md`](docs/extending_quickjs.md).
 

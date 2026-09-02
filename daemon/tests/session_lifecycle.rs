@@ -1371,6 +1371,109 @@ async fn a_projects_own_script_reaches_the_prompt_the_daemon_sends() {
     srv.stop().await;
 }
 
+/// `session.get` says what this session's scripts have been doing.
+///
+/// The failure mode of the whole script tier is a script that quietly does
+/// nothing, and until this the only account of it was a line on the daemon's
+/// stderr — which the person asking "why is my script not working" does not
+/// have. A throwing script is the case worth reporting: nothing about the
+/// session looks different, and the answer has to come from somewhere.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn session_get_reports_what_the_scripts_did() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("hi")],
+        ask_settings_no_memory(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let project = srv._dir.path().join("reported-project");
+    std::fs::create_dir_all(project.join(".atta").join("scripts")).unwrap();
+    std::fs::write(
+        project.join(".atta").join("scripts").join("broken.js"),
+        "function onAssemble() { throw new Error('nope'); }",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".atta").join("settings.json"),
+        r#"{
+             "memory_enabled": false,
+             "scripts": [
+               {"path": ".atta/scripts/broken.js", "point": "prompt.assemble", "entry": "onAssemble"}
+             ]
+           }"#,
+    )
+    .unwrap();
+
+    let created = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.create","params":{{"project_root":"{}"}},"id":1}}"#,
+            project.display()
+        ),
+    )
+    .await;
+    let sid = created["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session.create failed: {created}"))
+        .to_string();
+    run_turn(&srv.sock, Some(&sid), "hello").await;
+
+    let detail = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.get","params":{{"session_id":"{sid}"}},"id":2}}"#
+        ),
+    )
+    .await;
+    let scripts = &detail["result"]["scripts"];
+    assert!(
+        scripts.is_object(),
+        "a session that bound a script must report on it: {detail}"
+    );
+    assert!(
+        scripts["failed"].as_u64().unwrap_or(0) >= 1,
+        "the throwing script is not reported as having failed: {scripts}"
+    );
+    let recent = scripts["recent"].as_array().expect("recent is an array");
+    let first = &recent[0];
+    assert_eq!(first["point"], "prompt.assemble");
+    assert_eq!(first["outcome"], "failed");
+    assert!(
+        first["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "a failure without a reason sends the reader nowhere: {first}"
+    );
+
+    srv.stop().await;
+}
+
+/// A session that bound none has no key at all — absent and empty are
+/// different answers, and the difference is the first thing a reader needs.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn session_get_says_nothing_about_scripts_when_there_are_none() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("hi")],
+        ask_settings_no_memory(),
+        Duration::ZERO,
+    )
+    .await;
+    let sid = run_turn(&srv.sock, None, "hello").await;
+    let detail = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.get","params":{{"session_id":"{sid}"}},"id":2}}"#
+        ),
+    )
+    .await;
+    assert!(
+        detail["result"]["scripts"].is_null(),
+        "a session with no scripts must not report an empty ledger: {detail}"
+    );
+    srv.stop().await;
+}
+
 /// A binding the daemon cannot honor costs the session every script, not some
 /// of them.
 ///
