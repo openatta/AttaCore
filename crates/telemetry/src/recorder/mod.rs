@@ -790,7 +790,7 @@ impl RecordingStream {
             self.call_seq,
             outcome,
             stop_reason,
-            Some(self.usage.clone()),
+            Some(self.usage),
             self.started,
         );
     }
@@ -805,7 +805,7 @@ impl futures::Stream for RecordingStream {
             Poll::Ready(Some(Ok(event))) => {
                 if let ModelEvent::EndTurn { stop_reason, usage } = &event {
                     this.stop_reason = stop_reason.clone();
-                    this.usage = usage.clone();
+                    this.usage = *usage;
                 }
                 let records = this.packer.push(ChunkRecord {
                     // Numbered on the way out, not here — see `pack::stamp_seqs`.

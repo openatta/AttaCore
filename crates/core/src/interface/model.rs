@@ -338,10 +338,26 @@ pub enum ModelEvent {
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+impl Usage {
+    /// This and one more call's worth.
+    ///
+    /// A provider reports usage per call and a turn is several calls, so
+    /// summing is what anyone asking "what did that cost" has to do. Saturating
+    /// because a turn that overflowed a `u32` of tokens has a bigger problem
+    /// than an inexact total, and wrapping to nearly zero would be the one
+    /// answer worse than the true one.
+    pub fn plus(self, other: Usage) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

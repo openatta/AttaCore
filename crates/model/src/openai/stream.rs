@@ -221,7 +221,7 @@ impl ChunkAccumulator {
                 .stop_reason
                 .clone()
                 .unwrap_or_else(|| "end_turn".to_string()),
-            usage: self.usage.clone(),
+            usage: self.usage,
         });
         out
     }

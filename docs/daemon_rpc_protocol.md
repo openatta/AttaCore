@@ -1234,7 +1234,10 @@ RPC 出口。要看子 Agent 干了什么,走它的侧链会话:`session.list
 `prompt_type` 目前只有 `"permission"`,但字段刻意保持通用 —— 未来的"停下来问一句"
 可以复用同一帧与同一回答通道。
 
-`turn_complete` 的 `usage` 只有 `input_tokens` / `output_tokens`(§3.5)。
+`turn_complete` 的 `usage` 只有 `input_tokens` / `output_tokens`(§3.5),
+**是这一轮所有模型调用的合计**,不是最后一趟。一轮可能来回好几趟
+(`api_calls` 就是趟数),按最后一趟计费会少算——用它做预算的宿主尤其要看清这一点。
+
 **`stop_reason` 和 `usage` 只在这里出现**,`run_turn` 的最终响应里没有。
 
 ---

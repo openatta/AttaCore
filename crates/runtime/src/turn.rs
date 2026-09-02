@@ -121,6 +121,7 @@ impl Agent {
                                     stop_reason: "command_executed".into(),
                                     api_calls: 0,
                                     tool_calls: 0,
+                                    total_usage: Usage::default(),
                                     usage: Usage::default(),
                                 });
                             }
@@ -349,6 +350,7 @@ impl Agent {
                     stop_reason: "stopped_by_hook".into(),
                     api_calls: 0,
                     tool_calls: 0,
+                    total_usage: Usage::default(),
                     usage: Usage::default(),
                 });
             }
@@ -404,6 +406,8 @@ impl Agent {
         // the two wins; that rule now lives in `LimitsPolicy::new`, which is
         // built once per session — see `Builder::turn_policy`.
         let mut total_tokens_used: u64 = 0;
+        // The same sum the budget already keeps, in the shape a caller reads.
+        let mut turn_usage = Usage::default();
         let start = std::time::Instant::now();
 
         // Check for externally modified skill files and reload them.
@@ -813,11 +817,12 @@ impl Agent {
         loop {
             if cancel.is_cancelled() {
                 self.last_had_tool_uses = had_tool_uses_this_turn;
-                self.emit_turn_complete("cancelled", api_calls, tool_calls, start);
+                self.emit_turn_complete("cancelled", api_calls, tool_calls, turn_usage, start);
                 return Ok(TurnOutcome {
                     stop_reason: "cancelled".into(),
                     api_calls,
                     tool_calls,
+                    total_usage: turn_usage,
                     usage: Usage::default(),
                 });
             }
@@ -831,11 +836,12 @@ impl Agent {
                 })
             {
                 self.last_had_tool_uses = had_tool_uses_this_turn;
-                self.emit_turn_complete(&reason, api_calls, tool_calls, start);
+                self.emit_turn_complete(&reason, api_calls, tool_calls, turn_usage, start);
                 return Ok(TurnOutcome {
                     stop_reason: reason,
                     api_calls,
                     tool_calls,
+                    total_usage: turn_usage,
                     usage: Usage::default(),
                 });
             }
@@ -851,11 +857,18 @@ impl Agent {
                 if carried > cap {
                     tracing::warn!(carried, cap, "context above the hard cap after compaction");
                     self.last_had_tool_uses = had_tool_uses_this_turn;
-                    self.emit_turn_complete("context_exceeded", api_calls, tool_calls, start);
+                    self.emit_turn_complete(
+                        "context_exceeded",
+                        api_calls,
+                        tool_calls,
+                        turn_usage,
+                        start,
+                    );
                     return Ok(TurnOutcome {
                         stop_reason: "context_exceeded".into(),
                         api_calls,
                         tool_calls,
+                        total_usage: turn_usage,
                         usage: Usage::default(),
                     });
                 }
@@ -1069,6 +1082,11 @@ impl Agent {
             tool_calls += stream_result.tool_calls;
             let stop_reason = stream_result.stop_reason;
             let usage = stream_result.usage;
+            // Added here rather than beside the budget's own counter further
+            // down: a turn can end between the two, and a call that happened
+            // has to be counted whether or not the turn went on to check a
+            // budget.
+            turn_usage = turn_usage.plus(usage);
 
             // `PostSampling`: one model response has been fully streamed and
             // is now in the transcript. Declared since the hook system was
@@ -1135,6 +1153,7 @@ impl Agent {
                     api_calls,
                     tool_calls,
                     usage,
+                    total_usage: turn_usage,
                 });
             }
 
@@ -1158,11 +1177,12 @@ impl Agent {
                     "turn policy ended the turn"
                 );
                 self.last_had_tool_uses = had_tool_uses_this_turn;
-                self.emit_turn_complete(&reason, api_calls, tool_calls, start);
+                self.emit_turn_complete(&reason, api_calls, tool_calls, turn_usage, start);
                 return Ok(TurnOutcome {
                     stop_reason: reason,
                     api_calls,
                     tool_calls,
+                    total_usage: turn_usage,
                     usage: Usage::default(),
                 });
             }
@@ -1216,11 +1236,18 @@ impl Agent {
                             ),
                         );
                         self.last_had_tool_uses = had_tool_uses_this_turn;
-                        self.emit_turn_complete("budget_exceeded", api_calls, tool_calls, start);
+                        self.emit_turn_complete(
+                            "budget_exceeded",
+                            api_calls,
+                            tool_calls,
+                            turn_usage,
+                            start,
+                        );
                         return Ok(TurnOutcome {
                             stop_reason: "budget_exceeded".into(),
                             api_calls,
                             tool_calls,
+                            total_usage: turn_usage,
                             usage: Usage::default(),
                         });
                     }
@@ -1395,6 +1422,7 @@ impl Agent {
                         api_calls,
                         tool_calls,
                         usage,
+                        total_usage: turn_usage,
                     });
                 }
                 // Teammate lifecycle hooks (TaskCompleted + TeammateIdle).
@@ -1488,7 +1516,10 @@ impl Agent {
                 stop_reason: stop_reason.clone(),
                 api_calls,
                 tool_calls,
-                usage: usage.clone(),
+                // The turn's total. This used to be the last call's, which for
+                // a turn of four round trips is a quarter of an answer wearing
+                // the name of a whole one.
+                usage: turn_usage,
                 turn_id: tid,
             });
             // TurnComplete — the normal end of a turn. Distinct from the
@@ -1586,6 +1617,7 @@ or project context that should survive across sessions.
                 api_calls,
                 tool_calls,
                 usage,
+                total_usage: turn_usage,
             });
         }
     }
@@ -1611,6 +1643,7 @@ or project context that should survive across sessions.
             stop_reason: "tool_result_received".into(),
             api_calls: 0,
             tool_calls: 0,
+            total_usage: Usage::default(),
             usage: Usage::default(),
         })
     }
@@ -1852,11 +1885,20 @@ or project context that should survive across sessions.
     /// until something unrelated came along. There is no
     /// `AgentEvent::TurnComplete` for these in the normal tail either: that
     /// tail is exactly what these paths return early to skip.
+    /// `usage` is the turn's total, not its last call's.
+    ///
+    /// Every path through here used to report a hardcoded `Usage::default()`
+    /// — the ends that are not the ordinary one: cancelled, out of context,
+    /// over budget, stopped by policy. The daemon forwards this field verbatim
+    /// to every subscriber, so a client watching a turn get cancelled was told
+    /// it had cost nothing, and a turn stopped *for spending too much*
+    /// reported zero spent.
     fn emit_turn_complete(
         &self,
         stop_reason: &str,
         api_calls: u32,
         tool_calls: u32,
+        usage: Usage,
         start: std::time::Instant,
     ) {
         let tid = self.current_turn_id.clone();
@@ -1864,7 +1906,7 @@ or project context that should survive across sessions.
             stop_reason: stop_reason.to_string(),
             api_calls,
             tool_calls,
-            usage: Usage::default(),
+            usage,
             turn_id: tid.clone(),
         });
         let _ = self
@@ -4146,7 +4188,20 @@ pub struct TurnOutcome {
     pub stop_reason: String,
     pub api_calls: u32,
     pub tool_calls: u32,
+    /// What the **last** model call of this turn reported, and zero on the
+    /// paths that end a turn without one.
+    ///
+    /// Kept as it is because hosts read it. It is not what its name suggests
+    /// and never was — see [`Self::total_usage`], which is. The two will be
+    /// reconciled at a version boundary rather than by changing what this one
+    /// means underneath somebody.
     pub usage: Usage,
+    /// What every model call in this turn reported, added up.
+    ///
+    /// The number to budget on: a turn is several calls, and one of them is a
+    /// fraction of the answer. A host that capped spending on `usage` was
+    /// capping on whatever the last round trip happened to cost.
+    pub total_usage: Usage,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5508,7 +5563,7 @@ mod tests {
                 Ok(base::interface::model::ModelEvent::TextDelta { text: "ok".into() }),
                 Ok(base::interface::model::ModelEvent::EndTurn {
                     stop_reason: "end_turn".into(),
-                    usage: self.usage.clone(),
+                    usage: self.usage,
                 }),
             ];
             Ok(Box::new(futures::stream::iter(events)))

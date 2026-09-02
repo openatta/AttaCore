@@ -357,6 +357,11 @@ Builder::new().budget_policy(Arc::new(Capped {
 }))
 ```
 
+**给一次执行卡预算,应该卡在这里,不是在 `TurnOutcome` 上。** `on_usage` 在**每次
+模型调用之后**被调,拿到的 `Spend::total_tokens` 是这一轮到此为止的累计——所以超了
+可以当场把这一轮停掉,而不是等到结束才知道花了多少。`TurnOutcome.total_usage` 回答
+的是"花了多少",这里回答的是"还能不能继续花"。
+
 ### 一份日志对模型意味着什么 — `history.projection`
 
 `history::transcript::TranscriptProjection`。哪些条目变成消息,以及它们说什么。它

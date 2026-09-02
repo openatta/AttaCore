@@ -46,6 +46,7 @@ pub struct Session {
     project: Option<PathBuf>,
     scene: Option<Arc<dyn AgentScene>>,
     asking: bool,
+    hooks: Option<serde_json::Value>,
     #[allow(clippy::type_complexity)]
     between_turns: Option<Box<dyn Fn(usize, &Path) + Send>>,
 }
@@ -63,6 +64,7 @@ impl Session {
             project: None,
             scene: None,
             asking: false,
+            hooks: None,
             between_turns: None,
         }
     }
@@ -144,6 +146,16 @@ impl Session {
         self
     }
 
+    /// A `hooks_config` for this session, in the shape `settings.json` uses.
+    ///
+    /// A command hook is a shell line, so a case can be one string rather than
+    /// a script file that has to be found, made executable and kept in step
+    /// with the case that reads it.
+    pub fn hooks(mut self, config: serde_json::Value) -> Self {
+        self.hooks = Some(config);
+        self
+    }
+
     /// Which scene to run under. Chat by default, because most cases only
     /// need a turn loop; a case about tools needs the scene that offers them.
     pub fn scene(mut self, scene: Arc<dyn AgentScene>) -> Self {
@@ -173,6 +185,8 @@ pub struct Ran {
     pub log: String,
     /// The tools this run stopped to ask about, in order.
     pub prompts: Vec<String>,
+    /// The usage each `TurnComplete` event reported, one per turn.
+    pub reported_usage: Vec<base::interface::model::Usage>,
     pub ledger: Arc<ScriptLedger>,
 }
 
@@ -249,6 +263,7 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
         settings.permission_mode = base::interface::settings::PermissionMode::Default;
     }
     settings.scripts = session.bindings;
+    settings.hooks_config = session.hooks;
     let settings = Arc::new(settings);
 
     let registry = Arc::new(InMemoryToolRegistry::new());
@@ -322,6 +337,7 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
     let join = tokio::spawn(async move { agent.run(run_cancel).await });
 
     let mut prompts = Vec::new();
+    let mut reported_usage = Vec::new();
     for (i, turn) in session.turns.iter().enumerate() {
         input_tx
             .send(InputMessage::User {
@@ -354,8 +370,11 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
                         },
                     });
                 }
-                base::event::AgentEvent::TurnComplete { .. }
-                | base::event::AgentEvent::Error { .. } => break,
+                base::event::AgentEvent::TurnComplete { usage, .. } => {
+                    reported_usage.push(usage);
+                    break;
+                }
+                base::event::AgentEvent::Error { .. } => break,
                 _ => {}
             }
         }
@@ -375,6 +394,7 @@ pub async fn drive(root: &Path, session: Session) -> Ran {
         calls: model_arc.calls(),
         log: read_log(&root.join("global")),
         prompts,
+        reported_usage,
         ledger,
     }
 }

@@ -1,0 +1,181 @@
+//! What a turn reports having spent.
+//!
+//! A turn is several model calls, and a provider reports usage per call. Which
+//! makes "how much did this turn cost" a sum, and every number the engine hands
+//! a host something that has to be that sum — otherwise a host budgeting on it
+//! is budgeting on a fraction, and a budget that undercounts is worse than none
+//! because nobody knows it is not holding.
+//!
+//! The two numbers were both wrong in different ways: `TurnOutcome.usage` was
+//! whatever the last call happened to report, and `AgentEvent::TurnComplete`
+//! carried a hardcoded zero on every path — which the daemon forwards, so every
+//! JSON-RPC client saw a turn that spent nothing.
+//!
+//! The usages here are deliberately different per call. Equal ones would let a
+//! sum and a last-value pass the same assertion.
+
+use base::interface::model::{Model, Usage};
+use base::interface::scene::AgentScene;
+use base::interface::settings::{PathSettings, PermissionMode, Settings, ThinkingMode};
+use base::interface::tool::{
+    InMemoryToolRegistry, PermissionDecision, ProgressSender, PromptContext, Tool, ToolContext,
+    ToolResult,
+};
+use runtime::agent::Builder;
+use std::sync::Arc;
+use test_runner::scripted_model::{Reply, ScriptedModel};
+use tokio_util::sync::CancellationToken;
+
+/// One turn, two model calls: the model asks for a tool and then answers.
+const PER_CALL: &[(u32, u32)] = &[(100, 20), (7, 3)];
+
+fn expected_total() -> Usage {
+    Usage {
+        input_tokens: PER_CALL.iter().map(|(i, _)| i).sum(),
+        output_tokens: PER_CALL.iter().map(|(_, o)| o).sum(),
+    }
+}
+
+struct Ran {
+    outcome: runtime::turn::TurnOutcome,
+    reported: Vec<Usage>,
+}
+
+async fn one_turn_of_two_calls() -> Ran {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let model_arc = ScriptedModel::new(vec![
+        Reply::Tool {
+            id: "call-1",
+            name: "Echo",
+            input: serde_json::json!({"say": "anything"}),
+        },
+        Reply::Text("done"),
+    ])
+    .reporting_usage(PER_CALL);
+    let model: Arc<dyn Model> = model_arc.clone();
+
+    let mut settings = Settings::defaults_for("accounting-model");
+    settings.model.model_name = "accounting-model".into();
+    settings.model.max_tokens = 1024;
+    settings.model.thinking_mode = ThinkingMode::Off;
+    settings.memory_enabled = false;
+    settings.permission_mode = PermissionMode::BypassPermissions;
+    settings.paths = PathSettings {
+        user_data_dir: root.join("user"),
+        global_data_dir: root.join("global"),
+        local_data_dir: root.join("local"),
+        scope: "code".into(),
+    };
+
+    let registry = Arc::new(InMemoryToolRegistry::new());
+    registry.register(Arc::new(Echo) as Arc<dyn Tool>);
+
+    let (mut agent, mut event_rx, input_tx) = Builder::new()
+        .scene(Arc::new(scene::scene::chat::ChatScene) as Arc<dyn AgentScene>)
+        .model(model)
+        .tools(registry)
+        .settings(Arc::new(settings))
+        .skip_warmup(true)
+        .build()
+        .expect("agent builds");
+
+    // `run_turn` rather than the event loop: it is the entry the daemon uses
+    // and the only one that hands back a `TurnOutcome`, which is half of what
+    // this case is about.
+    let outcome = agent
+        .run_turn("use the tool".into(), "t0".into(), CancellationToken::new())
+        .await
+        .expect("the turn ran");
+
+    let mut reported = Vec::new();
+    while let Ok(ev) = event_rx.try_recv() {
+        if let base::event::AgentEvent::TurnComplete { usage, .. } = ev {
+            reported.push(usage);
+        }
+    }
+    drop(input_tx);
+
+    Ran { outcome, reported }
+}
+
+/// The outcome reports the whole turn, not its last call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_reports_what_all_of_its_calls_spent() {
+    let ran = one_turn_of_two_calls().await;
+
+    assert_eq!(
+        ran.outcome.api_calls, 2,
+        "the case needs a turn of more than one call to mean anything"
+    );
+    assert_eq!(
+        ran.outcome.total_usage,
+        expected_total(),
+        "the outcome reported {:?}, which is the last call rather than the turn",
+        ran.outcome.total_usage
+    );
+}
+
+/// And so does the event, which is the only number a daemon client ever sees.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_turn_complete_event_carries_the_same_total() {
+    let ran = one_turn_of_two_calls().await;
+
+    assert_eq!(
+        ran.reported.len(),
+        1,
+        "one turn, one TurnComplete: {:?}",
+        ran.reported
+    );
+    assert_eq!(
+        ran.reported[0],
+        expected_total(),
+        "the event reported {:?}. A daemon forwards this verbatim, so a zero \
+         here is a zero in every client.",
+        ran.reported[0]
+    );
+}
+
+/// Echoes its argument, so a turn has a reason to make a second call.
+#[derive(Debug)]
+struct Echo;
+
+#[async_trait::async_trait]
+impl Tool for Echo {
+    fn name(&self) -> &str {
+        "Echo"
+    }
+    fn description(&self) -> &str {
+        "Echo the `say` argument back."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"say": {"type": "string"}},
+            "required": ["say"]
+        })
+    }
+    fn is_read_only(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
+        PermissionDecision::allow()
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        let say = input.get("say").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(ToolResult::text(format!("echo: {say}")))
+    }
+}

@@ -145,6 +145,14 @@ impl Reply {
 /// loop spin and the test still pass.
 pub struct ScriptedModel {
     replies: Mutex<std::collections::VecDeque<Reply>>,
+    /// What each call reports having spent, in order.
+    ///
+    /// A provider reports usage per call, and a turn is several calls — so a
+    /// model that reports the same number every time cannot tell "the sum" and
+    /// "the last one" apart, which is the whole question when a host budgets
+    /// on it. Empty means zero, which is what every case that does not care
+    /// about tokens gets.
+    usages: Mutex<std::collections::VecDeque<Usage>>,
     /// Every request the engine made, in order. Several decisions are visible
     /// only here, because they change what is *sent* and nothing about what
     /// comes back: the fallback-model switch, compaction shortening the
@@ -189,10 +197,27 @@ impl ScriptedModel {
     pub fn new(replies: Vec<Reply>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into()),
+            usages: Mutex::new(std::collections::VecDeque::new()),
             calls: Mutex::new(Vec::new()),
             request_texts: Mutex::new(Vec::new()),
             request_tools: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Report `(input, output)` tokens on successive calls.
+    ///
+    /// Different numbers per call on purpose: equal ones would let a sum and a
+    /// last-value pass the same assertion.
+    pub fn reporting_usage(self: Arc<Self>, per_call: &[(u32, u32)]) -> Arc<Self> {
+        {
+            let mut q = self.usages.lock().unwrap_or_else(|e| e.into_inner());
+            q.clear();
+            q.extend(per_call.iter().map(|(i, o)| Usage {
+                input_tokens: *i,
+                output_tokens: *o,
+            }));
+        }
+        self
     }
 
     /// Each request the engine made, in order.
@@ -299,7 +324,20 @@ impl Model for ScriptedModel {
                 )
             });
 
-        let events = reply.into_events()?;
+        let mut events = reply.into_events()?;
+        // The provider reports what a call spent on the event that ends it.
+        if let Some(spent) = self
+            .usages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+        {
+            for event in events.iter_mut() {
+                if let ModelEvent::EndTurn { usage, .. } = event {
+                    *usage = spent;
+                }
+            }
+        }
         Ok(Box::new(futures::stream::iter(
             events.into_iter().map(Ok).collect::<Vec<_>>(),
         )))

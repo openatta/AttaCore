@@ -645,6 +645,50 @@ async fn withdrawing_a_tool_from_the_request_does_not_gate_its_dispatch() {
     );
 }
 
+/// `tool.result` runs after the hooks, not before them.
+///
+/// The carrier's document says so — "一个工具结果一次，在所有 hook 之后" — and
+/// nothing checked it. The order decides what a script is even looking at: a
+/// script that redacts or tags results sees the hook's verdict if it runs
+/// second, and the raw tool output if it runs first, which is a different
+/// program with the same source.
+///
+/// A `PostToolUse` hook that blocks replaces the result with its own text, so
+/// the two orders leave visibly different strings in the transcript. One
+/// assertion tells them apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_result_point_runs_after_the_hooks() {
+    let ran = run_session(|_| {
+        session(&["use the tool"], calls_the_echo_tool())
+            .bind("tool_result.js", "tool.result", "onResult")
+            .hooks(serde_json::json!({
+                "PostToolUse": [{
+                    "type": "command",
+                    // Reads the payload and refuses; the message becomes the
+                    // result the model is shown.
+                    "command": "cat >/dev/null; echo '{\"decision\":\"block\",\"message\":\"HOOK-WAS-HERE\"}'"
+                }]
+            }))
+    })
+    .await;
+
+    assert!(
+        ran.holds("HOOK-WAS-HERE"),
+        "the hook did not run at all, so this proves nothing. Requests:\n{}",
+        ran.requests.join("\n---\n")
+    );
+    assert!(
+        ran.holds("SCRIPT-TRACE-RESULT(ScriptEcho) Denied by PostToolUse hook: HOOK-WAS-HERE"),
+        "the script did not wrap the hook's verdict, so it ran before the hook \
+         rather than after it. Requests:\n{}",
+        ran.requests.join("\n---\n")
+    );
+    assert!(
+        !ran.holds("echo: anything"),
+        "the tool's own output survived a hook that refused it"
+    );
+}
+
 /// The message the model is shown next turn and the message in the transcript
 /// are the same message.
 ///
