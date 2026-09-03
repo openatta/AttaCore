@@ -203,22 +203,29 @@ The credential deny-read list is not really sandboxing and stays either way:
 the command classifier uses it to keep `cat ~/.ssh/id_rsa` from being treated
 as a harmless read whose output goes to a model provider.
 
-### One carrier per build
+### One carrier per build — but packages are not a carrier
 
 `scripts` and `plugins` are mutually exclusive features, and `scripts` is the
-default:
+default. `plugin-packages` — reading, verifying, unpacking, disclosing and
+managing a package — needs no runtime and is exclusive with neither, so it is
+on by default too:
 
 ```sh
-cargo build -p daemon                                            # QuickJS
-cargo build -p daemon --no-default-features --features plugins   # WebAssembly
-cargo build -p daemon --no-default-features                      # neither
+cargo build -p daemon                                                   # QuickJS + packages
+cargo build -p daemon --no-default-features --features plugins          # WebAssembly + packages
+cargo build -p daemon --no-default-features --features plugin-packages  # packages, no carrier
+cargo build -p daemon --no-default-features                             # neither
 ```
 
-Both configurations are checked on every push, including that the two still
-refuse to compile together. With plugins off, `PluginHost` is `None` and every
-call site is an `if let Some(..)` that does nothing — no `#[cfg]` scattered
-through the engine, and no behavior to reason about beyond "there are no
-plugins".
+Every configuration is checked on every push, including that the two carriers
+still refuse to compile together and that the default build links no
+WebAssembly. With plugins off, `PluginHost` is `None` and every call site is an
+`if let Some(..)` that does nothing — no `#[cfg]` scattered through the engine,
+and no behavior to reason about beyond "there are no components".
+
+A package whose content is an MCP server or a script runs on the default build;
+one carrying WebAssembly components still installs there, and its disclosure
+says the components will not run.
 
 The whole catalog, with costs and trust rules per point:
 [`docs/extension_points.md`](docs/extension_points.md).
@@ -532,7 +539,7 @@ which is what makes gating on it possible at all.
 | L0 | `telemetry` | Telemetry + recorder | `TelemetryHandle`, `EventPayload` (37), `RecorderModel` |
 | L1 | `core` (`base`) | Shared traits and types | `Model`, `AgentScene`, `Permission`, `Tool`, `Id`, `EngineConfig` |
 | L1 | `wasm-host` | WASM component runtime | `API_VERSION`, capability resolver, health tracking |
-| L1 | `script-host` | QuickJS carrier | `QuickJsEngine`, `bindings::bind_quickjs` |
+| L1 | `script-host` | QuickJS carrier | `QuickJsEngine`, `bindings::bind_into` / `bind_lenient` |
 | L2 | `model` | Anthropic + OpenAI adapters | `AnthropicModel`, `OpenAICompatibleModel`, `ModelEvent` |
 | L2 | `history` | JSONL persistence | `HistoryStore`, `JsonlHistoryStore`, `LogEntry` |
 | L2 | `permissions` | Rule engine | `RuleSet`, `PermissionGate`, `LlmClassifier`, `WritePolicy` |

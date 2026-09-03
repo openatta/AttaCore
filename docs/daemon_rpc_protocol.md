@@ -1098,10 +1098,19 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 
 ```jsonc
 // ← result
-{ "plugins": [ ] }   // 元素:{ "name":"…", "version":"…", "description":"…", "enabled": true }
+{ "plugins": [ ] }
+// 元素:{ "name":"…", "version":"…", "description":"…", "enabled": true,
+//        "root": "/…/plugins/cache/<name>/<version>", "script_faults": [] }
 ```
 
 列出磁盘上的全部插件及启用状态,包括已停用的。
+
+`root` 是解包后的目录。有它,宿主要读包里自己关心的东西(界面产物、图标)就不必自己
+拼 `<plugins-dir>/cache/{name}/{version}/`——那样会把 daemon 的磁盘布局变成它 API 的
+一部分。
+
+`script_faults` 是这个包的 `[[script]]` 绑定里没能兑现的那些,每条带原因。来自包的绑定
+是逐条降级的,所以这里非空不代表包没装上,只代表少了那几条贡献。
 
 #### `plugin.install`
 
@@ -1119,6 +1128,10 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 **`checksum` 对 `http(s)://` 源是必填的**,缺了会在发起请求之前就拒绝;`file://`
 源可以省略。流程:取包 → 校验 → 解包 → **在安装时就把组件编译成 AOT 产物**;编译
 失败会把这次安装**回滚**并报错,而不是留一个每次加载都要重编的插件。
+
+**组件数为 0 的包不走编译这一步**,也就不需要任何编译器。纯脚本、纯 MCP 的包在
+默认构建(`plugin-packages`,不带 WASM 载体)上装得上;带 `[[wasm]]` 的包也装得上,
+disclosure 的 `wasm.runnable` 会如实报成 `false`。
 
 响应:`{ "success": true, "message": "…", "disclosure": … }`。`disclosure` 是这个
 插件会往模型上下文里塞的文本,让调用方在依赖它之前先看见。

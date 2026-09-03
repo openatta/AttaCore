@@ -1619,18 +1619,24 @@ impl SessionPool {
         let script_root = project_root_for_meta
             .clone()
             .unwrap_or_else(|| self.cwd.clone());
+        let package_scripts = self.plugins.script_bindings();
         #[cfg(feature = "scripts")]
-        let script_ledger = match bind_scripts(&settings_snapshot, &script_root) {
-            Some(bound) => {
-                let ledger = bound.ledger.clone();
-                builder = builder.bound_scripts(bound);
-                Some(ledger)
+        let script_ledger = {
+            let (bound, faults) = bind_scripts(&settings_snapshot, &script_root, &package_scripts);
+            self.plugins.note_script_faults(faults);
+            match bound {
+                Some(bound) => {
+                    let ledger = bound.ledger.clone();
+                    builder = builder.bound_scripts(bound);
+                    Some(ledger)
+                }
+                None => None,
             }
-            None => None,
         };
         #[cfg(not(feature = "scripts"))]
         let script_ledger = {
-            let _ = bind_scripts(&settings_snapshot, &script_root);
+            let (_, faults) = bind_scripts(&settings_snapshot, &script_root, &package_scripts);
+            self.plugins.note_script_faults(faults);
             None
         };
 
@@ -4343,34 +4349,76 @@ fn effective_permission_mode(
 fn bind_scripts(
     settings: &Arc<base::interface::settings::Settings>,
     project_root: &std::path::Path,
-) -> Option<script_host::bindings::BoundScripts> {
-    if settings.scripts.is_empty() {
-        return None;
+    packages: &[crate::plugins::PackageScripts],
+) -> (
+    Option<script_host::bindings::BoundScripts>,
+    Vec<(String, String)>,
+) {
+    use script_host::bindings::{bind_into, bind_lenient, BindingSource, BoundScripts};
+
+    if settings.scripts.is_empty() && packages.is_empty() {
+        return (None, Vec::new());
     }
-    match script_host::bindings::bind_quickjs(&settings.scripts, project_root) {
-        Ok(bound) => {
-            if let Some(bound) = &bound {
-                info!(
-                    scripts = bound.carriers.len(),
-                    "bound scripts to extension points"
-                );
-            }
-            bound
-        }
-        Err(e) => {
-            error!(error = %e, "a script binding is invalid; no scripts were bound");
-            None
+
+    // One value, so one ledger: the operator's scripts and the packages'
+    // share the record a turn resets and `session.scripts` reads. Two would
+    // have left whichever the session did not hold running on a per-turn
+    // budget nothing ever reset.
+    let mut bound = BoundScripts::default();
+    let engine = script_host::bindings::engine();
+
+    if let Err(e) = bind_into(
+        &mut bound,
+        engine.clone(),
+        &settings.scripts,
+        &BindingSource::Project { root: project_root },
+    ) {
+        // All-or-nothing, and `bind_into` already left `bound` untouched.
+        // Louder than it looks on purpose: a script that silently never runs
+        // sends its author looking for a bug in their JavaScript.
+        error!(error = %e, "a script binding is invalid; no scripts from settings were bound");
+    }
+
+    let mut faults = Vec::new();
+    for package in packages {
+        for e in bind_lenient(
+            &mut bound,
+            engine.clone(),
+            &package.bindings,
+            &BindingSource::Package {
+                name: &package.name,
+                root: &package.root,
+            },
+        ) {
+            // One binding at a time, and the failure is recorded against the
+            // package that shipped it: a set assembled from several packages
+            // has no single author, so dropping it whole would let one bad
+            // package take away every other package's contributions.
+            warn!(plugin = %package.name, error = %e, "a plugin script binding was not honored");
+            faults.push((package.name.clone(), e.to_string()));
         }
     }
+
+    if bound.carriers.is_empty() {
+        return (None, faults);
+    }
+    info!(
+        scripts = bound.carriers.len(),
+        "bound scripts to extension points"
+    );
+    (Some(bound), faults)
 }
 
 /// Without the script carrier compiled in, a `scripts` section is refused
-/// loudly rather than ignored.
+/// loudly rather than ignored — and so is a package that ships one.
 #[cfg(not(feature = "scripts"))]
 fn bind_scripts(
     settings: &Arc<base::interface::settings::Settings>,
     _project_root: &std::path::Path,
-) -> Option<()> {
+    packages: &[crate::plugins::PackageScripts],
+) -> (Option<()>, Vec<(String, String)>) {
+    const NO_ENGINE: &str = "this build carries no script engine";
+
     if !settings.scripts.is_empty() {
         error!(
             scripts = settings.scripts.len(),
@@ -4378,7 +4426,21 @@ fn bind_scripts(
              rebuild with the `scripts` feature or remove the section"
         );
     }
-    None
+    let faults = packages
+        .iter()
+        .flat_map(|p| {
+            p.bindings
+                .iter()
+                .map(|b| {
+                    (
+                        p.name.clone(),
+                        format!("{NO_ENGINE}, so `{}` is not bound", b.point),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (None, faults)
 }
 
 fn resolve_session_permission(

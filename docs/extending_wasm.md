@@ -13,22 +13,34 @@
 
 ---
 
-## 在别的之前:一个构建只带一个载体
+## 在别的之前:包方案和载体是两件事
 
-插件子系统**不在**默认构建里。`daemon` 的默认 feature 是 `scripts`(QuickJS),
-两个载体互斥——`daemon/src/lib.rs` 碰上同时带两个的构建会 `compile_error!` 直接拒掉,
-而不是默不作声地接受,因为 cargo 的 feature 合并会让"两个都带"成为一个人误打误撞就
-走到的地方。
+**读一个包**——解析 manifest、取包、校验 checksum、解压、版本化缓存、安装期披露、
+启停——不需要任何运行时。**跑一个包的 WebAssembly 组件**需要 wasmtime,二十兆。
+
+这两件事是两个 feature:
+
+- **`plugin-packages`**(默认开启):包方案。`plugin.*` 全套 RPC 在这个 feature 上,
+  包声明的 `[[mcp]]` 服务器和 `[[script]]` 脚本也在这里被兑现。它和谁都不互斥。
+- **`plugins`**:WASM 载体,把组件跑起来的那部分。它和 `scripts` 互斥——
+  `daemon/src/lib.rs` 碰上同时带两个的构建会 `compile_error!` 直接拒掉,而不是
+  默不作声地接受,因为 cargo 的 feature 合并会让"两个都带"成为一个人误打误撞就
+  走到的地方。
 
 ```bash
-cargo build -p daemon                                            # QuickJS 脚本(默认)
-cargo build -p daemon --no-default-features --features plugin-compile   # 插件,编译器在进程内
-cargo build -p daemon --no-default-features --features plugins          # 插件,不链接编译器
-cargo build -p daemon --no-default-features                       # 两个载体都不带
+cargo build -p daemon                                                   # QuickJS + 包方案(默认)
+cargo build -p daemon --no-default-features --features plugin-compile   # 包 + WASM,编译器在进程内
+cargo build -p daemon --no-default-features --features plugins          # 包 + WASM,不链接编译器
+cargo build -p daemon --no-default-features --features plugin-packages  # 只有包方案,没有任何载体
+cargo build -p daemon --no-default-features                             # 什么都不带
 ```
 
-`--no-default-features` 是必须的:单独给 `--features plugins`,`scripts` 会被并回来,
-守卫会拒掉这个构建。
+`--no-default-features` 对带 `plugins` 的构建是必须的:单独给 `--features plugins`,
+默认的 `scripts` 会被并回来,守卫会拒掉这个构建。
+
+**默认构建装得上带 `[[wasm]]` 的包**,只是不跑它的组件——安装响应里的 disclosure
+会把 `wasm.components` 报成实际数量、`wasm.runnable` 报成 `false`。这比"整个包装不上"
+诚实:一个包的组件跑不了,不该连它的 MCP 服务器和脚本一起没了。
 
 第二个 flag 决定的是**组件在哪里被编译**:
 
@@ -39,13 +51,16 @@ cargo build -p daemon --no-default-features                       # 两个载体
   就是拒绝,而不是悄悄重编一遍。载体三分之二的体积是编译器,所以这是给那种"要跑插件、
   但不想让服务进程里带一个代码生成器"的部署用的构建。
 
+  **组件数为 0 的包不走编译。** 一个纯脚本 / 纯 MCP 的包在这个构建上照样装得上,
+  不必再拖一个编译器进来。
+
 `tests/scripts/locked_build.sh` 拿真实的依赖图把这些逐条验过:两个载体一起上会失败;
-不带载体的构建 `cargo tree` 里没有任何插件机器;带 `plugins` 而不带 `plugin-compile`
-的构建不链接 Cranelift。
+什么都不带的构建 `cargo tree` 里没有任何插件机器;默认构建里有 `plugin` 而没有
+wasmtime;带 `plugins` 而不带 `plugin-compile` 的构建不链接 Cranelift。
 
 一个跑着的 daemon 会自己回答关于自己的这个问题——`daemon.doctor` 把 `plugins.status`
-报成 `compiled-out`、`enabled` 或 `disabled-by-policy`;子系统不在时,`plugin.*` 这些
-RPC 返回 `PLUGINS_DISABLED`(`-32016`),而不是一个空列表。
+报成 `compiled-out`、`packages-only`、`enabled` 或 `disabled-by-policy`。包方案都不在时,
+`plugin.*` 这些 RPC 返回 `PLUGINS_DISABLED`(`-32016`),而不是一个空列表。
 
 ---
 
@@ -230,7 +245,9 @@ prompt = "scene/prompt.md"
 
 ## `plugin.toml`
 
-下面每一节都是加载器真的会读的。文件里别的东西一律被静默忽略。
+下面每一节都是加载器真的会读的。别的顶层小节不会让加载失败——一个针对更新版本 Core
+写的包不该在旧 Core 上装不上——但会带着小节名打一条 warning。`[[scripts]]` 拼成复数
+的那种笔误,只有这条日志会告诉你。
 
 ```toml
 [plugin]
@@ -257,6 +274,16 @@ net      = ["api.github.com"]
 env      = ["GITHUB_TOKEN"]
 max_memory_mb = 128            # 默认 64
 timeout_ms    = 5000           # 默认 30000
+
+# ── 脚本载荷 ──
+#
+# 载体是宿主的,不是包的:包发一份 JavaScript 并指名一个扩展点,跑它的是进程里
+# 已经有的那个引擎。所以这一节在默认构建上就能兑现,不需要 WASM。
+[[script]]
+point = "tool.result"                 # 扩展点 id
+entry = "scripts/annotate.js:onResult"  # <文件>:<导出函数>,文件相对插件根目录
+timeout_ms = 100               # 可选;默认取载体自己的预算
+calls_per_turn = 1000          # 可选;同上
 
 # ── MCP 载荷 ──
 [[mcp]]
@@ -306,6 +333,18 @@ scene = "plugin:github-tools"  # 让这个 agent 的子代理跑在插件的场�
   多个组件没问题,只要只有一个订阅。
 - `[[wasm]]` 下的 `tools = [...]` 是写给安装器看的文档。运行时以组件自己的 `list-tools`
   为准——真正被注册的是那个。
+- `[[script]]` 的 `entry` 必须是 `<文件>:<函数>`,文件必须落在包里面。绝对路径、
+  `..`、以及解析后指到包外面的符号链接,都会被拒。
+
+`[[script]]` 还有两条运行期的规矩:
+
+- **哪些点能绑脚本由载体说了算**,不由 manifest 说了算——那份清单是
+  `script_host::bindings::BINDABLE_POINTS`,`docs/extending_quickjs.md` 里有。
+  manifest 层不复述它,复述出来的第二份答案只会过期。
+- **来自包的绑定逐条降级。** 一条兑现不了的绑定只让它自己消失,原因记进那个包的
+  状态,`plugin.list` 的 `script_faults` 里能看到。运维自己写在 `settings.json` 里的
+  `scripts` 仍然是全有或全无——那是一份文档、一个作者,半份是没人写过的;而由若干
+  已安装的包拼出来的集合没有这么一个作者,一个坏包不该悄悄拿掉其它所有包的贡献。
 
 ### 可订阅的事件
 
@@ -409,7 +448,8 @@ PermissionRequested   SessionStart   SessionEnd
 
 ```json
 {"plugin":"github-tools","version":"1.2.0",
- "capabilities":["read files under ${workspace}/src","make network requests to api.github.com"],
+ "capabilities":["read files under ${workspace}/src","make network requests to api.github.com",
+                 "run its own JavaScript at the `tool.result` extension point"],
  "events":["PreToolUse"],
  "scene":"plugin:github-tools",
  "mcp_servers":["github (native)"],
@@ -417,8 +457,16 @@ PermissionRequested   SessionStart   SessionEnd
                   {"origin":"tool `diff` description","text":"…"},
                   {"origin":"tool `diff` guide","text":"…"},
                   {"origin":"agent `pr-reviewer` system prompt","text":"…"}],
+ "wasm":{"components":1,"runnable":true},
  "inert":false}
 ```
+
+`[[script]]` 出现在 `capabilities` 里,和文件、网络那些并排:它是宿主进程里的代码,
+跑在一个能改写模型读到什么的点上,沙箱对它无话可说。
+
+`wasm` 讲的是这个**构建**会不会跑这个包的组件。`components` 是包声明的组件数,
+`runnable` 在没有 WASM 载体的构建上是 `false` —— 包照装,组件不跑,而不是整个包
+装不上。
 
 `model_visible` 之所以存在:沙箱管的是插件**执行**什么,对它**说**什么毫无办法。工具描述、
 agent 描述、场景的系统提示词,都会一字不差地到达模型,而"文本到达模型"是这套隔离模型
@@ -433,7 +481,8 @@ agent 描述、场景的系统提示词,都会一字不差地到达模型,而"�
 
 注意工具那部分文本只可能来自一个**已加载的组件**——manifest 里没有它——所以在没有 WASM
 宿主的情况下产出的披露就是不列任何工具。`inert: true` 意味着这个插件不声明能力、不声明
-事件、没有场景、没有 MCP server,也没有任何对模型可见的文本:除了名字之外没什么可审的。
+事件、没有场景、没有 MCP server、没有组件,也没有任何对模型可见的文本:除了名字之外
+没什么可审的。
 
 披露刻意与载体无关。它讲的是一个扩展**说**了什么,所以 `crates/plugin/src/disclosure.rs`
 里不提任何运行时,一旦它开始提,不变量测试就会失败。

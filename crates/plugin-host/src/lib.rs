@@ -205,25 +205,10 @@ impl PluginHost for InstalledPlugins {
     /// names a JS entry module rather than a server, and reaches the host as
     /// an `atta-dsh-bridge` invocation — see that bridge's own docs.
     fn mcp_servers(&self) -> Vec<(String, serde_json::Value)> {
-        let mut out = Vec::new();
-        for p in &self.plugins {
-            for server in &p.manifest.mcp {
-                let key = format!("{}-mcp-{}", p.name(), server.name);
-                match server.kind {
-                    plugin::manifest::McpKind::Native => {
-                        if let Some(config) = read_native_config(p, server) {
-                            out.push((key, config));
-                        }
-                    }
-                    plugin::manifest::McpKind::Dsh => {
-                        if let Some(config) = dsh_bridge_config(p, server) {
-                            out.push((key, config));
-                        }
-                    }
-                }
-            }
-        }
-        out
+        self.plugins
+            .iter()
+            .flat_map(plugin::mcp::servers_for)
+            .collect()
     }
 
     /// Only from plugins whose components actually loaded: a manifest that
@@ -264,76 +249,6 @@ impl PluginHost for InstalledPlugins {
     }
 }
 
-fn read_native_config(
-    plugin: &plugin::manifest::Plugin,
-    server: &plugin::manifest::McpPayload,
-) -> Option<serde_json::Value> {
-    let path = plugin.path(server.config.as_ref()?);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(
-                    plugin = %plugin.name(),
-                    path = %path.display(),
-                    error = %e,
-                    "plugin MCP server config is not valid JSON, skipping"
-                );
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                plugin = %plugin.name(),
-                path = %path.display(),
-                error = %e,
-                "failed to read plugin MCP server config, skipping"
-            );
-            None
-        }
-    }
-}
-
-/// A DSH payload as a stdio MCP server: `atta-dsh-bridge` loading the
-/// plugin's entry module.
-///
-/// The bridge is a separate Node process on purpose. Keeping the JS runtime
-/// outside the host is the whole reason DSH plugins arrive over MCP rather
-/// than as a second in-process plugin format — see the bridge's README.
-///
-/// `command` is `node` rather than a resolved path: which Node runs a
-/// plugin is the user's environment's business, and hardcoding one here
-/// would break every install that manages its own toolchain.
-fn dsh_bridge_config(
-    plugin: &plugin::manifest::Plugin,
-    server: &plugin::manifest::McpPayload,
-) -> Option<serde_json::Value> {
-    let entry = plugin.path(server.entry.as_ref()?);
-    if !entry.exists() {
-        tracing::warn!(
-            plugin = %plugin.name(),
-            entry = %entry.display(),
-            "DSH plugin entry module does not exist, skipping"
-        );
-        return None;
-    }
-    let bridge = bridge_entry_path()?;
-    // Only the variables the manifest named are passed through, the same
-    // rule the WASM capability list follows.
-    let env: serde_json::Map<String, serde_json::Value> = server
-        .env
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v.into())))
-        .collect();
-
-    Some(serde_json::json!({
-        "type": "stdio",
-        "command": "node",
-        "args": [bridge.to_string_lossy(), entry.to_string_lossy()],
-        "env": env,
-    }))
-}
-
 /// Compile every component a freshly installed plugin declares.
 ///
 /// Runs at install, not at first load, and a failure fails the install:
@@ -344,9 +259,19 @@ fn dsh_bridge_config(
 /// hardened build, where the daemon has no Cranelift at all — the work goes
 /// to `atta-plugin-compile`, located the same way the DSH bridge is.
 pub async fn precompile_plugin(dir: &Path) -> anyhow::Result<()> {
+    // What the package declares decides whether a compiler is needed at all.
+    // Asking the manifest first is what keeps a script-only or MCP-only
+    // package installable on a build that carries no compiler: going looking
+    // for `atta-plugin-compile` on its behalf failed the install over
+    // components the package never had.
+    let p = plugin::manifest::Plugin::load(dir, &dir.join("plugin.toml"))?;
+    if p.manifest.wasm.is_empty() {
+        return Ok(());
+    }
+
     #[cfg(feature = "compile")]
     {
-        let compiled = compile_in_process(dir)?;
+        let compiled = compile_in_process(&p)?;
         tracing::info!(
             dir = %dir.display(),
             components = compiled,
@@ -361,13 +286,11 @@ pub async fn precompile_plugin(dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "compile")]
-fn compile_in_process(dir: &Path) -> anyhow::Result<usize> {
-    let manifest = dir.join("plugin.toml");
-    let p = plugin::manifest::Plugin::load(dir, &manifest)?;
+fn compile_in_process(p: &plugin::manifest::Plugin) -> anyhow::Result<usize> {
     let engine = WasmEngine::new()?;
     let mut n = 0;
     for payload in &p.manifest.wasm {
-        engine.precompile(&p.path(&payload.component), dir)?;
+        engine.precompile(&p.path(&payload.component), &p.root)?;
         n += 1;
     }
     Ok(n)
@@ -375,12 +298,13 @@ fn compile_in_process(dir: &Path) -> anyhow::Result<usize> {
 
 #[cfg(not(feature = "compile"))]
 async fn compile_out_of_process(dir: &Path) -> anyhow::Result<()> {
-    let exe = locate_tool("atta-plugin-compile", "ATTA_PLUGIN_COMPILE").ok_or_else(|| {
-        anyhow::anyhow!(
-            "this build cannot compile plugin components and `atta-plugin-compile` was not \
+    let exe = plugin::locate::locate_tool("atta-plugin-compile", "ATTA_PLUGIN_COMPILE")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this build cannot compile plugin components and `atta-plugin-compile` was not \
              found; set ATTA_PLUGIN_COMPILE to its path"
-        )
-    })?;
+            )
+        })?;
     let out = tokio::process::Command::new(&exe)
         .arg(dir)
         .output()
@@ -393,80 +317,6 @@ async fn compile_out_of_process(dir: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// Path of the bridge's entry module inside a checkout or an install.
-const BRIDGE_REL: &str = "bridges/atta-dsh-bridge/src/main.js";
-
-/// Where the bridge's entry point lives, or `None` when it cannot be found.
-///
-/// Deliberately not `CARGO_MANIFEST_DIR`: that is a compile-time constant,
-/// so a shipped binary would carry the build machine's absolute path and
-/// point at a directory that exists on no user's computer.
-///
-/// Instead, `override_path` (from `ATTA_DSH_BRIDGE`) wins if it exists, and
-/// otherwise the search walks up from the running executable looking for the
-/// bridge. Walking rather than counting `..`s because the executable's depth
-/// is not fixed: `target/debug/`, `target/debug/deps/` for tests, and an
-/// installed `bin/` are all different distances from the same file.
-///
-/// Every candidate is checked for existence. Handing `node` a script that is
-/// not there produces a failure message about node, from a process we did
-/// not start, with nothing connecting it back to the plugin that caused it.
-fn locate_bridge(override_path: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
-    if let Some(p) = override_path {
-        if p.is_file() {
-            return Some(p);
-        }
-        tracing::warn!(
-            path = %p.display(),
-            "ATTA_DSH_BRIDGE does not point at a file; falling back to the search"
-        );
-    }
-    search_near_executable(&[BRIDGE_REL, "atta-dsh-bridge/src/main.js"])
-}
-
-/// Look for a sibling file at each of `relatives`, walking up from the
-/// running executable.
-///
-/// Walking rather than counting `..`s because the executable's depth is not
-/// fixed: `target/debug/`, `target/debug/deps/` under test, and an installed
-/// `bin/` are all different distances from the same file. Bounded, because
-/// an unbounded walk eventually inspects `/`.
-fn search_near_executable(relatives: &[&str]) -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let mut dir = exe.parent()?;
-    for _ in 0..4 {
-        for rel in relatives {
-            let candidate = dir.join(rel);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        dir = dir.parent()?;
-    }
-    None
-}
-
-/// Find a companion executable this build needs but does not contain.
-///
-/// The environment variable is named rather than derived from `name`: every
-/// one of these tools is already called `atta-something`, so deriving it
-/// produced `ATTA_ATTA_PLUGIN_COMPILE` and nothing anyone was told to set
-/// was ever read.
-#[cfg_attr(feature = "compile", allow(dead_code))]
-fn locate_tool(name: &str, var: &str) -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var(var) {
-        let p = std::path::PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    search_near_executable(&[name])
-}
-
-fn bridge_entry_path() -> Option<std::path::PathBuf> {
-    locate_bridge(std::env::var("ATTA_DSH_BRIDGE").ok().map(Into::into))
 }
 
 /// What loading one plugin produced.
@@ -781,45 +631,6 @@ env = ["ATTA_TEST_DSH_TOKEN", "ATTA_TEST_UNSET"]
         );
     }
 
-    /// The bridge is found relative to the running executable, never from a
-    /// compile-time path: a shipped binary carrying the build machine's
-    /// directory would point at somewhere that exists on no user's computer.
-    ///
-    /// Takes the override as an argument rather than setting the process
-    /// environment, because tests share one process and an env var set here
-    /// would leak into whatever runs beside it.
-    #[test]
-    fn an_existing_override_is_used_verbatim() {
-        let dir = tempfile::tempdir().unwrap();
-        let bridge = dir.path().join("main.js");
-        std::fs::write(&bridge, "// bridge").unwrap();
-        assert_eq!(
-            locate_bridge(Some(bridge.clone())).as_deref(),
-            Some(bridge.as_path())
-        );
-    }
-
-    #[test]
-    fn an_override_pointing_nowhere_is_not_returned() {
-        let dir = tempfile::tempdir().unwrap();
-        let absent = dir.path().join("absent.js");
-        assert_ne!(
-            locate_bridge(Some(absent.clone())).as_deref(),
-            Some(absent.as_path()),
-            "a path that does not exist must never be handed to node"
-        );
-    }
-
-    /// The walk has to reach the repo copy from wherever the test binary
-    /// lives — which is `target/debug/deps/`, a different depth from the
-    /// `target/debug/` a normal build produces.
-    #[test]
-    fn the_search_finds_the_repo_copy_from_a_test_binary() {
-        let found = locate_bridge(None).expect("the in-repo bridge should be reachable");
-        assert!(found.is_file());
-        assert!(found.ends_with("atta-dsh-bridge/src/main.js"), "{found:?}");
-    }
-
     /// An entry module that isn't there would produce a server that fails to
     /// start on every session. Better to notice at load.
     #[test]
@@ -1103,6 +914,45 @@ component = "broken.wasm"
             ["broken"],
             "the plugin is still known; only its tools are missing"
         );
+    }
+}
+
+#[cfg(test)]
+mod precompile_tests {
+    /// A package with no components must install on a build that carries no
+    /// compiler. This used to go looking for `atta-plugin-compile` on behalf
+    /// of components the package never declared, and fail the install when it
+    /// was not there — which is what kept a script-only or MCP-only package
+    /// off every build but the one with the compiler linked in.
+    ///
+    /// The claim is only load-bearing without the `compile` feature, so
+    /// `cargo test -p plugin-host --no-default-features` is where it bites;
+    /// CI runs that configuration for exactly this reason.
+    #[tokio::test]
+    async fn a_package_with_no_components_needs_no_compiler() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            "[plugin]\nname = \"scripts-only\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\n\n\
+             [[script]]\npoint = \"tool.result\"\nentry = \"annotate.js:onResult\"\n",
+        )
+        .unwrap();
+        super::precompile_plugin(dir.path())
+            .await
+            .expect("nothing to compile is not a compile failure");
+    }
+
+    /// The manifest is read before anything is compiled, so a package that
+    /// cannot be parsed says so rather than reporting a compiler problem.
+    #[tokio::test]
+    async fn an_unreadable_manifest_fails_as_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("plugin.toml"), "not toml at all {{{").unwrap();
+        let err = format!(
+            "{:#}",
+            super::precompile_plugin(dir.path()).await.unwrap_err()
+        );
+        assert!(err.contains("toml"), "{err}");
     }
 }
 

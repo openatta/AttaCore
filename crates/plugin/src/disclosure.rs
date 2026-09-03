@@ -77,6 +77,18 @@ impl Disclosure {
             d.events.extend(payload.events.iter().cloned());
         }
 
+        // A script the host runs in its own process, at a point that can
+        // rewrite a tool result or what goes to the model. The sandbox has
+        // nothing to say about it, so it is disclosed with the capability
+        // grants rather than left for the reader to infer from the package
+        // contents.
+        for script in &m.script {
+            d.capabilities.push(format!(
+                "run its own JavaScript at the `{}` extension point",
+                script.point
+            ));
+        }
+
         for server in &m.mcp {
             let kind = match server.kind {
                 crate::manifest::McpKind::Native => "native",
@@ -202,6 +214,28 @@ mod tests {
         assert!(d.is_inert());
         assert_eq!(d.plugin, "demo");
         assert_eq!(d.version, "1.0.0");
+    }
+
+    /// A script is a capability, and the least visible one: it runs in the
+    /// host's own process, at a point that decides what the model reads, and
+    /// no sandbox is between it and anything. A package that ships one is not
+    /// inert.
+    #[test]
+    fn a_script_binding_is_disclosed_as_a_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = load(
+            dir.path(),
+            "\n[[script]]\npoint = \"tool.result\"\nentry = \"annotate.js:onResult\"\n",
+        );
+        let d = Disclosure::from_plugin(&p).unwrap();
+        assert!(
+            d.capabilities
+                .iter()
+                .any(|c| c.contains("`tool.result`") && c.contains("JavaScript")),
+            "{:?}",
+            d.capabilities
+        );
+        assert!(!d.is_inert(), "a package that runs code is not inert");
     }
 
     #[test]

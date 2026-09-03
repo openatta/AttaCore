@@ -13,8 +13,10 @@ use daemon::config::StaticDaemonPaths;
 use daemon::rpc::codes;
 use daemon::{DaemonServer, SessionPool};
 use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
-// Only the plugin-archive helper hashes anything, and that helper is gated.
-#[cfg(feature = "plugins")]
+// Only the plugin-archive helper hashes anything, and that helper is gated —
+// on the package layer, which is what installing needs; running a package's
+// components is a separate feature and a separate set of tests below.
+#[cfg(feature = "plugin-packages")]
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -23,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 /// Build a zip archive (in memory) for a minimal demo plugin declaring one
 /// `/name` slash command, write it to `dir`, and return `(archive_path,
 /// sha256_hex)`.
-#[cfg(feature = "plugins")]
+#[cfg(feature = "plugin-packages")]
 fn build_demo_plugin_zip(dir: &std::path::Path, plugin_name: &str) -> (PathBuf, String) {
     let mut buf = Vec::new();
     {
@@ -703,7 +705,88 @@ async fn commands_list_returns_builtin_local_commands() {
     let _ = handle.await;
 }
 
-#[cfg(feature = "plugins")]
+/// A package whose whole content is a script: no components, nothing to
+/// compile, nothing that needs a WebAssembly engine.
+#[cfg(feature = "plugin-packages")]
+fn build_script_plugin_zip(dir: &std::path::Path, plugin_name: &str) -> (PathBuf, String) {
+    let mut buf = Vec::new();
+    {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file("plugin.toml", opts).unwrap();
+        write!(
+            writer,
+            "[plugin]\nname = \"{plugin_name}\"\nversion = \"1.0.0\"\n\
+             api_version = \"0.1\"\ndescription = \"annotates tool results\"\n\n\
+             [[script]]\npoint = \"tool.result\"\nentry = \"annotate.js:onResult\"\n"
+        )
+        .unwrap();
+        writer.start_file("annotate.js", opts).unwrap();
+        write!(writer, "function onResult(r) {{ return r.text }}").unwrap();
+        writer.finish().unwrap();
+    }
+    let archive_path = dir.join(format!("{plugin_name}.zip"));
+    std::fs::write(&archive_path, &buf).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    (archive_path, hex::encode(hasher.finalize()))
+}
+
+/// The point of splitting the package layer off the carrier: a package that
+/// only ships a script installs in the default build, which carries no
+/// WebAssembly at all. This used to answer `PLUGINS_DISABLED` — and on a
+/// `plugins` build without the compiler it installed and was then rolled
+/// back, for want of a compiler the package gave it nothing to do.
+#[cfg(feature = "plugin-packages")]
+#[tokio::test]
+async fn a_script_only_package_installs_and_discloses_what_it_will_run() {
+    let (_server, sock, dir, handle) = start_server().await;
+    let (archive_path, checksum) = build_script_plugin_zip(dir.path(), "annotator");
+
+    let resp = rpc_call(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"plugin.install","id":1,"params":{{"name":"annotator","version":"1.0.0","download_url":"file://{}","checksum":"{}"}}}}"#,
+            archive_path.display(),
+            checksum,
+        ),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["success"], true, "install resp: {v}");
+
+    // The script is a capability, not an implementation detail: it runs in
+    // this process at a point that rewrites what the model reads, and the
+    // sandbox has nothing to say about that. Whoever installs it has to see
+    // it before they rely on it.
+    let d = &v["result"]["disclosure"];
+    let caps = d["capabilities"].as_array().unwrap();
+    assert!(
+        caps.iter()
+            .any(|c| c.as_str().unwrap().contains("`tool.result`")),
+        "the script binding must be disclosed: {d}"
+    );
+    assert_eq!(d["wasm"]["components"], 0, "{d}");
+
+    // `root` so a host can read what it cares about out of the package
+    // without rebuilding the daemon's disk layout for itself.
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":2}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let plugins = v["result"]["plugins"].as_array().unwrap();
+    let it = plugins.iter().find(|p| p["name"] == "annotator").unwrap();
+    assert_eq!(it["enabled"], true);
+    let root = std::path::Path::new(it["root"].as_str().expect("list carries the root: {it}"));
+    assert!(
+        root.join("annotate.js").is_file(),
+        "the root must be the unpacked directory: {root:?}"
+    );
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+#[cfg(feature = "plugin-packages")]
 #[tokio::test]
 async fn plugin_install_rejects_bad_checksum() {
     let (_server, sock, dir, handle) = start_server().await;
@@ -729,7 +812,7 @@ async fn plugin_install_rejects_bad_checksum() {
     let _ = handle.await;
 }
 
-#[cfg(feature = "plugins")]
+#[cfg(feature = "plugin-packages")]
 #[tokio::test]
 async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
     let (_server, sock, dir, handle) = start_server().await;
@@ -757,6 +840,16 @@ async fn plugin_lifecycle_install_list_disable_enable_uninstall() {
         0,
         "this fixture asks for nothing: {d}"
     );
+    // Whether this binary will run a package's components is a fact about
+    // the build, and the disclosure is where it is answerable — otherwise
+    // "installed, and its tool is missing" has no explanation from here.
+    assert_eq!(
+        d["wasm"]["runnable"],
+        cfg!(feature = "plugins"),
+        "the disclosure must say whether this build runs components: {d}"
+    );
+    assert_eq!(d["wasm"]["components"], 0, "this fixture ships none: {d}");
+
     // The plugin's own description reaches the model, so it is listed with
     // its provenance rather than left for the reader to infer.
     let visible = d["model_visible"].as_array().unwrap();
@@ -1470,10 +1563,15 @@ async fn recreating_a_stale_session_at_capacity_does_not_evict_an_unrelated_sess
     let _ = handle.await;
 }
 
-/// A build without the plugin subsystem must say so, not pretend. An empty
+/// A build without the package layer must say so, not pretend. An empty
 /// `plugin.list` would read as "nothing installed", which is a different fact
 /// from "this binary cannot load plugins at all".
-#[cfg(not(feature = "plugins"))]
+///
+/// Gated on the *package* layer, not on the carrier: a build that reads
+/// packages but runs no components manages them perfectly well, and answering
+/// `PLUGINS_DISABLED` there was the whole defect — a package with nothing to
+/// run was refused for want of an engine it never needed.
+#[cfg(not(feature = "plugin-packages"))]
 #[tokio::test]
 async fn plugin_rpcs_report_plugins_disabled_when_compiled_out() {
     let (_server, sock, _dir, handle) = start_server().await;

@@ -48,7 +48,8 @@ const WIRING_CHECKS: &[(&str, &str)] = &[
     ("tools", "register_worktree_tools"),
     ("hooks", "enable_file_watching"),
     ("mcp", "set_elicitation_callback"),
-    ("script-host", "bind_quickjs"),
+    ("script-host", "bind_into"),
+    ("script-host", "bind_lenient"),
 ];
 
 /// Functions matching `WIRING_CHECKS`-style naming that are deliberately

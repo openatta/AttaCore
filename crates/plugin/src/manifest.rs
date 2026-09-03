@@ -35,6 +35,10 @@ pub const SUBSCRIBABLE_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+/// Top-level sections this build understands, for the unknown-section
+/// warning in [`Plugin::load`].
+pub const KNOWN_SECTIONS: &[&str] = &["plugin", "wasm", "mcp", "script", "scene", "agent"];
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PluginManifest {
     pub plugin: PluginMeta,
@@ -44,6 +48,9 @@ pub struct PluginManifest {
     /// MCP server payloads, native or DSH-bridged.
     #[serde(default)]
     pub mcp: Vec<McpPayload>,
+    /// Scripts this package binds to extension points.
+    #[serde(default)]
+    pub script: Vec<ScriptPayload>,
     /// How this plugin appears in other scenes, and the scene it owns.
     #[serde(default)]
     pub scene: SceneSection,
@@ -136,6 +143,42 @@ impl Capabilities {
             || !self.fs_write.is_empty()
             || !self.net.is_empty()
             || !self.env.is_empty()
+    }
+}
+
+/// A script this package binds to an extension point.
+///
+/// The carrier is the host's, not the package's: a package ships JavaScript
+/// and names a point, and the engine that runs it is the one already in the
+/// process. Nothing here can widen what the script may do — that follows
+/// from the package the file arrived in, and is decided at bind time.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScriptPayload {
+    /// Extension point id, e.g. `tool.result`. Which ids accept a script is
+    /// the carrier's list, not this crate's — a manifest layer that repeated
+    /// it would be a second answer to go stale.
+    pub point: String,
+    /// `<file>:<function>`, the file relative to the plugin root.
+    pub entry: String,
+    /// Wall clock for one call. Defaults to the carrier's own budget.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// How many times it may run in a turn. Defaults to the carrier's.
+    #[serde(default)]
+    pub calls_per_turn: Option<u32>,
+}
+
+impl ScriptPayload {
+    /// The file half of `entry`. Split from the right: a Windows-style
+    /// absolute path carries a colon of its own, and such a path is refused
+    /// by [`validate`] rather than silently split in the wrong place.
+    pub fn file(&self) -> &str {
+        self.entry.rsplit_once(':').map_or("", |(f, _)| f)
+    }
+
+    /// The exported function `entry` names.
+    pub fn function(&self) -> &str {
+        self.entry.rsplit_once(':').map_or("", |(_, f)| f)
     }
 }
 
@@ -266,6 +309,7 @@ impl Plugin {
         let raw = std::fs::read_to_string(manifest_path)?;
         let manifest: PluginManifest = toml::from_str(&raw)?;
         validate(&manifest)?;
+        warn_unknown_sections(&raw, &manifest.plugin.name);
         Ok(Plugin {
             root: root.to_path_buf(),
             manifest,
@@ -288,6 +332,30 @@ impl Plugin {
     /// Resolve a manifest-relative path against this plugin's root.
     pub fn path(&self, rel: &Path) -> PathBuf {
         self.root.join(rel)
+    }
+}
+
+/// Say so when a manifest carries a section this build does not read.
+///
+/// A warning rather than `deny_unknown_fields`, because the two failure modes
+/// are not symmetric: refusing would turn every package built against a
+/// *newer* Core into an install failure, while a typo — `[[scripts]]` for
+/// `[[script]]` — silently produces a package that contributes nothing and
+/// looks installed. Naming the section costs the forward-compatible case
+/// nothing and is the only signal the typo ever gets.
+fn warn_unknown_sections(raw: &str, plugin: &str) {
+    let Ok(toml::Value::Table(table)) = raw.parse::<toml::Value>() else {
+        return;
+    };
+    for key in table.keys() {
+        if !KNOWN_SECTIONS.contains(&key.as_str()) {
+            tracing::warn!(
+                plugin,
+                section = key.as_str(),
+                known = KNOWN_SECTIONS.join(", "),
+                "plugin.toml declares a section this build does not read; it contributes nothing"
+            );
+        }
     }
 }
 
@@ -323,6 +391,38 @@ fn validate(m: &PluginManifest) -> Result<(), PluginError> {
             }
         }
     }
+    for s in &m.script {
+        if s.point.trim().is_empty() {
+            return Err(PluginError::Schema(
+                "a `[[script]]` declares no `point`".into(),
+            ));
+        }
+        let Some((file, function)) = s.entry.rsplit_once(':') else {
+            return Err(PluginError::Schema(format!(
+                "script entry `{}` is not `<file>:<function>`",
+                s.entry
+            )));
+        };
+        if file.is_empty() || function.is_empty() {
+            return Err(PluginError::Schema(format!(
+                "script entry `{}` is not `<file>:<function>`",
+                s.entry
+            )));
+        }
+        // The path is resolved against the package's own directory, so
+        // anything that could leave it is refused here rather than relied on
+        // being caught later — the later check is in a different crate, and a
+        // package that reaches outside itself is the one case where "it
+        // probably fails anyway" is not good enough.
+        let path = Path::new(file);
+        if path.is_absolute() || path.components().any(|c| c.as_os_str() == "..") {
+            return Err(PluginError::Schema(format!(
+                "script entry `{}` must name a file inside the package",
+                s.entry
+            )));
+        }
+    }
+
     for s in &m.mcp {
         match s.kind {
             McpKind::Native if s.config.is_none() => {
@@ -506,6 +606,61 @@ version = "1.0.0"
         )
         .unwrap_err();
         assert!(matches!(err, PluginError::Toml(_)));
+    }
+
+    #[test]
+    fn a_script_payload_splits_into_a_file_and_a_function() {
+        let m = load_str(&format!(
+            "{MINIMAL}\n[[script]]\npoint = \"tool.result\"\nentry = \"a/b.js:onResult\"\n"
+        ))
+        .unwrap();
+        assert_eq!(m.script[0].file(), "a/b.js");
+        assert_eq!(m.script[0].function(), "onResult");
+        assert_eq!(m.script[0].timeout_ms, None);
+    }
+
+    /// The manifest layer does not know which points accept a script — that
+    /// is the carrier's list. It knows only that `entry` has to say which
+    /// file and which function, because neither half can be guessed.
+    #[test]
+    fn a_script_entry_that_is_not_file_colon_function_is_refused() {
+        for entry in ["onResult", "a.js:", ":onResult"] {
+            let err = load_str(&format!(
+                "{MINIMAL}\n[[script]]\npoint = \"tool.result\"\nentry = \"{entry}\"\n"
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(&err, PluginError::Schema(m) if m.contains("<file>:<function>")),
+                "`{entry}`: {err}"
+            );
+        }
+    }
+
+    /// A package's script has to be the package's. Refused at the manifest
+    /// rather than left to the bind, because "it would probably fail anyway"
+    /// is not the standard for a file that runs in the host's process.
+    #[test]
+    fn a_script_entry_that_reaches_outside_the_package_is_refused() {
+        for entry in ["../../etc/evil.js:go", "/etc/evil.js:go"] {
+            let err = load_str(&format!(
+                "{MINIMAL}\n[[script]]\npoint = \"tool.result\"\nentry = \"{entry}\"\n"
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(&err, PluginError::Schema(m) if m.contains("inside the package")),
+                "`{entry}`: {err}"
+            );
+        }
+    }
+
+    /// An unknown section does not fail the load: a package built against a
+    /// newer Core has to stay installable on an older one. The warning is
+    /// what a typo gets, and this is the check that the load still succeeds.
+    #[test]
+    fn an_unknown_section_is_ignored_rather_than_refused() {
+        let m = load_str(&format!("{MINIMAL}\n[[ui]]\nbundle = \"dist/index.js\"\n")).unwrap();
+        assert_eq!(m.plugin.name, "p");
+        assert!(m.script.is_empty());
     }
 
     #[test]

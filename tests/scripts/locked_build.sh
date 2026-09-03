@@ -69,6 +69,23 @@ if [ -n "$compiler" ]; then
   exit 1
 fi
 
+# The claim the package/carrier split exists to make: the default build reads,
+# verifies, unpacks and manages packages, and contains no WebAssembly at all.
+# It is the one people actually ship, and the one where "you cannot install a
+# plugin here" used to be true for want of an engine most packages never need.
+echo "==> asserting the default build carries packages but no WebAssembly"
+graph=$(cargo tree -p daemon -e normal)
+if ! grep -q 'plugin v' <<<"$graph"; then
+  echo "FAIL: the default build cannot read a package; the plugin crate is not in its graph" >&2
+  exit 1
+fi
+wasm=$(grep -Eo '(plugin-host|wasm-host|wasmtime|cranelift-codegen) v' <<<"$graph" || true)
+if [ -n "$wasm" ]; then
+  echo "FAIL: WebAssembly machinery is linked into the default build:" >&2
+  echo "$wasm" >&2
+  exit 1
+fi
+
 echo "==> running the daemon test suite in the locked configuration"
 cargo test -p daemon --no-default-features
 
@@ -87,4 +104,4 @@ else
   echo "    skipped: node is not installed"
 fi
 
-echo "OK: locked build contains no plugin subsystem"
+echo "OK: locked build contains no plugin subsystem, and the default build no WebAssembly"

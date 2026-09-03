@@ -475,13 +475,32 @@ pub mod bindings {
         }
     }
 
-    /// Where a script came from, which is what decides what it may do.
+    /// Where a set of bindings came from, which is what decides what they
+    /// may do.
+    ///
+    /// The two differ in more than provenance. A project's bindings resolve
+    /// against the project root and are judged by where the file landed —
+    /// the operator's own tree means the operator's authority. A package's
+    /// resolve against the package's own directory and carry the package's
+    /// name, stated rather than inferred: inferring it from the path is only
+    /// correct while the plugin cache happens to sit outside every project
+    /// root, which is a fact about default path layout and not something
+    /// anything enforces. A deployment that put its scene root inside a
+    /// checkout would have handed a downloaded package the authority to
+    /// rewrite the prompt.
+    pub enum BindingSource<'a> {
+        Project { root: &'a Path },
+        Package { name: &'a str, root: &'a Path },
+    }
+
+    /// Where a project script came from, which is what decides what it may do.
     ///
     /// Inside the project root means the operator wrote it, and it gets their
-    /// authority. Anywhere else — a plugin's directory, a shared location —
-    /// means it arrived from outside, and it may add and no more. The check is
-    /// on the resolved path rather than on anything the binding declares,
-    /// because a declaration is exactly what an outside script would lie in.
+    /// authority. Anywhere else — a shared location, an absolute path out of
+    /// tree — means it arrived from outside, and it may add and no more. The
+    /// check is on the resolved path rather than on anything the binding
+    /// declares, because a declaration is exactly what an outside script
+    /// would lie in.
     fn origin_of(path: &Path, project_root: &Path) -> BlockOrigin {
         let inside = path
             .canonicalize()
@@ -511,6 +530,16 @@ pub mod bindings {
         }
     }
 
+    /// The engine behind the script carrier, as the trait the rest of the
+    /// engine talks to.
+    ///
+    /// Exists so a host binding its own extension points gets this carrier's
+    /// quota, wall clock, provenance and ledger rather than linking a second
+    /// interpreter and growing a second answer to "what may an extension do".
+    pub fn engine() -> Arc<dyn ScriptEngine> {
+        Arc::new(crate::QuickJsEngine::new())
+    }
+
     /// Everything a host does to honor a `scripts` section: pick the engine,
     /// register the bindings, hand back the answer.
     ///
@@ -529,63 +558,161 @@ pub mod bindings {
         if bindings.is_empty() {
             return Ok(None);
         }
-        let engine: Arc<dyn ScriptEngine> = Arc::new(crate::QuickJsEngine::new());
-        bind(engine, bindings, project_root).map(Some)
+        bind(engine(), bindings, project_root).map(Some)
     }
 
     /// Register every binding, or say which one is wrong.
     ///
     /// All-or-nothing: a partially applied script configuration is a
     /// configuration nobody wrote.
-    /// Read every binding, build a carrier for each, and sort the adapters by
-    /// where they have to be installed.
     pub fn bind(
         engine: Arc<dyn ScriptEngine>,
         bindings: &[ScriptBinding],
         project_root: &Path,
     ) -> Result<BoundScripts, BindingError> {
-        let mut prepared = Vec::new();
+        let mut out = BoundScripts::default();
+        bind_into(
+            &mut out,
+            engine,
+            bindings,
+            &BindingSource::Project { root: project_root },
+        )?;
+        Ok(out)
+    }
+
+    /// Add a whole set of bindings to `out`, or add none of them.
+    ///
+    /// `out` rather than a fresh value because the ledger lives on it: two
+    /// sets bound into separate values would keep separate records and count
+    /// their per-turn quotas apart, so a turn resetting one would leave the
+    /// other running on a budget nobody reset.
+    ///
+    /// Nothing is installed until every binding has been read, so a failure
+    /// leaves `out` exactly as it was.
+    pub fn bind_into(
+        out: &mut BoundScripts,
+        engine: Arc<dyn ScriptEngine>,
+        bindings: &[ScriptBinding],
+        source: &BindingSource<'_>,
+    ) -> Result<(), BindingError> {
+        let mut prepared = Vec::with_capacity(bindings.len());
         for binding in bindings {
-            if base::interface::catalog::find(&binding.point).is_none() {
-                return Err(BindingError::UnknownPoint {
-                    point: binding.point.clone(),
-                });
+            prepared.push(prepare(binding, source)?);
+        }
+        install(out, &engine, prepared)
+    }
+
+    /// Add what can be added, and hand back what could not with the reason.
+    ///
+    /// The lenient half of the pair, and the difference is whose mistake it
+    /// is. An operator's `scripts` section is one document by one author, so
+    /// half of it is a document nobody wrote — [`bind_into`] refuses the lot.
+    /// A set assembled from several installed packages has no such author:
+    /// dropping it whole would let one bad package silently take away every
+    /// other package's contributions. So a package's bindings fail one at a
+    /// time, and the caller reports each failure against the package it came
+    /// from.
+    pub fn bind_lenient(
+        out: &mut BoundScripts,
+        engine: Arc<dyn ScriptEngine>,
+        bindings: &[ScriptBinding],
+        source: &BindingSource<'_>,
+    ) -> Vec<BindingError> {
+        let mut errors = Vec::new();
+        for binding in bindings {
+            match prepare(binding, source) {
+                // One at a time, so a later binding cannot be lost to an
+                // earlier one's failure.
+                Ok(one) => {
+                    if let Err(e) = install(out, &engine, vec![one]) {
+                        errors.push(e);
+                    }
+                }
+                Err(e) => errors.push(e),
             }
-            if !BINDABLE_POINTS.contains(&binding.point.as_str()) {
-                return Err(BindingError::UnbindablePoint {
-                    point: binding.point.clone(),
-                });
-            }
-            let path = if binding.path.is_absolute() {
-                binding.path.clone()
-            } else {
-                project_root.join(&binding.path)
-            };
-            let code = std::fs::read_to_string(&path).map_err(|e| BindingError::Unreadable {
-                path: path.display().to_string(),
-                reason: e.to_string(),
-            })?;
-            let origin = origin_of(&path, project_root);
-            let defaults = ScriptLimits::default();
-            prepared.push((
-                binding.clone(),
-                ScriptSource {
-                    id: path.display().to_string(),
-                    origin: origin.clone(),
-                    code,
-                },
-                ScriptLimits {
-                    timeout: binding
-                        .timeout_ms
-                        .map(std::time::Duration::from_millis)
-                        .unwrap_or(defaults.timeout),
-                    calls_per_turn: binding.calls_per_turn.unwrap_or(defaults.calls_per_turn),
-                },
-                authority_for(&origin),
-            ));
+        }
+        errors
+    }
+
+    /// One binding, read and judged: the code, its budget, and the authority
+    /// its provenance earns it.
+    type Prepared = (ScriptBinding, ScriptSource, ScriptLimits, Authority);
+
+    fn prepare(
+        binding: &ScriptBinding,
+        source: &BindingSource<'_>,
+    ) -> Result<Prepared, BindingError> {
+        if base::interface::catalog::find(&binding.point).is_none() {
+            return Err(BindingError::UnknownPoint {
+                point: binding.point.clone(),
+            });
+        }
+        if !BINDABLE_POINTS.contains(&binding.point.as_str()) {
+            return Err(BindingError::UnbindablePoint {
+                point: binding.point.clone(),
+            });
         }
 
-        let mut out = BoundScripts::default();
+        let (path, origin) = match source {
+            BindingSource::Project { root } => {
+                let path = if binding.path.is_absolute() {
+                    binding.path.clone()
+                } else {
+                    root.join(&binding.path)
+                };
+                let origin = origin_of(&path, root);
+                (path, origin)
+            }
+            BindingSource::Package { name, root } => {
+                let path = root.join(&binding.path);
+                // A package's file has to be the package's. The manifest
+                // layer refuses a path that could leave the directory, and
+                // this refuses one that left it anyway — through a symlink,
+                // which no amount of reading the manifest can see.
+                if !path
+                    .canonicalize()
+                    .ok()
+                    .zip(root.canonicalize().ok())
+                    .map(|(p, r)| p.starts_with(r))
+                    .unwrap_or(false)
+                {
+                    return Err(BindingError::Unreadable {
+                        path: path.display().to_string(),
+                        reason: "it is not inside the package that declared it".to_string(),
+                    });
+                }
+                (path, BlockOrigin::Plugin((*name).to_string()))
+            }
+        };
+
+        let code = std::fs::read_to_string(&path).map_err(|e| BindingError::Unreadable {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let defaults = ScriptLimits::default();
+        Ok((
+            binding.clone(),
+            ScriptSource {
+                id: path.display().to_string(),
+                origin: origin.clone(),
+                code,
+            },
+            ScriptLimits {
+                timeout: binding
+                    .timeout_ms
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(defaults.timeout),
+                calls_per_turn: binding.calls_per_turn.unwrap_or(defaults.calls_per_turn),
+            },
+            authority_for(&origin),
+        ))
+    }
+
+    fn install(
+        out: &mut BoundScripts,
+        engine: &Arc<dyn ScriptEngine>,
+        prepared: Vec<Prepared>,
+    ) -> Result<(), BindingError> {
         for (binding, source, limits, authority) in prepared {
             let carrier = Arc::new(
                 ScriptCarrier::new(engine.clone(), source, &binding.point, limits)
@@ -659,7 +786,7 @@ pub mod bindings {
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1309,5 +1436,204 @@ mod binding_tests {
             ModelContentBlock::Text { text } => assert_eq!(text, "the key is [redacted]"),
             other => panic!("the text block was replaced by something else: {other:?}"),
         }
+    }
+}
+
+/// The half of binding that decides what a script may do, and the half that
+/// decides what happens when one of a set cannot be honored.
+#[cfg(test)]
+mod package_binding_tests {
+    use super::bindings::*;
+    use base::prompt::BlockOrigin;
+    use base::settings::ScriptBinding;
+    use std::path::{Path, PathBuf};
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "atta-package-binding-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn script(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "function onResult(r) { return r }").unwrap();
+    }
+
+    fn binding(path: &str, point: &str) -> ScriptBinding {
+        ScriptBinding {
+            path: path.into(),
+            point: point.into(),
+            entry: "onResult".into(),
+            timeout_ms: None,
+            calls_per_turn: None,
+        }
+    }
+
+    /// The point of stating the source: a package's script is the package's
+    /// wherever the package happens to be unpacked. Here it sits *inside* the
+    /// project root, which is the layout that used to hand it the operator's
+    /// own authority to rewrite the prompt.
+    #[test]
+    fn a_packages_script_is_the_packages_even_when_it_sits_inside_the_project() {
+        let project = tempdir();
+        let pkg = project.join("plugins/annotate");
+        std::fs::create_dir_all(&pkg).unwrap();
+        script(&pkg, "a.js");
+
+        let mut out = BoundScripts::default();
+        let errors = bind_lenient(
+            &mut out,
+            engine(),
+            &[binding("a.js", "tool.result")],
+            &BindingSource::Package {
+                name: "annotate",
+                root: &pkg,
+            },
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(out.carriers.len(), 1);
+        assert_eq!(
+            out.carriers[0].origin(),
+            &BlockOrigin::Plugin("annotate".to_string()),
+            "the origin is the package's name, not the path it was unpacked to"
+        );
+    }
+
+    /// A path that leaves the package through a symlink is one the manifest
+    /// check cannot see.
+    #[cfg(unix)]
+    #[test]
+    fn a_script_symlinked_out_of_the_package_is_refused() {
+        let outside = tempdir();
+        script(&outside, "evil.js");
+        let pkg = tempdir();
+        std::os::unix::fs::symlink(outside.join("evil.js"), pkg.join("a.js")).unwrap();
+
+        let mut out = BoundScripts::default();
+        let errors = bind_lenient(
+            &mut out,
+            engine(),
+            &[binding("a.js", "tool.result")],
+            &BindingSource::Package {
+                name: "evil",
+                root: &pkg,
+            },
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(out.carriers.is_empty());
+    }
+
+    /// One bad package must not cost the others their contributions. The
+    /// operator's own set still fails whole — that is `bind_into` — and the
+    /// two are different on purpose.
+    #[test]
+    fn a_binding_that_cannot_be_honored_costs_only_itself() {
+        let pkg = tempdir();
+        script(&pkg, "good.js");
+
+        let mut out = BoundScripts::default();
+        let errors = bind_lenient(
+            &mut out,
+            engine(),
+            &[
+                binding("good.js", "tool.result"),
+                binding("absent.js", "tool.result"),
+                binding("good.js", "no.such.point"),
+            ],
+            &BindingSource::Package {
+                name: "mixed",
+                root: &pkg,
+            },
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert_eq!(
+            out.tool_results.len(),
+            1,
+            "the one binding that was fine is still bound"
+        );
+    }
+
+    /// Everything bound into one value writes into its ledger, so a turn that
+    /// resets one set's quotas resets them all and one report says what every
+    /// script did. Two `BoundScripts` would have kept two records.
+    #[test]
+    fn a_project_set_and_a_package_set_share_one_ledger() {
+        use base::interface::tool_middleware::ToolCall;
+        use base::interface::tool_result::ToolResultDraft;
+
+        let project = tempdir();
+        script(&project, "p.js");
+        let pkg = tempdir();
+        script(&pkg, "k.js");
+
+        let mut out = BoundScripts::default();
+        bind_into(
+            &mut out,
+            engine(),
+            &[binding("p.js", "tool.result")],
+            &BindingSource::Project { root: &project },
+        )
+        .expect("the project binding is valid");
+        let errors = bind_lenient(
+            &mut out,
+            engine(),
+            &[binding("k.js", "tool.result")],
+            &BindingSource::Package {
+                name: "pkg",
+                root: &pkg,
+            },
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(out.tool_results.len(), 2);
+
+        let call = ToolCall {
+            name: "Read".into(),
+            input: serde_json::json!({}),
+        };
+        for transformer in &out.tool_results {
+            let mut draft = ToolResultDraft {
+                text: "hello".into(),
+                images: Vec::new(),
+                is_error: false,
+            };
+            transformer.transform(&call, &mut draft);
+        }
+
+        assert_eq!(
+            out.ledger.records().len(),
+            2,
+            "both sets report into the one ledger the session reads"
+        );
+    }
+
+    /// The strict half is still strict: half an operator's `scripts` section
+    /// is a section nobody wrote.
+    #[test]
+    fn a_projects_set_is_still_all_or_nothing() {
+        let project = tempdir();
+        script(&project, "p.js");
+
+        let mut out = BoundScripts::default();
+        let err = bind_into(
+            &mut out,
+            engine(),
+            &[
+                binding("p.js", "tool.result"),
+                binding("p.js", "no.such.point"),
+            ],
+            &BindingSource::Project { root: &project },
+        )
+        .expect_err("an unknown point fails the set");
+        assert!(matches!(err, BindingError::UnknownPoint { .. }), "{err:?}");
+        assert!(
+            out.carriers.is_empty(),
+            "a refused set leaves nothing behind"
+        );
     }
 }

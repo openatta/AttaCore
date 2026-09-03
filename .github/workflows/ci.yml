@@ -68,6 +68,19 @@ jobs:
       - name: plugin carrier
         run: cargo check -p daemon --no-default-features --features plugins
 
+      # The package layer without any carrier: `plugin.*` works, nothing runs.
+      # A build worth checking on its own because it is the one that proves
+      # the split — package management that needs no runtime.
+      - name: packages without a carrier
+        run: cargo check -p daemon --no-default-features --features plugin-packages
+
+      # `precompile_plugin` must not go looking for `atta-plugin-compile` on
+      # behalf of components a package never declared. The claim only bites
+      # without the in-process compiler, so this is where it is checked; the
+      # rest of this crate's suite needs the compiler to load its fixtures.
+      - name: a package with no components needs no compiler
+        run: cargo test -p plugin-host --no-default-features precompile_tests
+
       - name: both carriers must not compile
         run: |
           if cargo check -p daemon --features plugins 2>/dev/null; then

@@ -371,6 +371,7 @@ mod tests {
 
         for status in [
             crate::plugins::PluginStatus::Enabled,
+            crate::plugins::PluginStatus::PackagesOnly,
             crate::plugins::PluginStatus::DisabledByPolicy,
             crate::plugins::PluginStatus::CompiledOut,
         ] {
