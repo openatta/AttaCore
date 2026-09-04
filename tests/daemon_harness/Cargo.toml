@@ -20,3 +20,8 @@ anyhow      = { workspace = true }
 async-trait = { workspace = true }
 url         = { workspace = true }
 tempfile    = { workspace = true }
+
+[dev-dependencies]
+# For the demo package's zip: one packer, shared, rather than a second copy
+# of "walk a directory into an archive and hash it".
+test-runner = { path = "../runner" }

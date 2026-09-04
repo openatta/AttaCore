@@ -830,6 +830,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test-runner",
  "tokio",
  "tokio-util",
  "url",

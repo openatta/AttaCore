@@ -216,6 +216,12 @@ impl Daemon {
             )
             .with_permission_prompt_timeout(opts.prompt_timeout),
         );
+        // `main.rs` does this before it serves, and its own doc comment says
+        // every embedder must: until it has run, an installed package
+        // contributes its manifest but none of its tools or scenes. Leaving
+        // it out here would make this mode quietly different from the
+        // spawned one in exactly the way these tests exist to catch.
+        pool.load_plugin_components().await;
 
         let cancel = CancellationToken::new();
         let server = Arc::new(DaemonServer::new(pool, cancel.clone()));

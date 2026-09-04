@@ -621,3 +621,226 @@ async fn a_build_with_no_script_carrier_honors_no_scripts_section() -> anyhow::R
     daemon.stop().await;
     Ok(())
 }
+
+// ── Telemetry, reload, and state that outlives a process ─────────────────
+
+/// Telemetry is a report about a turn, so it is checked against an
+/// independent witness of that turn rather than against itself: the stub
+/// counted the calls, and the file has to agree.
+async fn telemetry_counts_what_the_turn_actually_did(mode: Mode) -> anyhow::Result<()> {
+    let (world, provider, daemon, project) = stage("telemetry-counts", mode).await?;
+    let target = project.join("counted.txt");
+    provider.script([
+        Reply::Blocks(vec![Block::tool(
+            "call-1",
+            "Write",
+            json!({ "file_path": target.to_string_lossy(), "content": "counted\n" }),
+        )]),
+        Reply::text("done"),
+    ]);
+    let output = world.telemetry_file("counts.jsonl");
+
+    let mut client = daemon.connect().await?;
+    let session = client
+        .session_create(json!({
+            "options": { "telemetry": { "output": output.to_string_lossy() } }
+        }))
+        .await?;
+    client
+        .session_run_turn(&session, "write it", "t1", None)
+        .await?;
+
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&output)?
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let of_type = |kind: &str| -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some(kind))
+            .collect()
+    };
+
+    assert_eq!(
+        of_type("api_request").len(),
+        provider.call_count(),
+        "telemetry and the provider disagree about how many calls this turn made"
+    );
+    let executions = of_type("tool_execution");
+    assert!(
+        executions.iter().any(|e| e["tool_name"] == "Write"),
+        "the tool that ran is not in the telemetry: {executions:?}"
+    );
+
+    let complete = of_type("turn_complete");
+    let complete = complete
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no turn_complete event"))?;
+    assert_eq!(
+        complete["api_calls"].as_u64(),
+        Some(2),
+        "turn_complete miscounts its calls: {complete}"
+    );
+    assert_eq!(
+        complete["tool_calls"].as_u64(),
+        Some(1),
+        "turn_complete miscounts its tools: {complete}"
+    );
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telemetry_counts_what_the_turn_actually_did_here() -> anyhow::Result<()> {
+    telemetry_counts_what_the_turn_actually_did(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn telemetry_counts_what_the_turn_actually_did_in_a_spawned_daemon() -> anyhow::Result<()> {
+    telemetry_counts_what_the_turn_actually_did(Mode::Spawned).await
+}
+
+/// A settings file edited while the daemon runs, and `config.reload` to pick
+/// it up. The same session runs both turns: a reload that only reached new
+/// sessions would leave every open one on the old configuration, which is
+/// the state an operator is least likely to suspect.
+async fn a_reload_reaches_a_session_that_is_already_open(mode: Mode) -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = world.project("reloaded")?;
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(mode),
+    )
+    .await?;
+    provider.script([
+        Reply::text("before"),
+        Reply::text("after"),
+        Reply::text("spare"),
+        Reply::text("spare"),
+    ]);
+
+    let mut client = daemon.connect().await?;
+    let session = client.session_create(json!({})).await?;
+    client
+        .session_run_turn(&session, "first", "t1", None)
+        .await?;
+
+    // A watermark rather than an index: a turn is not the only thing that
+    // calls the model, and a case that assumed call *n* was its own would
+    // break the first time the engine did anything else in between.
+    let before_reload = provider.call_count();
+
+    world.write_project_settings(
+        "reloaded",
+        &json!({ "prompt_append": "RELOADED-MARK-PLUGH" }),
+    )?;
+    let reloaded = client.config_reload().await?;
+    anyhow::ensure!(
+        reloaded.error.is_none(),
+        "config.reload failed: {reloaded:?}"
+    );
+
+    client
+        .session_run_turn(&session, "second", "t2", None)
+        .await?;
+
+    let calls = provider.calls();
+    let (before, after) = calls.split_at(before_reload);
+    assert!(
+        !before
+            .iter()
+            .any(|c| c.system_text().contains("RELOADED-MARK-PLUGH")),
+        "the mark was in the prompt before it was ever configured"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|c| c.system_text().contains("RELOADED-MARK-PLUGH")),
+        "an open session kept its old settings across config.reload"
+    );
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_reaches_a_session_that_is_already_open_here() -> anyhow::Result<()> {
+    a_reload_reaches_a_session_that_is_already_open(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn a_reload_reaches_a_session_that_is_already_open_in_a_spawned_daemon() -> anyhow::Result<()>
+{
+    a_reload_reaches_a_session_that_is_already_open(Mode::Spawned).await
+}
+
+/// Installing is a write to disk, and the only way to prove it is a write to
+/// disk is to ask a daemon that was not running when it happened.
+///
+/// The RPC surface of install/list/enable/disable is covered in
+/// `daemon/tests/daemon_e2e.rs`, in one process. That cannot distinguish a
+/// package registered on disk from one remembered in a `HashMap`, because
+/// nothing there ever forgets.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns two real daemon processes"]
+async fn an_installed_package_outlives_the_daemon_that_installed_it() -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = world.project("packaged")?;
+    let provider = ProviderStub::start().await?;
+    let (archive, checksum) = test_runner::plugin_fixture::package_demo_plugin(world.root())?;
+
+    let first = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(Mode::Spawned),
+    )
+    .await?;
+    let mut client = first.connect().await?;
+    let installed = client
+        .call(
+            "plugin.install",
+            json!({
+                "name": "demo-plugin",
+                "version": "1.0.0",
+                "download_url": format!("file://{}", archive.display()),
+                "checksum": checksum,
+            }),
+        )
+        .await?;
+    anyhow::ensure!(
+        installed.error.is_none(),
+        "plugin.install failed: {installed:?}"
+    );
+    first.stop().await;
+
+    let second = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project).mode(Mode::Spawned),
+    )
+    .await?;
+    let mut client = second.connect().await?;
+    let listed = client.call("plugin.list", json!({})).await?;
+    let plugins = listed
+        .result
+        .as_ref()
+        .and_then(|r| r.get("plugins"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let demo = plugins
+        .iter()
+        .find(|p| p["name"] == "demo-plugin")
+        .ok_or_else(|| {
+            anyhow::anyhow!("a package installed by the previous daemon is gone: {plugins:?}")
+        })?;
+    assert_eq!(
+        demo["enabled"], true,
+        "the package came back disabled: {demo}"
+    );
+    second.stop().await;
+    Ok(())
+}
