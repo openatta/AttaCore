@@ -75,6 +75,22 @@ impl World {
         write_json(&root.join(".atta").join("settings.json"), settings)
     }
 
+    /// Put a file inside a project — a script, a skill, whatever the case
+    /// needs the daemon to find where a real one would.
+    pub fn write_project_file(
+        &self,
+        project: &str,
+        relative: &str,
+        contents: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let path = self.project(project)?.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, contents)?;
+        Ok(path)
+    }
+
     /// Where a daemon leaves its discovery entry — one file per instance,
     /// under the global root so every instance's lands in one directory.
     pub fn instances_dir(&self) -> PathBuf {

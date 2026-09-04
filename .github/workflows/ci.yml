@@ -40,6 +40,18 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # A second daemon, built with no script engine at all. It needs a
+      # target directory of its own: both builds produce a binary called
+      # `attacored`, so building this one into `target/` would replace the
+      # daemon every other spawned case is meant to run against.
+      #
+      # What it buys is the only way to observe a build that has no carrier.
+      # A test running inside a build that has one cannot answer what the
+      # other does with a `scripts` section — see `docs/testing_scripts.md`,
+      # which lists exactly that as outside the script carrier's own net.
+      - name: build a daemon with no carrier
+        run: CARGO_TARGET_DIR=${{ github.workspace }}/target/no-carrier cargo build -p daemon --no-default-features
+
       # The ignored set is where the slow cases live — a real daemon, a real
       # MCP server over stdio, the schema the documents are generated from.
       # They are ignored because they are slow, not because they are optional,
@@ -49,6 +61,8 @@ jobs:
       # block in a doc comment is illustration, not a test somebody forgot to
       # switch on, and it does not compile on its own.
       - name: test (ignored)
+        env:
+          ATTA_TEST_DAEMON_BIN_NO_CARRIER: ${{ github.workspace }}/target/no-carrier/debug/attacored
         run: cargo test --workspace --all-targets -- --ignored
 
   carriers:

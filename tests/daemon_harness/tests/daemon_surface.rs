@@ -470,3 +470,154 @@ async fn a_spawned_run_leaves_nothing_outside_the_world_it_was_given() -> anyhow
     );
     Ok(())
 }
+
+// ── The carrier matrix ───────────────────────────────────────────────────
+//
+// A build carries one extension carrier or none, decided at compile time.
+// That makes the interesting question — what does a build *without* a
+// carrier do with a settings file that asks for one — unanswerable from
+// inside a build that has one, which is why `docs/testing_scripts.md` lists
+// it as outside the script carrier's own net. A spawned daemon can be a
+// different build, so here it is.
+
+const SCRIPT_MARK: &str = "CARRIER-SCRIPT-REACHED-THE-PROMPT";
+
+/// A project whose settings bind one script to the prompt.
+fn a_project_with_a_script(world: &World) -> anyhow::Result<std::path::PathBuf> {
+    let project = world.project("scripted")?;
+    world.write_project_file(
+        "scripted",
+        ".atta/scripts/house.js",
+        &format!(
+            r#"function onAssemble(blocks) {{
+                 var out = blocks.map(function (b) {{ return b; }});
+                 out.push({{ name: "daemon.house", content: "{SCRIPT_MARK}" }});
+                 return out;
+               }}"#
+        ),
+    )?;
+    world.write_project_settings(
+        "scripted",
+        &json!({
+            "memory_enabled": false,
+            "scripts": [
+                {
+                    "path": ".atta/scripts/house.js",
+                    "point": "prompt.assemble",
+                    "entry": "onAssemble"
+                }
+            ]
+        }),
+    )?;
+    Ok(project)
+}
+
+/// What the daemon did with that project: whether the mark arrived, and what
+/// the session says its scripts have been doing.
+async fn run_the_scripted_project(
+    world: &World,
+    provider: &ProviderStub,
+    daemon: &Daemon,
+    project: &std::path::Path,
+) -> anyhow::Result<(bool, Option<serde_json::Value>)> {
+    let _ = world;
+    provider.script([Reply::text("done")]);
+    let mut client = daemon.connect().await?;
+    let session = client
+        .session_create(json!({ "project_root": project.to_string_lossy() }))
+        .await?;
+    client
+        .session_run_turn(&session, "hello", "t1", None)
+        .await?;
+
+    let arrived = provider
+        .calls()
+        .last()
+        .is_some_and(|call| call.system_text().contains(SCRIPT_MARK));
+    let detail = client.session_get(&session).await?;
+    let ledger = detail
+        .result
+        .and_then(|r| r.get("scripts").cloned())
+        .filter(|v| !v.is_null());
+    Ok((arrived, ledger))
+}
+
+async fn a_bound_script_reaches_the_prompt_and_the_ledger(mode: Mode) -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = a_project_with_a_script(&world)?;
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(mode),
+    )
+    .await?;
+
+    let (arrived, ledger) = run_the_scripted_project(&world, &provider, &daemon, &project).await?;
+    assert!(
+        arrived,
+        "the project's script never reached the prompt the daemon sent"
+    );
+    let ledger = ledger.ok_or_else(|| {
+        anyhow::anyhow!("session.get reports no scripts at all on a session that bound one")
+    })?;
+    assert!(
+        ledger["applied"].as_u64().unwrap_or(0) >= 1,
+        "the ledger does not record the script as having applied anything: {ledger}"
+    );
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_script_reaches_the_prompt_and_the_ledger_here() -> anyhow::Result<()> {
+    a_bound_script_reaches_the_prompt_and_the_ledger(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn a_bound_script_reaches_the_prompt_and_the_ledger_in_a_spawned_daemon() -> anyhow::Result<()>
+{
+    a_bound_script_reaches_the_prompt_and_the_ledger(Mode::Spawned).await
+}
+
+/// The same project, against a daemon with no script engine in it.
+///
+/// Both halves are needed. That the mark is missing only says the script did
+/// not run; that `session.get` reports no scripts at all says why — there was
+/// nothing to run it, rather than a script that ran and did nothing. In a
+/// build with a carrier those two are told apart by the ledger, and this is
+/// the build where the ledger does not exist.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built without the script carrier"]
+async fn a_build_with_no_script_carrier_honors_no_scripts_section() -> anyhow::Result<()> {
+    let carrierless = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_NO_CARRIER",
+        "CARGO_TARGET_DIR=$PWD/target/no-carrier cargo build -p daemon --no-default-features\n  \
+         ATTA_TEST_DAEMON_BIN_NO_CARRIER=$PWD/target/no-carrier/debug/attacored cargo test \
+         -p daemon-harness -- --ignored",
+    )?;
+
+    let world = World::new()?;
+    let project = a_project_with_a_script(&world)?;
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(carrierless),
+    )
+    .await?;
+
+    let (arrived, ledger) = run_the_scripted_project(&world, &provider, &daemon, &project).await?;
+    assert!(
+        !arrived,
+        "a build with no script engine ran a script anyway — \
+         the `scripts` feature is not the only thing gating the carrier"
+    );
+    assert!(
+        ledger.is_none(),
+        "a build with no script engine reported a script ledger: {ledger:?}"
+    );
+    daemon.stop().await;
+    Ok(())
+}

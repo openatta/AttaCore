@@ -1,6 +1,6 @@
 # AttaCore 测试系统
 
-三层，各自回答不同的问题：
+分几层，各自回答不同的问题：
 
 | 位置 | 是什么 | 怎么跑 |
 |---|---|---|
@@ -8,6 +8,7 @@
 | `crates/*/tests/*.rs` | crate 验收：从公开的缝进去，这个 crate 的承诺还成立吗 | `cargo test` |
 | `daemon/tests/*.rs` | daemon 的 e2e：真的起一个 server，走真的 socket 收发 JSON-RPC | `cargo test -p daemon` |
 | `tests/runner/tests/*.rs` | 引擎行为网：真的驱动 Agent，模型那端是写死的脚本 | `cargo test -p test-runner` |
+| `tests/daemon_harness/tests/*.rs` | 装配面：从 JSON-RPC 进去，模型那端是一个 HTTP 桩；同一批用例跑「本进程」和「另起一个 attacored」两遍 | `cargo test -p daemon-harness`（跨进程那半在 `-- --ignored` 里） |
 | `tests/scripts/*.sh` | 构建面的断言（无插件构建里没有插件依赖等） | `tests/scripts/locked_build.sh` |
 
 **全部不联网、不需要凭据**，`cargo test --workspace` 一条命令跑完，CI 每次 push 都跑。
@@ -19,7 +20,7 @@
 
 ## 几个约定
 
-**模型那一端总是假的，但假法有三种，各答一个问题。**
+**模型那一端总是假的，但假法有四种，各答一个问题。**
 
 - `test_runner::scripted_model::ScriptedModel` —— 回答写在测试里。问的是「引擎拿到
   这串回答会怎么决策」，包括 529 过载、`prompt_too_long`、`max_tokens` 续写这些
@@ -30,6 +31,14 @@
   （运维者可以录自己的会话拿去排查），不再是测试基础设施：本仓库不再录制、也不再
   提交任何录像。用它的方式见 `docs/ARCHITECTURE.md` 与 `settings.json` 的
   `recorder` 段。
+- `daemon_harness::ProviderStub` —— 一个说 Anthropic SSE 的 HTTP 服务器。它扎得
+  最深：请求序列化、SSE 解码、退避重试全都真的在跑，而这三样在前三种假法里都被跳
+  过了。它也是**唯一能给另一个进程用的**假法——`Arc<dyn AnthropicClient>` 递不进
+  子进程，`ANTHROPIC_BASE_URL` 可以。桩记下收到的每个请求，「脚本/插件改了发出去
+  的东西吗」在 daemon 这一层只有这一个观测点。
+
+  它不是录像：回答写在 Rust 里，对提示词措辞不敏感。**不要**对整个请求做全量比
+  对——那会让它退化成一份每次改提示词就全挂的录像。
 
 **黄金轨迹要读 diff 再提交。** `turn_behavior_net.rs` 把事件流和会话日志归一化后比
 对黄金文件，`ATTA_UPDATE_GOLDEN=1` 重新生成——反射式重生成的黄金文件是一种更慢的

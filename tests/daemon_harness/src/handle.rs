@@ -72,6 +72,9 @@ pub struct DaemonOptions {
     pub extra_wires: bool,
     /// The discovery entry this daemon writes, in the modes that write one.
     pub instance: String,
+    /// Which `attacored` to spawn. `None` takes the one built beside this
+    /// test; a carrier case names another.
+    pub binary: Option<PathBuf>,
     /// Extra arguments for a spawned daemon. Ignored in this process, which
     /// has no command line to put them on.
     pub extra_args: Vec<String>,
@@ -87,8 +90,18 @@ impl DaemonOptions {
             prompt_timeout: Duration::from_secs(10),
             extra_wires: false,
             instance: "harness".to_string(),
+            binary: None,
             extra_args: Vec::new(),
         }
+    }
+
+    /// Spawn this binary instead of the one beside the test. The carriers
+    /// are compile-time features, so a case about one is a case about a
+    /// different build — there is no way to ask for it at runtime.
+    pub fn binary(mut self, path: PathBuf) -> Self {
+        self.binary = Some(path);
+        self.mode = Mode::Spawned;
+        self
     }
 
     pub fn mode(mut self, mode: Mode) -> Self {
@@ -431,7 +444,11 @@ async fn spawn_command(
         (None, None)
     };
 
-    let mut cmd = tokio::process::Command::new(daemon_binary()?);
+    let binary = match &opts.binary {
+        Some(path) => path.clone(),
+        None => daemon_binary()?,
+    };
+    let mut cmd = tokio::process::Command::new(binary);
     cmd.arg("--socket")
         .arg(&socket)
         .arg("--scene")
@@ -502,6 +519,28 @@ pub fn daemon_binary() -> anyhow::Result<PathBuf> {
         candidate.display()
     );
     Ok(candidate)
+}
+
+/// A daemon built with features this test binary was not built with.
+///
+/// It cannot be found by looking beside the test executable: both builds
+/// produce a binary called `attacored`, so the second one has to be built
+/// into a target directory of its own and named here. CI does that; a
+/// developer running these by hand is told how.
+pub fn alternate_daemon_binary(var: &str, how_to_build: &str) -> anyhow::Result<PathBuf> {
+    let path = std::env::var(var).map_err(|_| {
+        anyhow::anyhow!(
+            "{var} is not set, so there is no daemon to run this against.\n\
+             Build one and point at it:\n  {how_to_build}"
+        )
+    })?;
+    let path = PathBuf::from(path);
+    anyhow::ensure!(
+        path.exists(),
+        "{var} points at {}, which does not exist",
+        path.display()
+    );
+    Ok(path)
 }
 
 /// A port nothing is listening on. Racy by construction — the listener is
