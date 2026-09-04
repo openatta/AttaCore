@@ -116,7 +116,13 @@ impl telemetry::TelemetryRecorder for OtelExporter {
             }
             EventPayload::ApiRequest(p) => {
                 record_api_latency(p.latency_ms as f64, &p.model);
-                record_token_usage(p.input_tokens, p.output_tokens, &p.model);
+                record_token_usage(
+                    p.input_tokens,
+                    p.output_tokens,
+                    p.cache_creation_tokens,
+                    p.cache_read_tokens,
+                    &p.model,
+                );
             }
             _ => {}
         }
@@ -297,7 +303,18 @@ pub fn record_api_latency(latency_ms: f64, model: &str) {
 /// Record token usage via the global meter provider.
 ///
 /// This is a no-op if the global meter provider has not been configured.
-pub fn record_token_usage(input_tokens: u64, output_tokens: u64, model: &str) {
+/// One call's token counts, one histogram, one `direction` per kind.
+///
+/// Cache reads and writes are their own directions rather than being folded
+/// into `input`: they are priced differently, so a dashboard that added them
+/// together could not compute a cost from what it sees.
+pub fn record_token_usage(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    model: &str,
+) {
     let meter = opentelemetry::global::meter("attacore");
     let hist = meter
         .u64_histogram("atta.token.usage")
@@ -315,6 +332,20 @@ pub fn record_token_usage(input_tokens: u64, output_tokens: u64, model: &str) {
         output_tokens,
         &[
             KeyValue::new("direction", "output"),
+            KeyValue::new("model", model.to_string()),
+        ],
+    );
+    hist.record(
+        cache_creation_tokens,
+        &[
+            KeyValue::new("direction", "cache_creation"),
+            KeyValue::new("model", model.to_string()),
+        ],
+    );
+    hist.record(
+        cache_read_tokens,
+        &[
+            KeyValue::new("direction", "cache_read"),
             KeyValue::new("model", model.to_string()),
         ],
     );

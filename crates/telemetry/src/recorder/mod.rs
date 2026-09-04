@@ -903,6 +903,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 11,
                     output_tokens: 3,
+                    ..Default::default()
                 },
             },
         ]

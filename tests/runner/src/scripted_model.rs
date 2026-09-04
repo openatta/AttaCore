@@ -215,6 +215,7 @@ impl ScriptedModel {
             q.extend(per_call.iter().map(|(i, o)| Usage {
                 input_tokens: *i,
                 output_tokens: *o,
+                ..Default::default()
             }));
         }
         self

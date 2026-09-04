@@ -516,6 +516,7 @@ mod tests {
                     usage: Usage {
                         input_tokens: 1,
                         output_tokens: 2,
+                        ..Default::default()
                     },
                 },
             },

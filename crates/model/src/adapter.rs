@@ -183,7 +183,7 @@ impl Model for AnthropicModel {
 #[derive(Default)]
 struct StreamState {
     tool_uses: std::collections::HashMap<u32, PendingToolUse>,
-    input_tokens: u32,
+    opening_usage: base::interface::model::Usage,
 }
 
 struct PendingToolUse {
@@ -388,7 +388,13 @@ fn map_stream_event(
         // nothing else. Kept rather than emitted: a caller wants one usage
         // figure per call, at the end, and that is what `EndTurn` is.
         StreamEvent::MessageStart { message } => {
-            acc.input_tokens = message.usage.input_tokens as u32;
+            acc.opening_usage = Usage {
+                input_tokens: message.usage.input_tokens as u32,
+                output_tokens: 0,
+                cache_creation_input_tokens: message.usage.cache_creation_input_tokens.unwrap_or(0)
+                    as u32,
+                cache_read_input_tokens: message.usage.cache_read_input_tokens.unwrap_or(0) as u32,
+            };
             vec![]
         }
         StreamEvent::MessageDelta { delta, usage } => {
@@ -405,18 +411,32 @@ fn map_stream_event(
                 .unwrap_or("unknown")
                 .to_string();
             let reported = usage.unwrap_or_default();
+            // A relay that repeats an input-side count here is the later word
+            // on the same call and wins; the usual wire says nothing about
+            // any of them here, and the opening event answers instead.
+            let later_or_opening = |reported: u64, opening: u32| {
+                if reported > 0 {
+                    reported as u32
+                } else {
+                    opening
+                }
+            };
             vec![Ok(ModelEvent::EndTurn {
                 stop_reason,
                 usage: Usage {
-                    // A relay that repeats the input count here is the later
-                    // word on the same call and wins; the usual wire says
-                    // nothing, and the opening event answers instead.
-                    input_tokens: if reported.input_tokens > 0 {
-                        reported.input_tokens as u32
-                    } else {
-                        acc.input_tokens
-                    },
+                    input_tokens: later_or_opening(
+                        reported.input_tokens,
+                        acc.opening_usage.input_tokens,
+                    ),
                     output_tokens: reported.output_tokens as u32,
+                    cache_creation_input_tokens: later_or_opening(
+                        reported.cache_creation_input_tokens.unwrap_or(0),
+                        acc.opening_usage.cache_creation_input_tokens,
+                    ),
+                    cache_read_input_tokens: later_or_opening(
+                        reported.cache_read_input_tokens.unwrap_or(0),
+                        acc.opening_usage.cache_read_input_tokens,
+                    ),
                 },
             })]
         }
@@ -511,6 +531,46 @@ mod map_stream_event_tests {
         let usage = end_turn_usage(&out);
         assert_eq!(usage.input_tokens, 101, "the input count was dropped");
         assert_eq!(usage.output_tokens, 17);
+    }
+
+    /// A cached read is billed at a fraction of a fresh one, and a cache
+    /// write at a premium. Folding either into `input_tokens` misprices the
+    /// call in opposite directions, so both travel as themselves.
+    #[test]
+    fn the_cache_counts_travel_with_the_input_count() {
+        let out = run(vec![
+            StreamEvent::MessageStart {
+                message: crate::stream::MessageStartPayload {
+                    id: "msg_1".into(),
+                    model: "m".into(),
+                    role: "assistant".into(),
+                    usage: crate::stream::Usage {
+                        input_tokens: 20,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: Some(7),
+                        cache_read_input_tokens: Some(13),
+                    },
+                    stop_reason: None,
+                },
+            },
+            StreamEvent::MessageDelta {
+                delta: crate::stream::MessageDeltaPayload {
+                    stop_reason: Some(base::message::StopReason::EndTurn),
+                    stop_sequence: None,
+                },
+                usage: Some(crate::stream::Usage {
+                    input_tokens: 0,
+                    output_tokens: 4,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                }),
+            },
+        ]);
+
+        let usage = end_turn_usage(&out);
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_creation_input_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 13);
     }
 
     /// A relay that repeats the input count in `message_delta` is believed

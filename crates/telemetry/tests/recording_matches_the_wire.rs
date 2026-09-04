@@ -136,6 +136,10 @@ fn realistic_response(tool_id: &str) -> Vec<ModelEvent> {
         usage: Usage {
             input_tokens: 1024,
             output_tokens: 57,
+            // A cached read is priced differently from a fresh one, so a
+            // recording that lost it would misprice every replay.
+            cache_creation_input_tokens: 128,
+            cache_read_input_tokens: 896,
         },
     });
     events

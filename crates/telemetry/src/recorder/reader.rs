@@ -257,6 +257,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 5,
                     output_tokens: 6,
+                    ..Default::default()
                 }),
                 duration_ms: 100,
             }))

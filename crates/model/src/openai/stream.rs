@@ -103,11 +103,10 @@ pub struct ChunkUsage {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct PromptTokensDetails {
-    /// Tokens served from the provider's automatic prefix cache. **Currently
-    /// parsed but not forwarded**: `base::interface::model::Usage` has only
-    /// `input_tokens` / `output_tokens`, with no cache-read field, so there is
-    /// nowhere protocol-agnostic to put it. Kept here (and logged) so the
-    /// wiring is a one-line change once that struct grows the field.
+    /// Tokens served from the provider's automatic prefix cache, forwarded as
+    /// `Usage::cache_read_input_tokens` — the same field the Anthropic path
+    /// fills from its own cache figures, since a cached read is priced the
+    /// same way whichever protocol reported it.
     #[serde(default)]
     pub cached_tokens: Option<u32>,
 }
@@ -134,7 +133,6 @@ pub struct ChunkAccumulator {
     pending: BTreeMap<u32, PendingToolCall>,
     stop_reason: Option<String>,
     usage: Usage,
-    cached_tokens: Option<u32>,
     /// Set once a terminal event has been produced, so a stray trailing chunk
     /// after `finish_reason` cannot emit a second `EndTurn`.
     finished: bool,
@@ -149,8 +147,15 @@ impl ChunkAccumulator {
             self.usage = Usage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
+                // This protocol has no notion of a cache *write*: the prefix
+                // cache is the provider's own and nobody is billed for
+                // filling it.
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: u
+                    .prompt_tokens_details
+                    .and_then(|d| d.cached_tokens)
+                    .unwrap_or(0),
             };
-            self.cached_tokens = u.prompt_tokens_details.and_then(|d| d.cached_tokens);
         }
 
         for choice in chunk.choices {
@@ -206,12 +211,6 @@ impl ChunkAccumulator {
         // `finish_reason` would otherwise silently swallow its own tool calls.
         let mut out = self.drain_tool_calls();
 
-        if let Some(cached) = self.cached_tokens {
-            tracing::debug!(
-                cached_tokens = cached,
-                "openai prompt cache hit (not forwarded — base::Usage has no cache-read field)"
-            );
-        }
         out.push(ModelEvent::EndTurn {
             // No `finish_reason` at all means the stream ended cleanly without
             // the server saying why — treat that as a normal end of turn
@@ -372,6 +371,32 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The prefix cache count is part of what the call cost, not a detail of
+    /// how the provider served it: it is priced separately and has to reach
+    /// the same place the other counts do.
+    #[test]
+    fn a_cached_prompt_read_reaches_end_turn() {
+        let events = run(&[
+            json!({"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 300,
+                "completion_tokens": 9,
+                "prompt_tokens_details": {"cached_tokens": 256}
+            }}),
+        ]);
+
+        match events.last().expect("EndTurn") {
+            ModelEvent::EndTurn { usage, .. } => {
+                assert_eq!(usage.input_tokens, 300);
+                assert_eq!(
+                    usage.cache_read_input_tokens, 256,
+                    "the cached read was dropped"
+                );
+            }
+            other => panic!("expected EndTurn, got {other:?}"),
+        }
     }
 
     /// Text deltas concatenate, the role-only opening chunk contributes

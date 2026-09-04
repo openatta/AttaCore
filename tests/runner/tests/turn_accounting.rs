@@ -33,6 +33,7 @@ fn expected_total() -> Usage {
     Usage {
         input_tokens: PER_CALL.iter().map(|(i, _)| i).sum(),
         output_tokens: PER_CALL.iter().map(|(_, o)| o).sum(),
+        ..Default::default()
     }
 }
 

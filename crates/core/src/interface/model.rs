@@ -342,6 +342,18 @@ pub enum ModelEvent {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens written into the prompt cache by this call, and tokens read
+    /// back from it. Both are priced differently from ordinary input — a
+    /// cache read costs a fraction of one — so a report that folded them
+    /// into `input_tokens` would overcharge and one that dropped them, as
+    /// this type used to force, undercharges by whatever the cache covered.
+    ///
+    /// `#[serde(default)]` because recordings written before these existed
+    /// must still read back.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 impl Usage {
@@ -356,6 +368,12 @@ impl Usage {
         Usage {
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
         }
     }
 }

@@ -31,6 +31,13 @@ pub struct ApiRequestPayload {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens this call wrote into the prompt cache, and tokens it read back
+    /// from it. Separate fields because they are separate prices — a read is
+    /// a fraction of ordinary input and a write is a premium on it — and
+    /// `crate::cost` has priced all four since it was written, with nothing
+    /// feeding it the last two.
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
     /// Wall clock for the whole call, request to last event.
     pub latency_ms: u64,
     pub stop_reason: String,
@@ -150,6 +157,8 @@ mod tests {
                 model: "claude-sonnet-5".into(),
                 input_tokens: 1200,
                 output_tokens: 300,
+                cache_creation_tokens: 64,
+                cache_read_tokens: 900,
                 latency_ms: 2100,
                 stop_reason: "end_turn".into(),
                 input_message_count: 5,
@@ -162,6 +171,7 @@ mod tests {
             serde_json::to_value(event).expect("serialization of telemetry event should not fail");
         assert_eq!(v["type"], "api_request");
         assert_eq!(v["input_tokens"], 1200);
+        assert_eq!(v["cache_read_tokens"], 900);
     }
 
     #[test]

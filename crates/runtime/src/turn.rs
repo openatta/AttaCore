@@ -1102,6 +1102,8 @@ impl Agent {
                         model: effective_model.clone(),
                         input_tokens: usage.input_tokens as u64,
                         output_tokens: usage.output_tokens as u64,
+                        cache_creation_tokens: usage.cache_creation_input_tokens as u64,
+                        cache_read_tokens: usage.cache_read_input_tokens as u64,
                         latency_ms: call_started.elapsed().as_millis() as u64,
                         stop_reason: stop_reason.clone(),
                         input_message_count: sent_message_count,
@@ -5606,6 +5608,7 @@ mod tests {
             usage: base::interface::model::Usage {
                 input_tokens: 800,
                 output_tokens: 300,
+                ..Default::default()
             },
         });
         let scene: Arc<dyn base::interface::scene::AgentScene> =

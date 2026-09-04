@@ -38,6 +38,8 @@ use tokio::net::TcpListener;
 /// case can tell an input count from an output one at a glance.
 pub const INPUT_TOKENS: u64 = 11;
 pub const OUTPUT_TOKENS: u64 = 7;
+pub const CACHE_CREATION_TOKENS: u64 = 5;
+pub const CACHE_READ_TOKENS: u64 = 23;
 
 /// One content block of a scripted answer.
 pub enum Block {
@@ -339,7 +341,12 @@ fn sse_response(blocks: &[Block]) -> String {
             "id": "msg_stub",
             "model": "claude-sonnet-4-6",
             "role": "assistant",
-            "usage": { "input_tokens": INPUT_TOKENS, "output_tokens": 0 }
+            "usage": {
+                "input_tokens": INPUT_TOKENS,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": CACHE_CREATION_TOKENS,
+                "cache_read_input_tokens": CACHE_READ_TOKENS
+            }
         }
     })));
 

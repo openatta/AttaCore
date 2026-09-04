@@ -730,6 +730,19 @@ async fn telemetry_counts_what_the_turn_actually_did(mode: Mode) -> anyhow::Resu
             Some(daemon_harness::provider::OUTPUT_TOKENS),
             "the output count the wire carried is not in the telemetry: {request}"
         );
+        // Their own fields, not folded into the input count: a cache read is
+        // priced at a fraction of ordinary input and a write at a premium, so
+        // one number for all three cannot be turned back into a cost.
+        assert_eq!(
+            request["cache_creation_tokens"].as_u64(),
+            Some(daemon_harness::provider::CACHE_CREATION_TOKENS),
+            "the cache write the wire reported is not in the telemetry: {request}"
+        );
+        assert_eq!(
+            request["cache_read_tokens"].as_u64(),
+            Some(daemon_harness::provider::CACHE_READ_TOKENS),
+            "the cache read the wire reported is not in the telemetry: {request}"
+        );
     }
 
     let complete = of_type("turn_complete");

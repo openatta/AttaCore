@@ -102,6 +102,14 @@ jobs:
             exit 1
           fi
 
+      # The OTLP recorder is compiled out of every default build — the SDK is
+      # a large dependency tree and the file recorder is what makes a run
+      # debuggable out of the box — so nothing else builds this module at all.
+      # It reads the same event payloads the file recorder does, which is
+      # exactly why it rots silently when one of them grows a field.
+      - name: otel recorder
+        run: cargo check -p daemon --features otel
+
       # The OS sandbox is optional too, and independent of the carriers. Its
       # backends and the ~30 tests that drive them are compiled out of every
       # default build, so this job is the only place they are built at all —
