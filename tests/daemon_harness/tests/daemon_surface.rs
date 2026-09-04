@@ -1364,6 +1364,120 @@ async fn a_trapping_component_costs_its_call_and_not_the_turn() -> anyhow::Resul
     Ok(())
 }
 
+/// Three faults in a row and the plugin is set aside — all of it, not just
+/// the tool that trapped.
+///
+/// Per-call isolation is what makes it safe to keep calling something that
+/// just failed; it is not a reason to. A component that traps on every
+/// invocation turns each of the model's attempts into an error result and the
+/// model will keep trying, so something has to decide the plugin is broken.
+/// `wasm-host` counts the faults and `HealthRegistry` makes the verdict
+/// outlive the instance; neither can say whether a turn ever reaches the
+/// refusal, which is the only form of it anyone sees.
+///
+/// The last call is the point. It asks a tool that works, and is refused
+/// anyway, because health is the plugin's and not the tool's — a breaker that
+/// only stopped the trapping tool would leave the model working its way
+/// through the other four.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built with the plugin carrier"]
+async fn a_plugin_that_keeps_faulting_is_set_aside() -> anyhow::Result<()> {
+    let with_plugins = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_PLUGINS",
+        PLUGIN_DAEMON_HOWTO,
+    )?;
+
+    let world = World::new()?;
+    let project = world.project("faulting")?;
+    world.write_project_settings(
+        "faulting",
+        &json!({
+            "memory_enabled": false,
+            "permission_rules": [
+                { "tool": "plugin__echo-plugin__explode", "action": "allow" },
+                { "tool": "plugin__echo-plugin__echo", "action": "allow" }
+            ]
+        }),
+    )?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(with_plugins),
+    )
+    .await?;
+    let mut client = daemon.connect().await?;
+    install_the_component_package(&world, &mut client).await?;
+
+    // `wasm_host::health::FAULT_LIMIT` is three. One short of it would prove
+    // nothing, so this goes exactly to it and then asks for something else.
+    provider.script([
+        Reply::Blocks(vec![Block::tool(
+            "t1",
+            "plugin__echo-plugin__explode",
+            json!({}),
+        )]),
+        Reply::Blocks(vec![Block::tool(
+            "t2",
+            "plugin__echo-plugin__explode",
+            json!({}),
+        )]),
+        Reply::Blocks(vec![Block::tool(
+            "t3",
+            "plugin__echo-plugin__explode",
+            json!({}),
+        )]),
+        Reply::Blocks(vec![Block::tool(
+            "healthy",
+            "plugin__echo-plugin__echo",
+            json!({ "text": "anyone home" }),
+        )]),
+        Reply::text("done"),
+    ]);
+
+    let session = client
+        .session_create(json!({
+            "project_root": project.to_string_lossy(),
+            "scene": "plugin:echo-plugin",
+        }))
+        .await?;
+    client
+        .session_run_turn(&session, "keep at it", "t1", None)
+        .await?;
+
+    let reason_for = |call: usize, id: &str| -> anyhow::Result<String> {
+        let result = tool_result_for(&provider.calls()[call], id)
+            .ok_or_else(|| anyhow::anyhow!("no result for `{id}` reached the model"))?;
+        anyhow::ensure!(
+            result["is_error"] == json!(true),
+            "`{id}` did not reach the model as a failure: {result}"
+        );
+        let mut text = String::new();
+        collect_text(&result["content"], &mut text);
+        Ok(text)
+    };
+
+    // The three that trapped say so, and say nothing about being disabled —
+    // the third is the one that trips the limit, not the one that reports it.
+    for (call, id) in [(1, "t1"), (2, "t2"), (3, "t3")] {
+        let reason = reason_for(call, id)?;
+        assert!(
+            !reason.contains("disabled"),
+            "call {call} was refused before the limit was reached: {reason}"
+        );
+    }
+
+    let refused = reason_for(4, "healthy")?;
+    assert!(
+        refused.contains("disabled") && refused.contains("consecutive"),
+        "a tool that works was called anyway after its plugin was set aside: {refused}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
 /// A capability the package never declared is unreachable, and the guest is
 /// told which one would have allowed it.
 ///
