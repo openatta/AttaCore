@@ -22,22 +22,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio_util::sync::CancellationToken;
 
-/// Build a zip archive (in memory) for a minimal demo plugin declaring one
-/// `/name` slash command, write it to `dir`, and return `(archive_path,
-/// sha256_hex)`.
+/// Build a zip archive (in memory) around one `plugin.toml`, write it to
+/// `dir`, and return `(archive_path, sha256_hex)`.
 #[cfg(feature = "plugin-packages")]
-fn build_demo_plugin_zip(dir: &std::path::Path, plugin_name: &str) -> (PathBuf, String) {
+fn build_plugin_zip(dir: &std::path::Path, plugin_name: &str, manifest: &str) -> (PathBuf, String) {
     let mut buf = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
         let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
         writer.start_file("plugin.toml", opts).unwrap();
         use std::io::Write;
-        write!(
-            writer,
-            "[plugin]\nname = \"{plugin_name}\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\ndescription = \"demo plugin\"\n"
-        )
-        .unwrap();
+        write!(writer, "{manifest}").unwrap();
         writer.finish().unwrap();
     }
     let archive_path = dir.join(format!("{plugin_name}.zip"));
@@ -46,6 +41,18 @@ fn build_demo_plugin_zip(dir: &std::path::Path, plugin_name: &str) -> (PathBuf, 
     hasher.update(&buf);
     let checksum = hex::encode(hasher.finalize());
     (archive_path, checksum)
+}
+
+/// A minimal demo plugin declaring one `/name` slash command.
+#[cfg(feature = "plugin-packages")]
+fn build_demo_plugin_zip(dir: &std::path::Path, plugin_name: &str) -> (PathBuf, String) {
+    build_plugin_zip(
+        dir,
+        plugin_name,
+        &format!(
+            "[plugin]\nname = \"{plugin_name}\"\nversion = \"1.0.0\"\napi_version = \"0.1\"\ndescription = \"demo plugin\"\n"
+        ),
+    )
 }
 
 /// Always-allow permission for tests.
@@ -806,6 +813,62 @@ async fn plugin_install_rejects_bad_checksum() {
     assert!(
         v["error"]["message"].as_str().unwrap().contains("checksum"),
         "resp: {v}"
+    );
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
+/// Installing and being found are two different pieces of code, and only one
+/// of them reads the manifest. A package that unpacks but will not load is
+/// installed in no sense the caller cares about: it never appears in
+/// `plugin.list`, contributes nothing, and — before this — reported success
+/// on the way in, so nothing anywhere said why.
+#[cfg(feature = "plugin-packages")]
+#[tokio::test]
+async fn plugin_install_refuses_a_package_it_cannot_load_back() {
+    let (_server, sock, dir, handle) = start_server().await;
+    // No `api_version`, which is a parse error rather than a default — the
+    // same shape as the committed `demo-plugin` fixture, which spent a
+    // release being installed successfully and then skipped by discovery.
+    let (archive_path, checksum) = build_plugin_zip(
+        dir.path(),
+        "unloadable",
+        "[plugin]\nname = \"unloadable\"\nversion = \"1.0.0\"\ndescription = \"no api_version\"\n",
+    );
+
+    let resp = rpc_call(
+        &sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"plugin.install","id":1,"params":{{"name":"unloadable","version":"1.0.0","download_url":"file://{}","checksum":"{}"}}}}"#,
+            archive_path.display(),
+            checksum,
+        ),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], codes::INVALID_PARAMS, "resp: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("api_version"),
+        "the refusal does not say what was wrong with the package: {v}"
+    );
+
+    // And it is gone, not left unpacked where a later `plugin.list` would
+    // keep skipping it in silence.
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"plugin.list","id":2}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let names: Vec<&str> = v["result"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"unloadable"),
+        "the refused package was left behind: {names:?}"
     );
 
     _server.shutdown_token().cancel();

@@ -250,6 +250,25 @@ mod packages {
             }
         }
 
+        /// Load back what was just installed, the way discovery will.
+        ///
+        /// Unpacking and being found are two different pieces of code and
+        /// only the second one reads the manifest, so a package can unpack
+        /// cleanly and still be one nothing will ever load. Left alone it is
+        /// installed in no sense a caller cares about: absent from `list`,
+        /// contributing nothing, with the reason in a log line nobody is
+        /// reading. Asking here is what turns that into an answer at the
+        /// moment somebody is standing in front of it.
+        pub fn load_back(&self, name: &str, version: &str, scope: &str) -> Result<(), String> {
+            let cache = plugin::cache::PluginCache::new(self.tier_root(scope)?.join("cache"));
+            let manifest = cache
+                .cached_manifest(name, version)
+                .ok_or_else(|| format!("no plugin.toml in the installed package `{name}`"))?;
+            plugin::manifest::Plugin::load(&cache.version_dir(name, version), &manifest)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+
         pub fn commands_for(&self, scope: &str) -> Result<plugin::cli::PluginCommands, String> {
             let cache = plugin::cache::PluginCache::new(self.tier_root(scope)?.join("cache"));
             Ok(plugin::cli::PluginCommands::new(cache, None))
@@ -512,6 +531,15 @@ mod imp {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            // Before the compiler, which has nothing to say about a
+            // manifest that will not parse.
+            if let Err(e) = self.packages.load_back(name, version, scope) {
+                let _ = commands.uninstall(name, Some(version)).await;
+                return Err(format!(
+                    "installed but could not be loaded back, so it was removed: {e}"
+                ));
+            }
+
             // Ahead of the refresh, and fatal: a plugin whose components
             // cannot be compiled is one that will fail to load every time,
             // and discovering that at install — where the user is standing
@@ -698,6 +726,13 @@ mod imp {
                 .install_source(name, &source)
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Err(e) = self.packages.load_back(name, version, scope) {
+                let _ = commands.uninstall(name, Some(version)).await;
+                return Err(format!(
+                    "installed but could not be loaded back, so it was removed: {e}"
+                ));
+            }
+
             // No compile step, and nothing to roll back for want of one:
             // this build would not run the components either way, and the
             // disclosure says so.

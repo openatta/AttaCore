@@ -34,6 +34,11 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// What every scripted answer reports having spent. Fixed and distinct, so a
+/// case can tell an input count from an output one at a glance.
+pub const INPUT_TOKENS: u64 = 11;
+pub const OUTPUT_TOKENS: u64 = 7;
+
 /// One content block of a scripted answer.
 pub enum Block {
     Text(String),
@@ -324,13 +329,17 @@ fn sse_response(blocks: &[Block]) -> String {
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
     );
 
+    // Usage is split the way the real wire splits it: the input count
+    // arrives in `message_start` and only the output count is repeated in
+    // `message_delta`. A stub that put both in one event would let a reader
+    // that ignores half of them look correct.
     out.push_str(&event(&serde_json::json!({
         "type": "message_start",
         "message": {
             "id": "msg_stub",
             "model": "claude-sonnet-4-6",
             "role": "assistant",
-            "usage": { "input_tokens": 11, "output_tokens": 0 }
+            "usage": { "input_tokens": INPUT_TOKENS, "output_tokens": 0 }
         }
     })));
 
@@ -377,7 +386,7 @@ fn sse_response(blocks: &[Block]) -> String {
     out.push_str(&event(&serde_json::json!({
         "type": "message_delta",
         "delta": { "stop_reason": if calls_a_tool { "tool_use" } else { "end_turn" } },
-        "usage": { "input_tokens": 0, "output_tokens": 7 }
+        "usage": { "output_tokens": OUTPUT_TOKENS }
     })));
     out.push_str(&event(&serde_json::json!({ "type": "message_stop" })));
     out

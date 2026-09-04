@@ -24,6 +24,37 @@ use daemon_harness::{Block, Daemon, DaemonOptions, Mode, ProviderStub, Reply, Wo
 use serde_json::json;
 use std::time::Duration;
 
+/// The events a session has written so far, waited for rather than read once.
+///
+/// Telemetry leaves the engine on a channel and is written by another task,
+/// so a turn's last events land some time after the RPC that produced them
+/// has already answered. Reading the file the moment a turn returns is a race
+/// that only loses under load — which is to say, in CI.
+async fn telemetry_until(
+    path: &std::path::Path,
+    enough: impl Fn(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if enough(&events) || std::time::Instant::now() > deadline {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn kinds(events: &[serde_json::Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+        .collect()
+}
+
 /// A daemon, a stub, and a project — the three every case starts with.
 async fn stage(
     name: &str,
@@ -186,13 +217,8 @@ async fn a_session_writes_the_telemetry_it_was_asked_for(mode: Mode) -> anyhow::
         .session_run_turn(&session, "hello", "t1", None)
         .await?;
 
-    let written = std::fs::read_to_string(&output)
-        .map_err(|e| anyhow::anyhow!("no telemetry at {}: {e}", output.display()))?;
-    let kinds: Vec<String> = written
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("type").and_then(|k| k.as_str()).map(str::to_string))
-        .collect();
+    let events = telemetry_until(&output, |events| kinds(events).contains(&"turn_complete")).await;
+    let written = kinds(&events);
     for expected in [
         "session_start",
         "turn_start",
@@ -200,10 +226,11 @@ async fn a_session_writes_the_telemetry_it_was_asked_for(mode: Mode) -> anyhow::
         "turn_complete",
     ] {
         assert!(
-            kinds.iter().any(|k| k == expected),
-            "no `{expected}` in the telemetry a turn wrote: {kinds:?}"
+            written.contains(&expected),
+            "no `{expected}` in the telemetry a turn wrote: {written:?}"
         );
     }
+
     daemon.stop().await;
     Ok(())
 }
@@ -650,10 +677,7 @@ async fn telemetry_counts_what_the_turn_actually_did(mode: Mode) -> anyhow::Resu
         .session_run_turn(&session, "write it", "t1", None)
         .await?;
 
-    let events: Vec<serde_json::Value> = std::fs::read_to_string(&output)?
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    let events = telemetry_until(&output, |events| kinds(events).contains(&"turn_complete")).await;
     let of_type = |kind: &str| -> Vec<&serde_json::Value> {
         events
             .iter()
@@ -661,10 +685,28 @@ async fn telemetry_counts_what_the_turn_actually_did(mode: Mode) -> anyhow::Resu
             .collect()
     };
 
+    // Both sides are scoped to the turn, and neither is a raw count. The
+    // engine makes one more model call after the turn returns — memory
+    // extraction, on a smaller model, with no system prompt and no tools —
+    // and it lands asynchronously, so `provider.call_count()` grows on its
+    // own schedule. The turn's own calls are the ones carrying its tool
+    // table; that call is not one of them.
+    let turn_calls = provider
+        .calls()
+        .into_iter()
+        .filter(|c| !c.tool_names().is_empty())
+        .count();
+    let turn_requests = of_type("api_request")
+        .into_iter()
+        .filter(|e| e.get("turn_id").and_then(|v| v.as_str()) == Some("t1"))
+        .count();
     assert_eq!(
-        of_type("api_request").len(),
-        provider.call_count(),
+        turn_requests, turn_calls,
         "telemetry and the provider disagree about how many calls this turn made"
+    );
+    assert_eq!(
+        turn_calls, 2,
+        "the scripted turn should have made two calls"
     );
     let executions = of_type("tool_execution");
     assert!(
