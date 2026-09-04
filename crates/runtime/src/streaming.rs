@@ -75,7 +75,7 @@ pub async fn execute_stream<F, Fut, G>(
 ) -> Result<StreamResult, crate::turn::TurnError>
 where
     F: Fn(String, serde_json::Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<(String, Option<Vec<serde_json::Value>>), String>> + Send,
+    Fut: Future<Output = base::interface::tool_middleware::ToolOutcome> + Send,
     G: Fn(&str, &serde_json::Value) -> bool + Send + Sync,
 {
     use futures::StreamExt;
@@ -248,12 +248,11 @@ where
                     // then flush the whole batch as one paired message pair.
                     if !batch_futures.is_empty() {
                         while let Some((idx, tid, result)) = batch_futures.next().await {
-                            let is_err = result.is_err();
-                            let (content, new_msgs) = match &result {
-                                Ok((t, msgs)) => (t.clone(), msgs.clone()),
-                                Err(e) => (e.clone(), None),
-                            };
-                            if is_err {
+                            let (content, new_msgs, failed) = read_outcome(&result);
+                            // Only an `Err` takes the batch down with it. A
+                            // tool that ran and reports a failure has not
+                            // said anything about its siblings.
+                            if result.is_err() {
                                 batch_abort.cancel();
                             }
                             let tname = queued_tools
@@ -268,7 +267,7 @@ where
                                 &tid,
                                 &tname,
                                 &content,
-                                is_err,
+                                failed,
                             );
                             if let Some(msgs) = new_msgs {
                                 pending_new_msgs.push(msgs);
@@ -277,11 +276,7 @@ where
                     }
                     // Execute the sequential tool
                     let result = execute_tool(name.clone(), input).await;
-                    let is_err = result.is_err();
-                    let (content, new_msgs) = match &result {
-                        Ok((t, msgs)) => (t.clone(), msgs.clone()),
-                        Err(e) => (e.clone(), None),
-                    };
+                    let (content, new_msgs, failed) = read_outcome(&result);
                     buffer_result(
                         event_tx,
                         &turn_id,
@@ -290,7 +285,7 @@ where
                         &id,
                         &name,
                         &content,
-                        is_err,
+                        failed,
                     );
                     if let Some(msgs) = new_msgs {
                         pending_new_msgs.push(msgs);
@@ -352,10 +347,7 @@ where
         if is_err {
             batch_abort.cancel();
         }
-        let (content, new_msgs) = match &result {
-            Ok((t, msgs)) => (t.clone(), msgs.clone()),
-            Err(e) => (e.clone(), None),
-        };
+        let (content, new_msgs, failed) = read_outcome(&result);
         let tname = queued_tools
             .get(idx)
             .map(|t| t.name.clone())
@@ -368,7 +360,7 @@ where
             &tid,
             &tname,
             &content,
-            is_err,
+            failed,
         );
         if let Some(msgs) = new_msgs {
             pending_new_msgs.push(msgs);
@@ -390,6 +382,23 @@ where
         has_tool_uses,
         tool_calls,
     })
+}
+
+/// One outcome, read the two ways the loop needs it: what the model is shown,
+/// and whether that is a failure.
+///
+/// The second is not `is_err`. A tool that ran and calls its own result a
+/// failure — a non-zero exit, an MCP server's `isError`, a trapped guest —
+/// belongs on the wire with `is_error: true` and does *not* cancel the
+/// siblings sharing its batch, which is what an `Err` here means and what the
+/// caller keeps reading `is_err` for.
+fn read_outcome(
+    outcome: &base::interface::tool_middleware::ToolOutcome,
+) -> (String, Option<Vec<serde_json::Value>>, bool) {
+    match outcome {
+        Ok(a) => (a.text.clone(), a.new_messages.clone(), a.reported_failure),
+        Err(e) => (e.clone(), None, true),
+    }
 }
 
 /// Buffer a tool result (not yet pushed to the session — see
@@ -535,6 +544,7 @@ fn inject_new_messages(
 mod tests {
     use super::*;
     use base::interface::model::{ModelError, ModelEvent, Usage};
+    use base::interface::tool_middleware::ToolAnswer;
 
     /// Thinking blocks must survive into the transcript, with their
     /// signatures, and must lead the assistant turn.
@@ -582,7 +592,7 @@ mod tests {
             &mut session,
             &tx,
             "test-turn".into(),
-            |_name, _input| async move { Ok(("ok".to_string(), None)) },
+            |_name, _input| async move { Ok(ToolAnswer::text("ok")) },
             |_name, _input| true,
             CancellationToken::new(),
             &[],
@@ -649,7 +659,7 @@ mod tests {
             &mut session,
             &tx,
             "test-turn".into(),
-            |_name, _input| async move { Ok(("ok".to_string(), None)) },
+            |_name, _input| async move { Ok(ToolAnswer::text("ok")) },
             |_name, _input| true,
             CancellationToken::new(),
             &[],
@@ -708,7 +718,7 @@ mod tests {
             &mut session,
             &tx,
             "test-turn".into(),
-            |_name, _input| async move { Ok(("ok".to_string(), None)) },
+            |_name, _input| async move { Ok(ToolAnswer::text("ok")) },
             |_name, _input| true,
             CancellationToken::new(),
             &[],
@@ -774,7 +784,7 @@ mod tests {
             &mut session,
             &tx,
             "test-turn".into(),
-            |_name, _input| async move { Ok(("ok".to_string(), None)) },
+            |_name, _input| async move { Ok(ToolAnswer::text("ok")) },
             |name, _input| name == "Glob", // Glob concurrency-safe, Bash is not
             CancellationToken::new(),
             &[],
@@ -818,7 +828,7 @@ mod tests {
             &mut session,
             &tx,
             "test-turn".into(),
-            |_name, _input| async move { Ok(("ok".to_string(), None)) },
+            |_name, _input| async move { Ok(ToolAnswer::text("ok")) },
             |_name, _input| true,
             CancellationToken::new(),
             &[],
@@ -890,7 +900,7 @@ mod tests {
                     _ => 0,
                 };
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                Ok((format!("done:{pattern}"), None))
+                Ok(ToolAnswer::text(format!("done:{pattern}")))
             },
             |_name, _input| true,
             CancellationToken::new(),
@@ -966,7 +976,7 @@ mod tests {
                     // Would take 30s if actually run to completion — the
                     // test's own timeout below is the proof it didn't.
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    Ok(("done".to_string(), None))
+                    Ok(ToolAnswer::text("done"))
                 }
             },
             |_name, _input| true,
@@ -1031,7 +1041,7 @@ mod tests {
             &mut session,
             &tx,
             "test-turn".into(),
-            |_name, _input| async move { Ok(("ok".to_string(), None)) },
+            |_name, _input| async move { Ok(ToolAnswer::text("ok")) },
             |_name, _input| false,
             CancellationToken::new(),
             &[],

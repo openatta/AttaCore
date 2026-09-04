@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::interface::script::{ScriptCarrier, ScriptOutcome};
 use crate::interface::tool_middleware::{
-    NextDispatch, ToolCall, ToolExec, ToolMiddleware, ToolOutcome,
+    NextDispatch, ToolAnswer, ToolCall, ToolExec, ToolMiddleware, ToolOutcome,
 };
 
 /// A script bound to the tool-middleware point.
@@ -169,7 +169,7 @@ impl ToolMiddleware for ToolAroundScript {
 
         match directed {
             Directed::Deny(reason) => Err(reason),
-            Directed::Respond(text) => Ok((text, None)),
+            Directed::Respond(text) => Ok(ToolAnswer::text(text)),
             Directed::Dispatch { timeout } => {
                 if let Some(after) = timeout {
                     exec.with_timeout(after);
@@ -231,7 +231,7 @@ mod tests {
             let dispatched = dispatched.clone();
             async move {
                 dispatched.fetch_add(1, Ordering::SeqCst);
-                Ok(("the file".to_string(), None))
+                Ok(ToolAnswer::text("the file"))
             }
         })
         .await
@@ -262,7 +262,7 @@ mod tests {
             dispatched.clone(),
         )
         .await;
-        assert_eq!(out, Ok(("(cached)".to_string(), None)));
+        assert_eq!(out, Ok(ToolAnswer::text("(cached)")));
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
@@ -276,7 +276,7 @@ mod tests {
         ] {
             let dispatched = Arc::new(AtomicUsize::new(0));
             let out = run(engine_returning(undecided.clone()), dispatched.clone()).await;
-            assert_eq!(out, Ok(("the file".to_string(), None)), "{undecided}");
+            assert_eq!(out, Ok(ToolAnswer::text("the file")), "{undecided}");
             assert_eq!(dispatched.load(Ordering::SeqCst), 1, "{undecided}");
         }
     }
@@ -292,7 +292,7 @@ mod tests {
         ] {
             let dispatched = Arc::new(AtomicUsize::new(0));
             let out = run(engine_returning(nonsense.clone()), dispatched.clone()).await;
-            assert_eq!(out, Ok(("the file".to_string(), None)), "{nonsense}");
+            assert_eq!(out, Ok(ToolAnswer::text("the file")), "{nonsense}");
             assert_eq!(dispatched.load(Ordering::SeqCst), 1, "{nonsense}");
         }
     }
@@ -306,7 +306,7 @@ mod tests {
         ));
         let dispatched = Arc::new(AtomicUsize::new(0));
         let out = run(engine, dispatched.clone()).await;
-        assert_eq!(out, Ok(("the file".to_string(), None)));
+        assert_eq!(out, Ok(ToolAnswer::text("the file")));
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
@@ -335,10 +335,10 @@ mod tests {
             "onTool",
         ))];
         let out = dispatch_through(&chain, call(), CancellationToken::new(), |_| async {
-            Ok(("the file".to_string(), None))
+            Ok(ToolAnswer::text("the file"))
         })
         .await;
-        assert_eq!(out, Ok(("the file".to_string(), None)));
+        assert_eq!(out, Ok(ToolAnswer::text("the file")));
     }
 
     /// The deadline a script asks for is felt by the tool.

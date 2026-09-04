@@ -575,6 +575,11 @@ Builder::new().tool_middleware(Arc::new(Deadline));
 `with_timeout` 派生的是当前 token 的*子* token,所以包装者能让一次调用比整轮更早
 结束,而绝不会更晚。
 
+自己造一个结果的时候(缓存那种),`ToolOutcome` 的 `Ok` 装的是 `ToolAnswer`:
+`ToolAnswer::text(..)` 是答上了,`ToolAnswer::failure(..)` 是跑完了但这活没成。
+后者和 `Err` 不是一回事——`Err` 是"这个工具根本没跑起来",它会连带取消同一批里
+并发的其他调用,而 `failure` 只是让模型收到的那个结果带上 `is_error: true`。
+
 包装按注册顺序嵌套,先注册的在最外面。
 
 ### 一个工具结果能长什么样 — `tool.result`

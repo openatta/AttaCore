@@ -332,6 +332,30 @@ async fn tool_error_is_reported_to_the_model() {
     .await;
 }
 
+/// A tool that runs and reports its own failure.
+///
+/// Distinct from `tool_error` above, and the distinction is the whole point:
+/// there the engine could not run the tool, here it ran and says the work
+/// failed. The model has to be able to tell that from an answer, so the
+/// result carries `is_error=Some(true)` — which for a long time it did not,
+/// because the flag had nowhere to sit between the tool and the wire.
+#[tokio::test]
+async fn a_tool_that_reports_its_own_failure_says_so_to_the_model() {
+    check(Case::new(
+        "tool_reports_failure",
+        vec!["run it"],
+        vec![
+            Reply::Tool {
+                id: "c1",
+                name: "GoldenReports",
+                input: serde_json::json!({}),
+            },
+            Reply::Text("it says that failed"),
+        ],
+    ))
+    .await;
+}
+
 /// Overload on the first call, success on the retry. With a fallback model
 /// configured, the retry must go to it — visible only in the recorded call
 /// list, since the response is the script's either way.

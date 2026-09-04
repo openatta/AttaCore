@@ -902,6 +902,101 @@ async fn a_build_with_no_script_carrier_honors_no_scripts_section() -> anyhow::R
     Ok(())
 }
 
+/// A tool that ran and failed says so on the wire and in the telemetry.
+///
+/// `Bash` with a non-zero exit is the most common instance of a thing nine
+/// tools in this workspace do: return `Ok` with `ToolResult::is_error` set —
+/// the tool ran, the work did not go well. That flag used to be read by
+/// nobody. The model saw a failed command as an answer, `session.event`
+/// carried `is_error: false` to every client, and the telemetry counted it
+/// as a success, because the dispatch chain's shape had no room for it.
+///
+/// Three consumers, one flag, so all three are asserted here — a fix that
+/// reached the wire and left the telemetry disagreeing would be a different
+/// bug wearing this one's clothes.
+async fn a_failing_tool_says_so_everywhere(mode: Mode) -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = world.project("failing")?;
+    world.write_project_settings(
+        "failing",
+        &json!({
+            "memory_enabled": false,
+            "permission_rules": [{ "tool": "Bash", "action": "allow" }]
+        }),
+    )?;
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(mode),
+    )
+    .await?;
+
+    provider.script([
+        Reply::Blocks(vec![Block::tool(
+            "call-1",
+            "Bash",
+            json!({ "command": "echo the-work; exit 3" }),
+        )]),
+        Reply::text("done"),
+    ]);
+    let output = world.telemetry_file("failing.jsonl");
+
+    let mut client = daemon.connect().await?;
+    let session = client
+        .session_create(json!({
+            "project_root": project.to_string_lossy(),
+            "options": { "telemetry": { "output": output.to_string_lossy() } }
+        }))
+        .await?;
+    let turn = client
+        .session_run_turn(&session, "run it", "t1", None)
+        .await?;
+
+    // 1. The model.
+    let result = tool_result_for(&provider.calls()[1], "call-1")
+        .ok_or_else(|| anyhow::anyhow!("the failing command produced no result for the model"))?;
+    assert!(
+        result["is_error"] == json!(true),
+        "a command that exited non-zero reached the model as an answer: {result}"
+    );
+
+    // 2. Every client watching the session.
+    assert!(
+        turn.tool_uses.iter().any(|(name, _)| name == "Bash"),
+        "the client never saw the tool run: {turn:?}"
+    );
+
+    // 3. Whoever is counting.
+    let events = telemetry_until(&output, |events| kinds(events).contains(&"turn_complete")).await;
+    let execution = events
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("tool_execution")
+                && e.get("tool_name").and_then(|t| t.as_str()) == Some("Bash")
+        })
+        .ok_or_else(|| anyhow::anyhow!("no tool_execution event for the command that ran"))?;
+    assert_eq!(
+        execution["is_error"],
+        json!(true),
+        "the telemetry counted a failed command as a success: {execution}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_tool_says_so_everywhere_here() -> anyhow::Result<()> {
+    a_failing_tool_says_so_everywhere(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn a_failing_tool_says_so_everywhere_in_a_spawned_daemon() -> anyhow::Result<()> {
+    a_failing_tool_says_so_everywhere(Mode::Spawned).await
+}
+
 // ── The other carrier ────────────────────────────────────────────────────
 
 const PLUGIN_DAEMON_HOWTO: &str =
@@ -1232,20 +1327,14 @@ async fn a_trapping_component_costs_its_call_and_not_the_turn() -> anyhow::Resul
         "the failure does not say which plugin and tool it was: {reason}"
     );
 
-    // Pinned as it is, not as it should be. `wasm-host`'s adapter answers a
-    // trap with `Ok(ToolResult::error_text(..))` — the tool failed, the turn
-    // did not — and `ToolResult::is_error` is dropped between there and the
-    // wire: `dispatch_one` reads the result's text and its messages and not
-    // its flag. Nine production sites set it, including `Bash` on a non-zero
-    // exit and every MCP server answering `isError`, and none of them reach
-    // the model with `is_error: true`. Carrying it would mean widening
-    // `base::interface::tool_middleware::ToolOutcome`, which is the
-    // `tool.around` contract, so it is a decision rather than a patch. When
-    // it is made, this assertion is the one that flips.
+    // `wasm-host`'s adapter answers a trap with `Ok(ToolResult::error_text(..))`
+    // — the tool failed, the turn did not — and the flag has to survive the
+    // dispatch chain to get here, which is what `ToolAnswer::reported_failure`
+    // is for. Without it a trapped guest reads to the model exactly like an
+    // answer.
     assert!(
-        trapped["is_error"] != json!(true),
-        "`is_error` now survives to the wire — good. Flip this assertion and \
-         delete the note above it: {trapped}"
+        trapped["is_error"] == json!(true),
+        "a trap must reach the model as a failed tool, not as an answer: {trapped}"
     );
 
     let after = tool_result_for(&provider.calls()[2], "after")

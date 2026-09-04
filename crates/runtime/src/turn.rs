@@ -3193,7 +3193,7 @@ pub(crate) async fn execute_tool_with_telemetry(
     ctx: &ToolExecCtx,
     name: &str,
     input: serde_json::Value,
-) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
+) -> base::interface::tool_middleware::ToolOutcome {
     // No wrappers means no wrapping: the call goes straight through, with no
     // context clone and no future inside a future. A seam nobody uses should
     // cost nothing on the hot path.
@@ -3267,7 +3267,7 @@ async fn execute_tool_inner(
     ctx: &ToolExecCtx,
     name: &str,
     input: serde_json::Value,
-) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
+) -> base::interface::tool_middleware::ToolOutcome {
     let tool = ctx
         .tools
         .get(name)
@@ -3544,7 +3544,13 @@ async fn execute_tool_inner(
         .call(input, tool_ctx, base::tool::ProgressSender::noop(""))
         .await;
     let latency_ms = tool_start.elapsed().as_millis() as f64;
-    let is_error = result.is_err();
+    // Both ways a call can go wrong: the engine could not run it, or it ran
+    // and called its own result a failure. Reading only `is_err` reported a
+    // shell command that exited non-zero as a success.
+    let is_error = match &result {
+        Ok(r) => r.is_error,
+        Err(_) => true,
+    };
     let _ = ctx
         .telemetry_handle
         .record(telemetry::TelemetryEvent::tool_execution(
@@ -3577,7 +3583,11 @@ async fn execute_tool_inner(
                     .unwrap_or_else(|e| e.into_inner())
                     .extend(images);
             }
-            Ok((text, r.new_messages))
+            Ok(base::interface::tool_middleware::ToolAnswer {
+                text,
+                new_messages: r.new_messages,
+                reported_failure: r.is_error,
+            })
         }
         Err(e) => Err(e.to_string()),
     };
@@ -3618,7 +3628,10 @@ async fn execute_tool_inner(
 
     if ctx.hooks.has_hooks_for(hooks::HookEvent::PostToolUse) {
         let (result_json, is_error_flag) = match &outcome {
-            Ok((text, _)) => (serde_json::Value::String(text.clone()), false),
+            Ok(a) => (
+                serde_json::Value::String(a.text.clone()),
+                a.reported_failure,
+            ),
             Err(e) => (serde_json::Value::String(e.clone()), true),
         };
         let post_input = hooks::HookInput {
@@ -3697,8 +3710,8 @@ fn apply_result_transformers(
     ctx: &ToolExecCtx,
     name: &str,
     input: &serde_json::Value,
-    outcome: Result<(String, Option<Vec<serde_json::Value>>), String>,
-) -> Result<(String, Option<Vec<serde_json::Value>>), String> {
+    outcome: base::interface::tool_middleware::ToolOutcome,
+) -> base::interface::tool_middleware::ToolOutcome {
     if ctx.result_transformers.is_empty() {
         return outcome;
     }
@@ -3706,8 +3719,14 @@ fn apply_result_transformers(
         name: name.to_string(),
         input: input.clone(),
     };
+    // A transformer that turns a plain answer into a failure gets the
+    // engine-level treatment that has always meant: the call is an `Err`,
+    // which cancels its concurrent siblings. One handed a result the tool
+    // itself already called a failure hands back the same shape, because
+    // nothing about it changed.
+    let was_reported_failure = matches!(&outcome, Ok(a) if a.reported_failure);
     let (text, is_error, new_messages) = match outcome {
-        Ok((text, msgs)) => (text, false, msgs),
+        Ok(a) => (a.text, a.reported_failure, a.new_messages),
         Err(e) => (e, true, None),
     };
     let images = std::mem::take(&mut *ctx.images.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3733,10 +3752,14 @@ fn apply_result_transformers(
         })
         .collect();
 
-    if draft.is_error {
+    if draft.is_error && !was_reported_failure {
         Err(draft.text)
     } else {
-        Ok((draft.text, new_messages))
+        Ok(base::interface::tool_middleware::ToolAnswer {
+            text: draft.text,
+            new_messages,
+            reported_failure: draft.is_error,
+        })
     }
 }
 

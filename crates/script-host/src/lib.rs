@@ -1319,7 +1319,9 @@ mod binding_tests {
                         let dispatched = dispatched.clone();
                         async move {
                             dispatched.fetch_add(1, Ordering::SeqCst);
-                            Ok(("the file".to_string(), None))
+                            Ok(base::interface::tool_middleware::ToolAnswer::text(
+                                "the file",
+                            ))
                         }
                     },
                 )
@@ -1332,7 +1334,12 @@ mod binding_tests {
             Err("not that file".to_string())
         );
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert_eq!(outcome("a.txt").await, Ok(("the file".to_string(), None)));
+        assert_eq!(
+            outcome("a.txt").await,
+            Ok(base::interface::tool_middleware::ToolAnswer::text(
+                "the file"
+            ))
+        );
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 

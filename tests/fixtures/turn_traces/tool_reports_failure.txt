@@ -1,0 +1,18 @@
+== events ==
+SystemInit
+ToolUse GoldenReports {}
+ToolResult GoldenReports is_error=Some(true) content="exit status 1"
+TextDelta "\n[Turn 0 used tools: GoldenReports]\n"
+TextDelta "it says that failed"
+TurnComplete stop_reason=end_turn
+
+== session log ==
+User blocks=1
+Assistant
+User blocks=1
+Assistant
+
+== model calls ==
+golden-model max_tokens=1024 messages=1 content_bytes=6 truncated_results=0
+golden-model max_tokens=1024 messages=3 content_bytes=19 truncated_results=0
+unconsumed_replies=0

@@ -38,9 +38,50 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-/// What dispatch returns: the text the model sees, plus any messages the tool
-/// asked to have injected.
-pub type ToolOutcome = Result<(String, Option<Vec<serde_json::Value>>), String>;
+/// What dispatch returns.
+pub type ToolOutcome = Result<ToolAnswer, String>;
+
+/// A tool that ran, and what it produced.
+///
+/// `reported_failure` is not the same thing as the `Err` this rides beside.
+/// `Err` is the engine failing to run a tool at all: it cancels the rest of a
+/// concurrent batch and fires `PostToolUseFailure`. This is the tool running
+/// exactly as designed and saying the work did not go well — a shell command
+/// with a non-zero exit, an HTTP status a fetch will not follow, an MCP
+/// server answering `isError`, a plugin whose guest trapped. The model has to
+/// be able to tell those from an answer, which is what `is_error` on the wire
+/// is for, and carrying the flag here is the only way it gets there: a
+/// wrapper sits between the tool and the caller, so a shape with no room for
+/// it drops it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolAnswer {
+    /// The text the model sees.
+    pub text: String,
+    /// Messages the tool asked to have injected.
+    pub new_messages: Option<Vec<serde_json::Value>>,
+    /// The tool ran and is calling its own result a failure.
+    pub reported_failure: bool,
+}
+
+impl ToolAnswer {
+    /// A tool that ran and answered.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            new_messages: None,
+            reported_failure: false,
+        }
+    }
+
+    /// A tool that ran and is calling the result a failure.
+    pub fn failure(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            new_messages: None,
+            reported_failure: true,
+        }
+    }
+}
 
 /// The call being made, as a wrapper may see it. Read-only by design — see
 /// the module docs.
@@ -185,8 +226,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_chain_is_the_call_itself() {
-        let out = run(vec![], |_| Ok(("ran".into(), None))).await;
-        assert_eq!(out, Ok(("ran".to_string(), None)));
+        let out = run(vec![], |_| Ok(ToolAnswer::text("ran"))).await;
+        assert_eq!(out, Ok(ToolAnswer::text("ran")));
     }
 
     /// The acceptance case: a wrapper imposes a deadline the tool actually
@@ -267,7 +308,7 @@ mod tests {
                 _exec: &mut ToolExec,
                 _next: NextDispatch<'_>,
             ) -> ToolOutcome {
-                Ok(("from cache".into(), None))
+                Ok(ToolAnswer::text("from cache"))
             }
         }
 
@@ -275,10 +316,10 @@ mod tests {
         let seen = calls.clone();
         let out = run(vec![Arc::new(Cached)], move |_| {
             seen.fetch_add(1, Ordering::SeqCst);
-            Ok(("ran".into(), None))
+            Ok(ToolAnswer::text("ran"))
         })
         .await;
-        assert_eq!(out, Ok(("from cache".to_string(), None)));
+        assert_eq!(out, Ok(ToolAnswer::text("from cache")));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -310,11 +351,11 @@ mod tests {
             if seen.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err("flaked".into())
             } else {
-                Ok(("second time".into(), None))
+                Ok(ToolAnswer::text("second time"))
             }
         })
         .await;
-        assert_eq!(out, Ok(("second time".to_string(), None)));
+        assert_eq!(out, Ok(ToolAnswer::text("second time")));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
@@ -343,7 +384,7 @@ mod tests {
             Arc::new(Records("outer", log.clone())),
             Arc::new(Records("inner", log.clone())),
         ];
-        let _ = run(chain, |_| Ok(("ran".into(), None))).await;
+        let _ = run(chain, |_| Ok(ToolAnswer::text("ran"))).await;
         assert_eq!(
             log.lock().unwrap().as_slice(),
             ["enter outer", "enter inner", "exit inner", "exit outer"]

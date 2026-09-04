@@ -112,6 +112,50 @@ impl Tool for GoldenFlood {
     }
 }
 
+/// Runs fine and calls its own result a failure.
+///
+/// The other half of failing, and the one that had no fixture. `GoldenBoom`
+/// returns `Err` — the engine could not run the tool — which has always
+/// reached the model as `is_error: true`. Nine production tools instead
+/// return `Ok` with `ToolResult::is_error` set: a shell command that exited
+/// non-zero, an HTTP status a fetch will not follow, an MCP server answering
+/// `isError`, a plugin whose guest trapped. That flag was dropped on the way
+/// to the model for as long as it existed, and no fixture here failed that
+/// way, so nothing noticed.
+#[derive(Debug)]
+struct GoldenReports;
+
+#[async_trait::async_trait]
+impl Tool for GoldenReports {
+    fn name(&self) -> &str {
+        "GoldenReports"
+    }
+    fn description(&self) -> &str {
+        "Runs, and reports that the work failed."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn check_permissions(
+        &self,
+        _: &serde_json::Value,
+        _: &ToolContext,
+    ) -> PermissionDecision {
+        PermissionDecision::allow()
+    }
+    async fn prompt(&self, _: &PromptContext) -> String {
+        self.description().to_string()
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+        _p: ProgressSender,
+    ) -> Result<ToolResult, base::error::ToolError> {
+        Ok(ToolResult::error_text("exit status 1"))
+    }
+}
+
 /// Always fails. Exists so the net covers "a tool errored" as a distinct
 /// decision from "the model errored".
 #[derive(Debug)]
@@ -246,6 +290,7 @@ pub fn fake_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(GoldenEcho),
         Arc::new(GoldenBoom),
+        Arc::new(GoldenReports),
         Arc::new(GoldenAsk),
         Arc::new(GoldenFlood),
     ]
