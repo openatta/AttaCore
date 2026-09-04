@@ -158,7 +158,7 @@ impl Model for AnthropicModel {
         // comment); `flat_map` then flattens each step's `Vec` back into a
         // flat event stream.
         let mapped = stream
-            .scan(ToolUseAccumulators::default(), |acc, result| {
+            .scan(StreamState::default(), |acc, result| {
                 let events = match result {
                     Ok(event) => map_stream_event(event, acc),
                     Err(e) => vec![Err(map_error(e))],
@@ -170,13 +170,21 @@ impl Model for AnthropicModel {
     }
 }
 
-/// Buffers a `tool_use`/`server_tool_use` content block's `id`/`name` plus its
-/// still-streaming JSON input, keyed by content-block index (a single message
-/// can have several tool_use blocks interleaved with text blocks at different
-/// indices). Removed once the block's `ContentBlockStop` arrives and the
+/// What one message's events have said so far.
+///
+/// `tool_uses` buffers each `tool_use`/`server_tool_use` block's `id`/`name`
+/// plus its still-streaming JSON input, keyed by content-block index (a
+/// single message can have several interleaved with text blocks at different
+/// indices); an entry is removed once its `ContentBlockStop` arrives and the
 /// accumulated JSON has been parsed into the final `ModelEvent::ToolUse`.
+///
+/// `input_tokens` is here for the same reason: what a call cost is reported
+/// in two halves, and the halves arrive in different events.
 #[derive(Default)]
-struct ToolUseAccumulators(std::collections::HashMap<u32, PendingToolUse>);
+struct StreamState {
+    tool_uses: std::collections::HashMap<u32, PendingToolUse>,
+    input_tokens: u32,
+}
 
 struct PendingToolUse {
     id: String,
@@ -260,7 +268,7 @@ fn to_content_block(b: ModelContentBlock) -> ContentBlock {
 
 fn map_stream_event(
     event: crate::stream::StreamEvent,
-    acc: &mut ToolUseAccumulators,
+    acc: &mut StreamState,
 ) -> Vec<Result<ModelEvent, ModelError>> {
     use crate::stream::{BlockDelta, ContentBlockStart, StreamEvent};
     match event {
@@ -292,7 +300,8 @@ fn map_stream_event(
                     serde_json::Value::Object(o) if o.is_empty() => String::new(),
                     _ => input.to_string(),
                 };
-                acc.0.insert(index, PendingToolUse { id, name, json });
+                acc.tool_uses
+                    .insert(index, PendingToolUse { id, name, json });
                 vec![]
             }
             // Thinking blocks were parsed by `stream.rs` but died here, in a
@@ -327,7 +336,7 @@ fn map_stream_event(
             BlockDelta::SignatureDelta { signature } => {
                 vec![Ok(ModelEvent::ThinkingSignature { signature })]
             }
-            BlockDelta::InputJsonDelta { partial_json } => match acc.0.get_mut(&index) {
+            BlockDelta::InputJsonDelta { partial_json } => match acc.tool_uses.get_mut(&index) {
                 // The fragment is forwarded *as well as* accumulated: the
                 // engine still acts on the assembled `ToolUse` emitted at
                 // `ContentBlockStop`, but concatenation is lossy in the one
@@ -349,7 +358,7 @@ fn map_stream_event(
             _ => vec![],
         },
         StreamEvent::ContentBlockStop { index } => {
-            let Some(pending) = acc.0.remove(&index) else {
+            let Some(pending) = acc.tool_uses.remove(&index) else {
                 return vec![];
             };
             let input = if pending.json.trim().is_empty() {
@@ -374,6 +383,14 @@ fn map_stream_event(
                 input,
             })]
         }
+        // The opening event is the only place the input count appears on the
+        // real wire — `message_delta` repeats the output count and, usually,
+        // nothing else. Kept rather than emitted: a caller wants one usage
+        // figure per call, at the end, and that is what `EndTurn` is.
+        StreamEvent::MessageStart { message } => {
+            acc.input_tokens = message.usage.input_tokens as u32;
+            vec![]
+        }
         StreamEvent::MessageDelta { delta, usage } => {
             let stop_reason = delta
                 .stop_reason
@@ -387,12 +404,20 @@ fn map_stream_event(
                 })
                 .unwrap_or("unknown")
                 .to_string();
+            let reported = usage.unwrap_or_default();
             vec![Ok(ModelEvent::EndTurn {
                 stop_reason,
-                usage: usage.map_or(Usage::default(), |u| Usage {
-                    input_tokens: u.input_tokens as u32,
-                    output_tokens: u.output_tokens as u32,
-                }),
+                usage: Usage {
+                    // A relay that repeats the input count here is the later
+                    // word on the same call and wins; the usual wire says
+                    // nothing, and the opening event answers instead.
+                    input_tokens: if reported.input_tokens > 0 {
+                        reported.input_tokens as u32
+                    } else {
+                        acc.input_tokens
+                    },
+                    output_tokens: reported.output_tokens as u32,
+                },
             })]
         }
         StreamEvent::Error { error } => vec![Err(ModelError::Api {
@@ -425,12 +450,104 @@ mod map_stream_event_tests {
     use crate::stream::{BlockDelta, ContentBlockStart, StreamEvent};
 
     fn run(events: Vec<StreamEvent>) -> Vec<ModelEvent> {
-        let mut acc = ToolUseAccumulators::default();
+        let mut acc = StreamState::default();
         events
             .into_iter()
             .flat_map(|e| map_stream_event(e, &mut acc))
             .map(|r| r.expect("no errors in these fixtures"))
             .collect()
+    }
+
+    fn end_turn_usage(out: &[ModelEvent]) -> Usage {
+        out.iter()
+            .find_map(|e| match e {
+                ModelEvent::EndTurn { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .expect("the fixtures all end a message")
+    }
+
+    /// The two halves of a usage report arrive in different events: the input
+    /// count in `message_start`, the output count in `message_delta`. A
+    /// reader of only the second one reports every call as having read
+    /// nothing — and input is most of what a call costs.
+    ///
+    /// The OpenAI-compatible path has carried its own accumulator for this
+    /// since it was written (`openai::stream`); this is the same claim on
+    /// this side of the parity.
+    #[test]
+    fn the_input_count_comes_from_message_start_and_the_output_from_message_delta() {
+        let out = run(vec![
+            StreamEvent::MessageStart {
+                message: crate::stream::MessageStartPayload {
+                    id: "msg_1".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    role: "assistant".into(),
+                    usage: crate::stream::Usage {
+                        input_tokens: 101,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    },
+                    stop_reason: None,
+                },
+            },
+            StreamEvent::MessageDelta {
+                delta: crate::stream::MessageDeltaPayload {
+                    stop_reason: Some(base::message::StopReason::EndTurn),
+                    stop_sequence: None,
+                },
+                // What the wire really carries here: the output count, and no
+                // input count at all.
+                usage: Some(crate::stream::Usage {
+                    input_tokens: 0,
+                    output_tokens: 17,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                }),
+            },
+        ]);
+
+        let usage = end_turn_usage(&out);
+        assert_eq!(usage.input_tokens, 101, "the input count was dropped");
+        assert_eq!(usage.output_tokens, 17);
+    }
+
+    /// A relay that repeats the input count in `message_delta` is believed
+    /// over the opening one — it is the later word on the same call, and
+    /// some Anthropic-compatible endpoints only report it there.
+    #[test]
+    fn a_final_input_count_wins_over_the_opening_one() {
+        let out = run(vec![
+            StreamEvent::MessageStart {
+                message: crate::stream::MessageStartPayload {
+                    id: "msg_1".into(),
+                    model: "m".into(),
+                    role: "assistant".into(),
+                    usage: crate::stream::Usage {
+                        input_tokens: 5,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    },
+                    stop_reason: None,
+                },
+            },
+            StreamEvent::MessageDelta {
+                delta: crate::stream::MessageDeltaPayload {
+                    stop_reason: Some(base::message::StopReason::EndTurn),
+                    stop_sequence: None,
+                },
+                usage: Some(crate::stream::Usage {
+                    input_tokens: 900,
+                    output_tokens: 3,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                }),
+            },
+        ]);
+
+        assert_eq!(end_turn_usage(&out).input_tokens, 900);
     }
 
     /// The assembled tool calls in `out` — what the engine dispatches on.

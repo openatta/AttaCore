@@ -714,6 +714,24 @@ async fn telemetry_counts_what_the_turn_actually_did(mode: Mode) -> anyhow::Resu
         "the tool that ran is not in the telemetry: {executions:?}"
     );
 
+    // What a call cost arrives in two halves — the input count in
+    // `message_start`, the output count in `message_delta` — and the daemon
+    // reports one figure per call. A report that only ever carried the
+    // second half would say every call read nothing, which is most of what a
+    // call actually costs.
+    for request in of_type("api_request") {
+        assert_eq!(
+            request["input_tokens"].as_u64(),
+            Some(daemon_harness::provider::INPUT_TOKENS),
+            "the input count the wire carried is not in the telemetry: {request}"
+        );
+        assert_eq!(
+            request["output_tokens"].as_u64(),
+            Some(daemon_harness::provider::OUTPUT_TOKENS),
+            "the output count the wire carried is not in the telemetry: {request}"
+        );
+    }
+
     let complete = of_type("turn_complete");
     let complete = complete
         .first()
