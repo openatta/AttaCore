@@ -56,6 +56,22 @@ fn kinds(events: &[serde_json::Value]) -> Vec<&str> {
 }
 
 /// A daemon, a stub, and a project — the three every case starts with.
+/// How many model calls this turn made.
+///
+/// Not `call_count()`. Memory is on by default, so the engine makes one more
+/// call after the turn has already answered — on its own schedule, with no
+/// tools and no system prompt — and a case that counts raw is racing it. That
+/// race is won on a fast machine and lost on a loaded one, which is to say it
+/// is a test that passes everywhere except CI. The turn's own calls are the
+/// ones carrying its tool table.
+fn turn_calls(provider: &ProviderStub) -> usize {
+    provider
+        .calls()
+        .into_iter()
+        .filter(|c| !c.tool_names().is_empty())
+        .count()
+}
+
 async fn stage(
     name: &str,
     mode: Mode,
@@ -89,7 +105,7 @@ async fn a_turn_crosses_http_and_comes_back(mode: Mode) -> anyhow::Result<()> {
         "the scripted answer did not reach the client: {turn:?}"
     );
     assert!(turn.turn_complete, "turn never completed: {turn:?}");
-    assert_eq!(provider.call_count(), 1, "expected exactly one model call");
+    assert_eq!(turn_calls(&provider), 1, "expected exactly one model call");
     daemon.stop().await;
     Ok(())
 }
@@ -145,7 +161,7 @@ async fn a_tool_call_runs_in_the_project(mode: Mode) -> anyhow::Result<()> {
         "no Write in the frames the client saw: {turn:?}"
     );
     assert_eq!(
-        provider.call_count(),
+        turn_calls(&provider),
         2,
         "a tool result should cost a second call"
     );
@@ -1539,11 +1555,7 @@ async fn telemetry_counts_what_the_turn_actually_did(mode: Mode) -> anyhow::Resu
     // and it lands asynchronously, so `provider.call_count()` grows on its
     // own schedule. The turn's own calls are the ones carrying its tool
     // table; that call is not one of them.
-    let turn_calls = provider
-        .calls()
-        .into_iter()
-        .filter(|c| !c.tool_names().is_empty())
-        .count();
+    let turn_calls = turn_calls(&provider);
     let turn_requests = of_type("api_request")
         .into_iter()
         .filter(|e| e.get("turn_id").and_then(|v| v.as_str()) == Some("t1"))
