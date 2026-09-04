@@ -212,11 +212,19 @@ Meta.scene
 时间戳一律 RFC 3339 UTC(`2026-08-11T10:00:00Z`)。会话未激活时,列表里的
 `created_at` / `last_active` 是**空字符串**(见 `session.list`)。
 
-`usage` 只有两个字段,没有缓存分项:
+`usage` 四个字段,缓存读写各自成项:
 
 ```jsonc
-{ "input_tokens": 12345, "output_tokens": 678 }
+{ "input_tokens": 12345, "output_tokens": 678,
+  "cache_creation_input_tokens": 2048, "cache_read_input_tokens": 30720 }
 ```
+
+四项**互不重叠**,不能只读 `input_tokens` 当作这一轮读了多少:开了提示缓存的
+provider 上,命中之后绝大部分输入记在 `cache_read_input_tokens`,`input_tokens`
+只剩增量。三项各自的价钱也不同(缓存读是普通输入的一个零头,缓存写是溢价),
+所以要算钱就得四项分开算。
+
+缓存两项是后加的。0.2.5 之前的客户端只读前两项,不受影响;读旧录像时这两项缺省为 0。
 
 daemon 按**单轮**如实上报,不做跨轮/跨会话聚合。
 
@@ -1258,7 +1266,7 @@ RPC 出口。要看子 Agent 干了什么,走它的侧链会话:`session.list
 `prompt_type` 目前只有 `"permission"`,但字段刻意保持通用 —— 未来的"停下来问一句"
 可以复用同一帧与同一回答通道。
 
-`turn_complete` 的 `usage` 只有 `input_tokens` / `output_tokens`(§3.5),
+`turn_complete` 的 `usage` 是完整的四字段用量(§3.5),
 **是这一轮所有模型调用的合计**,不是最后一趟。一轮可能来回好几趟
 (`api_calls` 就是趟数),按最后一趟计费会少算——用它做预算的宿主尤其要看清这一点。
 
@@ -1442,7 +1450,8 @@ TCP / WebSocket 上,第一件事是 `call("daemon.auth", {token})`。
 
 // 7. 结束。stop_reason 和 usage 在事件里,不在最终响应里。
 ← {"…":"…","event":{"kind":"turn_complete","stop_reason":"end_turn","api_calls":3,
-   "usage":{"input_tokens":12345,"output_tokens":678}}}
+   "usage":{"input_tokens":12345,"output_tokens":678,
+             "cache_creation_input_tokens":2048,"cache_read_input_tokens":30720}}}
 ← {"jsonrpc":"2.0","id":4,"result":{"session_id":"S1","turn_id":"t1",
    "name":null,"api_calls":3}}
 

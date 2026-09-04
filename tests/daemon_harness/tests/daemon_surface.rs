@@ -1849,6 +1849,72 @@ async fn telemetry_counts_what_the_turn_actually_did_in_a_spawned_daemon() -> an
     telemetry_counts_what_the_turn_actually_did(Mode::Spawned).await
 }
 
+/// The `turn_complete` event is the only place a client is told what a turn
+/// cost — the final response carries neither `stop_reason` nor `usage`, and
+/// the daemon has no telemetry method to ask instead. So the whole of
+/// `Usage` has to survive the trip, not the half of it that existed when the
+/// frame was first written.
+///
+/// This is checked at the socket rather than at the engine, which already
+/// has a case of its own. The frame between them is assembled by hand, and a
+/// hand-assembled frame is exactly where a type can grow a field and leave
+/// nobody behind to notice: a cache-heavy turn reports most of its input
+/// under `cache_read_input_tokens`, so dropping those two fields does not
+/// lose a rounding error, it loses the bulk of what was read.
+async fn the_turn_complete_event_carries_the_whole_of_usage(mode: Mode) -> anyhow::Result<()> {
+    let (_world, provider, daemon, _project) = stage("turn-complete-usage", mode).await?;
+    provider.script([Reply::text("done")]);
+
+    let mut client = daemon.connect().await?;
+    let session = client.session_create(json!({})).await?;
+    let turn = client
+        .session_run_turn(&session, "say something", "t1", None)
+        .await?;
+
+    let event = turn
+        .turn_complete_event
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no turn_complete event: {turn:?}"))?;
+    let usage = &event["usage"];
+
+    // Spelled out rather than round-tripped through `Usage`. These names are
+    // the protocol, and a test that deserialized them back into the type it
+    // is guarding would agree with any renaming the type ever does.
+    for (field, expected) in [
+        ("input_tokens", daemon_harness::provider::INPUT_TOKENS),
+        ("output_tokens", daemon_harness::provider::OUTPUT_TOKENS),
+        (
+            "cache_creation_input_tokens",
+            daemon_harness::provider::CACHE_CREATION_TOKENS,
+        ),
+        (
+            "cache_read_input_tokens",
+            daemon_harness::provider::CACHE_READ_TOKENS,
+        ),
+    ] {
+        assert_eq!(
+            usage[field].as_u64(),
+            Some(expected),
+            "`{field}` is not what the wire reported, in {event}"
+        );
+    }
+
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_turn_complete_event_carries_the_whole_of_usage_here() -> anyhow::Result<()> {
+    the_turn_complete_event_carries_the_whole_of_usage(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn the_turn_complete_event_carries_the_whole_of_usage_in_a_spawned_daemon(
+) -> anyhow::Result<()> {
+    the_turn_complete_event_carries_the_whole_of_usage(Mode::Spawned).await
+}
+
 /// A settings file edited while the daemon runs, and `config.reload` to pick
 /// it up. The same session runs both turns: a reload that only reached new
 /// sessions would leave every open one on the old configuration, which is

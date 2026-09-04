@@ -2365,7 +2365,12 @@ impl SessionPool {
                         &turn_id,
                         serde_json::json!({
                             "kind":"turn_complete","stop_reason":stop_reason,"api_calls":api_calls,
-                            "usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens}
+                            // Serialized whole rather than field by field: a
+                            // hand-written projection is invisible to the
+                            // compiler when `Usage` grows, and the last two
+                            // fields it grew reached the recording and the
+                            // price table without ever reaching this frame.
+                            "usage":serde_json::to_value(usage).unwrap_or_else(|_| serde_json::json!({}))
                         }),
                     );
                     self.broadcast_to_session(&sid, &f).await;

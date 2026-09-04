@@ -146,6 +146,13 @@ pub struct TurnEvents {
     /// tell a tool that failed from one that succeeded and was ignored.
     pub tool_results: Vec<(String, String, bool)>,
     pub turn_complete: bool,
+    /// The `turn_complete` event as it came off the wire.
+    ///
+    /// `turn_complete` above says the turn ended; this says what it reported
+    /// while ending. The daemon builds this frame by hand, so it is the one
+    /// payload in the protocol no type checks — a test that wants to hold it
+    /// to the protocol has to read the JSON.
+    pub turn_complete_event: Option<Value>,
     pub response: Option<RpcResponse>,
 }
 
@@ -407,7 +414,10 @@ impl DaemonRpcClient {
                             .unwrap_or(false);
                         out.tool_results.push((name, content, is_error));
                     }
-                    Some("turn_complete") => out.turn_complete = true,
+                    Some("turn_complete") => {
+                        out.turn_complete = true;
+                        out.turn_complete_event = Some(event.clone());
+                    }
                     _ => {}
                 },
                 TurnItem::Response(resp) => {
