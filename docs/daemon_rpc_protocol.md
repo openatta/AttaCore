@@ -1101,7 +1101,8 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 // ← result
 { "plugins": [ ] }
 // 元素:{ "name":"…", "version":"…", "description":"…", "enabled": true,
-//        "root": "/…/plugins/cache/<name>/<version>", "script_faults": [] }
+//        "root": "/…/plugins/cache/<name>/<version>",
+//        "script_faults": [], "component_faults": [] }
 ```
 
 列出磁盘上的全部插件及启用状态,包括已停用的。
@@ -1112,6 +1113,15 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 
 `script_faults` 是这个包的 `[[script]]` 绑定里没能兑现的那些,每条带原因。来自包的绑定
 是逐条降级的,所以这里非空不代表包没装上,只代表少了那几条贡献。
+
+`component_faults` 是同一回事,换成 `[[wasm]]` 组件:哪个组件没能加载,以及为什么,
+每条以组件文件名开头(一个包可以声明不止一个)。**这一条比上一条更要紧**——一个包
+如果只有组件、而组件加载不了,它照样列在这里、照样 `enabled: true`、什么也不贡献,
+而其他每个能问的问题都答"没事":装上了、启用着、也没被熔断——熔断数的是调用产生的
+故障,而一个从没加载成功的组件从来不会被调用。
+
+不带载体的构建这一项恒为空:它不加载组件,所以没有可报的。那种构建里"组件不会跑"
+这件事由 `plugin.install` 的披露(`wasm.runnable`)说,不由这里说。
 
 #### `plugin.install`
 

@@ -100,6 +100,14 @@ mod packages {
         /// A fault here costs that binding and nothing else, so it has to be
         /// reported somewhere the person who installed the package will look.
         script_faults: RwLock<HashMap<String, Vec<String>>>,
+        /// Why a package's component could not be loaded, by package. Same
+        /// reasoning as the scripts above, and the sharper case: a package
+        /// whose only component will not load is listed, enabled, and
+        /// contributing nothing, with every other answer over RPC saying it
+        /// is fine — the breaker counts faults from calls, and a component
+        /// that never loaded is never called. Empty in a build with no
+        /// carrier, which loads nothing and so has nothing to report.
+        component_faults: RwLock<HashMap<String, Vec<String>>>,
     }
 
     impl Packages {
@@ -119,6 +127,7 @@ mod packages {
                 enabled,
                 active: RwLock::new(active),
                 script_faults: RwLock::new(HashMap::new()),
+                component_faults: RwLock::new(HashMap::new()),
             }
         }
 
@@ -181,15 +190,34 @@ mod packages {
                 .collect()
         }
 
-        pub fn note_script_faults(&self, faults: Vec<(String, String)>) {
-            let mut by_plugin: HashMap<String, Vec<String>> = HashMap::new();
+        /// Group `(plugin, reason)` pairs the way the two fault maps hold
+        /// them.
+        fn by_plugin(faults: Vec<(String, String)>) -> HashMap<String, Vec<String>> {
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
             for (plugin, reason) in faults {
-                by_plugin.entry(plugin).or_default().push(reason);
+                out.entry(plugin).or_default().push(reason);
             }
+            out
+        }
+
+        pub fn note_script_faults(&self, faults: Vec<(String, String)>) {
             *self
                 .script_faults
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = by_plugin;
+                .unwrap_or_else(|e| e.into_inner()) = Self::by_plugin(faults);
+        }
+
+        /// Only the carrier loads components, so only the carrier has
+        /// anything to report. The field it writes is read in every build —
+        /// `plugin.list` carries `component_faults` whether or not this
+        /// binary could ever fill it, because a client should not have to
+        /// know which build it is talking to in order to read the answer.
+        #[cfg(feature = "plugins")]
+        pub fn note_component_faults(&self, faults: Vec<(String, String)>) {
+            *self
+                .component_faults
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Self::by_plugin(faults);
         }
 
         /// Every plugin on disk with its enable state — including the
@@ -199,7 +227,11 @@ mod packages {
             let (global, scene) = self.tier_dirs();
             let global_state = plugin::state::EnableState::new(global.clone());
             let scene_state = plugin::state::EnableState::new(scene.clone());
-            let faults = self.script_faults.read().unwrap_or_else(|e| e.into_inner());
+            let script_faults = self.script_faults.read().unwrap_or_else(|e| e.into_inner());
+            let component_faults = self
+                .component_faults
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             plugin::discover_plugins(&global, &scene)
                 .iter()
                 .map(|p| {
@@ -214,7 +246,11 @@ mod packages {
                         // an icon — has to rebuild this path itself, which
                         // makes the daemon's disk layout part of its API.
                         "root": p.root.display().to_string(),
-                        "script_faults": faults.get(name.as_str()).cloned().unwrap_or_default(),
+                        "script_faults": script_faults.get(name.as_str()).cloned().unwrap_or_default(),
+                        "component_faults": component_faults
+                            .get(name.as_str())
+                            .cloned()
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -424,6 +460,8 @@ mod imp {
             refreshed
                 .load_components_with_health(engine, &self.workspace, &self.health)
                 .await;
+            self.packages
+                .note_component_faults(refreshed.component_faults().to_vec());
             *self.active.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(refreshed);
         }
 

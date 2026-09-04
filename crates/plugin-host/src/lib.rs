@@ -58,6 +58,14 @@ pub struct InstalledPlugins {
     /// trait. Adding a downcast to the engine's core tool trait to serve an
     /// installer's disclosure would be the wrong trade.
     tool_text: Vec<ToolText>,
+    /// Components that could not be loaded, by plugin, with the reason.
+    ///
+    /// A warning on the daemon's stderr is not a report. A plugin whose only
+    /// component will not load stays listed and stays enabled and contributes
+    /// nothing, and every question asked over RPC answers "fine" — the
+    /// breaker counts faults from calls, and a component that never loaded is
+    /// never called. This is what `plugin.list` says instead.
+    component_faults: Vec<(String, String)>,
 }
 
 /// One tool's model-visible text, for [`InstalledPlugins::disclose`].
@@ -76,7 +84,13 @@ impl InstalledPlugins {
             scenes: Vec::new(),
             instances: std::collections::HashMap::new(),
             tool_text: Vec::new(),
+            component_faults: Vec::new(),
         }
+    }
+
+    /// Why each component that did not load did not load, by plugin.
+    pub fn component_faults(&self) -> &[(String, String)] {
+        &self.component_faults
     }
 
     /// Compile, link and interrogate every declared WASM component.
@@ -125,6 +139,7 @@ impl InstalledPlugins {
         let mut scenes: Vec<Arc<dyn base::interface::scene::AgentScene>> = Vec::new();
         let mut instances = std::collections::HashMap::new();
         let mut tool_text: Vec<ToolText> = Vec::new();
+        let mut component_faults: Vec<(String, String)> = Vec::new();
 
         for outcome in loaded {
             let Loaded {
@@ -132,7 +147,11 @@ impl InstalledPlugins {
                 mut own_tools,
                 mut text,
                 instance,
+                faults,
             } = outcome;
+            for fault in faults {
+                component_faults.push((plugin.name().to_string(), fault));
+            }
             if let Some(instance) = instance {
                 instances.insert(plugin.name().to_string(), instance);
             }
@@ -151,6 +170,7 @@ impl InstalledPlugins {
         self.scenes = scenes;
         self.instances = instances;
         self.tool_text = tool_text;
+        self.component_faults = component_faults;
     }
 
     /// What one installed plugin will contribute, for an installer to put in
@@ -325,6 +345,7 @@ struct Loaded {
     own_tools: Vec<Arc<dyn base::tool::Tool>>,
     text: Vec<ToolText>,
     instance: Option<Arc<wasm_host::PluginInstance>>,
+    faults: Vec<String>,
 }
 
 /// Load every plugin, at most [`MAX_CONCURRENT_LOADS`] at a time.
@@ -345,6 +366,7 @@ async fn load_all(
             let mut own_tools: Vec<Arc<dyn base::tool::Tool>> = Vec::new();
             let mut text: Vec<ToolText> = Vec::new();
             let mut instance = None;
+            let mut faults: Vec<String> = Vec::new();
             for payload in &p.manifest.wasm {
                 match load_payload(engine, &p, payload, workspace, health).await {
                     Ok((inst, mut loaded, mut t)) => {
@@ -352,12 +374,18 @@ async fn load_all(
                         text.append(&mut t);
                         instance = Some(inst);
                     }
-                    Err(e) => tracing::warn!(
-                        plugin = %p.name(),
-                        component = %payload.component.display(),
-                        error = %e,
-                        "plugin component could not be loaded; skipping it"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = %p.name(),
+                            component = %payload.component.display(),
+                            error = %e,
+                            "plugin component could not be loaded; skipping it"
+                        );
+                        // Named by component, because a plugin may declare
+                        // more than one and "it did not load" is not enough
+                        // to act on when only one of them did not.
+                        faults.push(format!("{}: {e:#}", payload.component.display()));
+                    }
                 }
             }
             Loaded {
@@ -365,6 +393,7 @@ async fn load_all(
                 own_tools,
                 text,
                 instance,
+                faults,
             }
         })
         .buffered(MAX_CONCURRENT_LOADS)

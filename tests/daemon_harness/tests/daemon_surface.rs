@@ -1478,6 +1478,107 @@ async fn a_plugin_that_keeps_faulting_is_set_aside() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A component that will not load says so where the operator is looking.
+///
+/// `plugin.list` reports `script_faults` for a package's `[[script]]`
+/// bindings that could not be honored, for a stated reason: a contribution
+/// that silently never happens sends its author looking for a bug in their
+/// own code. A `[[wasm]]` component that will not load had no such report —
+/// it was a `tracing::warn!` on the daemon's stderr and nothing else. The
+/// plugin stays listed, stays enabled, contributes no tools, and every
+/// question an operator can ask over RPC answers "fine": installed, enabled,
+/// not set aside — the breaker counts faults from calls, and a component that
+/// never loaded is never called.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built with the plugin carrier"]
+async fn a_component_that_will_not_load_says_why() -> anyhow::Result<()> {
+    let with_plugins = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_PLUGINS",
+        PLUGIN_DAEMON_HOWTO,
+    )?;
+
+    let world = World::new()?;
+    let project = world.project("unloadable")?;
+    world.write_project_settings("unloadable", &json!({ "memory_enabled": false }))?;
+
+    // Straight onto disk, the way `plugin.reload` is meant to find one — an
+    // install would refuse this at its compile step, which is a different
+    // and already-covered path. What is under test is the one where a
+    // package is on disk and its component cannot be made to run.
+    let dir = world
+        .global_root()
+        .join("plugins")
+        .join("cache")
+        .join("dud-plugin")
+        .join("1.0.0");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("dud.wasm"), b"not a WebAssembly component at all")?;
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "[plugin]\n\
+         name = \"dud-plugin\"\n\
+         version = \"1.0.0\"\n\
+         api_version = \"0.1\"\n\
+         description = \"a component that will not load\"\n\
+         \n\
+         [[wasm]]\n\
+         component = \"dud.wasm\"\n",
+    )?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(with_plugins),
+    )
+    .await?;
+    let mut client = daemon.connect().await?;
+
+    let reloaded = client.call("plugin.reload", json!({})).await?;
+    anyhow::ensure!(
+        reloaded.error.is_none(),
+        "plugin.reload failed: {:?}",
+        reloaded.error
+    );
+
+    let listed = client.plugin_list().await?;
+    let plugins = listed
+        .result
+        .and_then(|r| r.get("plugins").cloned())
+        .and_then(|p| p.as_array().cloned())
+        .unwrap_or_default();
+    let dud = plugins
+        .iter()
+        .find(|p| p["name"] == "dud-plugin")
+        .ok_or_else(|| anyhow::anyhow!("the package is not listed at all: {plugins:?}"))?;
+
+    // Listed and enabled, which is true and is exactly why it is misleading
+    // on its own.
+    assert_eq!(dud["enabled"], json!(true), "{dud}");
+
+    let faults = dud["component_faults"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !faults.is_empty(),
+        "a package whose only component will not load is listed as if it were \
+         working: {dud}"
+    );
+    let reason: String = faults
+        .iter()
+        .filter_map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        reason.contains("dud.wasm"),
+        "the fault does not name the component it is about: {reason}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
 /// A capability the package never declared is unreachable, and the guest is
 /// told which one would have allowed it.
 ///
