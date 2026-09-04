@@ -15,10 +15,18 @@ pub fn demo_plugin_source_dir() -> PathBuf {
 /// 打包 `demo_plugin_source_dir()` 到 `out_dir/demo-plugin-<n>.zip`（`<n>` 自增，
 /// 避免并发测试互相覆盖），返回 `(zip 绝对路径, sha256 hex 校验和)`。
 pub fn package_demo_plugin(out_dir: &Path) -> anyhow::Result<(PathBuf, String)> {
+    package_dir(&demo_plugin_source_dir(), out_dir, "demo-plugin")
+}
+
+/// 打包任意一个插件源码目录，给 `plugin.install` 用。
+///
+/// 提交进仓库的 fixture 走 [`package_demo_plugin`]；用例现造的包（比如一个只带
+/// `[[script]]` 的包，JS 本身就是被测的东西，放在用例里比放在 fixture 目录里更
+/// 好读）走这里。两条路共用同一个打包器。
+pub fn package_dir(src: &Path, out_dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    let src = demo_plugin_source_dir();
     anyhow::ensure!(
         src.join("plugin.toml").exists(),
         "expected plugin.toml under {}",
@@ -29,12 +37,12 @@ pub fn package_demo_plugin(out_dir: &Path) -> anyhow::Result<(PathBuf, String)> 
     {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
         let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
-        add_dir_to_zip(&mut writer, &src, &src, opts)?;
+        add_dir_to_zip(&mut writer, src, src, opts)?;
         writer.finish()?;
     }
 
     std::fs::create_dir_all(out_dir)?;
-    let zip_path = out_dir.join(format!("demo-plugin-{n}.zip"));
+    let zip_path = out_dir.join(format!("{name}-{n}.zip"));
     std::fs::write(&zip_path, &buf)?;
 
     use sha2::{Digest, Sha256};

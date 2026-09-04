@@ -209,9 +209,25 @@ sidecar 只会让「这一组为什么这么绑」离断言更远。
 | C | `tests/runner/tests/script_boundaries.rs` |
 | D | `tests/runner/tests/script_task_profiles.rs` |
 | daemon 那条路 | `daemon/tests/session_lifecycle.rs` |
+| 装配好的那条路 | `tests/daemon_harness/tests/daemon_surface.rs` |
 
 daemon 的两条单独在那边：从 `.atta/settings.json` 到装到会话上的这一段全是 daemon
 的活——解析、按项目根解析路径、每个会话绑一次——驱动 `Builder` 的用例问不到它。
+
+`daemon_harness` 那几条又低一层：进去是 JSON-RPC，出来是一个说 Anthropic SSE 的
+HTTP 桩，所以「脚本改的东西到没到模型」是从**桩收到的那个请求**里读出来的，不是从
+引擎内部的某个中间值。每条跑两遍，本进程和另起一个 `attacored`。
+
+| 用例 | 问什么 |
+|---|---|
+| `a_bound_script_reaches_the_prompt_and_the_ledger` | 项目 settings 绑的脚本，痕迹到达提示词、账本记 `applied` |
+| `a_packaged_script_runs_beside_the_projects_own` | `plugin.install` 装进来的包里那个脚本**真的被调了**；它和项目的脚本共用一份账本（也就是共用一份每轮预算），账本靠路径把两种出身分得开 |
+| `a_package_may_add_to_the_prompt_but_not_rewrite_it` | 出身这条规则活过了整条装配路径：包的改写被拒、记成 `refused` 且带理由，项目自己那条照常 `applied` |
+| `a_build_with_no_script_carrier_honors_no_scripts_section` | 不带载体的构建拿到 `scripts` 段：痕迹没有，`session.get` 连 `scripts` 键都没有 |
+
+C 档里「项目外的脚本只能新增」问的是同一条规则，但那是在 `Builder` 那一层拿一个放在
+项目根外面的文件问的。这里问的是**一个真的装进来的包**——manifest 解析、解包落到
+版本化缓存、绑定按包的 root 判定出身——中间任何一步把出身弄丢了，C 档都看不见。
 
 驱动会话的那段代码在 `tests/runner/src/script_session.rs`——三个二进制共用一个，
 各写一份会漂，而漂了的驱动比没有测试更糟：它会持续报告一个并不存在的引擎。

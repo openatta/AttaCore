@@ -608,6 +608,259 @@ async fn a_bound_script_reaches_the_prompt_and_the_ledger_in_a_spawned_daemon() 
     a_bound_script_reaches_the_prompt_and_the_ledger(Mode::Spawned).await
 }
 
+const PACKAGE_MARK: &str = "CARRIER-PACKAGE-SCRIPT-REACHED-THE-PROMPT";
+
+/// A package whose whole content is one script bound to `prompt.assemble`,
+/// packed and ready for `plugin.install`.
+///
+/// It only ever *appends* a block. A script that arrives from outside the
+/// project may add to the prompt and nothing else — modifying, deleting or
+/// reordering needs a capability it never declared — so an appending script
+/// is the shape that is supposed to work, and the one worth proving works.
+fn a_package_with_a_script(
+    world: &World,
+    name: &str,
+    body: &str,
+) -> anyhow::Result<(std::path::PathBuf, String)> {
+    let src = world.root().join("packages").join(name);
+    std::fs::create_dir_all(&src)?;
+    std::fs::write(
+        src.join("plugin.toml"),
+        format!(
+            "[plugin]\n\
+             name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             api_version = \"0.1\"\n\
+             description = \"a script bound to prompt.assemble\"\n\
+             \n\
+             [[script]]\n\
+             point = \"prompt.assemble\"\n\
+             entry = \"annotate.js:onAssemble\"\n"
+        ),
+    )?;
+    std::fs::write(src.join("annotate.js"), body)?;
+
+    test_runner::plugin_fixture::package_dir(&src, &world.root().join("packed"), name)
+}
+
+/// Appends a block and touches nothing else — what a package's script is
+/// allowed to do.
+fn a_script_that_appends() -> String {
+    format!(
+        r#"function onAssemble(blocks) {{
+             var out = blocks.map(function (b) {{ return b; }});
+             out.push({{ name: "package.annotator", content: "{PACKAGE_MARK}" }});
+             return out;
+           }}"#
+    )
+}
+
+/// Rewrites the first block it is given — what a package's script is not
+/// allowed to do, and the only edit whose refusal is observable.
+fn a_script_that_rewrites() -> String {
+    r#"function onAssemble(blocks) {
+         var out = blocks.map(function (b) { return b; });
+         if (out.length > 0) { out[0] = { name: out[0].name, content: "REWRITTEN" }; }
+         return out;
+       }"#
+    .to_string()
+}
+
+/// A script that arrived in a package runs, and shares one ledger with the
+/// project's own.
+///
+/// Installing a script-only package was already covered — it unpacks, it is
+/// disclosed, `plugin.list` finds it. What nothing checked is the step after:
+/// that the script in it is ever called. The daemon binds a package's
+/// declarations into the same `BoundScripts` as the project's, which is the
+/// arrangement this asserts from outside: both marks reach the model, both
+/// calls land in the one ledger `session.get` reports, and the ledger names
+/// each script by a path that says where it came from.
+///
+/// One ledger is not cosmetic. It is also one per-turn budget, reset by the
+/// same turn — two would have left whichever set the session did not hold
+/// running against a budget nothing ever reset.
+async fn a_packaged_script_runs_beside_the_projects_own(mode: Mode) -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = a_project_with_a_script(&world)?;
+    let (archive, checksum) =
+        a_package_with_a_script(&world, "annotator", &a_script_that_appends())?;
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(mode),
+    )
+    .await?;
+
+    // Installed before any session exists: a session takes the package
+    // bindings when it is built, so one opened first would not have them.
+    let mut client = daemon.connect().await?;
+    let installed = client
+        .plugin_install(json!({
+            "name": "annotator",
+            "version": "1.0.0",
+            "download_url": test_runner::plugin_fixture::file_url(&archive),
+            "checksum": checksum,
+        }))
+        .await?;
+    anyhow::ensure!(
+        installed.error.is_none(),
+        "plugin.install failed: {:?}",
+        installed.error
+    );
+
+    let (project_mark_arrived, ledger) =
+        run_the_scripted_project(&world, &provider, &daemon, &project).await?;
+
+    let package_mark_arrived = provider
+        .calls()
+        .last()
+        .is_some_and(|call| call.system_text().contains(PACKAGE_MARK));
+
+    assert!(
+        project_mark_arrived,
+        "the project's own script stopped reaching the prompt once a package was installed"
+    );
+    assert!(
+        package_mark_arrived,
+        "the installed package's script never reached the prompt the daemon sent"
+    );
+
+    let ledger = ledger.ok_or_else(|| {
+        anyhow::anyhow!("session.get reports no scripts on a session with two sets bound")
+    })?;
+    assert!(
+        ledger["applied"].as_u64().unwrap_or(0) >= 2,
+        "one ledger should have counted both scripts: {ledger}"
+    );
+
+    // The path is what tells the two apart — the ledger has no separate
+    // provenance field, and "why did nothing happen" is answerable only if a
+    // reader can see which script it was.
+    let paths: Vec<&str> = ledger["recent"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e["script"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        paths.iter().any(|p| p.ends_with("house.js")),
+        "the project's script is missing from the ledger: {ledger}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("annotate.js")),
+        "the package's script is missing from the ledger: {ledger}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packaged_script_runs_beside_the_projects_own_here() -> anyhow::Result<()> {
+    a_packaged_script_runs_beside_the_projects_own(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn a_packaged_script_runs_beside_the_projects_own_in_a_spawned_daemon() -> anyhow::Result<()>
+{
+    a_packaged_script_runs_beside_the_projects_own(Mode::Spawned).await
+}
+
+/// An edit a package's script may not make is refused, reported, and costs
+/// only itself.
+///
+/// This is the one point where where a script came from changes what it may
+/// do: inside the project it is the operator's own code and may rewrite the
+/// prompt; anywhere else it may only add. The rule is worth nothing if a
+/// refusal is indistinguishable from a script that ran and found nothing to
+/// do — from inside the engine both are "the prompt did not change" — so the
+/// ledger has to say which, and the project's own script has to survive the
+/// refusal of somebody else's edit.
+async fn a_package_may_add_to_the_prompt_but_not_rewrite_it(mode: Mode) -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = a_project_with_a_script(&world)?;
+    let (archive, checksum) =
+        a_package_with_a_script(&world, "rewriter", &a_script_that_rewrites())?;
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(mode),
+    )
+    .await?;
+
+    let mut client = daemon.connect().await?;
+    let installed = client
+        .plugin_install(json!({
+            "name": "rewriter",
+            "version": "1.0.0",
+            "download_url": test_runner::plugin_fixture::file_url(&archive),
+            "checksum": checksum,
+        }))
+        .await?;
+    anyhow::ensure!(
+        installed.error.is_none(),
+        "plugin.install failed: {:?}",
+        installed.error
+    );
+
+    let (project_mark_arrived, ledger) =
+        run_the_scripted_project(&world, &provider, &daemon, &project).await?;
+
+    assert!(
+        project_mark_arrived,
+        "refusing the package's edit took the project's own script down with it"
+    );
+    let rewritten = provider
+        .calls()
+        .last()
+        .is_some_and(|call| call.system_text().contains("REWRITTEN"));
+    assert!(
+        !rewritten,
+        "the package rewrote a prompt block it may not touch"
+    );
+
+    let ledger = ledger.ok_or_else(|| anyhow::anyhow!("session.get reports no scripts at all"))?;
+    assert!(
+        ledger["refused"].as_u64().unwrap_or(0) >= 1,
+        "the refused edit is not counted as refused: {ledger}"
+    );
+    assert!(
+        ledger["applied"].as_u64().unwrap_or(0) >= 1,
+        "the project's own script should still be recorded as applied: {ledger}"
+    );
+
+    let refusal = ledger["recent"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|e| e["outcome"] == "refused").cloned())
+        .ok_or_else(|| anyhow::anyhow!("no refused entry in the ledger: {ledger}"))?;
+    assert!(
+        refusal["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "a refusal without a reason is the silence this ledger exists to break: {refusal}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_package_may_add_to_the_prompt_but_not_rewrite_it_here() -> anyhow::Result<()> {
+    a_package_may_add_to_the_prompt_but_not_rewrite_it(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn a_package_may_add_to_the_prompt_but_not_rewrite_it_in_a_spawned_daemon(
+) -> anyhow::Result<()> {
+    a_package_may_add_to_the_prompt_but_not_rewrite_it(Mode::Spawned).await
+}
+
 /// The same project, against a daemon with no script engine in it.
 ///
 /// Both halves are needed. That the mark is missing only says the script did
