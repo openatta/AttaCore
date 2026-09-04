@@ -66,7 +66,7 @@ pub struct PasteStore {
 }
 
 impl PasteStore {
-    /// Rooted at `base` (e.g. `~/.atta/<scope>`); the files live in
+    /// Rooted at `base` (e.g. `~/.atta/scenes/<scope>`); the files live in
     /// `<base>/pastes/`.
     pub fn new(base: &Path) -> Self {
         Self {

@@ -2251,7 +2251,7 @@ impl Builder {
         );
 
         // Cron tools + the scheduler that actually drains the store.
-        // `~/.atta/<scope>/scheduled_tasks.json` is the exact path
+        // `~/.atta/scenes/<scope>/scheduled_tasks.json` is the exact path
         // `CronCreate`'s own prompt promises the user for `durable: true`
         // jobs; session-only jobs never touch disk.
         //

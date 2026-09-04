@@ -105,7 +105,7 @@ read-modify-write 同一个索引文件而丢更新。读取方 `read_dir` 汇�
 连它的 `socket`。**不要自己拼 socket 路径去猜**;daemon 换启动参数重启时,读实例
 文件的客户端不用改代码。
 
-daemon 另外还写一份 `~/.atta/<scene>/daemon.lock`(`{pid, pid_start_time,
+daemon 另外还写一份 `~/.atta/scenes/<scene>/daemon.lock`(`{pid, pid_start_time,
 socket_path, version, started_at, protocol_version}`)。它早于多场景支持,只描述
 一个场景,新客户端用 `instances.d/`。
 
@@ -113,7 +113,7 @@ socket_path, version, started_at, protocol_version}`)。它早于多场景支持
 
 ```
 --socket <path> 指定        → 用它
-否则                        → $HOME/.atta/<scene>/daemon.sock
+否则                        → $HOME/.atta/scenes/<scene>/daemon.sock
 ```
 
 (Windows 上没有 Unix socket,daemon 改用命名管道 `\\.\pipe\attacore-daemon`。)
@@ -580,8 +580,9 @@ Unix socket 靠文件系统权限,不握手,一样是"能连上就全权"。
 的副本,放在顶层是因为现有客户端读的是它们。
 
 `providers.ok` 只说明配置**形状**解析得通(每个 `task_models` 条目都指向一个存在
-的 provider),不说明真能建出客户端 —— `api_type: openai_compatible` 之类 schema
-收但运行时没有实现的配置,这里仍然是 `ok: true`。
+的 provider),不说明真能建出客户端,更不说明那个端点能连上 —— 缺凭据、`base_url`
+指向一个没人监听的地址,这里都仍然是 `ok: true`。这项检查从已经握着的设置立刻回
+答,不发起任何网络探测。
 
 `plugins.status` 是这个二进制**能不能加载插件**:`enabled`、`disabled-by-policy`
 (编进来了但配置关掉了)、`compiled-out`(根本没编进来)。

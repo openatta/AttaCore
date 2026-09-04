@@ -27,7 +27,7 @@ pub struct TeamMemoryStore {
 }
 
 impl TeamMemoryStore {
-    /// Create a new team memory store at `~/.atta/<scope>/teams/{name}/memory/`.
+    /// Create a new team memory store at `~/.atta/scenes/<scope>/teams/{name}/memory/`.
     ///
     /// Creates the directory if it does not exist.
     pub fn new(team_name: &str, scope: &str) -> Self {

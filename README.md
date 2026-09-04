@@ -23,17 +23,17 @@ extension that fails costs its own contribution and nothing else.
 ```sh
 git clone https://github.com/openatta/AttaCore && cd AttaCore
 export ANTHROPIC_AUTH_TOKEN=sk-...          # or ANTHROPIC_API_KEY
-cargo run --release -p daemon               # listens on ~/.atta/coding/daemon.sock
+cargo run --release -p daemon               # listens on ~/.atta/scenes/coding/daemon.sock
 ```
 
 ```sh
 echo '{"jsonrpc":"2.0","id":1,"method":"session.run_turn",
        "params":{"message":"Write a TCP echo server in Rust"}}' \
-  | socat - UNIX-CONNECT:$HOME/.atta/coding/daemon.sock
+  | socat - UNIX-CONNECT:$HOME/.atta/scenes/coding/daemon.sock
 ```
 
 Tokens stream back as `session.event` frames while the turn runs; the response
-arrives when it ends. Thirty-five methods are documented in
+arrives when it ends. Thirty-seven methods are documented in
 [`docs/daemon_rpc_protocol.md`](docs/daemon_rpc_protocol.md), and every
 documented shape is compared against a real daemon's answer by a test — the
 document cannot drift from the code.
@@ -423,7 +423,18 @@ carrying that call's tokens, latency and the model it went to — which is what 
 cost is priced from, and the only thing that can say where the money went when a
 turn switches models partway — and the turn's total on `TurnOutcome` and on the
 event a daemon client watches. A turn is several calls; the last one is not the
-bill. And the recorder: wrap any `Model`, and every call is written to a
+bill.
+
+Two things make that total the one a host is actually billed for. **Four token
+counts per call, not two**: a cache read costs a fraction of ordinary input and
+a cache write a premium on it, so folding all three into one number cannot be
+turned back into a price. And **the calls no turn asked for are counted too** —
+memory extraction after a turn ends, compaction's summarizer, a `"type":
+"prompt"` hook. Those are made from places that cannot reach a telemetry handle,
+so the counting sits in the model they all share: any call carrying an auxiliary
+origin is reported with a `purpose`, which a reader can sum in or tell apart.
+
+And the recorder: wrap any `Model`, and every call is written to a
 self-contained directory — the assembled system blocks (per block, not joined),
 the full tool table, every message, the response down to token boundaries, and
 failures recorded as failures so an overload that switched to the fallback model
@@ -441,7 +452,9 @@ transport changes framing and nothing else, which is checked by running one
 exchange over all three.
 
 - **Session pool** with capacity, LRU eviction and idle timeout
-- **Discovery** via PID lock file next to the socket
+- **Discovery** via one JSON file per daemon under `~/.atta/daemon/instances.d/`,
+  written at startup and removed on exit — a client reads the directory and
+  picks by scene rather than reconstructing a socket path
 - **Graceful shutdown** that lets in-flight turns finish
 - **TCP and WebSocket require a `daemon.auth` handshake** (constant-time token
   comparison) as the first message on every connection; Unix sockets rely on
@@ -461,24 +474,31 @@ Builder::new()
     .history_store(my_store)      // Arc<dyn HistoryStore>  — your persistence
     .plugin_host(my_host)         // Arc<dyn PluginHost>
     .task_router(my_router)       // Arc<TaskRouter>
-    .tools(my_registry)           // Arc<InMemoryToolRegistry>  ← concrete
-    .hooks(my_hook_runner)        // Arc<HookRunner>            ← concrete
+    .tools(my_registry)           // Arc<dyn ToolRegistry>  — your own registry
+    .hooks(my_hook_runner)        // Arc<HookRunner>        ← concrete
     .build()?;
 ```
 
-Seven take a trait object, so an external crate can supply the implementation.
-Two do not, and it is worth knowing which: `.tools(...)` takes the concrete
-registry (the `ToolRegistry` trait carries only `all()` and `find()`), and
-`.hooks(...)` takes the concrete runner — customization there happens through
-hook *configuration* rather than by replacing the runner, though the two executor
-traits it delegates to are injectable.
+Eight take a trait object, so an external crate can supply the implementation —
+`ToolRegistry` among them, and it carries the whole surface a contributor needs:
+`all`, `find`, `register`, `replace`, and removal by name, each registration
+handing back something that withdraws exactly itself.
+
+One does not: `.hooks(...)` takes the concrete runner — customization there
+happens through hook *configuration* rather than by replacing the runner, though
+the two executor traits it delegates to are injectable.
 
 ---
 
 ## Configuration
 
-Four layers, lowest priority first: built-in defaults → `$HOME/.atta/<scene>/settings.json`
-→ `<project>/.atta/settings.json` → CLI arguments. TOML works anywhere JSON does.
+Four layers, lowest priority first: built-in defaults →
+`$HOME/.atta/scenes/<scene>/settings.json` → `<project>/.atta/settings.json` →
+CLI arguments. TOML works anywhere JSON does.
+
+`$HOME/.atta` is the global root, flat and shared by every scene; each scene
+gets its own subtree under `scenes/<scene>/` for the state that should not
+cross between them.
 
 The authoritative surface is the generated
 [JSON Schema](docs/schemas/settings.schema.json) — it is regenerated from the
@@ -490,7 +510,7 @@ Rust types by a test, so it cannot describe a shape the code does not have.
 | `ANTHROPIC_API_KEY` | Fallback for the above |
 | `ANTHROPIC_BASE_URL` | Custom endpoint (proxies, compatible providers) |
 | `ATTACORE_DAEMON_TOKEN` | TCP / WebSocket handshake token |
-| `ATTA_CONFIG_HOME` | Config root (default `$HOME/.atta/<scene>`) |
+| `ATTA_CONFIG_HOME` | Global root (default `$HOME/.atta`); the scene's own root is `{it}/scenes/<scene>` |
 | `ATTA_RECORD` / `ATTA_REPLAY` | Recorder mode, with `ATTA_RECORDINGS_DIR` |
 
 **Identifiers** are BASE58(UUID v4) — 22 characters, URL-safe, one generation
@@ -501,7 +521,7 @@ that maps to `TEXT` in Postgres and SQLite alike.
 
 ## Testing
 
-Four layers, each answering a different question, none of them needing a
+Five layers, each answering a different question, none of them needing a
 network or an API key — and all of it runs on every push.
 
 | Layer | What it answers | How |
@@ -510,22 +530,39 @@ network or an API key — and all of it runs on every push.
 | `crates/*/tests` | does this crate keep its promise through its public seam | `cargo test` |
 | `daemon/tests` | a real server, a real socket, real JSON-RPC | `cargo test -p daemon` |
 | `tests/runner/tests` | a real Agent doing real work, with the model's answers written down | `cargo test -p test-runner` |
+| `tests/daemon_harness/tests` | the assembled product: in through JSON-RPC, out through an HTTP provider — run twice, in-process and against a spawned `attacored` | `cargo test -p daemon-harness` |
+
+Plus `tests/scripts/*.sh`, which asserts things about the build itself — that a
+no-plugin build links no WebAssembly, for one.
 
 Three things about it are worth stealing:
 
-**The model is faked at one seam, three different ways.** A recorder for "does
-this run reproduce", a scripted model for "what does the engine decide given
-these answers" — including the 529s and truncations no provider will produce on
-request — and a scripted HTTP client below the adapter for the daemon's own
-tests.
+**The model is faked at three depths, and the depth is what each one buys.** A
+scripted `Model` for "what does the engine decide given these answers" —
+including the 529s and truncations no provider will produce on request. A
+scripted HTTP client *below* the Anthropic adapter, so the tool loop, the
+permission gate and the streaming frames are all really running and only the
+network is not. And an HTTP server speaking Anthropic SSE, below that again,
+which puts request serialization, SSE decoding and backoff back in the test —
+and is the only one of the three a *separate process* can use, because
+`ANTHROPIC_BASE_URL` crosses a process boundary where an `Arc<dyn
+AnthropicClient>` cannot. That last one is why the same cases can run twice,
+in-process and against a real spawned daemon; a case that passes in one mode
+only has found a startup step being skipped rather than performed.
+
+The recorder is deliberately not on that list any more. It is a product
+capability — an operator records their own session to debug it — and this
+repository records nothing and commits no recordings.
 
 **Documents are tested.** The RPC method list, the response shapes in it, the
-extension-point table, the settings schema: each is compared against the code by
-a test, so a document that drifts fails a build rather than misleading a reader.
+extension-point table, the settings schema — and this file's own counts, down to
+whether every tool its table names still exists: each is compared against the
+code by a test, so a document that drifts fails a build rather than misleading a
+reader.
 
-**Nothing in it needs a network or a key.** The model is faked at one seam and
-the answers are written down, so the whole suite runs anywhere in seconds —
-which is what makes gating on it possible at all.
+**Nothing in it needs a network or a key.** Every fake is a fake all the way
+down and the answers are written down, so the whole suite runs anywhere in
+seconds — which is what makes gating on it possible at all.
 
 ---
 
@@ -556,8 +593,8 @@ which is what makes gating on it possible at all.
 | L5 | `plugin-compiler` | AOT component compile | `atta-plugin-compile` |
 | — | `daemon` | JSON-RPC 2.0 server | `DaemonServer`, `SessionPool`, `run_doctor` |
 
-21 crates under `crates/`, plus `daemon/` and the test members — 25 workspace
-members in total.
+21 crates under `crates/`, plus `daemon/` and the four test members — 26
+workspace members in total.
 
 ---
 

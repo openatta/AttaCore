@@ -48,7 +48,7 @@ pub struct EngineConfig {
     /// Once escalated, stays at strong for rest of the turn.
     /// `None` = no routing (use `model` for everything; current default).
     /// User-facing API: surface as `--strong-model` CLI flag, or in
-    /// `~/.atta/<scope>/settings.json`.
+    /// `~/.atta/scenes/<scope>/settings.json`.
     pub strong_model: Option<String>,
     /// **P2 (Phase 2)**: optional fallback model for retry on overloaded /
     /// transport errors. When the primary model returns 503/529/transport
@@ -185,7 +185,7 @@ pub struct SystemPromptSettings {
     pub memory_walk_up: bool,
     /// **A-5 **: 选中的 output style 名称（user/project 级别均可）。
     /// 引擎在 collect FrozenContext 时按此名称从
-    /// `~/.atta/<scope>/output-styles/<name>.md` 或 `<cwd>/.atta/output-styles/<name>.md`
+    /// `~/.atta/scenes/<scope>/output-styles/<name>.md` 或 `<cwd>/.atta/output-styles/<name>.md`
     /// 读取内容，注入 system prompt 末段。None = 不注入额外 style。
     pub output_style: Option<String>,
     /// When true (default), use TaskCreate/Update/List/Get/Stop instead of

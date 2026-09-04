@@ -10,7 +10,7 @@
 //! # Agent type registry
 //!
 //! The module defines built-in agent types (`builtin_agent_types()`) and can
-//! load user-defined types from a directory (e.g. `~/.atta/<scope>/agents/*.md`
+//! load user-defined types from a directory (e.g. `~/.atta/scenes/<scope>/agents/*.md`
 //! or `<project>/.atta/agents/*.md`) via `load_agent_types_from_dir()`. Each
 //! type specifies a system prompt and an allowed tool set, which
 //! `resolve_tools()` applies when spawning sub-agents.

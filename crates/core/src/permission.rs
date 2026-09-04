@@ -143,7 +143,7 @@ pub struct PermissionRule {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum RuleSource {
-    /// `~/.atta/<scope>/settings.json`
+    /// `~/.atta/scenes/<scope>/settings.json`
     UserSettings,
     /// `<git-root>/.atta/settings.json`
     ProjectSettings,

@@ -21,7 +21,7 @@
 //! there's no collision to avoid the way there is under a shared `$HOME`.
 //!
 //! **2026-08-04 restructuring**: the user-level tree used to be entirely
-//! scene-scoped (`~/.atta/<scope>/{memory,sessions,recordings,skills,...}`). It is
+//! scene-scoped (`~/.atta/scenes/<scope>/{memory,sessions,recordings,skills,...}`). It is
 //! now split by resource type:
 //!
 //! - **Global + scene override** (config-shaped, keyed by name): `settings.json`,

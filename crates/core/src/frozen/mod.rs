@@ -55,15 +55,15 @@ pub struct FrozenContext {
     pub today: String,
     pub memory_blocks: Vec<MemoryFileEntry>,
     pub user_email: Option<String>,
-    /// `~/.atta/<scope>/skills/<name>/SKILL.md` + `<cwd>/.agents/skills/<name>/SKILL.md`
+    /// `~/.atta/scenes/<scope>/skills/<name>/SKILL.md` + `<cwd>/.agents/skills/<name>/SKILL.md`
     /// 的 metadata 索引（项目级技能挪到了 `.agents/skills/`——外部事实标准，Codex
-    /// 也扫描这个路径；用户级技能仍在 AttaCore 私有的 `.atta/<scope>/` 下，因为
+    /// 也扫描这个路径；用户级技能仍在 AttaCore 私有的 `.atta/scenes/<scope>/` 下，因为
     /// 用户主目录不存在"被别的工具扫描"的场景）。只入 frontmatter
     /// （name/description/when_to_use）+ 不嵌入 body / 不做参数代换 / 不做 slash
     /// 调用。模型能"知道"skills 存在 + 在合适时主动引用。
     pub skills: Vec<SkillEntry>,
     /// 跨会话 memory 目录（每个 cwd 一个）。位于
-    /// `~/.atta/<scope>/memory/<sha256(canonical_cwd)[..16]>/`。
+    /// `~/.atta/scenes/<scope>/memory/<sha256(canonical_cwd)[..16]>/`。
     pub memory_dir: PathBuf,
     /// 上面目录里 MEMORY.md 的内容（仅当存在时加载）。注入 system prompt。
     pub memory_index: Option<String>,
@@ -89,7 +89,7 @@ pub struct OutputStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputStyleSource {
-    /// `~/.atta/<scope>/output-styles/<name>.md`
+    /// `~/.atta/scenes/<scope>/output-styles/<name>.md`
     User,
     /// `<cwd>/.atta/output-styles/<name>.md`
     Project,
@@ -338,7 +338,7 @@ impl FrozenContext {
 }
 
 /// **A-5 **: load `<cwd>/.atta/output-styles/<name>.md` if present,
-/// else `~/.atta/<scope>/output-styles/<name>.md`. Trims whitespace and caps body
+/// else `~/.atta/scenes/<scope>/output-styles/<name>.md`. Trims whitespace and caps body
 /// at 8KB. Returns None if neither file is present or readable.
 async fn collect_output_style(cwd: &Path, name: &str, paths: &ConfigPaths) -> Option<OutputStyle> {
     let safe = name.trim();
