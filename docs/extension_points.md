@@ -358,9 +358,28 @@ Builder::new().budget_policy(Arc::new(Capped {
 ```
 
 **给一次执行卡预算,应该卡在这里,不是在 `TurnOutcome` 上。** `on_usage` 在**每次
-模型调用之后**被调,拿到的 `Spend::total_tokens` 是这一轮到此为止的累计——所以超了
-可以当场把这一轮停掉,而不是等到结束才知道花了多少。`TurnOutcome.total_usage` 回答
-的是"花了多少",这里回答的是"还能不能继续花"。
+模型调用之后**被调,拿到的 `Spend` 是这一轮到此为止的累计——所以超了可以当场把这一轮
+停掉,而不是等到结束才知道花了多少。`TurnOutcome.total_usage` 回答的是"花了多少",
+这里回答的是"还能不能继续花"。
+
+**`Spend` 把 provider 报的四项分开给,不给一个和。** 哪些算"花掉了"是策略的判断,
+不是引擎的:缓存读按普通输入的一个零头计费,全额计入会高估账单,不计入又会让一轮
+缓存命中的执行少算掉它读的绝大部分。两种都说得通,所以引擎只负责如实报。
+`Spend::total_tokens()` 是 input + output(引擎自带的 `EngineBudget` 用的就是它,
+`max_budget_tokens` 的含义因此不变),`Spend::all_tokens()` 是四项全含,想要第三种
+口径的自己按需加权:
+
+```rust
+fn on_usage(&self, spend: &Spend) -> Spending {
+    // 例:按费率折算成"等效输入 token"再卡
+    let weighted = spend.input_tokens
+        + spend.output_tokens * 5
+        + spend.cache_creation_tokens * 5 / 4
+        + spend.cache_read_tokens / 10;
+    if weighted >= self.cap { Spending::Exhausted { limit: self.cap } }
+    else { Spending::WithinBudget }
+}
+```
 
 ### 一份日志对模型意味着什么 — `history.projection`
 

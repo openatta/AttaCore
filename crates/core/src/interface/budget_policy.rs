@@ -12,13 +12,24 @@
 //!
 //! # Two ceilings that look alike and are not
 //!
-//! `Spending` is about the bill: input plus output, accumulated across the
-//! turn, checked against what the provider actually reported. `OutputTarget`
-//! is about the opposite problem — the model stopping short of the volume of
-//! work that was asked for. One ends a turn that has spent too much, the
-//! other prolongs a turn that has produced too little. They stay separate
-//! methods because merging them would let "write more" and "you have spent
-//! enough" argue with each other inside one verdict.
+//! `Spending` is about the bill, accumulated across the turn and checked
+//! against what the provider actually reported. `OutputTarget` is about the
+//! opposite problem — the model stopping short of the volume of work that was
+//! asked for. One ends a turn that has spent too much, the other prolongs a
+//! turn that has produced too little. They stay separate methods because
+//! merging them would let "write more" and "you have spent enough" argue with
+//! each other inside one verdict.
+//!
+//! # What counts as spent is the policy's call, not the engine's
+//!
+//! [`Spend`] carries the provider's four figures apart rather than one sum.
+//! There is no reading of them that is right for every deployment: a cache
+//! read is billed at a fraction of ordinary input, so counting it whole
+//! overstates the bill, and dropping it understates a cache-heavy turn by
+//! most of what it read. Both answers are defensible and they are not the
+//! engine's to choose, which is the reason this is a policy at all. The
+//! engine reports; [`Spend::total_tokens`] and [`Spend::all_tokens`] name the
+//! two obvious readings, and a policy that wants a third has the parts.
 //!
 //! `ContextBudget` is neither: it is about the size of a single request, not
 //! the cost of the turn.
@@ -26,10 +37,50 @@
 use crate::interface::scene::TokenBudget;
 
 /// What the turn has spent so far, as the provider reported it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Accumulated across every call in this turn, kept apart by kind because
+/// each kind is priced differently and no single sum answers for all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Spend {
-    /// Input plus output tokens across every call in this turn.
-    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Tokens written into the prompt cache, and tokens read back from it.
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+impl Spend {
+    /// Input plus output, leaving the cache out.
+    ///
+    /// What the engine has always measured a budget against, and what
+    /// [`EngineBudget`] still measures. Neither reading is the correct one —
+    /// see the module docs — but this one is the older, so it keeps the
+    /// shorter name and the existing behaviour.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Every token the provider reported, cache included.
+    ///
+    /// Counts a cache read the same as an ordinary input token, which is not
+    /// what it costs. A policy that wants the bill rather than the volume has
+    /// to weigh the parts itself.
+    pub fn all_tokens(&self) -> u64 {
+        self.total_tokens()
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+}
+
+impl From<crate::interface::model::Usage> for Spend {
+    fn from(u: crate::interface::model::Usage) -> Self {
+        Self {
+            input_tokens: u.input_tokens as u64,
+            output_tokens: u.output_tokens as u64,
+            cache_creation_tokens: u.cache_creation_input_tokens as u64,
+            cache_read_tokens: u.cache_read_input_tokens as u64,
+        }
+    }
 }
 
 /// Whether the turn may keep spending.
@@ -124,10 +175,15 @@ impl BudgetPolicy for EngineBudget {
         let Some(budget) = self.max_total_tokens else {
             return Spending::WithinBudget;
         };
-        if spend.total_tokens >= budget {
+        // `total_tokens()`, not `all_tokens()`: this ceiling is configured by
+        // deployments that set it against the old reading, and widening what
+        // it counts would silently lower every one of them — on a provider
+        // with prompt caching, by roughly the cache hit rate.
+        let spent = spend.total_tokens();
+        if spent >= budget {
             return Spending::Exhausted { limit: budget };
         }
-        if spend.total_tokens >= budget * 9 / 10 {
+        if spent >= budget * 9 / 10 {
             return Spending::Warn {
                 reminder: "<system-reminder>\nOutput token budget nearly exhausted. \
                            Keep your response concise and wrap up.\n</system-reminder>"
@@ -198,21 +254,25 @@ mod tests {
         EngineBudget::new(Some(budget))
     }
 
+    /// Input and output only, the way a caller with no cache reports.
+    fn spent(input: u64, output: u64) -> Spend {
+        Spend {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn the_bill_warns_at_ninety_percent_and_stops_at_the_cap() {
         let p = engine(1_000);
-        assert_eq!(
-            p.on_usage(&Spend { total_tokens: 899 }),
-            Spending::WithinBudget
-        );
+        assert_eq!(p.on_usage(&spent(800, 99)), Spending::WithinBudget);
         assert!(matches!(
-            p.on_usage(&Spend { total_tokens: 900 }),
+            p.on_usage(&spent(800, 100)),
             Spending::Warn { .. }
         ));
         assert_eq!(
-            p.on_usage(&Spend {
-                total_tokens: 1_000
-            }),
+            p.on_usage(&spent(800, 200)),
             Spending::Exhausted { limit: 1_000 },
             "the check is `>=`; at the cap the turn is over, not one call later"
         );
@@ -221,10 +281,83 @@ mod tests {
     #[test]
     fn no_cap_configured_means_no_ceiling() {
         assert_eq!(
-            EngineBudget::new(None).on_usage(&Spend {
-                total_tokens: u64::MAX
-            }),
+            EngineBudget::new(None).on_usage(&spent(u64::MAX, 0)),
             Spending::WithinBudget
+        );
+    }
+
+    /// The two readings, and the gap between them that made this a choice.
+    ///
+    /// A cache-heavy turn reads far more than `input_tokens` says: the figures
+    /// here are one call's worth from a provider with the cache warm, where
+    /// what was read is an order of magnitude past what a budget counting
+    /// input and output would see.
+    #[test]
+    fn the_cache_is_most_of_what_a_warm_turn_read() {
+        let spend = Spend {
+            input_tokens: 400,
+            output_tokens: 600,
+            cache_creation_tokens: 2_000,
+            cache_read_tokens: 30_000,
+        };
+        assert_eq!(spend.total_tokens(), 1_000);
+        assert_eq!(spend.all_tokens(), 33_000);
+    }
+
+    /// A ceiling an operator set stays where they set it.
+    ///
+    /// `EngineBudget` reads `total_tokens()`, so a turn whose cache traffic
+    /// dwarfs its budget is not stopped by it. That is a decision and not an
+    /// oversight — a policy that wants the cache counted overrides `on_usage`
+    /// and reads `all_tokens()`, and the engine does not make that choice for
+    /// deployments that configured the ceiling against the older reading.
+    #[test]
+    fn the_engines_ceiling_does_not_move_when_the_cache_fills() {
+        let spend = Spend {
+            input_tokens: 400,
+            output_tokens: 300,
+            cache_creation_tokens: 5_000,
+            cache_read_tokens: 90_000,
+        };
+        assert_eq!(
+            engine(1_000).on_usage(&spend),
+            Spending::WithinBudget,
+            "the cache moved a 1000-token ceiling that nobody asked to move"
+        );
+
+        struct CountsTheCache;
+        impl BudgetPolicy for CountsTheCache {
+            fn on_usage(&self, spend: &Spend) -> Spending {
+                if spend.all_tokens() >= 1_000 {
+                    Spending::Exhausted { limit: 1_000 }
+                } else {
+                    Spending::WithinBudget
+                }
+            }
+        }
+        assert_eq!(
+            CountsTheCache.on_usage(&spend),
+            Spending::Exhausted { limit: 1_000 },
+            "the parts a policy needs to reach the other answer are not reachable"
+        );
+    }
+
+    #[test]
+    fn a_usage_becomes_a_spend_without_losing_the_cache() {
+        let spend = Spend::from(crate::interface::model::Usage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 23,
+        });
+        assert_eq!(
+            spend,
+            Spend {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_creation_tokens: 5,
+                cache_read_tokens: 23,
+            }
         );
     }
 

@@ -405,8 +405,9 @@ impl Agent {
         // could declare any limit it liked and nothing enforced it. Lower of
         // the two wins; that rule now lives in `LimitsPolicy::new`, which is
         // built once per session — see `Builder::turn_policy`.
-        let mut total_tokens_used: u64 = 0;
-        // The same sum the budget already keeps, in the shape a caller reads.
+        // What the turn has spent, kept once. The budget reads it through
+        // `Spend` and a caller reads it whole; a second accumulator beside it
+        // is how the two came to disagree about the cache.
         let mut turn_usage = Usage::default();
         let start = std::time::Instant::now();
 
@@ -1223,13 +1224,14 @@ impl Agent {
             // Cumulative token budget, checked against the real usage the
             // provider reported for this call — no per-model price table,
             // no estimate. At 90% inject a warning; at 100% abort.
+            //
+            // The engine hands over all four figures and does not decide which
+            // of them count as spent; that is the policy's judgement, and the
+            // telemetry below records the reading the engine's own policy uses.
             {
-                total_tokens_used += usage.input_tokens as u64 + usage.output_tokens as u64;
-                match self
-                    .budget_policy
-                    .on_usage(&base::interface::budget_policy::Spend {
-                        total_tokens: total_tokens_used,
-                    }) {
+                let spend = base::interface::budget_policy::Spend::from(turn_usage);
+                let total_tokens_used = spend.total_tokens();
+                match self.budget_policy.on_usage(&spend) {
                     base::interface::budget_policy::Spending::WithinBudget => {}
                     base::interface::budget_policy::Spending::Warn { reminder, limit } => {
                         tracing::warn!(
@@ -5645,6 +5647,88 @@ mod tests {
             ];
             Ok(Box::new(futures::stream::iter(events)))
         }
+    }
+
+    /// A policy is handed every figure the provider reported, cache included.
+    ///
+    /// What counts as spent is the policy's judgement, and it cannot make one
+    /// on figures it never receives. The engine used to keep a second `u64`
+    /// beside `turn_usage` that summed input and output only, so the two
+    /// cache fields stopped at the accumulator no matter what a policy wanted
+    /// to do with them — and on a provider with the cache warm, that is most
+    /// of what the turn read.
+    #[tokio::test]
+    async fn a_policy_is_told_what_the_cache_cost() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<base::interface::budget_policy::Spend>>);
+
+        impl base::interface::budget_policy::BudgetPolicy for Recording {
+            fn on_usage(
+                &self,
+                spend: &base::interface::budget_policy::Spend,
+            ) -> base::interface::budget_policy::Spending {
+                self.0.lock().unwrap().push(*spend);
+                base::interface::budget_policy::Spending::WithinBudget
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let reported = base::interface::model::Usage {
+            input_tokens: 400,
+            output_tokens: 300,
+            cache_creation_input_tokens: 2_000,
+            cache_read_input_tokens: 30_000,
+        };
+        let model: Arc<dyn base::interface::model::Model> =
+            Arc::new(FixedUsageModel { usage: reported });
+        let scene: Arc<dyn base::interface::scene::AgentScene> =
+            Arc::new(scene::scene::coding::CodingScene);
+        let policy = Arc::new(Recording::default());
+
+        let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(16);
+        let (mut agent, _event_rx, _input_tx) = crate::agent::Builder::new()
+            .scene(scene)
+            .model(model)
+            .settings(Arc::new(recall_test_settings(tmp.path())))
+            .telemetry_handle(telemetry::TelemetryHandle::new(telemetry_tx))
+            .budget_policy(policy.clone())
+            .skip_warmup(true)
+            .build()
+            .expect("build should succeed");
+
+        agent
+            .process_turn(
+                InputMessage::User {
+                    content: "hello".into(),
+                    attachments: vec![],
+                    turn_id: "t1".into(),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("process_turn should succeed");
+
+        let seen = policy.0.lock().unwrap();
+        let spend = seen
+            .first()
+            .expect("the policy was never asked about this turn");
+        assert_eq!(
+            *spend,
+            base::interface::budget_policy::Spend::from(reported),
+            "the policy was given a different turn than the one the provider reported"
+        );
+        assert_eq!(
+            spend.total_tokens(),
+            700,
+            "the older reading has to keep meaning what it meant"
+        );
+        assert_eq!(
+            spend.all_tokens(),
+            32_700,
+            "reading everything is what the four fields are for"
+        );
     }
 
     /// `max_budget_tokens` must stop the turn on real reported usage — no
