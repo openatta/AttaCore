@@ -76,15 +76,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Tested, not just checked. Each of these two configurations compiles
+      # in daemon tests that no other configuration does — the
+      # plugins-disabled RPC answers here, the plugin-owned scene and
+      # `plugin.reload` under the carrier — and while this job only built
+      # them, those tests had never been run anywhere.
       - name: no carrier
-        run: cargo check -p daemon --no-default-features
+        run: cargo test -p daemon --no-default-features
 
       - name: plugin carrier
-        run: cargo check -p daemon --no-default-features --features plugins
+        run: cargo test -p daemon --no-default-features --features plugins
 
       # The package layer without any carrier: `plugin.*` works, nothing runs.
       # A build worth checking on its own because it is the one that proves
-      # the split — package management that needs no runtime.
+      # the split — package management that needs no runtime. Checked rather
+      # than tested because every test gated on the package layer also
+      # compiles into the default build, which the `test` job runs.
       - name: packages without a carrier
         run: cargo check -p daemon --no-default-features --features plugin-packages
 

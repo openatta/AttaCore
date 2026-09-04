@@ -59,6 +59,17 @@
 | `crates/core` 的 `settings_schema_matches_committed_file` | `docs/schemas/settings.schema.json` 由 `Settings` 类型生成（`#[ignore]`，CI 的 ignored 那一步跑） |
 | `daemon/tests/readme_matches_the_code.rs` | `README.md` 里可数的那些声称——workspace 成员数、RPC 方法数、扩展点数、hook 事件数、遥测事件类型数、内建工具数，以及工具表里每个名字都还实装着 |
 
+**每个 RPC 方法都得有人调。** 上面那两条盯的是「文档和 dispatch 说的是同一批方法」，
+都答不了「这个方法有没有被跑过」。`protocol_doc_matches_dispatch.rs` 的
+`every_method_a_client_can_send_is_driven_by_a_test` 答这个：dispatch 里的每个方法，
+加上握手用的 `daemon.auth`，都得有某个测试发过它——直接写方法名，或者调
+`rpc-client` 里发它的那个包装。
+
+这条是有来历的：`plugin.reload` 的两个调用点分别在两个互斥的 `#[cfg]` 里，没有哪个
+构建能同时编进去，而 CI 当时对这两种配置**只 `cargo check` 不 `cargo test`**——方法
+在，文档在，测试也在，就是从来没跑过。所以 `carriers` job 里那两步现在跑的是
+`cargo test`。
+
 ## fixture 项目
 
 `tests/fixtures/template_project/` 是模板项目：有 `.atta/settings.json`（hooks +

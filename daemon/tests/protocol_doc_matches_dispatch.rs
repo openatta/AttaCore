@@ -180,3 +180,108 @@ fn every_documented_error_code_exists() {
         "these error codes are documented but not declared in daemon/src/rpc.rs: {missing:?}"
     );
 }
+
+/// Every method the daemon answers is invoked by some test.
+///
+/// The two tests above keep the document and the dispatch table agreeing
+/// about what *exists*. Neither notices a method that exists, is documented,
+/// and has nothing driving it — and `plugin.reload` was in exactly that
+/// state: its only two call sites sat behind mutually exclusive `#[cfg]`s, so
+/// no single build compiled either one in, and CI built both configurations
+/// without running either.
+///
+/// A method counts as driven when a test names it as a JSON-RPC method
+/// string, or calls the `rpc-client` wrapper that sends it. Those are the two
+/// ways a test reaches the daemon; there is no third.
+///
+/// `daemon.auth` is checked here even though it never reaches `dispatch` —
+/// it is the first message on every network connection, so a client that
+/// cannot send it cannot send anything else either.
+#[test]
+fn every_method_a_client_can_send_is_driven_by_a_test() {
+    let root = repo_root();
+    let mut required =
+        dispatched_methods(&std::fs::read_to_string(root.join("daemon/src/server.rs")).unwrap());
+    required.push("daemon.auth".to_string());
+
+    let wrappers = client_wrappers(&root);
+    let corpus = test_sources(&root);
+
+    let undriven: Vec<&String> = required
+        .iter()
+        .filter(|method| {
+            let literal = format!("\"{method}\"");
+            !corpus.iter().any(|(_, src)| {
+                src.contains(&literal)
+                    || wrappers
+                        .iter()
+                        .any(|(f, m)| m == *method && src.contains(&format!(".{f}(")))
+            })
+        })
+        .collect();
+
+    assert!(
+        undriven.is_empty(),
+        "these methods are dispatched but no test sends them: {undriven:?}\n\
+         A method whose only proof is that it compiles is a method nobody has run."
+    );
+}
+
+/// `rpc-client`'s typed wrappers, paired with the method each one sends, so a
+/// test that calls `client.session_get(..)` counts as driving `session.get`.
+fn client_wrappers(root: &Path) -> Vec<(String, String)> {
+    let src = std::fs::read_to_string(root.join("tests/rpc_client/src/lib.rs"))
+        .expect("the typed client exists");
+    let mut out = Vec::new();
+    // Split rather than slice a window: each chunk already ends where the
+    // next wrapper begins, and this file has multi-byte comments that a
+    // fixed byte length lands in the middle of.
+    for chunk in src.split("pub async fn ").skip(1) {
+        let Some(name_end) = chunk.find(['(', '<', ' ']) else {
+            continue;
+        };
+        let name = &chunk[..name_end];
+        // The first method string in the body is the one this wrapper sends.
+        if let Some(method) = chunk
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .find(|s| s.contains('.') && !s.contains(' ') && !s.contains('/'))
+        {
+            out.push((name.to_string(), method.to_string()));
+        }
+    }
+    out
+}
+
+/// Every test file that can drive a daemon.
+///
+/// This file is excluded: it names methods to reason about them and sends
+/// none of them, which would make it evidence for itself.
+fn test_sources(root: &Path) -> Vec<(String, String)> {
+    let dirs = [
+        "daemon/tests",
+        "tests/daemon_harness/tests",
+        "tests/rpc_client/tests",
+    ];
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs")
+                && path
+                    .file_name()
+                    .is_some_and(|n| n != "protocol_doc_matches_dispatch.rs")
+            {
+                if let Ok(src) = std::fs::read_to_string(&path) {
+                    out.push((path.display().to_string(), src));
+                }
+            }
+        }
+    }
+    assert!(out.len() > 5, "the test corpus scan found almost nothing");
+    out
+}

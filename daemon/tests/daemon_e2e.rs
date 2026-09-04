@@ -433,6 +433,119 @@ async fn mcp_add_server_writes_settings_and_reports_connect_failure() {
     let _ = handle.await;
 }
 
+/// Where `cargo` put the toy MCP server, having built it.
+///
+/// Asked rather than reconstructed: a path built from `CARGO_MANIFEST_DIR`
+/// guesses the profile and misses a `CARGO_TARGET_DIR` override, and this
+/// test is meant to survive both.
+fn toy_mcp_server() -> PathBuf {
+    let out = std::process::Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "-p",
+            "mcp-toy-server",
+            "--message-format=json-render-diagnostics",
+        ])
+        .output()
+        .expect("cargo build -p mcp-toy-server runs");
+    assert!(
+        out.status.success(),
+        "cargo build -p mcp-toy-server failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["reason"] == "compiler-artifact" && v["target"]["name"] == "mcp-toy-server")
+        .and_then(|v| v["executable"].as_str().map(PathBuf::from))
+        .expect("cargo reported an executable for mcp-toy-server")
+}
+
+/// The other half of `mcp.addServer`: a server that actually starts.
+///
+/// Every other MCP case here points the daemon at a binary that does not
+/// exist. That covers the failure path twice over and leaves the one a user
+/// takes — a server connects, reports its tools, and turns up in
+/// `mcp.status` — resting on nothing. The `mcp_connected` notification is
+/// checked here for the same reason: it is the half of
+/// `daemon.subscribeEvents` a failing connect cannot show.
+#[tokio::test]
+#[ignore = "builds and spawns the toy MCP server"]
+async fn mcp_add_server_connects_a_real_server_and_lists_its_tools() {
+    let binary = toy_mcp_server();
+    let (_server, sock, dir, handle) = start_server().await;
+
+    let mut sub_client = UnixStream::connect(&sock).await.unwrap();
+    sub_client
+        .write_all(br#"{"jsonrpc":"2.0","method":"daemon.subscribeEvents","id":1}"#)
+        .await
+        .unwrap();
+    sub_client.write_all(b"\n").await.unwrap();
+    let (r, _w) = sub_client.split();
+    let mut sub_reader = BufReader::new(r);
+    let mut ack_line = String::new();
+    sub_reader.read_line(&mut ack_line).await.unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&ack_line).unwrap();
+    assert_eq!(ack["result"]["subscribed"], true, "ack: {ack}");
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "mcp.addServer",
+        "params": {
+            "name": "toy",
+            "config": { "type": "stdio", "command": binary.to_string_lossy() }
+        }
+    });
+    let resp = rpc_call(&sock, &request.to_string()).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+    let connected = |servers: &serde_json::Value| -> bool {
+        servers.as_array().is_some_and(|list| {
+            list.iter()
+                .any(|s| s["name"] == "toy" && s["tool_count"].as_u64().unwrap_or(0) > 0)
+        })
+    };
+
+    assert!(
+        v["result"]["written_to"].is_string(),
+        "addServer should report where it wrote: {v}"
+    );
+    assert!(
+        connected(&v["result"]["servers"]),
+        "addServer should report the server it just connected, with its tools: {v}"
+    );
+
+    let written = std::fs::read_to_string(dir.path().join(".atta").join("settings.json")).unwrap();
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        written["mcp_servers"]["toy"]["command"],
+        binary.to_string_lossy().as_ref()
+    );
+
+    let mut event_line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sub_reader.read_line(&mut event_line),
+    )
+    .await
+    .expect("timed out waiting for the mcp_connected notification")
+    .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event_line).unwrap();
+    assert_eq!(event["method"], "daemon.event", "event: {event}");
+    assert_eq!(event["params"]["kind"], "mcp_connected", "event: {event}");
+    assert_eq!(event["params"]["server"], "toy", "event: {event}");
+
+    let resp = rpc_call(&sock, r#"{"jsonrpc":"2.0","method":"mcp.status","id":3}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(
+        connected(&v["result"]["servers"]),
+        "a connected server must still be there when asked separately: {v}"
+    );
+
+    _server.shutdown_token().cancel();
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn subscribe_events_receives_mcp_connect_failed_notification() {
     let (_server, sock, _dir, handle) = start_server().await;

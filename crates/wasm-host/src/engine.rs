@@ -7,7 +7,9 @@
 
 use crate::cache::AotCache;
 use anyhow::{anyhow, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "compile")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine};
