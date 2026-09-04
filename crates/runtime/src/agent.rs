@@ -1814,6 +1814,23 @@ impl Builder {
         let settings = self
             .settings
             .ok_or_else(|| EngineError::Internal("settings required".into()))?;
+
+        // Telemetry: use pre-built handle if injected, else noop (events
+        // silently dropped).
+        let telemetry_handle = self.telemetry_handle_override.unwrap_or_else(|| {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            TelemetryHandle::new(tx)
+        });
+        // Every call this session makes is now accounted for, including the
+        // ones no turn asked for — see `telemetry::model::TelemetryModel`.
+        // Wrapped here rather than further down because the sub-agent spawner
+        // built below takes its own copy of the model, and a sub-agent's
+        // memory extraction costs exactly as much as a top-level one's.
+        let model: Arc<dyn Model> = Arc::new(telemetry::model::TelemetryModel::new(
+            model,
+            telemetry_handle.clone(),
+            settings.model.model_name.clone(),
+        ));
         let permission = self.permission.unwrap_or_else(|| {
             struct AllowAll;
             #[async_trait::async_trait]
@@ -2007,11 +2024,6 @@ impl Builder {
                 }
             }
         }
-        // Telemetry: use pre-built handle if injected, else noop (events silently dropped).
-        let telemetry_handle = self.telemetry_handle_override.unwrap_or_else(|| {
-            let (tx, _rx) = tokio::sync::mpsc::channel(1);
-            TelemetryHandle::new(tx)
-        });
         // MCP: use pre-built manager if injected, else empty (no servers).
         let mut mcp = self.mcp_manager_override.unwrap_or_else(McpManager::empty);
         // `McpManager::set_elicitation_callback` existed with zero production

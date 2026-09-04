@@ -46,6 +46,12 @@ pub struct ApiRequestPayload {
     /// Whether this call went to the model the session was configured with. A
     /// fallback or a recovery switch makes it false.
     pub default_model: bool,
+    /// What this call was for, when it was not a turn: extracting memories,
+    /// summarizing for compaction, answering a prompt hook. `None` is a call
+    /// the turn loop made, which is the common case and the one a reader
+    /// summing a turn's cost wants on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 /// API 请求失败事件的载荷。
@@ -164,6 +170,7 @@ mod tests {
                 input_message_count: 5,
                 tool_count: 12,
                 default_model: true,
+                purpose: None,
             },
         );
         assert_eq!(event.kind(), "api_request");

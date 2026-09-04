@@ -16,6 +16,7 @@ pub mod cost;
 pub mod events;
 pub mod file_recorder;
 pub mod handle;
+pub mod model;
 pub mod perf;
 pub mod recorder;
 pub mod redact;

@@ -917,3 +917,74 @@ async fn an_installed_package_outlives_the_daemon_that_installed_it() -> anyhow:
     second.stop().await;
     Ok(())
 }
+
+/// The engine calls the model for work no turn asked for — extracting
+/// memories once a turn is over, summarizing for compaction, running a prompt
+/// hook. Each is a real call to a real provider that a host pays for, and
+/// none of them appeared anywhere in the telemetry that host reads: the only
+/// place `api_request` was emitted from was inside the turn loop.
+///
+/// Memory extraction is the one every session does, so it is the one asserted
+/// here. It also arrives after the turn has answered, which is why this waits
+/// rather than reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_no_turn_made_is_still_accounted_for() -> anyhow::Result<()> {
+    let (world, provider, daemon, _project) = stage("auxiliary", Mode::InProcess).await?;
+    provider.script([
+        Reply::text("said something worth remembering"),
+        Reply::text("[]"),
+    ]);
+    let output = world.telemetry_file("auxiliary.jsonl");
+
+    let mut client = daemon.connect().await?;
+    let session = client
+        .session_create(json!({
+            "options": { "telemetry": { "output": output.to_string_lossy() } }
+        }))
+        .await?;
+    client
+        .session_run_turn(&session, "remember this", "t1", None)
+        .await?;
+
+    let events = telemetry_until(&output, |events| {
+        events
+            .iter()
+            .any(|e| e.get("purpose").and_then(|p| p.as_str()) == Some("memory"))
+    })
+    .await;
+
+    let auxiliary: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e.get("purpose").and_then(|p| p.as_str()).is_some())
+        .collect();
+    assert!(
+        auxiliary
+            .iter()
+            .any(|e| e["purpose"] == "memory" && e["type"] == "api_request"),
+        "the memory extraction call cost something and said so nowhere: {:?}",
+        kinds(&events)
+    );
+
+    let memory_call = auxiliary
+        .iter()
+        .find(|e| e["purpose"] == "memory")
+        .expect("just asserted");
+    assert_eq!(
+        memory_call["input_tokens"].as_u64(),
+        Some(daemon_harness::provider::INPUT_TOKENS),
+        "an auxiliary call is accounted for without what it cost: {memory_call}"
+    );
+
+    // The turn's own calls stay unlabelled: a reader summing everything gets
+    // the session total, and one asking what the turns alone cost can still
+    // tell them apart.
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "api_request"
+                && e.get("purpose").map(|p| p.is_null()).unwrap_or(true)),
+        "the turn's own call grew a purpose it should not have"
+    );
+    daemon.stop().await;
+    Ok(())
+}

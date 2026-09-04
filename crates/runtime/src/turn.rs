@@ -1109,6 +1109,10 @@ impl Agent {
                         input_message_count: sent_message_count,
                         tool_count: sent_tool_count,
                         default_model: effective_model == self.settings.model.model_name,
+                        // A turn's own call. The auxiliary ones are labelled
+                        // by `telemetry::model::TelemetryModel`, which is
+                        // where they are visible at all.
+                        purpose: None,
                     },
                 ));
             // Added here rather than beside the budget's own counter further
@@ -1578,7 +1582,7 @@ impl Agent {
                 // prior behavior.
                 let (model, model_name) = match &self.task_router {
                     Some(router) => (
-                        router.model_for("memory"),
+                        self.accounted(router.model_for("memory")),
                         router
                             .model_name_for("memory")
                             .unwrap_or(DEFAULT_MEMORY_MODEL)
@@ -1588,6 +1592,7 @@ impl Agent {
                 };
                 let prompt_intro = self.scene.memory_extraction_prompt();
                 let environment = self.environment.clone();
+                let session_id = self.session.session_id.clone();
                 tokio::spawn(async move {
                     extract_memories_after_turn(
                         &store,
@@ -1596,6 +1601,7 @@ impl Agent {
                         &model_name,
                         prompt_intro.as_deref(),
                         &*environment,
+                        &session_id,
                     )
                     .await;
                 });
@@ -1878,10 +1884,29 @@ or project context that should survive across sessions.
     /// model *and its own model name*. (The memory path instead hardcodes a
     /// Haiku model id in that case, which silently breaks if the default
     /// provider isn't Anthropic; not repeating that here.)
+    /// A model this session did not build, made to account for itself.
+    ///
+    /// `Builder::build` wraps the session's own model once, so everything
+    /// that reaches the provider through it is counted. A task model comes
+    /// from the router instead — pool-level, shared, built before any session
+    /// existed — so a call routed to one is the single kind that would still
+    /// arrive nowhere. Wrapping it here costs one allocation per auxiliary
+    /// call and closes that.
+    fn accounted(
+        &self,
+        model: Arc<dyn base::interface::model::Model>,
+    ) -> Arc<dyn base::interface::model::Model> {
+        Arc::new(telemetry::model::TelemetryModel::new(
+            model,
+            self.telemetry_handle.clone(),
+            self.settings.model.model_name.clone(),
+        ))
+    }
+
     fn compaction_summarizer(&self) -> Option<compaction::llm_summary::LlmSummarizer> {
         let (model, model_name) = match &self.task_router {
             Some(router) => (
-                router.model_for("compact"),
+                self.accounted(router.model_for("compact")),
                 router
                     .model_name_for("compact")
                     .unwrap_or(&self.settings.model.model_name)
@@ -6008,6 +6033,7 @@ pub(crate) async fn extract_memories_after_turn(
     model_name: &str,
     prompt_intro: Option<&str>,
     environment: &dyn base::interface::environment::Environment,
+    session_id: &str,
 ) {
     // Only extract if there are messages worth analyzing
     if messages.len() < 2 {
@@ -6077,7 +6103,13 @@ Return only a JSON array of memories. If nothing is worth saving, return []."
         thinking_mode: ThinkingMode::Off,
         fallback_model: None,
         cache_edits: vec![],
-        origin: None,
+        // A call the session pays for, outside any turn. Saying so is what
+        // lets it be counted; the recall half of this feature has always
+        // said it (`base::memory`), and this half never did.
+        origin: Some(base::interface::model::CallOrigin::auxiliary(
+            session_id,
+            base::interface::model::call_purpose::MEMORY,
+        )),
         input_map: None,
     };
     let mut full_text = String::new();
@@ -6352,6 +6384,7 @@ mod extract_memories_tests {
             "custom-vendor-model",
             None,
             &base::interface::environment::SystemEnvironment,
+            "test-session",
         )
         .await;
 
@@ -6377,6 +6410,7 @@ mod extract_memories_tests {
             "m",
             None,
             &base::interface::environment::SystemEnvironment,
+            "test-session",
         )
         .await;
 
@@ -6402,6 +6436,7 @@ mod extract_memories_tests {
             "m",
             Some("Extract facts about the user's chat preferences."),
             &base::interface::environment::SystemEnvironment,
+            "test-session",
         )
         .await;
 
@@ -6465,6 +6500,7 @@ mod extract_memories_tests {
             "m",
             None,
             &base::interface::environment::SystemEnvironment,
+            "test-session",
         )
         .await;
 
