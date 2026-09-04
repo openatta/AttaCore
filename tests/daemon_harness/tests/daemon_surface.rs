@@ -902,6 +902,261 @@ async fn a_build_with_no_script_carrier_honors_no_scripts_section() -> anyhow::R
     Ok(())
 }
 
+// ── The other carrier ────────────────────────────────────────────────────
+
+const PLUGIN_DAEMON_HOWTO: &str =
+    "CARGO_TARGET_DIR=$PWD/target/plugins cargo build -p daemon --no-default-features \
+     --features plugin-compile\n  \
+     ATTA_TEST_DAEMON_BIN_PLUGINS=$PWD/target/plugins/debug/attacored cargo test \
+     -p daemon-harness -- --ignored";
+
+/// A package carrying a real WebAssembly component, ready for
+/// `plugin.install`.
+///
+/// It declares a scene as well, because that is how a plugin's tools reach a
+/// session at all: `PluginScene` carries them as its `extra_tools`, so a
+/// session on a built-in scene never sees them. A component with no scene
+/// beside it is a component nothing can call.
+fn a_package_with_a_component(world: &World) -> anyhow::Result<(std::path::PathBuf, String)> {
+    let src = world.root().join("packages").join("echo-plugin");
+    std::fs::create_dir_all(src.join("scene"))?;
+    std::fs::copy(
+        test_runner::plugin_fixture::echo_component(),
+        src.join("echo.wasm"),
+    )?;
+    std::fs::write(src.join("scene/prompt.md"), "You are the echo agent.")?;
+    std::fs::write(
+        src.join("plugin.toml"),
+        "[plugin]\n\
+         name = \"echo-plugin\"\n\
+         version = \"1.0.0\"\n\
+         api_version = \"0.1\"\n\
+         description = \"one component, one scene to reach it through\"\n\
+         \n\
+         [[wasm]]\n\
+         component = \"echo.wasm\"\n\
+         \n\
+         [scene.own]\n\
+         name = \"Echo\"\n\
+         description = \"A plugin-owned scene\"\n\
+         prompt = \"scene/prompt.md\"\n",
+    )?;
+
+    test_runner::plugin_fixture::package_dir(&src, &world.root().join("packed"), "echo-plugin")
+}
+
+/// The `tool_result` block answering `tool_use_id`, out of a request's
+/// messages.
+fn tool_result_for(request: &daemon_harness::SeenRequest, id: &str) -> Option<serde_json::Value> {
+    request
+        .body
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.get("content")?.as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+        .cloned()
+}
+
+/// Every string under a value, joined — a `tool_result`'s content is a string
+/// or a list of blocks depending on what produced it.
+fn collect_text(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::String(s) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_text(x, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| collect_text(x, out)),
+        _ => {}
+    }
+}
+
+/// A plugin's tool is called by the model, runs in wasmtime, and its answer
+/// comes back — through the RPC surface, in one turn.
+///
+/// `wasm-host` drives a real component thoroughly and `plugin-host` turns one
+/// into registered tools, but both stop at a seam inside the process. What
+/// neither can say is whether a component that arrived as a package ever gets
+/// called: install, precompile, discovery, the plugin's own scene, the
+/// deferred-tool advertisement, the permission gate and the tool loop all sit
+/// between `plugin.install` and the guest, and every one of them is a place
+/// the call can quietly not happen.
+///
+/// Spawned only, and it needs a daemon somebody else built: the two carriers
+/// are mutually exclusive features and this test binary is compiled against
+/// the default one, so the daemon that can run a component is necessarily a
+/// different binary.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built with the plugin carrier"]
+async fn a_wasm_plugins_tool_is_called_and_answers() -> anyhow::Result<()> {
+    let with_plugins = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_PLUGINS",
+        PLUGIN_DAEMON_HOWTO,
+    )?;
+
+    let world = World::new()?;
+    let project = world.project("plugged")?;
+    // Plugin tools always answer `Ask`; a plugin asserting its own call is
+    // fine is not evidence. An operator who wants one to run says so, and
+    // says it with the whole name — the prefix shorthand that covers an MCP
+    // server is an `mcp__` special case and matches nothing here.
+    world.write_project_settings(
+        "plugged",
+        &json!({
+            "memory_enabled": false,
+            "permission_rules": [
+                { "tool": "plugin__echo-plugin__echo", "action": "allow" }
+            ]
+        }),
+    )?;
+    let (archive, checksum) = a_package_with_a_component(&world)?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(with_plugins),
+    )
+    .await?;
+
+    let mut client = daemon.connect().await?;
+    let installed = client
+        .plugin_install(json!({
+            "name": "echo-plugin",
+            "version": "1.0.0",
+            "download_url": test_runner::plugin_fixture::file_url(&archive),
+            "checksum": checksum,
+        }))
+        .await?;
+    anyhow::ensure!(
+        installed.error.is_none(),
+        "plugin.install failed: {:?}",
+        installed.error
+    );
+
+    provider.script([
+        Reply::Blocks(vec![Block::tool(
+            "call-1",
+            "plugin__echo-plugin__echo",
+            json!({ "text": "COMPONENT-ANSWERED" }),
+        )]),
+        Reply::text("done"),
+    ]);
+
+    let session = client
+        .session_create(json!({
+            "project_root": project.to_string_lossy(),
+            "scene": "plugin:echo-plugin",
+        }))
+        .await?;
+    let turn = client
+        .session_run_turn(&session, "echo something", "t1", None)
+        .await?;
+
+    assert!(
+        turn.tool_uses
+            .iter()
+            .any(|(name, _)| name == "plugin__echo-plugin__echo"),
+        "the client never saw the plugin tool run: {turn:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "a tool result should have cost a second call"
+    );
+
+    // The result block, not `messages_text()`: the text the guest echoes back
+    // is the text it was sent, and that string is already in the request as
+    // the tool call's own input. Searching the whole conversation for it
+    // would pass on a plugin that was never asked and on one that trapped.
+    let result = tool_result_for(&provider.calls()[1], "call-1")
+        .ok_or_else(|| anyhow::anyhow!("no tool result for the plugin call reached the model"))?;
+    assert!(
+        result["is_error"] != json!(true),
+        "the plugin call came back as an error: {result}"
+    );
+    let mut answer = String::new();
+    collect_text(&result["content"], &mut answer);
+    assert!(
+        answer.contains("COMPONENT-ANSWERED"),
+        "the guest's answer is not in the result the model was given: {result}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+/// An installed plugin's tools are offered to every session, including ones
+/// on a built-in scene.
+///
+/// Worth its own case because it is the surprising half and the one with a
+/// consequence: installing a plugin hands its tools to the whole process, not
+/// to the scene it ships. `extending_wasm.md` claimed the opposite until this
+/// test was written — the containment sentence predated
+/// `Builder::build`'s registration of `PluginHost::tools()` and survived a
+/// translation without being revisited, which is how a document ends up
+/// promising an isolation nobody implements.
+///
+/// If that reach is ever narrowed, this is the test that says so.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built with the plugin carrier"]
+async fn a_plugins_tools_are_offered_to_every_session() -> anyhow::Result<()> {
+    let with_plugins = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_PLUGINS",
+        PLUGIN_DAEMON_HOWTO,
+    )?;
+
+    let world = World::new()?;
+    let project = world.project("unplugged")?;
+    world.write_project_settings("unplugged", &json!({ "memory_enabled": false }))?;
+    let (archive, checksum) = a_package_with_a_component(&world)?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(with_plugins),
+    )
+    .await?;
+
+    let mut client = daemon.connect().await?;
+    let installed = client
+        .plugin_install(json!({
+            "name": "echo-plugin",
+            "version": "1.0.0",
+            "download_url": test_runner::plugin_fixture::file_url(&archive),
+            "checksum": checksum,
+        }))
+        .await?;
+    anyhow::ensure!(
+        installed.error.is_none(),
+        "plugin.install failed: {:?}",
+        installed.error
+    );
+
+    provider.script([Reply::text("done")]);
+    // No `scene`, so this is the daemon's default — a built-in one, with no
+    // relationship to the plugin.
+    let session = client
+        .session_create(json!({ "project_root": project.to_string_lossy() }))
+        .await?;
+    client
+        .session_run_turn(&session, "hello", "t1", None)
+        .await?;
+
+    let offered = provider.calls()[0].tool_names();
+    assert!(
+        offered.iter().any(|t| t == "plugin__echo-plugin__echo"),
+        "a session on a built-in scene was not offered the plugin's tools, \
+         which is what extending_wasm.md is written against: {offered:?}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
 // ── Telemetry, reload, and state that outlives a process ─────────────────
 
 /// Telemetry is a report about a turn, so it is checked against an

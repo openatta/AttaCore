@@ -52,6 +52,16 @@ jobs:
       - name: build a daemon with no carrier
         run: CARGO_TARGET_DIR=${{ github.workspace }}/target/no-carrier cargo build -p daemon --no-default-features
 
+      # And a third, carrying WebAssembly. Same reason as above — one binary
+      # called `attacored` per target directory — and the same shape of claim:
+      # whether a component a package shipped is ever called cannot be asked
+      # from inside a build that has no engine to call it with. `plugin-compile`
+      # rather than plain `plugins` because installing a package with
+      # components compiles them, and without the in-process compiler that
+      # work goes looking for `atta-plugin-compile`.
+      - name: build a daemon with the plugin carrier
+        run: CARGO_TARGET_DIR=${{ github.workspace }}/target/plugins cargo build -p daemon --no-default-features --features plugin-compile
+
       # The ignored set is where the slow cases live — a real daemon, a real
       # MCP server over stdio, the schema the documents are generated from.
       # They are ignored because they are slow, not because they are optional,
@@ -63,6 +73,7 @@ jobs:
       - name: test (ignored)
         env:
           ATTA_TEST_DAEMON_BIN_NO_CARRIER: ${{ github.workspace }}/target/no-carrier/debug/attacored
+          ATTA_TEST_DAEMON_BIN_PLUGINS: ${{ github.workspace }}/target/plugins/debug/attacored
         run: cargo test --workspace --all-targets -- --ignored
 
   carriers:

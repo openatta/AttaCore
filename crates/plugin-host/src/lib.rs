@@ -700,14 +700,44 @@ entry = "dist/index.js"
     }
 }
 
+/// The echo fixture's component, built if it is not there yet.
+///
+/// Built rather than skipped when absent, which is what this used to do. The
+/// argument for skipping was that a unit test suite should not shell out to
+/// cargo, and what it bought was five tests that drive a real component
+/// reporting green in CI without running: `cargo test --workspace` reaches
+/// this crate long before `wasm-host`, whose integration test is what builds
+/// the fixture. Forty-two tests in two hundredths of a second is what that
+/// looks like from the outside, which is to say it looks like nothing.
+#[cfg(test)]
+fn fixture_component() -> std::path::PathBuf {
+    static BUILT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/wasm_echo_plugin");
+            let out = dir.join("target/wasm32-wasip2/release/wasm_echo_plugin.wasm");
+            if out.exists() {
+                return out;
+            }
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--release", "--target", "wasm32-wasip2"])
+                .current_dir(&dir)
+                .status()
+                .expect("cargo should be runnable");
+            assert!(
+                status.success(),
+                "could not build the fixture component. If the target is missing: \
+                 rustup target add wasm32-wasip2"
+            );
+            out
+        })
+        .clone()
+}
+
 #[cfg(test)]
 mod component_tests {
     use super::*;
-
-    fn fixture_component() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/wasm_echo_plugin/target/wasm32-wasip2/release/wasm_echo_plugin.wasm")
-    }
 
     /// The whole point of the seam: a manifest on disk turns into tools the
     /// engine can register, named the way permission rules expect.
@@ -717,10 +747,6 @@ mod component_tests {
     #[tokio::test]
     async fn disclosure_covers_the_long_guide_not_just_the_one_liner() {
         let component = fixture_component();
-        if !component.exists() {
-            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
         std::fs::write(
@@ -754,13 +780,6 @@ mod component_tests {
     #[tokio::test]
     async fn a_declared_component_becomes_registered_tools() {
         let component = fixture_component();
-        if !component.exists() {
-            // The fixture is built by wasm-host's own integration test; this
-            // one does not build it, because a unit test suite should not
-            // shell out to cargo.
-            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
         std::fs::write(
@@ -805,10 +824,6 @@ component = "echo.wasm"
     #[tokio::test]
     async fn a_plugin_that_rejects_its_configuration_does_not_load() {
         let component = fixture_component();
-        if !component.exists() {
-            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(&component, dir.path().join("echo.wasm")).unwrap();
         std::fs::write(
@@ -840,10 +855,6 @@ component = "echo.wasm"
     #[tokio::test]
     async fn loading_is_concurrent_but_results_keep_their_order() {
         let component = fixture_component();
-        if !component.exists() {
-            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
-            return;
-        }
         let mut dirs = Vec::new();
         let mut plugins = Vec::new();
         for name in ["a-plugin", "b-plugin", "c-plugin"] {
@@ -960,11 +971,6 @@ mod precompile_tests {
 mod unload_tests {
     use super::*;
 
-    fn fixture_component() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/wasm_echo_plugin/target/wasm32-wasip2/release/wasm_echo_plugin.wasm")
-    }
-
     fn write_plugin(dir: &Path, component: &std::path::Path) {
         std::fs::copy(component, dir.join("echo.wasm")).unwrap();
         std::fs::write(
@@ -990,10 +996,6 @@ events = ["PreToolUse"]
     #[tokio::test]
     async fn replacing_the_host_takes_a_plugins_state_with_it() {
         let component = fixture_component();
-        if !component.exists() {
-            eprintln!("skipping: build the fixture first (cargo test -p wasm-host)");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         write_plugin(dir.path(), &component);
         let p =
