@@ -24,6 +24,7 @@ members = [
     "crates/task",
     "daemon",
     "tests/rpc_client",
+    "tests/daemon_harness",
     "tests/runner",
     "tests/fixtures/mcp_toy_server",
 ]
@@ -125,6 +126,7 @@ team       = { path = "crates/team" }
 task       = { path = "crates/task" }
 daemon     = { path = "daemon" }
 rpc-client = { path = "tests/rpc_client" }
+daemon-harness = { path = "tests/daemon_harness" }
 
 # The release artifact was 54 MB of which 14 MB was symbols nobody ships and
 # reads, and the rest was compiled without any cross-crate inlining. Three

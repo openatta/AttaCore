@@ -816,6 +816,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-harness"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base",
+ "daemon",
+ "history",
+ "model",
+ "rpc-client",
+ "scene",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

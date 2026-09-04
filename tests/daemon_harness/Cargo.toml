@@ -1,0 +1,22 @@
+[package]
+name = "daemon-harness"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Runs a scenario against a daemon — in this process or a spawned one — over the real RPC surface"
+
+[dependencies]
+daemon      = { workspace = true }
+rpc-client  = { workspace = true }
+base        = { workspace = true }
+model       = { workspace = true }
+scene       = { workspace = true }
+history     = { workspace = true }
+tokio       = { workspace = true, features = ["full"] }
+tokio-util  = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+url         = { workspace = true }
+tempfile    = { workspace = true }

@@ -255,6 +255,34 @@ impl DaemonRpcClient {
 
     // ── session.* ──
 
+    /// 建一个会话，返回它的 id。
+    ///
+    /// `params` 直传：`project_root` 的三态（省略 / `null` / 路径）在这一层不能
+    /// 被替换成 `Option`——那会把「用 daemon 的默认项目」和「无项目会话」两个不同
+    /// 的意思压成同一个。
+    pub async fn session_create(&mut self, params: Value) -> anyhow::Result<String> {
+        let resp = self.call("session.create", params).await?;
+        anyhow::ensure!(
+            resp.error.is_none(),
+            "session.create failed: {:?}",
+            resp.error
+        );
+        resp.result
+            .as_ref()
+            .and_then(|r| r.get("session_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("session.create returned no session_id: {resp:?}"))
+    }
+
+    pub async fn session_get(&mut self, session_id: &str) -> anyhow::Result<RpcResponse> {
+        self.call(
+            "session.get",
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
     pub async fn session_list(&mut self) -> anyhow::Result<RpcResponse> {
         self.call("session.list", Value::Null).await
     }
