@@ -29,6 +29,6 @@ pub mod handle;
 pub mod provider;
 pub mod world;
 
-pub use handle::{Daemon, DaemonOptions, Wire};
+pub use handle::{Daemon, DaemonOptions, Mode, Wire};
 pub use provider::{Block, ProviderStub, Reply, SeenRequest};
 pub use world::World;

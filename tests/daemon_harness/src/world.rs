@@ -75,6 +75,12 @@ impl World {
         write_json(&root.join(".atta").join("settings.json"), settings)
     }
 
+    /// Where a daemon leaves its discovery entry — one file per instance,
+    /// under the global root so every instance's lands in one directory.
+    pub fn instances_dir(&self) -> PathBuf {
+        self.global_root().join("daemon").join("instances.d")
+    }
+
     /// Somewhere for a scenario to point `options.telemetry.output` at.
     pub fn telemetry_file(&self, name: &str) -> PathBuf {
         self.dir.path().join("telemetry").join(name)
