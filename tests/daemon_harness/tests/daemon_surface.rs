@@ -945,6 +945,30 @@ fn a_package_with_a_component(world: &World) -> anyhow::Result<(std::path::PathB
     test_runner::plugin_fixture::package_dir(&src, &world.root().join("packed"), "echo-plugin")
 }
 
+/// Install the component package on a running daemon.
+async fn install_the_component_package(
+    world: &World,
+    client: &mut rpc_client::DaemonRpcClient,
+) -> anyhow::Result<serde_json::Value> {
+    let (archive, checksum) = a_package_with_a_component(world)?;
+    let installed = client
+        .plugin_install(json!({
+            "name": "echo-plugin",
+            "version": "1.0.0",
+            "download_url": test_runner::plugin_fixture::file_url(&archive),
+            "checksum": checksum,
+        }))
+        .await?;
+    anyhow::ensure!(
+        installed.error.is_none(),
+        "plugin.install failed: {:?}",
+        installed.error
+    );
+    installed
+        .result
+        .ok_or_else(|| anyhow::anyhow!("plugin.install answered with neither result nor error"))
+}
+
 /// The `tool_result` block answering `tool_use_id`, out of a request's
 /// messages.
 fn tool_result_for(request: &daemon_harness::SeenRequest, id: &str) -> Option<serde_json::Value> {
@@ -1011,8 +1035,6 @@ async fn a_wasm_plugins_tool_is_called_and_answers() -> anyhow::Result<()> {
             ]
         }),
     )?;
-    let (archive, checksum) = a_package_with_a_component(&world)?;
-
     let provider = ProviderStub::start().await?;
     let daemon = Daemon::start(
         &world,
@@ -1022,19 +1044,7 @@ async fn a_wasm_plugins_tool_is_called_and_answers() -> anyhow::Result<()> {
     .await?;
 
     let mut client = daemon.connect().await?;
-    let installed = client
-        .plugin_install(json!({
-            "name": "echo-plugin",
-            "version": "1.0.0",
-            "download_url": test_runner::plugin_fixture::file_url(&archive),
-            "checksum": checksum,
-        }))
-        .await?;
-    anyhow::ensure!(
-        installed.error.is_none(),
-        "plugin.install failed: {:?}",
-        installed.error
-    );
+    install_the_component_package(&world, &mut client).await?;
 
     provider.script([
         Reply::Blocks(vec![Block::tool(
@@ -1111,8 +1121,6 @@ async fn a_plugins_tools_are_offered_to_every_session() -> anyhow::Result<()> {
     let world = World::new()?;
     let project = world.project("unplugged")?;
     world.write_project_settings("unplugged", &json!({ "memory_enabled": false }))?;
-    let (archive, checksum) = a_package_with_a_component(&world)?;
-
     let provider = ProviderStub::start().await?;
     let daemon = Daemon::start(
         &world,
@@ -1122,19 +1130,7 @@ async fn a_plugins_tools_are_offered_to_every_session() -> anyhow::Result<()> {
     .await?;
 
     let mut client = daemon.connect().await?;
-    let installed = client
-        .plugin_install(json!({
-            "name": "echo-plugin",
-            "version": "1.0.0",
-            "download_url": test_runner::plugin_fixture::file_url(&archive),
-            "checksum": checksum,
-        }))
-        .await?;
-    anyhow::ensure!(
-        installed.error.is_none(),
-        "plugin.install failed: {:?}",
-        installed.error
-    );
+    install_the_component_package(&world, &mut client).await?;
 
     provider.script([Reply::text("done")]);
     // No `scene`, so this is the daemon's default — a built-in one, with no
@@ -1155,6 +1151,261 @@ async fn a_plugins_tools_are_offered_to_every_session() -> anyhow::Result<()> {
 
     daemon.stop().await;
     Ok(())
+}
+
+/// A component that traps costs its own call and nothing else.
+///
+/// The rule the whole extension surface is built on, asked of the carrier
+/// that can fail hardest: a guest that traps takes down its own invocation,
+/// the model is told what happened in a result it can act on, and the turn
+/// goes on to do the next thing. `wasm-host` asks this of a `PluginInstance`
+/// in isolation; what it cannot ask is whether the turn loop above it agrees
+/// — a trap that surfaced as an engine error rather than a tool result would
+/// end the turn, and look identical from inside the carrier.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built with the plugin carrier"]
+async fn a_trapping_component_costs_its_call_and_not_the_turn() -> anyhow::Result<()> {
+    let with_plugins = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_PLUGINS",
+        PLUGIN_DAEMON_HOWTO,
+    )?;
+
+    let world = World::new()?;
+    let project = world.project("trapping")?;
+    world.write_project_settings(
+        "trapping",
+        &json!({
+            "memory_enabled": false,
+            "permission_rules": [
+                { "tool": "plugin__echo-plugin__explode", "action": "allow" },
+                { "tool": "plugin__echo-plugin__echo", "action": "allow" }
+            ]
+        }),
+    )?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(with_plugins),
+    )
+    .await?;
+    let mut client = daemon.connect().await?;
+    install_the_component_package(&world, &mut client).await?;
+
+    provider.script([
+        Reply::Blocks(vec![Block::tool(
+            "boom",
+            "plugin__echo-plugin__explode",
+            json!({}),
+        )]),
+        Reply::Blocks(vec![Block::tool(
+            "after",
+            "plugin__echo-plugin__echo",
+            json!({ "text": "STILL-HERE" }),
+        )]),
+        Reply::text("done"),
+    ]);
+
+    let session = client
+        .session_create(json!({
+            "project_root": project.to_string_lossy(),
+            "scene": "plugin:echo-plugin",
+        }))
+        .await?;
+    client
+        .session_run_turn(&session, "provoke it", "t1", None)
+        .await?;
+
+    assert_eq!(
+        provider.call_count(),
+        3,
+        "the turn did not continue past the trap"
+    );
+
+    let trapped = tool_result_for(&provider.calls()[1], "boom")
+        .ok_or_else(|| anyhow::anyhow!("the trap produced no result for the model to read"))?;
+    let mut reason = String::new();
+    collect_text(&trapped["content"], &mut reason);
+    assert!(
+        reason.contains("echo-plugin") && reason.contains("explode"),
+        "the failure does not say which plugin and tool it was: {reason}"
+    );
+
+    // Pinned as it is, not as it should be. `wasm-host`'s adapter answers a
+    // trap with `Ok(ToolResult::error_text(..))` — the tool failed, the turn
+    // did not — and `ToolResult::is_error` is dropped between there and the
+    // wire: `dispatch_one` reads the result's text and its messages and not
+    // its flag. Nine production sites set it, including `Bash` on a non-zero
+    // exit and every MCP server answering `isError`, and none of them reach
+    // the model with `is_error: true`. Carrying it would mean widening
+    // `base::interface::tool_middleware::ToolOutcome`, which is the
+    // `tool.around` contract, so it is a decision rather than a patch. When
+    // it is made, this assertion is the one that flips.
+    assert!(
+        trapped["is_error"] != json!(true),
+        "`is_error` now survives to the wire — good. Flip this assertion and \
+         delete the note above it: {trapped}"
+    );
+
+    let after = tool_result_for(&provider.calls()[2], "after")
+        .ok_or_else(|| anyhow::anyhow!("the call after the trap never happened"))?;
+    assert!(
+        after["is_error"] != json!(true),
+        "the trap poisoned the next call to the same plugin: {after}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+/// A capability the package never declared is unreachable, and the guest is
+/// told which one would have allowed it.
+///
+/// The plugin carrier's answer to the question the script carrier answers
+/// with provenance: what an extension may do is decided outside it, and a
+/// refusal has to arrive somewhere it can be acted on rather than as silence.
+/// Here the package declares no `net`, so `fetch` cannot reach the host —
+/// and the reason travels all the way out to the model's tool result.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a second daemon, built with the plugin carrier"]
+async fn a_capability_the_package_never_declared_is_unreachable() -> anyhow::Result<()> {
+    let with_plugins = daemon_harness::alternate_daemon_binary(
+        "ATTA_TEST_DAEMON_BIN_PLUGINS",
+        PLUGIN_DAEMON_HOWTO,
+    )?;
+
+    let world = World::new()?;
+    let project = world.project("ungranted")?;
+    world.write_project_settings(
+        "ungranted",
+        &json!({
+            "memory_enabled": false,
+            "permission_rules": [
+                { "tool": "plugin__echo-plugin__fetch", "action": "allow" }
+            ]
+        }),
+    )?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).binary(with_plugins),
+    )
+    .await?;
+    let mut client = daemon.connect().await?;
+    let disclosure = install_the_component_package(&world, &mut client).await?;
+
+    // What the installer was shown is half the claim: a capability that is
+    // enforced but never disclosed is one nobody could have refused.
+    let capabilities = disclosure["disclosure"]["capabilities"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !capabilities
+            .iter()
+            .any(|c| c.as_str().unwrap_or_default().contains("net")),
+        "the package was disclosed as having network access it did not ask for: {capabilities:?}"
+    );
+
+    provider.script([
+        Reply::Blocks(vec![Block::tool(
+            "reach",
+            "plugin__echo-plugin__fetch",
+            json!({ "url": "https://example.com/" }),
+        )]),
+        Reply::text("done"),
+    ]);
+
+    let session = client
+        .session_create(json!({
+            "project_root": project.to_string_lossy(),
+            "scene": "plugin:echo-plugin",
+        }))
+        .await?;
+    client
+        .session_run_turn(&session, "fetch something", "t1", None)
+        .await?;
+
+    let refused = tool_result_for(&provider.calls()[1], "reach")
+        .ok_or_else(|| anyhow::anyhow!("the fetch produced no result for the model to read"))?;
+    let mut reason = String::new();
+    collect_text(&refused["content"], &mut reason);
+    assert!(
+        reason.contains("net"),
+        "the refusal does not name the capability that would have allowed it: {reason}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+/// A build with no plugin carrier installs a package carrying components,
+/// says they will not run, and does not run them.
+///
+/// The mirror of `a_build_with_no_script_carrier_honors_no_scripts_section`,
+/// and it needs no second binary: the default build is the one with the
+/// package layer and no WebAssembly engine, which is exactly the deployment
+/// this is about. Installing has to keep working — a package whose components
+/// are dead weight may still carry an MCP server or a script worth having —
+/// while the components themselves reach nothing.
+async fn a_build_with_no_plugin_carrier_installs_but_does_not_run(
+    mode: Mode,
+) -> anyhow::Result<()> {
+    let world = World::new()?;
+    let project = world.project("carrierless")?;
+    world.write_project_settings("carrierless", &json!({ "memory_enabled": false }))?;
+
+    let provider = ProviderStub::start().await?;
+    let daemon = Daemon::start(
+        &world,
+        &provider,
+        DaemonOptions::new(project.clone()).mode(mode),
+    )
+    .await?;
+    let mut client = daemon.connect().await?;
+    let disclosure = install_the_component_package(&world, &mut client).await?;
+
+    assert_eq!(
+        disclosure["disclosure"]["wasm"]["components"], 1,
+        "the disclosure hides that the package carries a component: {disclosure}"
+    );
+    assert_eq!(
+        disclosure["disclosure"]["wasm"]["runnable"],
+        json!(false),
+        "a build with no engine told the installer its components would run: {disclosure}"
+    );
+
+    provider.script([Reply::text("done")]);
+    let session = client
+        .session_create(json!({ "project_root": project.to_string_lossy() }))
+        .await?;
+    client
+        .session_run_turn(&session, "hello", "t1", None)
+        .await?;
+
+    let offered = provider.calls()[0].tool_names();
+    assert!(
+        !offered.iter().any(|t| t.starts_with("plugin__")),
+        "a build with no engine offered the model a component's tools: {offered:?}"
+    );
+
+    daemon.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_with_no_plugin_carrier_installs_but_does_not_run_here() -> anyhow::Result<()> {
+    a_build_with_no_plugin_carrier_installs_but_does_not_run(Mode::InProcess).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a real daemon process"]
+async fn a_build_with_no_plugin_carrier_installs_but_does_not_run_in_a_spawned_daemon(
+) -> anyhow::Result<()> {
+    a_build_with_no_plugin_carrier_installs_but_does_not_run(Mode::Spawned).await
 }
 
 // ── Telemetry, reload, and state that outlives a process ─────────────────
