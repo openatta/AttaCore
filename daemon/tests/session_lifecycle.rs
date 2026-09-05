@@ -487,6 +487,71 @@ async fn a_listed_session_says_which_scene_and_project_it_belongs_to() {
     srv.stop().await;
 }
 
+// ── session.list counters ───────────────────────────────────────────────
+
+/// How many times a conversation has been compacted is a by-product of a
+/// write that already happened, and it reached nobody: the marker went into
+/// the transcript and the count into a field with no writer. Counted as the
+/// log is written, so a session that has left memory answers too.
+#[tokio::test]
+async fn a_listed_session_reports_how_often_it_was_compacted() {
+    let (srv, _seen) = start_scripted_server_in(
+        "coding",
+        vec![text_round("answer")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let sid = run_turn(&srv.sock, None, "hello").await;
+
+    // The engine writes this marker when it compacts; here it stands in for
+    // one, since making a real turn cross the threshold needs a scene built
+    // for it (see `session_event_compact.rs`).
+    srv.store
+        .append(
+            base::session::SessionId::parse(&sid).unwrap(),
+            history::entry::LogEntry::Compact {
+                before_tokens: 100,
+                after_tokens: 40,
+                summary_block_id: None,
+                replacement_history: None,
+                summary: None,
+                snip_removed_uuids: None,
+            },
+        )
+        .await
+        .expect("the marker lands");
+
+    rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.close","id":1,"params":{{"session_id":"{sid}"}}}}"#
+        ),
+    )
+    .await;
+
+    let listed = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#).await;
+    let entry = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == sid.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("session missing from the list: {listed}"));
+
+    assert_eq!(
+        entry["status"], "inactive",
+        "the point is the session that is only on disk: {entry}"
+    );
+    assert_eq!(
+        entry["compact_count"], 1,
+        "the compaction was counted where a listing can read it: {entry}"
+    );
+
+    srv.stop().await;
+}
+
 // ── session.rename ──────────────────────────────────────────────────────
 
 /// A session's name belongs to the person looking at it, and it has to

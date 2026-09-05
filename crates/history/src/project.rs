@@ -247,6 +247,62 @@ pub async fn ensure_session_sidecar_in(
     Ok(paths)
 }
 
+/// What one appended entry adds to a session's running counts.
+///
+/// Only compactions today. The tokens a turn spent are reported by the
+/// provider and recorded in telemetry, but `LogEntry::Assistant` carries
+/// `usage: None` on every path that writes one — so counting them here would
+/// be counting nothing, and a total that is always zero reads like a session
+/// that spent nothing rather than like a number nobody keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CounterDelta {
+    pub compactions: u64,
+}
+
+impl CounterDelta {
+    pub fn of(entry: &crate::entry::LogEntry) -> Self {
+        match entry {
+            crate::entry::LogEntry::Compact { .. } => Self { compactions: 1 },
+            _ => Self::default(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Add one entry's numbers to what the sidecar already holds.
+///
+/// A by-product of a write that already happened, which is why it is counted
+/// here rather than recomputed by whoever wants it: the alternative is
+/// reading a whole transcript per session, per listing, to answer how many
+/// times this conversation has been compacted.
+pub async fn add_counters_in(
+    sessions_root: &Path,
+    canonical_cwd: &Path,
+    project_history_dir: &Path,
+    session: SessionId,
+    delta: CounterDelta,
+) -> Result<(), HistoryError> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+    let paths = session_sidecar_paths_in(sessions_root, &session);
+    let mut metadata = match tokio::fs::read_to_string(&paths.metadata).await {
+        Ok(content) => serde_json::from_str::<SessionMetadata>(&content)
+            .unwrap_or_else(|_| SessionMetadata::new(canonical_cwd, project_history_dir, session)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            SessionMetadata::new(canonical_cwd, project_history_dir, session)
+        }
+        Err(e) => return Err(HistoryError::Io(e)),
+    };
+    metadata.compact_count += delta.compactions;
+    metadata.updated_at = now_rfc3339();
+    tokio::fs::create_dir_all(&paths.dir).await?;
+    write_json_atomic(&paths.metadata, &metadata).await
+}
+
 /// Set (or clear) the name a person gave this session, creating the sidecar
 /// if this is the first thing anyone has recorded about it.
 ///
@@ -274,20 +330,30 @@ pub async fn set_session_title_in(
     write_json_atomic(&paths.metadata, &metadata).await
 }
 
-/// The name a person gave this session, if anyone has.
-pub async fn session_title_in(
+/// What the sidecar has recorded about this session: the name somebody gave
+/// it, and the totals counted as its log was written.
+///
+/// A session nobody has written anything about answers with the empty record
+/// rather than an error — not having been counted is a normal state.
+pub async fn session_stats_in(
     sessions_root: &Path,
     session: SessionId,
-) -> Result<Option<String>, HistoryError> {
+) -> Result<crate::store::SessionStats, HistoryError> {
     let path = session_metadata_file(sessions_root, &session);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(crate::store::SessionStats::default())
+        }
         Err(e) => return Err(HistoryError::Io(e)),
     };
-    Ok(serde_json::from_str::<SessionMetadata>(&content)
-        .ok()
-        .and_then(|m| m.title))
+    let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&content) else {
+        return Ok(crate::store::SessionStats::default());
+    };
+    Ok(crate::store::SessionStats {
+        title: metadata.title,
+        compact_count: metadata.compact_count,
+    })
 }
 
 pub fn now_rfc3339() -> String {

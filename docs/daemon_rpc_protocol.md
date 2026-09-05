@@ -802,7 +802,7 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
     { "session_id": "…", "name": null, "preview": null,
       "message_count": 0, "created_at": "…", "last_active": "…",
       "status": "active", "session_kind": "primary", "resumable": true,
-      "scene": "coding", "project_root": "…" } ] }
+      "scene": "coding", "project_root": "…", "compact_count": 0 } ] }
 ```
 
 返回内存中的会话 + 磁盘上的历史会话,合并去重,**不分页、不过滤场景、不过滤项目**。
@@ -813,6 +813,10 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 `scene` / `project_root` 来自会话自己的 `Meta` 行(§3.4 校验的是同一处),所以冷会话
 也答得出来。**两个字段恒出现**,老会话(`Meta` 里没记场景的 pre-v2 文件)是 `null` —— 
 `null` 是"这份日志没写",不是"没有项目"。
+
+`compact_count` 是这个会话被压缩过几次 —— 引擎写 transcript 的时候顺手记的,冷会话
+也答得出来。它回答的是"这个会话被压过没有",**不回答"哪一次压掉了什么"**:那件事只有
+压缩发生的当时说得清,看 §7.1 的 `compact` 帧。
 
 **未激活会话的摘要字段几乎全是空的**:`name` 为 `null`,`created_at` / `last_active`
 是**空字符串**,`message_count` 为 `0`。这是设计如此 —— 列表不为了填几个摘要字段去

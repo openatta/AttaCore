@@ -79,6 +79,19 @@ impl SessionFacts {
     }
 }
 
+/// What has been recorded about a session rather than in it.
+///
+/// Counted as a by-product of appends that already happened — the alternative
+/// is reading a whole transcript per session to answer "how much did this
+/// cost", per listing, forever.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionStats {
+    /// The name somebody chose, if anybody did.
+    pub title: Option<String>,
+    /// How many times this session's context has been compacted.
+    pub compact_count: u64,
+}
+
 /// Where a session's log lives between runs.
 ///
 /// The engine writes an append-only sequence of [`LogEntry`] per session and
@@ -189,9 +202,15 @@ pub trait HistoryStore: Send + Sync {
         ))
     }
 
-    /// The name set by [`set_session_title`](Self::set_session_title), if any.
-    async fn session_title(&self, _session: SessionId) -> Result<Option<String>, HistoryError> {
-        Ok(None)
+    /// What has been recorded *about* one session, as opposed to in it.
+    ///
+    /// The name somebody gave it and the running totals, which is everything
+    /// that cannot be answered from the log's first line and should not cost
+    /// a read of the whole log. A backend that keeps none of this answers
+    /// with the empty record, and every field of it is honestly "nothing
+    /// counted" rather than zero.
+    async fn session_stats(&self, _session: SessionId) -> Result<SessionStats, HistoryError> {
+        Ok(SessionStats::default())
     }
 
     /// Which session spawned this one, if any.
@@ -791,6 +810,11 @@ impl HistoryStore for JsonlHistoryStore {
             std::fs::create_dir_all(parent)?;
         }
 
+        // Read before the entry can be externalized: an assistant message big
+        // enough to move out to a blob would take its usage with it, and the
+        // totals would quietly stop counting anything over the threshold.
+        let counters = crate::project::CounterDelta::of(&entry);
+
         let entry = match &self.blobs {
             Some(blobs) => externalize_if_bulky(entry, blobs.as_ref())?,
             None => entry,
@@ -810,6 +834,23 @@ impl HistoryStore for JsonlHistoryStore {
         buf.push(b'\n');
         f.write_all(&buf)?;
         f.flush()?;
+
+        // After the log, and never in front of it. The transcript is the
+        // record; these are a convenience computed from it, so a sidecar that
+        // cannot be written costs a count and not the entry — still inside
+        // `append_lock`, which is what keeps two appends from reading the
+        // same total and writing back the same sum.
+        if let Err(e) = crate::project::add_counters_in(
+            &self.sessions_root,
+            &self.canonical_cwd,
+            &self.project_dir_path(),
+            session,
+            counters,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, %session, "could not update this session's counters");
+        }
         Ok(())
     }
 
@@ -867,8 +908,8 @@ impl HistoryStore for JsonlHistoryStore {
         .await
     }
 
-    async fn session_title(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
-        crate::project::session_title_in(&self.sessions_root, session).await
+    async fn session_stats(&self, session: SessionId) -> Result<SessionStats, HistoryError> {
+        crate::project::session_stats_in(&self.sessions_root, session).await
     }
 
     /// Reads only as far as the `Meta` entry, which the engine writes first.
@@ -1032,13 +1073,16 @@ impl HistoryStore for InMemoryHistoryStore {
         Ok(())
     }
 
-    async fn session_title(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
-        Ok(self
-            .titles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&session)
-            .cloned())
+    async fn session_stats(&self, session: SessionId) -> Result<SessionStats, HistoryError> {
+        Ok(SessionStats {
+            title: self
+                .titles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&session)
+                .cloned(),
+            ..SessionStats::default()
+        })
     }
 }
 
@@ -2295,8 +2339,8 @@ impl HistoryStore for ObservedHistoryStore {
         self.inner.set_session_title(session, title).await
     }
 
-    async fn session_title(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
-        self.inner.session_title(session).await
+    async fn session_stats(&self, session: SessionId) -> Result<SessionStats, HistoryError> {
+        self.inner.session_stats(session).await
     }
 
     async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
@@ -2553,14 +2597,14 @@ mod contract_tests {
     for_each_store!(a_session_keeps_the_name_a_person_gave_it, |store| {
         let s = SessionId::new();
         store.append(s, meta(None)).await.unwrap();
-        assert_eq!(store.session_title(s).await.unwrap(), None);
+        assert_eq!(store.session_stats(s).await.unwrap().title, None);
 
         store
             .set_session_title(s, Some("重构 daemon 装配".into()))
             .await
             .unwrap();
         assert_eq!(
-            store.session_title(s).await.unwrap().as_deref(),
+            store.session_stats(s).await.unwrap().title.as_deref(),
             Some("重构 daemon 装配")
         );
 
@@ -2569,11 +2613,11 @@ mod contract_tests {
             .set_session_title(s, Some("second".into()))
             .await
             .unwrap();
-        assert_eq!(store.session_title(s).await.unwrap().as_deref(), Some("second"));
+        assert_eq!(store.session_stats(s).await.unwrap().title.as_deref(), Some("second"));
 
         store.set_session_title(s, None).await.unwrap();
         assert_eq!(
-            store.session_title(s).await.unwrap(),
+            store.session_stats(s).await.unwrap().title,
             None,
             "clearing the name puts the session back to whatever names it automatically"
         );

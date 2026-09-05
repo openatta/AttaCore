@@ -439,6 +439,9 @@ pub struct SessionInfo {
     /// "not known" without a presence check.
     pub scene: Option<String>,
     pub project_root: Option<String>,
+    /// How many times this session's context has been compacted. Counted as
+    /// the log is written, so a session that is only on disk answers too.
+    pub compact_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// `false` only for a sidechain that already ran its one-shot task to
@@ -2714,6 +2717,20 @@ impl SessionPool {
         store.session_facts(sid).await.unwrap_or_default()
     }
 
+    /// What the store has recorded about this session — the name and the
+    /// counters. The empty record when there is no store or the id does not
+    /// parse, for the same reason `facts_of` answers that way: neither is a
+    /// reason to fail a listing.
+    async fn stats_of(&self, session_id: &str) -> history::store::SessionStats {
+        let Some(ref store) = self.history_store else {
+            return history::store::SessionStats::default();
+        };
+        let Ok(sid) = base::session::SessionId::parse(session_id) else {
+            return history::store::SessionStats::default();
+        };
+        store.session_stats(sid).await.unwrap_or_default()
+    }
+
     async fn session_facts_and_resumable(
         &self,
         session_id: &str,
@@ -3009,10 +3026,10 @@ impl SessionPool {
                 let sid_str = sid.to_string();
                 let active = active_ids.contains(&sid_str);
                 let (facts, resumable) = self.session_facts_and_resumable(&sid_str).await;
-                let name = store.session_title(sid).await.unwrap_or_default();
+                let stats = store.session_stats(sid).await.unwrap_or_default();
                 out.push(SessionInfo {
                     session_id: sid_str,
-                    name,
+                    name: stats.title,
                     preview: None,
                     message_count: 0,
                     created_at: String::new(),
@@ -3025,6 +3042,7 @@ impl SessionPool {
                     session_kind: facts.session_kind,
                     scene: facts.scene,
                     project_root: facts.project_root,
+                    compact_count: stats.compact_count,
                     parent_session_id: Some(parent.to_string()),
                     resumable,
                 });
@@ -3056,6 +3074,10 @@ impl SessionPool {
 
         for (sid, name, created_at, last_active) in active_snapshot {
             let (facts, resumable) = self.session_facts_and_resumable(&sid).await;
+            // From the same place a cold session's do: the store counts as it
+            // writes, so a live session and one on disk are answered alike
+            // instead of from two accountings that can disagree.
+            let stats = self.stats_of(&sid).await;
             seen.insert(sid.clone());
             if !include_children
                 && matches!(facts.session_kind, history::entry::SessionKind::Sidechain)
@@ -3073,6 +3095,7 @@ impl SessionPool {
                 session_kind: facts.session_kind,
                 scene: facts.scene,
                 project_root: facts.project_root,
+                compact_count: stats.compact_count,
                 parent_session_id: facts.parent_session_id,
                 resumable,
             });
@@ -3108,6 +3131,7 @@ impl SessionPool {
                         session_kind: facts.session_kind,
                         scene: facts.scene,
                         project_root: facts.project_root,
+                        compact_count: summary.compact_count,
                         parent_session_id: facts.parent_session_id,
                         resumable,
                     });
@@ -5753,6 +5777,7 @@ mod session_listing_tests {
                 "session_kind": "primary",
                 "scene": null,
                 "project_root": null,
+                "compact_count": 0,
                 "resumable": true,
             })
         );
