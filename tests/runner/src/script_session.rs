@@ -69,6 +69,21 @@ impl Session {
         }
     }
 
+    /// A budget wide enough that no case fails for the machine being busy.
+    ///
+    /// The carrier's own default is 100ms of wall clock, and that is the
+    /// right product default — but it makes every case that merely *uses* a
+    /// script depend on how loaded the machine is. A daemon-level case was
+    /// losing that race about one run in three under contention, reported as
+    /// "the script never reached the prompt" while the ledger said
+    /// "exceeded its 100ms budget": the engine had done exactly what it
+    /// promises, and the case failed for a property it is not about.
+    ///
+    /// So the default here is generous and a case that is *about* the clock
+    /// says so with [`within_ms`](Self::within_ms) — which is the convention
+    /// this file already followed, with the default on the wrong side of it.
+    const GENEROUS_TIMEOUT_MS: u64 = 5_000;
+
     /// Bind `path` at `point`. Order is the order of these calls, which is
     /// what decides which of two scripts on one point is the outer one.
     pub fn bind(mut self, path: &str, point: &str, entry: &str) -> Self {
@@ -76,13 +91,19 @@ impl Session {
             path: path.into(),
             point: point.into(),
             entry: entry.into(),
-            timeout_ms: None,
+            timeout_ms: Some(Self::GENEROUS_TIMEOUT_MS),
             calls_per_turn: None,
         });
         self
     }
 
     /// Give the binding just made a clock of its own.
+    ///
+    /// For a case whose subject is the clock — either tight, to be exceeded
+    /// on purpose, or wide, to take the clock out of a case about something
+    /// else that needs longer than [`GENEROUS_TIMEOUT_MS`].
+    ///
+    /// [`GENEROUS_TIMEOUT_MS`]: Self::GENEROUS_TIMEOUT_MS
     pub fn within_ms(mut self, timeout_ms: u64) -> Self {
         self.last_binding().timeout_ms = Some(timeout_ms);
         self
