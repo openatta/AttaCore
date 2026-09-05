@@ -6,10 +6,11 @@
 //! a spawned `attacored` without knowing which it got.
 //!
 //! The in-process build goes through `load_daemon_config` and
-//! `SessionPool::new` the way `main.rs` does, rather than assembling a pool
-//! by hand: the settings merge, the path resolution and the history layout
-//! are all things a daemon-level test is supposed to be exercising, and a
-//! harness that shortcuts them tests its own shortcut.
+//! `daemon::assemble::pool` — the same two calls `main.rs` makes — rather
+//! than assembling a pool by hand: the settings merge, the path resolution,
+//! the history layout and the startup steps are all things a daemon-level
+//! test is supposed to be exercising, and a harness that shortcuts them
+//! tests its own shortcut.
 //!
 //! It takes its paths as arguments where `main.rs` reads the environment.
 //! That is not a shortcut but a requirement: environment variables belong to
@@ -24,10 +25,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base::interface::memory::MemoryStore;
 use base::interface::permission::{Permission, PermissionOutcome};
 use daemon::config::{load_daemon_config, DaemonPaths, StaticDaemonPaths};
-use daemon::{DaemonServer, SessionPool};
+use daemon::DaemonServer;
 use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
 use rpc_client::DaemonRpcClient;
 use tokio::net::TcpListener;
@@ -179,49 +179,32 @@ impl Daemon {
             provider.base_url(),
         )?);
 
-        let global_dir = config.settings.paths.global_data_dir.clone();
-        let local_dir = config.settings.paths.local_data_dir.clone();
-        let memory = Arc::new(MemoryStore::new(
-            global_dir.join("memory"),
-            local_dir.join("memory"),
-        ));
-
-        let history = history::store::JsonlHistoryStore::with_roots(
-            &opts.project,
-            history::path::HistoryRoots::under(&global_dir),
-        )
-        .await
-        .ok()
-        .map(|s| Arc::new(s) as Arc<dyn history::store::HistoryStore>);
-
         let mut registry = scene::scene::SceneRegistry::new();
         registry.register_builtin();
         let agent_scene = registry
             .resolve(&opts.scene)
             .ok_or_else(|| anyhow::anyhow!("unknown scene `{}`", opts.scene))?;
 
-        let pool = Arc::new(
-            SessionPool::new(
-                opts.session_cap,
-                3600,
-                client,
-                Arc::new(config.settings.clone()),
-                agent_scene,
-                Arc::new(AllowAll) as Arc<dyn Permission>,
-                memory,
-                opts.project.clone(),
-                history,
-                config.paths.clone(),
-                None,
-            )
-            .with_permission_prompt_timeout(opts.prompt_timeout),
-        );
-        // `main.rs` does this before it serves, and its own doc comment says
-        // every embedder must: until it has run, an installed package
-        // contributes its manifest but none of its tools or scenes. Leaving
-        // it out here would make this mode quietly different from the
-        // spawned one in exactly the way these tests exist to catch.
-        pool.load_plugin_components().await;
+        let mut config = config;
+        config.session_cap = opts.session_cap;
+
+        // The same entry point `main.rs` uses, for the same reason a scenario
+        // exists: a harness that assembled its own pool would be testing its
+        // own assembly. Only the three things a spawned daemon would take
+        // from its own process differ here — the project it serves, the model
+        // it talks to, and how long an unanswered prompt may block.
+        let pool = daemon::assemble::pool(
+            &config,
+            agent_scene,
+            daemon::Assembly {
+                cwd: Some(opts.project.clone()),
+                permission_prompt_timeout: opts.prompt_timeout,
+                model_client: Some(client),
+                permission: Some(Arc::new(AllowAll) as Arc<dyn Permission>),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         let cancel = CancellationToken::new();
         let server = Arc::new(DaemonServer::new(pool, cancel.clone()));

@@ -66,6 +66,24 @@ while let Some(event) = events.recv().await {
 Three things are required — a scene, a model, settings. Everything else has a
 working default, and every default is a trait you can replace.
 
+Between the two, a host that wants the daemon's engine inside its own process
+hands over a configuration and gets one back, assembled:
+
+```rust
+let pool = daemon::assemble::pool(
+    &load_daemon_config("claude-sonnet-4-6", 2000, None, "coding", &paths),
+    Arc::new(scene::scene::coding::CodingScene),
+    daemon::Assembly::default(),
+)
+.await?;
+```
+
+Provider routing, credentials, the memory store, the history layout and its
+migration, plugin components, MCP connection, session expiry — the order and
+the defaults are the engine's knowledge, not yours. `attacored` is this call
+plus a command line and its listeners, and a test fails the build if anything
+in the workspace assembles a pool a second way.
+
 ---
 
 ## Why this one

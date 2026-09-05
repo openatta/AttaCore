@@ -14,10 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base::interface::memory::MemoryStore;
-use base::interface::settings::Settings;
-use daemon::config::StaticDaemonPaths;
-use daemon::{DaemonServer, SessionPool};
+use daemon::config::{load_daemon_config, StaticDaemonPaths};
+use daemon::DaemonServer;
 use model::client::AnthropicClient;
 use model::mock::MockAnthropicClient;
 use model::stream::{BlockDelta, ContentBlockStart, MessageDeltaPayload, StreamEvent, Usage};
@@ -138,10 +136,16 @@ async fn start_daemon(turns: usize) -> Daemon {
         model.push_turn(one_turn());
     }
 
-    let mut settings = Settings::defaults_for(DEFAULT_MODEL);
+    let mut config = load_daemon_config(
+        DEFAULT_MODEL,
+        2000,
+        Some(&sock),
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
     // Memory extraction would spend a canned turn of its own, off by one from
     // what every assertion below counts.
-    settings.memory_enabled = false;
+    config.settings.memory_enabled = false;
 
     let store: Arc<dyn history::store::HistoryStore> = Arc::new(
         history::store::JsonlHistoryStore::with_roots(
@@ -152,22 +156,19 @@ async fn start_daemon(turns: usize) -> Daemon {
         .unwrap(),
     );
 
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        model.clone() as Arc<dyn AnthropicClient>,
-        Arc::new(settings),
+    let pool = daemon::assemble::pool(
+        &config,
         Arc::new(scene::scene::coding::CodingScene),
-        Arc::new(PermitAll),
-        Arc::new(MemoryStore::new(
-            dir.path().join("user").join("memory"),
-            dir.path().join("local").join("memory"),
-        )),
-        cwd.clone(),
-        Some(store),
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf())),
-        None,
-    ));
+        daemon::Assembly {
+            cwd: Some(cwd.clone()),
+            model_client: Some(model.clone() as Arc<dyn AnthropicClient>),
+            transcripts: daemon::Transcripts::In(store),
+            permission: Some(Arc::new(PermitAll)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let server = Arc::new(DaemonServer::new(pool, CancellationToken::new()));
     let serving = server.clone();

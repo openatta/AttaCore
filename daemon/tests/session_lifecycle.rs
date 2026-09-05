@@ -13,11 +13,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use base::interface::memory::MemoryStore;
 use base::interface::settings::Settings;
-use daemon::config::StaticDaemonPaths;
+use daemon::config::{load_daemon_config, StaticDaemonPaths};
 use daemon::rpc::codes;
-use daemon::{DaemonServer, SessionPool};
+use daemon::DaemonServer;
 use model::client::{AnthropicClient, CountFuture, EventStream};
 use model::stream::{
     BlockDelta, ContentBlockStart, MessageDeltaPayload, StreamEvent, Usage as WireUsage,
@@ -180,22 +179,6 @@ fn asking_bash_rounds(marker: &str) -> Vec<Vec<StreamEvent>> {
 
 // ── Harness ─────────────────────────────────────────────────────────────
 
-/// The pool's *opt-out* permission instance — reachable only via
-/// `permission_mode: bypassPermissions`, never the default any more.
-struct AllowAllPermission;
-#[async_trait::async_trait]
-impl base::interface::permission::Permission for AllowAllPermission {
-    async fn check(
-        &self,
-        _: &str,
-        _: &serde_json::Value,
-        _: &std::path::Path,
-        _: &str,
-    ) -> base::interface::permission::PermissionOutcome {
-        base::interface::permission::PermissionOutcome::Permit
-    }
-}
-
 struct ScriptedServer {
     server: Arc<DaemonServer>,
     sock: PathBuf,
@@ -234,15 +217,21 @@ async fn start_scripted_server(
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
+    let (client, seen) = ScriptedClient::new(rounds);
+    let mut config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
+        Some(&sock),
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
+    config.session_cap = 8;
+    // The caller's settings, kept inside this test's directory: `Settings::
+    // defaults_for` carries a literal `~/.atta`, and the assembly places the
+    // memory store and the history roots from exactly these paths.
+    let settings_paths = config.settings.paths.clone();
+    config.settings = settings;
+    config.settings.paths = settings_paths;
 
     let store: Arc<dyn history::store::HistoryStore> = Arc::new(
         history::store::JsonlHistoryStore::with_roots(
@@ -253,23 +242,22 @@ async fn start_scripted_server(
         .unwrap(),
     );
 
-    let (client, seen) = ScriptedClient::new(rounds);
-    let pool = Arc::new(
-        SessionPool::new(
-            8,
-            3600,
-            client,
-            Arc::new(settings),
-            scene,
-            permission,
-            memory_store,
-            cwd,
-            Some(store.clone()),
-            paths,
-            None, // task_router
-        )
-        .with_permission_prompt_timeout(prompt_timeout),
-    );
+    // The entry point `main.rs` uses: these tests are about the behaviour of
+    // an assembled daemon, and an assembly of their own would be one more
+    // copy to keep in step with it.
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(cwd.clone()),
+            permission_prompt_timeout: prompt_timeout,
+            model_client: Some(client),
+            transcripts: daemon::Transcripts::In(store.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let cancel = CancellationToken::new();
     let server = Arc::new(DaemonServer::new(pool, cancel));
@@ -309,30 +297,28 @@ async fn start_server_without_history() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("test.sock");
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
     let (client, _seen) = ScriptedClient::new(vec![text_round("x")]);
+    let config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
+        Some(&sock),
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
 
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        client,
-        Arc::new(Settings::defaults_for("claude-sonnet-4-6")),
-        scene,
-        permission,
-        memory_store,
-        dir.path().to_path_buf(),
-        None,
-        paths,
-        None,
-    ));
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(dir.path().to_path_buf()),
+            model_client: Some(client),
+            transcripts: daemon::Transcripts::Nowhere,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
+
     let cancel = CancellationToken::new();
     let server = Arc::new(DaemonServer::new(pool, cancel));
     let server2 = server.clone();

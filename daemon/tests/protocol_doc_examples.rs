@@ -20,10 +20,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base::interface::memory::MemoryStore;
-use base::interface::settings::Settings;
-use daemon::config::StaticDaemonPaths;
-use daemon::{DaemonServer, SessionPool};
+use daemon::config::{load_daemon_config, StaticDaemonPaths};
+use daemon::DaemonServer;
 use model::client::{AnthropicClient, CountFuture, EventStream};
 use model::stream::{BlockDelta, ContentBlockStart, MessageDeltaPayload, StreamEvent, Usage};
 use model::types::MessagesRequest;
@@ -230,15 +228,18 @@ async fn start_daemon() -> Daemon {
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(PermitAll);
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
+    let mut config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
+        Some(&sock),
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
+    config.session_cap = 8;
+    // Post-turn memory extraction would fire a second model call and slow the
+    // one turn this test runs; nothing here reads memory.
+    config.settings.memory_enabled = false;
+
     let store: Arc<dyn history::store::HistoryStore> = Arc::new(
         history::store::JsonlHistoryStore::with_roots(
             &cwd,
@@ -248,24 +249,19 @@ async fn start_daemon() -> Daemon {
         .unwrap(),
     );
 
-    let mut settings = Settings::defaults_for("claude-sonnet-4-6");
-    // Post-turn memory extraction would fire a second model call and slow the
-    // one turn this test runs; nothing here reads memory.
-    settings.memory_enabled = false;
-
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        Arc::new(OneTurnClient),
-        Arc::new(settings),
-        scene,
-        permission,
-        memory_store,
-        cwd.clone(),
-        Some(store),
-        paths,
-        None,
-    ));
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(cwd.clone()),
+            model_client: Some(Arc::new(OneTurnClient)),
+            transcripts: daemon::Transcripts::In(store),
+            permission: Some(Arc::new(PermitAll)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let server = Arc::new(DaemonServer::new(pool, CancellationToken::new()));
     let serving = server.clone();

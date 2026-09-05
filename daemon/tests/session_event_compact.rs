@@ -15,12 +15,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base::interface::memory::MemoryStore;
 use base::interface::scene::{AgentScene, ScenePromptContext, TokenBudget};
-use base::interface::settings::Settings;
 use base::prompt::PromptBlock;
-use daemon::config::StaticDaemonPaths;
-use daemon::{DaemonServer, SessionPool};
+use daemon::config::{load_daemon_config, StaticDaemonPaths};
+use daemon::DaemonServer;
 use model::client::{AnthropicClient, CountFuture, EventStream};
 use model::stream::{BlockDelta, ContentBlockStart, MessageDeltaPayload, StreamEvent, Usage};
 use model::types::MessagesRequest;
@@ -163,9 +161,15 @@ async fn a_compacted_turn_says_so_on_the_wire() {
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let mut settings = Settings::defaults_for("claude-sonnet-4-6");
+    let mut config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
+        Some(&sock),
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
     // A second model call after the turn, for a session nothing reads back.
-    settings.memory_enabled = false;
+    config.settings.memory_enabled = false;
 
     let store: Arc<dyn history::store::HistoryStore> = Arc::new(
         history::store::JsonlHistoryStore::with_roots(
@@ -176,22 +180,19 @@ async fn a_compacted_turn_says_so_on_the_wire() {
         .unwrap(),
     );
 
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        Arc::new(OneTurnClient),
-        Arc::new(settings),
+    let pool = daemon::assemble::pool(
+        &config,
         Arc::new(HairTriggerScene(scene::scene::coding::CodingScene)),
-        Arc::new(PermitAll),
-        Arc::new(MemoryStore::new(
-            dir.path().join("user").join("memory"),
-            dir.path().join("local").join("memory"),
-        )),
-        cwd.clone(),
-        Some(store),
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf())),
-        None,
-    ));
+        daemon::Assembly {
+            cwd: Some(cwd.clone()),
+            model_client: Some(Arc::new(OneTurnClient)),
+            transcripts: daemon::Transcripts::In(store),
+            permission: Some(Arc::new(PermitAll)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let server = Arc::new(DaemonServer::new(pool, CancellationToken::new()));
     let serving = server.clone();

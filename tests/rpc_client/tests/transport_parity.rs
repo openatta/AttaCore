@@ -22,10 +22,8 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use base::interface::memory::MemoryStore;
-use base::interface::settings::Settings;
-use daemon::config::StaticDaemonPaths;
-use daemon::{DaemonServer, SessionPool};
+use daemon::config::{load_daemon_config, StaticDaemonPaths};
+use daemon::DaemonServer;
 use model::client::{AnthropicClient, CountFuture, EventStream};
 use model::stream::{
     BlockDelta, ContentBlockStart, MessageDeltaPayload, StreamEvent, Usage as WireUsage,
@@ -228,34 +226,42 @@ impl Harness {
             .await
             .unwrap(),
         );
-        let pool = Arc::new(SessionPool::new(
-            8,
-            3600,
-            client,
-            Arc::new(Settings::defaults_for("claude-sonnet-4-6")),
+        let sock = dir.path().join("parity.sock");
+        let config = load_daemon_config(
+            "claude-sonnet-4-6",
+            2000,
+            Some(&sock),
+            "coding",
+            &StaticDaemonPaths::new(dir.path().to_path_buf()),
+        );
+        // Assembled the way `main.rs` assembles, so a transport claim is
+        // tested against the daemon these tests are about rather than one
+        // this file put together itself.
+        let pool = daemon::assemble::pool(
+            &config,
             Arc::new(scene::scene::coding::CodingScene),
-            // `allow_all` decides whether the daemon ever raises a prompt:
-            // the streaming tests want turns that just run, the prompt test
-            // wants one that stops and asks.
-            if allow_all {
-                Arc::new(AllowAllPermission) as Arc<dyn base::interface::permission::Permission>
-            } else {
-                Arc::new(AskEverythingPermission)
+            daemon::Assembly {
+                cwd: Some(cwd.clone()),
+                model_client: Some(client),
+                transcripts: daemon::Transcripts::In(store),
+                permission: Some(// `allow_all` decides whether the daemon ever raises a prompt:
+                // the streaming tests want turns that just run, the prompt
+                // test wants one that stops and asks.
+                if allow_all {
+                    Arc::new(AllowAllPermission)
+                        as Arc<dyn base::interface::permission::Permission>
+                } else {
+                    Arc::new(AskEverythingPermission)
+                }),
+                ..Default::default()
             },
-            Arc::new(MemoryStore::new(
-                dir.path().join("user/memory"),
-                dir.path().join("local/memory"),
-            )),
-            cwd,
-            Some(store),
-            Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf())),
-            None,
-        ));
+        )
+        .await
+        .expect("the daemon assembles");
 
         let server = Arc::new(DaemonServer::new(pool, CancellationToken::new()));
         server.set_tcp_token(TOKEN.to_string()).await;
 
-        let sock = dir.path().join("parity.sock");
         let mut tasks = Vec::new();
         {
             let s = server.clone();

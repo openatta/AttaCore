@@ -17,6 +17,7 @@ compile_error!(
      `--no-default-features --features plugins` (or `plugin-compile`)."
 );
 
+pub mod assemble;
 pub mod config;
 pub mod discovery;
 pub mod doctor;
@@ -31,6 +32,7 @@ pub mod telemetry_otel;
 pub mod watch_hub;
 pub mod ws;
 
+pub use assemble::{AllowAllPermission, Assembly, Transcripts};
 pub use discovery::write_lock_file;
 pub use server::DaemonServer;
 pub use session_pool::SessionPool;

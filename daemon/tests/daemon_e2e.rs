@@ -7,11 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base::id::Id;
-use base::interface::memory::MemoryStore;
-use base::interface::settings::Settings;
-use daemon::config::StaticDaemonPaths;
+use daemon::config::{load_daemon_config, StaticDaemonPaths};
 use daemon::rpc::codes;
-use daemon::{DaemonServer, SessionPool};
+use daemon::DaemonServer;
 use model::client::{AnthropicClient, AuthMode, HttpAnthropicClient};
 // Only the plugin-archive helper hashes anything, and that helper is gated —
 // on the package layer, which is what installing needs; running a package's
@@ -92,39 +90,36 @@ async fn start_server_in(
 ) {
     let sock = dir.path().join("test.sock");
 
-    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
-
     // 使用 dummy client（不真正调 LLM）
     let client: Arc<dyn AnthropicClient> =
         Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
 
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
+    let config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
+        Some(&sock),
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
 
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        client,
-        settings,
-        scene,
-        permission,
-        memory_store,
-        dir.path().to_path_buf(),
-        None,
-        paths,
-        None, // task_router
-    ));
-
-    // Same startup step `main.rs` performs before serving: without it a
-    // session sees no plugin tools and no plugin scenes.
-    pool.load_plugin_components().await;
+    // Through `daemon::assemble` for the same reason `main.rs` is — including
+    // the startup steps a test would otherwise have to remember one at a
+    // time, which is how "no session here has any plugin tool" hid once
+    // before. `Nowhere` keeps this file's long-standing shape: these cases
+    // are about the RPC surface, not about transcripts.
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(dir.path().to_path_buf()),
+            model_client: Some(client),
+            transcripts: daemon::Transcripts::Nowhere,
+            permission: Some(Arc::new(AllowAllPermission)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let cancel = CancellationToken::new();
     let server = Arc::new(DaemonServer::new(pool, cancel));
@@ -1111,43 +1106,40 @@ async fn start_server_with_history(
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("test.sock");
 
-    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
-
     let client: Arc<dyn AnthropicClient> =
         Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
 
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
-
-    let history_store: Option<Arc<dyn history::store::HistoryStore>> = Some(Arc::new(
+    let store: Arc<dyn history::store::HistoryStore> = Arc::new(
         history::store::JsonlHistoryStore::with_roots(
             dir.path(),
             history::path::HistoryRoots::under(dir.path()),
         )
         .await
         .unwrap(),
-    ));
+    );
 
-    let pool = Arc::new(SessionPool::new(
-        cap,
-        3600,
-        client,
-        settings,
-        scene,
-        permission,
-        memory_store,
-        dir.path().to_path_buf(),
-        history_store,
-        paths,
-        None, // task_router
-    ));
+    let mut config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
+        None,
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
+    config.session_cap = cap;
+
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(dir.path().to_path_buf()),
+            model_client: Some(client),
+            transcripts: daemon::Transcripts::In(store),
+            permission: Some(Arc::new(AllowAllPermission)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let cancel = CancellationToken::new();
     let server = Arc::new(DaemonServer::new(pool, cancel));
@@ -1210,32 +1202,31 @@ async fn start_tcp_server(
 ) {
     let dir = tempfile::tempdir().unwrap();
 
-    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
     let client: Arc<dyn AnthropicClient> =
         Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
 
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        client,
-        settings,
-        scene,
-        permission,
-        memory_store,
-        dir.path().to_path_buf(),
+    let mut config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
         None,
-        paths,
-        None, // task_router
-    ));
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
+    config.session_cap = 8;
+
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(dir.path().to_path_buf()),
+            model_client: Some(client),
+            transcripts: daemon::Transcripts::Nowhere,
+            permission: Some(Arc::new(AllowAllPermission)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
 
     let cancel = CancellationToken::new();
     let server = Arc::new(DaemonServer::new(pool, cancel));
@@ -1348,31 +1339,28 @@ async fn serve_tcp_listener_bails_without_a_token_even_when_called_directly() {
     // entirely, and asserts it fails loudly instead of silently rejecting
     // every future connection forever.
     let dir = tempfile::tempdir().unwrap();
-    let settings = Arc::new(Settings::defaults_for("claude-sonnet-4-6"));
-    let memory_store = Arc::new(MemoryStore::new(
-        dir.path().join("user").join("memory"),
-        dir.path().join("local").join("memory"),
-    ));
-    let scene: Arc<dyn base::interface::scene::AgentScene> =
-        Arc::new(scene::scene::coding::CodingScene);
-    let permission: Arc<dyn base::interface::permission::Permission> = Arc::new(AllowAllPermission);
     let client: Arc<dyn AnthropicClient> =
         Arc::new(HttpAnthropicClient::new(AuthMode::ApiKey("test-key".into())).unwrap());
-    let paths: Arc<dyn daemon::config::DaemonPaths> =
-        Arc::new(StaticDaemonPaths::new(dir.path().to_path_buf()));
-    let pool = Arc::new(SessionPool::new(
-        8,
-        3600,
-        client,
-        settings,
-        scene,
-        permission,
-        memory_store,
-        dir.path().to_path_buf(),
+    let config = load_daemon_config(
+        "claude-sonnet-4-6",
+        2000,
         None,
-        paths,
-        None, // task_router
-    ));
+        "coding",
+        &StaticDaemonPaths::new(dir.path().to_path_buf()),
+    );
+    let pool = daemon::assemble::pool(
+        &config,
+        Arc::new(scene::scene::coding::CodingScene),
+        daemon::Assembly {
+            cwd: Some(dir.path().to_path_buf()),
+            model_client: Some(client),
+            transcripts: daemon::Transcripts::Nowhere,
+            permission: Some(Arc::new(AllowAllPermission)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the daemon assembles");
     let server = Arc::new(DaemonServer::new(pool, CancellationToken::new()));
     // Deliberately NOT calling server.set_tcp_token(...).
 
