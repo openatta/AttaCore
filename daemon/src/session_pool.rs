@@ -2353,6 +2353,41 @@ impl SessionPool {
                     );
                     self.broadcast_to_session(&sid, &f).await;
                 }
+                // Context was compacted mid-turn. The only moment this is
+                // worth saying: the user sees the consequence (the model
+                // stopped remembering something) and has no way back to the
+                // cause once the turn is over.
+                //
+                // Destructured exhaustively on purpose — a field added to
+                // `CompactAction` must fail this build rather than quietly
+                // stop reaching the client, which is how `Usage`'s two cache
+                // fields missed `turn_complete` for a release.
+                Some(AgentEvent::CompactAction {
+                    strategy,
+                    messages_before,
+                    messages_after,
+                    turn_id: _,
+                    dropped_rounds,
+                    dropped_messages,
+                    estimated_tokens_saved,
+                }) => {
+                    let mut event = serde_json::json!({
+                        "kind":"compact","strategy":strategy,
+                        "messages_before":messages_before,"messages_after":messages_after
+                    });
+                    let map = event.as_object_mut().expect("json! built an object");
+                    for (key, value) in [
+                        ("dropped_rounds", dropped_rounds),
+                        ("dropped_messages", dropped_messages),
+                        ("estimated_tokens_saved", estimated_tokens_saved),
+                    ] {
+                        if let Some(v) = value {
+                            map.insert(key.into(), serde_json::json!(v));
+                        }
+                    }
+                    let f = StreamFrame::event(&sid, &turn_id, event);
+                    self.broadcast_to_session(&sid, &f).await;
+                }
                 Some(AgentEvent::TurnComplete {
                     stop_reason,
                     api_calls: ac,

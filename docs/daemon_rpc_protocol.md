@@ -1257,14 +1257,39 @@ RPC 出口。要看子 Agent 干了什么,走它的侧链会话:`session.list
 | `subagent_progress` | `{agent_label,agent_session_id,agent_type,parent_turn,event}` | 子 Agent 事件镜像,`event` 是嵌套的本表结构 |
 | `team_progress` | `{team,team_id,stage,stage_index,stage_count,status,members,failed}` | 团队阶段生命周期 |
 | `skills_changed` | `{added,removed}` | 会话下的 skill 文件变了,缓存了 `commands.list` 的客户端该重取 |
+| `compact` | `{strategy,messages_before,messages_after,dropped_rounds?,dropped_messages?,estimated_tokens_saved?}` | 上下文被压缩了(§7.1) |
 | `turn_complete` | `{stop_reason,api_calls,usage}` | 模型侧完成;最终响应随后到达 |
 
-**这张表是白名单,没有别的 `kind`。** 引擎内部还有其它事件,但只有上面这些会被转成
-帧发出来。特别地:没有 `turn_state` / `agent_state` / `compact` 事件 —— 判断 turn
-是不是在跑要问 `session.get` 的 `turn_state`。
+**这张表是白名单。** 引擎内部还有其它事件,但只有上面这些会被转成帧发出来。特别地:
+没有 `turn_state` / `agent_state` 事件 —— 判断 turn 是不是在跑要问 `session.get` 的
+`turn_state`。
+
+**但客户端必须忽略不认识的 `kind`。** 这张表只会往下长,而且加一种事件不该是一次
+破坏性变更:碰到没见过的 `kind` 就跳过它,不要报错、不要断开、更不要把整条连接当成
+协议错误。
 
 `prompt_type` 目前只有 `"permission"`,但字段刻意保持通用 —— 未来的"停下来问一句"
 可以复用同一帧与同一回答通道。
+
+### 7.1 `compact`
+
+```jsonc
+{ "kind":"compact", "strategy":"Snip",
+  "messages_before":84, "messages_after":22,
+  "dropped_rounds":9, "dropped_messages":61,      // 可选,压缩策略给不出就不出现
+  "estimated_tokens_saved":31200 }                // 同上
+```
+
+`strategy` 是引擎选中的那一档:`Snip`(丢最旧的轮次)、`MicroCompact`(清空旧工具结
+果的正文)、`CollapseContext`(把旧轮次折成摘要)、`FullCompact`(LLM 生成全文摘要)。
+这份名单会随引擎增删,**按未知值处理它**,别把没见过的策略当成错误。
+
+上下文被压掉是使用者**看得见结果、看不见原因**的一件事 —— "它怎么把前面说过的忘
+了"。这条帧是唯一说出原因的时机:事后从 transcript 里推不回来,`session.get` 也不
+答它。压缩发生在轮次中间,所以它**不是终止帧**,后面照常有 `text_delta` 与
+`turn_complete`。
+
+后三项是策略相关的:给不出的策略就不带这三个键,不是带 `null`。
 
 `turn_complete` 的 `usage` 是完整的四字段用量(§3.5),
 **是这一轮所有模型调用的合计**,不是最后一趟。一轮可能来回好几趟
