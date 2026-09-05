@@ -485,6 +485,83 @@ async fn a_listed_session_says_which_scene_and_project_it_belongs_to() {
     srv.stop().await;
 }
 
+// ── session.subscribe ───────────────────────────────────────────────────
+
+/// Opening a session that is only on disk is the most ordinary thing a client
+/// does, and it used to be three calls with a failure in the middle: subscribe,
+/// recognize `SESSION_NOT_FOUND`, resume, subscribe again. Every client wrote
+/// that sequence, and the details it has to get right (which scene, which
+/// project) are the ones it is worst placed to know.
+#[tokio::test]
+async fn subscribing_with_resume_opens_a_session_that_left_memory() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("answer")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let sid = run_turn(&srv.sock, None, "hello").await;
+    let closed = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.close","id":1,"params":{{"session_id":"{sid}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(closed["result"]["closed"], sid.as_str());
+
+    // The default is unchanged: subscribing does not resume, and says so
+    // rather than handing back a subscription that will never see a frame.
+    let refused = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.subscribe","id":2,"params":{{"session_id":"{sid}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"], codes::SESSION_NOT_FOUND as i64,
+        "subscribe still refuses a cold session by default: {refused}"
+    );
+
+    let opened = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.subscribe","id":3,"params":{{"session_id":"{sid}","resume":true}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        opened.get("result").is_some(),
+        "subscribe with resume opens it: {opened}"
+    );
+    assert_eq!(opened["result"]["session_id"], sid.as_str());
+    assert_eq!(
+        opened["result"]["resumed"], true,
+        "the caller is told a resume happened on its behalf: {opened}"
+    );
+    assert_eq!(
+        opened["result"]["scene_inferred"], false,
+        "this transcript records its scene, so nothing was inferred: {opened}"
+    );
+
+    // Already live now: the same call subscribes without resuming again.
+    let again = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.subscribe","id":4,"params":{{"session_id":"{sid}","resume":true}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        again["result"]["resumed"], false,
+        "a live session is subscribed to, not resumed: {again}"
+    );
+
+    srv.stop().await;
+}
+
 // ── session.history ─────────────────────────────────────────────────────
 
 #[tokio::test]

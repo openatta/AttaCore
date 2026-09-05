@@ -46,6 +46,40 @@ use tracing::{debug, info, warn};
 
 type Reader = Box<dyn AsyncRead + Send + Unpin + 'static>;
 
+/// A resume that could not happen, as the wire sees it.
+///
+/// Shared by `session.resume` and by `session.subscribe {resume: true}`:
+/// opening a session that is only on disk fails for the same reasons however
+/// the caller asked, and a second copy of this mapping would be a second set
+/// of error codes to keep in step.
+fn resume_failure(id: serde_json::Value, e: crate::session_pool::ResumeError) -> RpcResponse {
+    match e {
+        crate::session_pool::ResumeError::SidechainTerminal {
+            session_id,
+            parent_session_id,
+            final_state,
+        } => {
+            let final_state = match final_state {
+                history::entry::SessionEndState::Completed => "completed",
+                history::entry::SessionEndState::Failed => "failed",
+            };
+            RpcResponse::err_with_data(
+                id,
+                codes::SIDECHAIN_TERMINAL,
+                "sidechain session already ran to completion",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "parent_session_id": parent_session_id,
+                    "final_state": final_state,
+                }),
+            )
+        }
+        crate::session_pool::ResumeError::Rpc((code, message)) => {
+            RpcResponse::err(id, code, message)
+        }
+    }
+}
+
 /// How many requests one connection may have in flight at once.
 ///
 /// A bound, not a queue: at the limit further requests are refused with
@@ -1177,13 +1211,49 @@ impl DaemonServer {
         let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
             return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
         };
+        // Opt-in, and opt-in is the whole design. Resuming costs a transcript
+        // read and a slot in a capped pool, and a client drawing a session
+        // list subscribes to rows it is only looking at — doing this by
+        // default would resume every one of them on its behalf.
+        let resume = params
+            .get("resume")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if let Some(err) = self.scene_mismatch_response(&id, session_id).await {
             return err;
         }
-        match self.pool.subscribe_session(session_id, client).await {
-            Ok(v) => RpcResponse::ok(id, v),
-            Err((code, message)) => RpcResponse::err(id, code, message),
+
+        let mut report = match self.pool.subscribe_session(session_id, client.clone()).await {
+            Ok(v) => Some(v),
+            Err((code, _)) if resume && code == codes::SESSION_NOT_FOUND => {
+                // §3.4 still applies: the mismatch check above ran first, and
+                // this records the pre-v2 case the same way `session.resume`
+                // reports it.
+                let inferred = matches!(
+                    self.pool.check_scene(session_id).await,
+                    crate::session_pool::SceneCheck::Inferred
+                );
+                match self.pool.resume_session(session_id, false, None).await {
+                    Ok(_) => match self.pool.subscribe_session(session_id, client).await {
+                        Ok(mut v) => {
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.insert("resumed".into(), serde_json::json!(true));
+                                obj.insert("scene_inferred".into(), serde_json::json!(inferred));
+                            }
+                            return RpcResponse::ok(id, v);
+                        }
+                        Err((code, message)) => return RpcResponse::err(id, code, message),
+                    },
+                    Err(e) => return resume_failure(id, e),
+                }
+            }
+            Err((code, message)) => return RpcResponse::err(id, code, message),
+        };
+
+        if let Some(obj) = report.as_mut().and_then(|v| v.as_object_mut()) {
+            obj.insert("resumed".into(), serde_json::json!(false));
         }
+        RpcResponse::ok(id, report.unwrap_or_else(|| serde_json::json!({})))
     }
 
     /// `session.setModel` params: `{"session_id": "...", "model": "..."}`.
@@ -1384,29 +1454,7 @@ impl DaemonServer {
                 }
                 RpcResponse::ok(id, result)
             }
-            Err(crate::session_pool::ResumeError::SidechainTerminal {
-                session_id,
-                parent_session_id,
-                final_state,
-            }) => {
-                let final_state = match final_state {
-                    history::entry::SessionEndState::Completed => "completed",
-                    history::entry::SessionEndState::Failed => "failed",
-                };
-                RpcResponse::err_with_data(
-                    id,
-                    codes::SIDECHAIN_TERMINAL,
-                    "sidechain session already ran to completion",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "parent_session_id": parent_session_id,
-                        "final_state": final_state,
-                    }),
-                )
-            }
-            Err(crate::session_pool::ResumeError::Rpc((code, message))) => {
-                RpcResponse::err(id, code, message)
-            }
+            Err(e) => resume_failure(id, e),
         }
     }
 

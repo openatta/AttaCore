@@ -832,18 +832,30 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 
 ```jsonc
 // → params
-{ "session_id": "…" }
+{ "session_id": "…",
+  "resume": false }            // 可选,默认 false
 // ← result
 { "session_id": "…",
   "last_seq": "…",             // 数字:transcript 水位,用于追赶(§5.6)
-  "pending_prompts": [ ] }     // 还没被回答的 kind:"prompt" 帧,原样重放
+  "pending_prompts": [ ],      // 还没被回答的 kind:"prompt" 帧,原样重放
+  "resumed": false }           // 这次调用有没有替你恢复它;true 时另有 scene_inferred
 ```
 
 订阅之后该会话的 `session.event` 帧都推到这条连接上,直到 `session.unsubscribe`
 或连接断开。重复订阅同一会话是幂等的。
 
-**只能订阅内存里的会话** —— 会话不在内存里返回 `SESSION_NOT_FOUND`,而不是给一个
-永远不会有数据的订阅。先 `session.resume` 再订阅。
+**默认只能订阅内存里的会话** —— 会话不在内存里返回 `SESSION_NOT_FOUND`,而不是给一
+个永远不会有数据的订阅。
+
+**`resume: true` 表示"打开它,不管它在不在内存里"**:冷会话先恢复再订阅,响应带
+`"resumed": true` 与 `session.resume` 那边同样的 `scene_inferred`。这不是默认行为,
+因为恢复要读一遍 transcript 并占掉会话池的一个名额 —— 一个画会话列表的宿主给每一行
+都订阅一次,默认恢复就等于替它把整页会话全恢复了,而它以为自己只是在看。
+
+`resume: true` 不接 `options`:要指定 `permission_mode` 之类的恢复,显式调
+`session.resume`。恢复失败的错误跟 `session.resume` 完全一致 —— 跨场景仍然
+`SCENE_MISMATCH`(§3.4),终态侧链仍然 `SIDECHAIN_TERMINAL`,池子满了仍然按恢复那边
+的规矩来。
 
 `pending_prompts` 里的帧带**原来的 `prompt_id`**,所以中途打开的 tab 可以直接答那个
 还悬着的权限提问。这些帧在 turn 结束时清空。
