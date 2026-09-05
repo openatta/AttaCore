@@ -39,6 +39,19 @@ pub const SUBSCRIBABLE_EVENTS: &[&str] = &[
 /// warning in [`Plugin::load`].
 pub const KNOWN_SECTIONS: &[&str] = &["plugin", "wasm", "mcp", "script", "scene", "agent"];
 
+/// Top-level sections addressed to whoever embeds the engine, not to the
+/// engine.
+///
+/// A host that lets packages contribute to something the engine has no
+/// concept of — a user interface, a marketplace listing — needs somewhere in
+/// the manifest to put it, and the unknown-section warning was calling every
+/// such section a mistake that "contributes nothing". For that section it is
+/// the opposite: it is the only thing the host reads.
+///
+/// A prefix rather than one blessed name (`[[host]]`) because one package can
+/// be installed under two hosts, and they would have to share the name.
+pub const HOST_SECTION_PREFIX: &str = "x-";
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PluginManifest {
     pub plugin: PluginMeta,
@@ -343,20 +356,32 @@ impl Plugin {
 /// `[[script]]` — silently produces a package that contributes nothing and
 /// looks installed. Naming the section costs the forward-compatible case
 /// nothing and is the only signal the typo ever gets.
+///
+/// [`HOST_SECTION_PREFIX`] is the third case: a section neither this build nor
+/// any build reads, because it was never addressed to the engine.
 fn warn_unknown_sections(raw: &str, plugin: &str) {
-    let Ok(toml::Value::Table(table)) = raw.parse::<toml::Value>() else {
-        return;
-    };
-    for key in table.keys() {
-        if !KNOWN_SECTIONS.contains(&key.as_str()) {
-            tracing::warn!(
-                plugin,
-                section = key.as_str(),
-                known = KNOWN_SECTIONS.join(", "),
-                "plugin.toml declares a section this build does not read; it contributes nothing"
-            );
-        }
+    for section in unknown_sections(raw) {
+        tracing::warn!(
+            plugin,
+            section = section.as_str(),
+            known = KNOWN_SECTIONS.join(", "),
+            "plugin.toml declares a section this build does not read; it contributes nothing"
+        );
     }
+}
+
+/// Sections [`warn_unknown_sections`] would name, split out so the decision
+/// can be tested without a tracing subscriber.
+fn unknown_sections(raw: &str) -> Vec<String> {
+    let Ok(toml::Value::Table(table)) = raw.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    table
+        .keys()
+        .filter(|key| !key.starts_with(HOST_SECTION_PREFIX))
+        .filter(|key| !KNOWN_SECTIONS.contains(&key.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn validate(m: &PluginManifest) -> Result<(), PluginError> {
@@ -459,6 +484,27 @@ name = "p"
 version = "1.0.0"
 api_version = "0.1"
 "#;
+
+    /// A host section is not a typo, and the warning that calls it one is
+    /// wrong about the only part of the manifest that host reads.
+    #[test]
+    fn a_host_section_is_not_reported_as_a_section_nobody_reads() {
+        let manifest = format!(
+            "{MINIMAL}\n[[x-ui]]\npanel = \"panel.js\"\n\n[x-marketplace]\nlisting = \"listed\"\n"
+        );
+        assert!(
+            unknown_sections(&manifest).is_empty(),
+            "`x-` sections are addressed to the host, not to this build"
+        );
+    }
+
+    /// Reserving a prefix must not cost the typo its warning — that is what
+    /// the whole check exists for.
+    #[test]
+    fn a_misspelled_engine_section_is_still_reported() {
+        let manifest = format!("{MINIMAL}\n[[scripts]]\nentry = \"main.js\"\n");
+        assert_eq!(unknown_sections(&manifest), vec!["scripts".to_string()]);
+    }
 
     #[test]
     fn a_manifest_may_declare_no_payloads_at_all() {
