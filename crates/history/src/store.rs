@@ -3086,6 +3086,32 @@ mod query_contract_tests {
         }
     }
 
+    /// Give each session file a distinct mtime, in the order they were
+    /// written.
+    ///
+    /// The two backends order by different clocks — a file's mtime and an
+    /// entry's timestamp — and only one of them has a resolution this test
+    /// controls. On a filesystem whose mtime granularity is coarser than the
+    /// loop that wrote these files (ext4 with small inodes rounds to the
+    /// second), all four land on the same mtime, the file-backed store falls
+    /// through to its id tie-break, and a *limited* query then answers with a
+    /// different set rather than a different order. That is the tie the test
+    /// below says it tolerates in ordering — but a set difference is not an
+    /// ordering difference, and the assertion is about the set.
+    fn stamp_distinct_mtimes(store: &JsonlHistoryStore, ids: &[SessionId]) {
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for (i, id) in ids.iter().enumerate() {
+            let path = store.session_file_path(id);
+            let when = base + std::time::Duration::from_secs(10 * (i as u64 + 1));
+            let file = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("the session file this test just wrote");
+            file.set_times(std::fs::FileTimes::new().set_modified(when))
+                .expect("the temp filesystem allows setting mtimes");
+        }
+    }
+
     /// The two shipped backends have different notions of "when was this last
     /// touched" — a file's mtime and an entry's timestamp — so their orders
     /// can differ by a tie. Which sessions match cannot.
@@ -3100,6 +3126,7 @@ mod query_contract_tests {
         let ids: Vec<SessionId> = (0..CORPUS.len()).map(|_| SessionId::new()).collect();
         fill(&jsonl, &ids).await;
         fill(&memory, &ids).await;
+        stamp_distinct_mtimes(&jsonl, &ids);
 
         for query in queries() {
             let matched = |summaries: Vec<SessionSummary>| {
