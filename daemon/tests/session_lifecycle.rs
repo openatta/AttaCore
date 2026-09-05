@@ -1317,13 +1317,9 @@ async fn session_resume_refuses_an_unknown_id_unless_asked_to_create() {
     srv.stop().await;
 }
 
-/// P1 §3.4: a session recorded under a scene other than this daemon's must
-/// be rejected, not silently resumed into the wrong scene.
-#[tokio::test]
-async fn session_resume_rejects_a_scene_mismatch() {
-    let (srv, _seen) =
-        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
-
+/// A transcript recorded under `scene`, with nothing in it but its `Meta`
+/// line — enough for §3.4's check, which reads that line and nothing else.
+async fn inject_session_in_scene(srv: &ScriptedServer, scene: &str) -> base::session::SessionId {
     let sid = base::session::SessionId::new();
     srv.store
         .append(
@@ -1336,7 +1332,7 @@ async fn session_resume_rejects_a_scene_mismatch() {
                 engine_version: "0.0.1".into(),
                 attacode_version: "0.0.1".into(),
                 parent_session_id: None,
-                scene: Some("chat".into()),
+                scene: Some(scene.to_string()),
                 project_root: None,
                 session_kind: history::entry::SessionKind::Primary,
                 schema_version: history::entry::CURRENT_META_SCHEMA_VERSION,
@@ -1344,6 +1340,17 @@ async fn session_resume_rejects_a_scene_mismatch() {
         )
         .await
         .unwrap();
+    sid
+}
+
+/// P1 §3.4: a session recorded under a scene other than this daemon's must
+/// be rejected, not silently resumed into the wrong scene.
+#[tokio::test]
+async fn session_resume_rejects_a_scene_mismatch() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+
+    let sid = inject_session_in_scene(&srv, "chat").await;
 
     let resumed = rpc(
         &srv.sock,
@@ -1356,6 +1363,57 @@ async fn session_resume_rejects_a_scene_mismatch() {
     assert_eq!(resumed["error"]["data"]["session_id"], sid.to_string());
     assert_eq!(resumed["error"]["data"]["recorded_scene"], "chat");
     assert_eq!(resumed["error"]["data"]["requested_scene"], "coding");
+
+    srv.stop().await;
+}
+
+/// §3.4 binds every method that names a session, not the three that happened
+/// to have tests. A guard is added per method and the newest one is the
+/// easiest to forget — `session.rename` in particular reads like metadata
+/// rather than like reaching into a session, and naming a conversation that
+/// belongs to another scene is how it would end up labelled in a list it does
+/// not belong to.
+#[tokio::test]
+async fn the_newer_methods_reject_a_scene_mismatch_too() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("x")], ask_settings(), Duration::ZERO).await;
+    let sid = inject_session_in_scene(&srv, "chat").await;
+
+    let calls = [
+        (
+            "session.rename",
+            format!(r#"{{"session_id":"{sid}","name":"别的场景的会话"}}"#),
+        ),
+        (
+            "session.setModel",
+            format!(r#"{{"session_id":"{sid}","model":"claude-opus-4-6"}}"#),
+        ),
+        (
+            "session.subscribe",
+            format!(r#"{{"session_id":"{sid}","resume":true}}"#),
+        ),
+    ];
+
+    for (method, params) in calls {
+        let response = rpc(
+            &srv.sock,
+            &format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":1}}"#),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            codes::SCENE_MISMATCH,
+            "{method} did not refuse a session from another scene: {response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["recorded_scene"], "chat",
+            "{method}"
+        );
+        assert_eq!(
+            response["error"]["data"]["requested_scene"], "coding",
+            "{method}"
+        );
+    }
 
     srv.stop().await;
 }
@@ -1395,6 +1453,56 @@ async fn session_resume_rejects_a_terminal_sidechain() {
     assert_eq!(resumed["error"]["data"]["session_id"], child.to_string());
     assert_eq!(resumed["error"]["data"]["parent_session_id"], parent);
     assert_eq!(resumed["error"]["data"]["final_state"], "completed");
+
+    srv.stop().await;
+}
+
+/// `session.subscribe {resume: true}` opens a cold session, and "cold" must
+/// not become a way around the rule that a finished sidechain has no
+/// continuation. It refuses through the same mapping `session.resume` uses,
+/// which is why the structured `data` is asserted here too: a second copy of
+/// that mapping is exactly what would drift.
+#[tokio::test]
+async fn opening_a_terminal_sidechain_is_refused_the_same_way() {
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("a")], ask_settings(), Duration::ZERO).await;
+    let parent = run_turn(&srv.sock, None, "root").await;
+    let child = inject_sidechain(&srv, &parent).await;
+    srv.store
+        .append(
+            child,
+            history::entry::LogEntry::SessionEnd {
+                state: history::entry::SessionEndState::Failed,
+            },
+        )
+        .await
+        .unwrap();
+
+    let opened = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.subscribe","params":{{"session_id":"{child}","resume":true}},"id":1}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        opened["error"]["code"],
+        codes::SIDECHAIN_TERMINAL,
+        "{opened}"
+    );
+    assert_eq!(opened["error"]["data"]["parent_session_id"], parent);
+    assert_eq!(opened["error"]["data"]["final_state"], "failed");
+
+    // Without `resume` it is the plain refusal, not the sidechain one: the
+    // session is simply not in memory, and nothing was asked to open it.
+    let plain = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.subscribe","params":{{"session_id":"{child}"}},"id":2}}"#
+        ),
+    )
+    .await;
+    assert_eq!(plain["error"]["code"], codes::SESSION_NOT_FOUND, "{plain}");
 
     srv.stop().await;
 }
