@@ -343,6 +343,63 @@ async fn every_transport_answers_the_same_request() {
     h.stop().await;
 }
 
+/// A method that *changes* something answers alike on every transport, and
+/// the change itself is one change however it arrived.
+///
+/// The cases above ask a question (`daemon.status`) or watch a stream. Both
+/// are read-shaped, and a transport that mangled a request body on the way in
+/// would still answer them. `session.rename` carries a payload the daemon
+/// has to parse — including one that is not ASCII, which is where a framing
+/// bug shows up first — and the result is readable back through a different
+/// connection than the one that wrote it.
+#[tokio::test]
+async fn a_mutating_method_lands_once_however_it_arrived() {
+    let h = Harness::dripping(&["hello"], Duration::ZERO).await;
+
+    let mut owner = DaemonRpcClient::connect(&h.sock).await.unwrap();
+    let session = owner
+        .session_create(serde_json::json!({}))
+        .await
+        .expect("a session");
+
+    // Each transport names it, and each name is the one that comes back.
+    for (i, mut client) in h.clients().await.into_iter().enumerate() {
+        let name = client.transport_name();
+        let chosen = format!("第 {i} 个传输起的名字");
+        let resp = client
+            .session_rename(&session, Some(&chosen))
+            .await
+            .unwrap();
+        let result = resp
+            .result
+            .unwrap_or_else(|| panic!("{name}: session.rename failed: {:?}", resp.error));
+        assert_eq!(result["name"], chosen.as_str(), "{name}: {result}");
+
+        // Read back on a connection that did not write it: the rename is a
+        // fact about the session, not about the connection.
+        let seen = owner.session_get(&session).await.unwrap().result.unwrap();
+        assert_eq!(
+            seen["name"],
+            chosen.as_str(),
+            "{name}: the rename did not reach the session"
+        );
+
+        // The other method that changes a live session, for the same reason:
+        // it carries a payload and answers with what it accepted.
+        let model = format!("claude-model-{i}");
+        let switched = client
+            .session_set_model(&session, &model)
+            .await
+            .unwrap()
+            .result
+            .unwrap_or_else(|| panic!("{name}: session.setModel failed"));
+        assert_eq!(switched["model"], model.as_str(), "{name}: {switched}");
+        assert_eq!(switched["applies"], "next_turn", "{name}: {switched}");
+    }
+
+    h.stop().await;
+}
+
 /// The property an aggregate client cannot express: a token arrives while
 /// the turn is still running.
 ///

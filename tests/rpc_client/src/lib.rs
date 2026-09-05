@@ -304,6 +304,32 @@ impl DaemonRpcClient {
         .await
     }
 
+    /// 换掉这个会话下一次模型调用用的模型。
+    pub async fn session_set_model(
+        &mut self,
+        session_id: &str,
+        model: &str,
+    ) -> anyhow::Result<RpcResponse> {
+        self.call(
+            "session.setModel",
+            serde_json::json!({ "session_id": session_id, "model": model }),
+        )
+        .await
+    }
+
+    /// 给会话起名字；`None` 清除。
+    pub async fn session_rename(
+        &mut self,
+        session_id: &str,
+        name: Option<&str>,
+    ) -> anyhow::Result<RpcResponse> {
+        self.call(
+            "session.rename",
+            serde_json::json!({ "session_id": session_id, "name": name }),
+        )
+        .await
+    }
+
     /// 起一轮，一帧一帧地读。
     ///
     /// 调用方拿到 [`TurnStream`] 后每 `next()` 一次是一个 await 点——可以在外面套

@@ -200,8 +200,11 @@ fn every_documented_error_code_exists() {
 /// without running either.
 ///
 /// A method counts as driven when a test names it as a JSON-RPC method
-/// string, or calls the `rpc-client` wrapper that sends it. Those are the two
-/// ways a test reaches the daemon; there is no third.
+/// string, or calls the `rpc-client` wrapper that sends it — **in a file that
+/// stands up a daemon**. That last part is the floor: without it the check
+/// is satisfied by any file that merely mentions a name, and several files in
+/// this corpus scan source text for a living. Naming a method in a source
+/// scan is not sending it.
 ///
 /// `daemon.auth` is checked here even though it never reaches `dispatch` —
 /// it is the first message on every network connection, so a client that
@@ -214,7 +217,14 @@ fn every_method_a_client_can_send_is_driven_by_a_test() {
     required.push("daemon.auth".to_string());
 
     let wrappers = client_wrappers(&root);
-    let corpus = test_sources(&root);
+    let corpus: Vec<(String, String)> = test_sources(&root)
+        .into_iter()
+        .filter(|(_, src)| starts_a_daemon(src))
+        .collect();
+    assert!(
+        corpus.len() > 5,
+        "the daemon-starting corpus is almost empty — the marker list is stale, not the tests"
+    );
 
     let undriven: Vec<&String> = required
         .iter()
@@ -319,6 +329,25 @@ fn every_stream_event_is_documented_and_every_documented_one_is_sent() {
          sent but undocumented: {undocumented:?}\n\
          documented but never sent: {never_sent:?}"
     );
+}
+
+/// Whether this test file talks to a running daemon at all.
+///
+/// The check runs in the sound direction only: a file containing none of
+/// these — the assembly, a raw socket, the typed client, the scenario harness
+/// — cannot have sent anything, whatever names it contains. A file that
+/// matches one still might not, and that is fine; the floor is meant to
+/// exclude `rpc_smoke.rs`, whose own header says "pure data tests; no real
+/// socket needed" and which was standing in as the evidence that
+/// `session.create` gets exercised.
+fn starts_a_daemon(src: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "assemble::pool",
+        "DaemonRpcClient::connect",
+        "daemon_harness::",
+        "serve_unix",
+    ];
+    MARKERS.iter().any(|marker| src.contains(marker))
 }
 
 /// `rpc-client`'s typed wrappers, paired with the method each one sends, so a
