@@ -167,6 +167,33 @@ pub trait HistoryStore: Send + Sync {
             .unwrap_or_default())
     }
 
+    /// Give this session the name its owner calls it, or clear it (`None`).
+    ///
+    /// Not an entry in the log, and deliberately so. A name is not something
+    /// that happened in the conversation — it is chosen afterwards, changed
+    /// afterwards, and belongs to whoever is looking at the session rather
+    /// than to the session's own history. It also has to be readable without
+    /// replaying anything, which is why it lives beside the log instead of
+    /// in it.
+    ///
+    /// The default refuses: a backend that cannot keep a name should say so
+    /// rather than accept one and forget it, which is the failure a host
+    /// discovers only when the name is gone.
+    async fn set_session_title(
+        &self,
+        _session: SessionId,
+        _title: Option<String>,
+    ) -> Result<(), HistoryError> {
+        Err(HistoryError::Path(
+            "this history store cannot name sessions".into(),
+        ))
+    }
+
+    /// The name set by [`set_session_title`](Self::set_session_title), if any.
+    async fn session_title(&self, _session: SessionId) -> Result<Option<String>, HistoryError> {
+        Ok(None)
+    }
+
     /// Which session spawned this one, if any.
     ///
     /// Reads through [`session_facts`](Self::session_facts) so a backend has
@@ -421,8 +448,15 @@ impl JsonlHistoryStore {
                 // The directory listing already answered the question. Opening
                 // each transcript to fill in a preview nobody asked for turns
                 // a listing into a full parse of every session in the project.
+                //
+                // The sidecar is a different matter and is read: it is one
+                // small JSON document per session, and it holds the things
+                // that exist nowhere else — the name a person gave this
+                // session, and the counters. Leaving it out is why a renamed
+                // session used to come back unnamed.
                 crate::query::SummaryDetail::IdsOnly => {
-                    out.push(self.summary_from_parts(session_id, mtime, 0, &[], None))
+                    let metadata = load_session_metadata(&self.sessions_root, session_id).await;
+                    out.push(self.summary_from_parts(session_id, mtime, 0, &[], metadata))
                 }
                 crate::query::SummaryDetail::Full => {
                     if let Some(summary) = self.session_summary(session_id, mtime).await? {
@@ -818,6 +852,25 @@ impl HistoryStore for JsonlHistoryStore {
         Ok(())
     }
 
+    async fn set_session_title(
+        &self,
+        session: SessionId,
+        title: Option<String>,
+    ) -> Result<(), HistoryError> {
+        crate::project::set_session_title_in(
+            &self.sessions_root,
+            &self.canonical_cwd,
+            &self.project_dir_path(),
+            session,
+            title,
+        )
+        .await
+    }
+
+    async fn session_title(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        crate::project::session_title_in(&self.sessions_root, session).await
+    }
+
     /// Reads only as far as the `Meta` entry, which the engine writes first.
     /// The default would parse — and hydrate every paste of — an entire
     /// transcript to reach the fields on its first line.
@@ -912,6 +965,7 @@ impl HistoryStore for JsonlHistoryStore {
 #[derive(Default)]
 pub struct InMemoryHistoryStore {
     sessions: std::sync::Mutex<std::collections::HashMap<SessionId, Vec<EnvelopedEntry>>>,
+    titles: std::sync::Mutex<std::collections::HashMap<SessionId, String>>,
 }
 
 impl InMemoryHistoryStore {
@@ -958,7 +1012,33 @@ impl HistoryStore for InMemoryHistoryStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&session);
+        self.titles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session);
         Ok(())
+    }
+
+    async fn set_session_title(
+        &self,
+        session: SessionId,
+        title: Option<String>,
+    ) -> Result<(), HistoryError> {
+        let mut titles = self.titles.lock().unwrap_or_else(|e| e.into_inner());
+        match title {
+            Some(t) => titles.insert(session, t),
+            None => titles.remove(&session),
+        };
+        Ok(())
+    }
+
+    async fn session_title(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        Ok(self
+            .titles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .cloned())
     }
 }
 
@@ -2207,6 +2287,18 @@ impl HistoryStore for ObservedHistoryStore {
         self.inner.session_facts(session).await
     }
 
+    async fn set_session_title(
+        &self,
+        session: SessionId,
+        title: Option<String>,
+    ) -> Result<(), HistoryError> {
+        self.inner.set_session_title(session, title).await
+    }
+
+    async fn session_title(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        self.inner.session_title(session).await
+    }
+
     async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
         self.inner.session_parent(session).await
     }
@@ -2456,6 +2548,49 @@ mod contract_tests {
             SessionFacts::default(),
             "a session with no log is not an error here, it is no facts"
         );
+    });
+
+    for_each_store!(a_session_keeps_the_name_a_person_gave_it, |store| {
+        let s = SessionId::new();
+        store.append(s, meta(None)).await.unwrap();
+        assert_eq!(store.session_title(s).await.unwrap(), None);
+
+        store
+            .set_session_title(s, Some("重构 daemon 装配".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.session_title(s).await.unwrap().as_deref(),
+            Some("重构 daemon 装配")
+        );
+
+        // Renaming twice is renaming, not accumulating.
+        store
+            .set_session_title(s, Some("second".into()))
+            .await
+            .unwrap();
+        assert_eq!(store.session_title(s).await.unwrap().as_deref(), Some("second"));
+
+        store.set_session_title(s, None).await.unwrap();
+        assert_eq!(
+            store.session_title(s).await.unwrap(),
+            None,
+            "clearing the name puts the session back to whatever names it automatically"
+        );
+    });
+
+    // A name is not an entry in the log — it is chosen after the fact and
+    // changed after the fact, so naming a session must not disturb what was
+    // said in it.
+    for_each_store!(naming_a_session_does_not_touch_its_transcript, |store| {
+        let s = SessionId::new();
+        store.append(s, meta(None)).await.unwrap();
+        store.append(s, user("hello")).await.unwrap();
+        let before = store.load(s).await.unwrap().len();
+
+        store.set_session_title(s, Some("named".into())).await.unwrap();
+
+        assert_eq!(store.load(s).await.unwrap().len(), before);
     });
 
     for_each_store!(an_extension_entry_comes_back_exactly_as_written, |store| {

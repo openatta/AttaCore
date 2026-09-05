@@ -651,6 +651,7 @@ impl DaemonServer {
             "session.fork" => self.method_session_fork(id, req.params).await,
             "session.resume" => self.method_session_resume(id, req.params).await,
             "session.setModel" => self.method_session_set_model(id, req.params).await,
+            "session.rename" => self.method_session_rename(id, req.params).await,
             "scene.list" => RpcResponse::ok(
                 id,
                 serde_json::json!({"scenes": self.pool.list_scenes().await}),
@@ -1254,6 +1255,29 @@ impl DaemonServer {
             obj.insert("resumed".into(), serde_json::json!(false));
         }
         RpcResponse::ok(id, report.unwrap_or_else(|| serde_json::json!({})))
+    }
+
+    /// `session.rename` params: `{"session_id": "...", "name": "..."|null}`.
+    ///
+    /// A missing `name` key and an explicit `null` mean the same thing here —
+    /// clear it — because there is nothing else a rename with no name could
+    /// be asking for.
+    async fn method_session_rename(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
+        };
+        let name = params.get("name").and_then(|v| v.as_str());
+        if let Some(err) = self.scene_mismatch_response(&id, session_id).await {
+            return err;
+        }
+        match self.pool.rename_session(session_id, name).await {
+            Ok(v) => RpcResponse::ok(id, v),
+            Err((code, message)) => RpcResponse::err(id, code, message),
+        }
     }
 
     /// `session.setModel` params: `{"session_id": "...", "model": "..."}`.

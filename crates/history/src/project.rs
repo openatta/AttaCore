@@ -247,6 +247,49 @@ pub async fn ensure_session_sidecar_in(
     Ok(paths)
 }
 
+/// Set (or clear) the name a person gave this session, creating the sidecar
+/// if this is the first thing anyone has recorded about it.
+///
+/// Read-modify-write rather than a blind overwrite: the file also carries the
+/// counters and the paths, and a rename is not a reason to forget them.
+pub async fn set_session_title_in(
+    sessions_root: &Path,
+    canonical_cwd: &Path,
+    project_history_dir: &Path,
+    session: SessionId,
+    title: Option<String>,
+) -> Result<(), HistoryError> {
+    let paths = ensure_session_sidecar_in(sessions_root, canonical_cwd, project_history_dir, session)
+        .await?;
+    let mut metadata = match tokio::fs::read_to_string(&paths.metadata).await {
+        Ok(content) => serde_json::from_str::<SessionMetadata>(&content)
+            .unwrap_or_else(|_| SessionMetadata::new(canonical_cwd, project_history_dir, session)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            SessionMetadata::new(canonical_cwd, project_history_dir, session)
+        }
+        Err(e) => return Err(HistoryError::Io(e)),
+    };
+    metadata.title = title;
+    metadata.updated_at = now_rfc3339();
+    write_json_atomic(&paths.metadata, &metadata).await
+}
+
+/// The name a person gave this session, if anyone has.
+pub async fn session_title_in(
+    sessions_root: &Path,
+    session: SessionId,
+) -> Result<Option<String>, HistoryError> {
+    let path = session_metadata_file(sessions_root, &session);
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(HistoryError::Io(e)),
+    };
+    Ok(serde_json::from_str::<SessionMetadata>(&content)
+        .ok()
+        .and_then(|m| m.title))
+}
+
 pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)

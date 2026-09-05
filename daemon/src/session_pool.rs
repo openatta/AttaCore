@@ -164,6 +164,10 @@ struct LiveSession {
     last_active: Instant,
     /// 用于首轮命名判断。
     is_first_turn: bool,
+    /// Set by `session.rename`. The first-turn auto-namer skips a session
+    /// that has one: a name somebody typed outranks a name a model guessed,
+    /// and the guess arrives later.
+    named_by_user: bool,
     /// `SessionPool.config_generation` 的值，建这个 Agent 时记录的快照。
     /// `run_turn` 每次分派给一个已存在的 session 前，会拿这个值跟池子当前的
     /// 代数比——落后就说明期间有过 `config.setProvider`/`config.reload`，
@@ -1919,6 +1923,7 @@ impl SessionPool {
             created_at: Instant::now(),
             last_active: Instant::now(),
             is_first_turn: true,
+            named_by_user: false,
             config_generation: self
                 .config_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1955,6 +1960,95 @@ impl SessionPool {
             .expect("model_overrides mutex is never held across a panic")
             .get(session_id)
             .cloned()
+    }
+
+    /// Longest name `session.rename` accepts.
+    ///
+    /// A name is a label in somebody's session list, not a description. The
+    /// cap is here rather than at the wire layer because it is the engine's
+    /// answer, and a host that embeds the engine gets the same one.
+    const MAX_SESSION_NAME: usize = 200;
+
+    /// `session.rename` — what the person looking at this session calls it.
+    ///
+    /// `None` clears the name, putting the session back under whatever names
+    /// it automatically. The name is written where the session's own facts
+    /// live, so every host sharing `~/.atta` sees it — a name each host kept
+    /// in an overlay of its own is a name that differs depending on which
+    /// window you have open.
+    ///
+    /// Works on a session that is not in memory: naming is a fact about the
+    /// session, not an operation on a running engine, so it does not resume
+    /// anything to do it.
+    pub async fn rename_session(
+        &self,
+        session_id: &str,
+        name: Option<&str>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let name = match name {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err((
+                        codes::INVALID_PARAMS,
+                        "name must not be empty; pass null to clear it".into(),
+                    ));
+                }
+                if trimmed.chars().count() > Self::MAX_SESSION_NAME {
+                    return Err((
+                        codes::INVALID_PARAMS,
+                        format!("name must be at most {} characters", Self::MAX_SESSION_NAME),
+                    ));
+                }
+                // A host renders this in a list. A newline or a control
+                // character in it is not a name, it is a rendering bug
+                // somebody else has to find.
+                if trimmed.chars().any(char::is_control) {
+                    return Err((
+                        codes::INVALID_PARAMS,
+                        "name must not contain control characters".into(),
+                    ));
+                }
+                Some(trimmed.to_string())
+            }
+        };
+
+        let store = self.require_history_store()?;
+        let sid = base::session::SessionId::parse(session_id).map_err(|_| {
+            (
+                codes::INVALID_PARAMS,
+                format!("invalid session_id: {session_id}"),
+            )
+        })?;
+        // Naming something that does not exist would create a sidecar for a
+        // session nothing else knows about — a row in every future listing
+        // that nobody can open.
+        let live = self.sessions.lock().await.contains_key(session_id);
+        if !live && matches!(
+            store.load(sid).await,
+            Err(history::error::HistoryError::SessionNotFound(_))
+        ) {
+            return Err((
+                codes::SESSION_NOT_FOUND,
+                format!("session not found: {session_id}"),
+            ));
+        }
+
+        store
+            .set_session_title(sid, name.clone())
+            .await
+            .map_err(|e| (codes::INTERNAL_ERROR, format!("could not rename: {e}")))?;
+
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(live) = sessions.get_mut(session_id) {
+                live.name = name.clone();
+                live.named_by_user = name.is_some();
+            }
+        }
+
+        Ok(serde_json::json!({ "session_id": session_id, "name": name }))
     }
 
     /// `session.setModel` — what the next API call this session makes should
@@ -2565,7 +2659,7 @@ impl SessionPool {
                     live.is_first_turn = false;
                     // 尝试通过场景判断是否需要命名（现在是这个 daemon 实例唯一
                     // 配置的那个 scene 说了算，不再写死查 chat 场景）
-                    if self.scene.auto_name_session() {
+                    if self.scene.auto_name_session() && !live.named_by_user {
                         if let Some(prompt) = self.scene.session_name_prompt(&message) {
                             match self.generate_session_name(&prompt).await {
                                 Ok(name) => {
@@ -2915,9 +3009,10 @@ impl SessionPool {
                 let sid_str = sid.to_string();
                 let active = active_ids.contains(&sid_str);
                 let (facts, resumable) = self.session_facts_and_resumable(&sid_str).await;
+                let name = store.session_title(sid).await.unwrap_or_default();
                 out.push(SessionInfo {
                     session_id: sid_str,
-                    name: None,
+                    name,
                     preview: None,
                     message_count: 0,
                     created_at: String::new(),
@@ -2992,6 +3087,10 @@ impl SessionPool {
                     if seen.contains(&sid_str) {
                         continue;
                     }
+                    // The name somebody gave it. A cold session has no live
+                    // entry to carry one, which is why `session.rename`
+                    // writes it beside the log rather than into the pool.
+                    let name = summary.title.clone();
                     let (facts, resumable) = self.session_facts_and_resumable(&sid_str).await;
                     if !include_children
                         && matches!(facts.session_kind, history::entry::SessionKind::Sidechain)
@@ -3000,7 +3099,7 @@ impl SessionPool {
                     }
                     out.push(SessionInfo {
                         session_id: sid_str,
-                        name: None,
+                        name,
                         preview: None,
                         message_count: 0,
                         created_at: String::new(),
@@ -4960,6 +5059,7 @@ mod eviction_tests {
             created_at: last_active,
             last_active,
             is_first_turn: true,
+            named_by_user: false,
             config_generation: 0,
             current_turn: None,
             scripts: None,

@@ -202,6 +202,18 @@ async fn start_scripted_server(
     settings: Settings,
     prompt_timeout: Duration,
 ) -> (ScriptedServer, SeenRequests) {
+    start_scripted_server_in("coding", rounds, settings, prompt_timeout).await
+}
+
+/// The same daemon in a named scene — `chat` names its own sessions after the
+/// first turn, which `coding` does not, and that difference is a behaviour
+/// worth a test.
+async fn start_scripted_server_in(
+    scene_id: &str,
+    rounds: Vec<Vec<StreamEvent>>,
+    settings: Settings,
+    prompt_timeout: Duration,
+) -> (ScriptedServer, SeenRequests) {
     // Silent unless `RUST_LOG` says otherwise. These tests drive the whole
     // engine, so being able to turn logging on without editing the file is
     // worth the four lines — it is how the `respondToPrompt` deadlock this
@@ -222,7 +234,7 @@ async fn start_scripted_server(
         "claude-sonnet-4-6",
         2000,
         Some(&sock),
-        "coding",
+        scene_id,
         &StaticDaemonPaths::new(dir.path().to_path_buf()),
     );
     config.session_cap = 8;
@@ -245,9 +257,13 @@ async fn start_scripted_server(
     // The entry point `main.rs` uses: these tests are about the behaviour of
     // an assembled daemon, and an assembly of their own would be one more
     // copy to keep in step with it.
+    let mut registry = scene::scene::SceneRegistry::new();
+    registry.register_builtin();
+    let agent_scene = registry.resolve(scene_id).expect("a builtin scene");
+
     let pool = daemon::assemble::pool(
         &config,
-        Arc::new(scene::scene::coding::CodingScene),
+        agent_scene,
         daemon::Assembly {
             cwd: Some(cwd.clone()),
             permission_prompt_timeout: prompt_timeout,
@@ -467,6 +483,166 @@ async fn a_listed_session_says_which_scene_and_project_it_belongs_to() {
     .await;
     assert_eq!(detail["result"]["scene"], entry["scene"]);
     assert_eq!(detail["result"]["project_root"], entry["project_root"]);
+
+    srv.stop().await;
+}
+
+// ── session.rename ──────────────────────────────────────────────────────
+
+/// A session's name belongs to the person looking at it, and it has to
+/// survive that person closing the window. Kept beside the log rather than in
+/// a host's own overlay, so two hosts sharing `~/.atta` agree about what a
+/// session is called.
+#[tokio::test]
+async fn a_renamed_session_keeps_its_name_after_it_leaves_memory() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("answer")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let sid = run_turn(&srv.sock, None, "hello").await;
+    let renamed = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.rename","id":1,"params":{{"session_id":"{sid}","name":"重构 daemon 装配"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(renamed["result"]["name"], "重构 daemon 装配");
+
+    let listed_live = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#).await;
+    let live_entry = listed_live["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == sid.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("session missing from the list: {listed_live}"));
+    assert_eq!(live_entry["name"], "重构 daemon 装配");
+
+    // Out of memory entirely — the case a host's own overlay gets wrong,
+    // since it never had a row for a session it did not open.
+    rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.close","id":3,"params":{{"session_id":"{sid}"}}}}"#
+        ),
+    )
+    .await;
+    let listed_cold = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":4}"#).await;
+    let cold_entry = listed_cold["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == sid.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("session missing from the list: {listed_cold}"));
+    assert_eq!(
+        cold_entry["status"], "inactive",
+        "the session really did leave memory: {cold_entry}"
+    );
+    assert_eq!(
+        cold_entry["name"], "重构 daemon 装配",
+        "a name outlives the running session: {cold_entry}"
+    );
+
+    // Clearing puts it back to whatever names it automatically.
+    let cleared = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.rename","id":5,"params":{{"session_id":"{sid}","name":null}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(cleared["result"]["name"], serde_json::Value::Null);
+
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn a_name_that_would_break_a_list_is_refused() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("answer")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+    let sid = run_turn(&srv.sock, None, "hello").await;
+
+    for bad in [r#""  ""#, r#""a\nb""#] {
+        let response = rpc(
+            &srv.sock,
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"session.rename","id":1,"params":{{"session_id":"{sid}","name":{bad}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], codes::INVALID_PARAMS as i64,
+            "`{bad}` is not a name: {response}"
+        );
+    }
+
+    let missing = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.rename","id":2,"params":{"session_id":"WnZ55VTERDNsFKVQdkQ7hi","name":"x"}}"#,
+    )
+    .await;
+    assert_eq!(
+        missing["error"]["code"], codes::SESSION_NOT_FOUND as i64,
+        "naming a session that does not exist would put an unopenable row in every listing: {missing}"
+    );
+
+    srv.stop().await;
+}
+
+/// A scene that names its own sessions does so after the first turn — by
+/// which time the user may already have typed a name. The guess must not win:
+/// it arrives second and it is a guess.
+#[tokio::test]
+async fn the_automatic_namer_does_not_overwrite_a_name_somebody_typed() {
+    let (srv, _seen) = start_scripted_server_in(
+        "chat",
+        vec![text_round("answer"), text_round("模型猜的标题")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let created = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.create","id":1,"params":{}}"#,
+    )
+    .await;
+    let sid = created["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no session: {created}"))
+        .to_string();
+
+    rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.rename","id":2,"params":{{"session_id":"{sid}","name":"我起的名字"}}}}"#
+        ),
+    )
+    .await;
+
+    // The turn that would otherwise trigger automatic naming.
+    run_turn(&srv.sock, Some(&sid), "hello").await;
+
+    let detail = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.get","id":3,"params":{{"session_id":"{sid}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        detail["result"]["name"], "我起的名字",
+        "the name somebody typed survived the turn: {detail}"
+    );
 
     srv.stop().await;
 }
