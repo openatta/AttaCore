@@ -18,7 +18,7 @@ use base::interface::settings::{Divergence, RecorderConfig, RecorderMode};
 use mcp::manager::McpManager;
 use model::adapter::AnthropicModel;
 use model::client::AnthropicClient;
-use runtime::agent::{Builder, EventReceiver, InputMessage, InputSender};
+use runtime::agent::{Builder, EngineCommand, EventReceiver, InputMessage, InputSender};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +66,15 @@ pub enum ResumeError {
         parent_session_id: Option<String>,
         final_state: history::entry::SessionEndState,
     },
+    Rpc(RpcError),
+}
+
+/// `SessionPool::set_session_model`'s failure type. `Busy` carries the turn
+/// id `server.rs` needs for `SESSION_BUSY`'s structured `data`, which a plain
+/// `RpcError` — `(code, message)` — has no room for. Same shape and same
+/// reason as [`ResumeError`].
+pub enum SetModelError {
+    Busy { current_turn_id: String },
     Rpc(RpcError),
 }
 
@@ -362,6 +371,21 @@ pub struct SessionPool {
     /// a stale *generation number* (worst case: one extra turn served on
     /// old config before the recreate check catches up, never fewer).
     config_generation: std::sync::atomic::AtomicU64,
+    /// Models chosen with `session.setModel`, by session id.
+    ///
+    /// The command itself reaches the engine through the session's input
+    /// channel and lives in that `Agent`'s settings — which is not where it
+    /// can stay. An `Agent` is rebuilt from settings whenever
+    /// `config_generation` moves on or the janitor evicts an idle session,
+    /// and a rebuild would put the model back to the configured one with
+    /// nothing said to the client that chose otherwise. `create()` replays
+    /// this map onto every session it builds, so the choice outlives the
+    /// `Agent` it was made on.
+    ///
+    /// Not persisted: it lasts as long as this daemon does. A restart is a
+    /// visible event; an eviction is not, and that is the difference that
+    /// decides which one is allowed to forget.
+    model_overrides: std::sync::Mutex<HashMap<String, String>>,
     /// How long a `kind:"prompt"` permission ask may sit unanswered before
     /// the daemon answers it with a `Deny` on the client's behalf.
     /// `Duration::ZERO` disables the timer entirely (wait forever — the
@@ -557,6 +581,7 @@ impl SessionPool {
             skill_catalog,
             projects: AsyncMutex::new(HashMap::new()),
             config_generation: std::sync::atomic::AtomicU64::new(0),
+            model_overrides: std::sync::Mutex::new(HashMap::new()),
             permission_prompt_timeout: DEFAULT_PERMISSION_PROMPT_TIMEOUT,
             pool_telemetry,
         }
@@ -1877,6 +1902,9 @@ impl SessionPool {
             evict_lru(&mut sessions);
         }
 
+        // Cloned before the sender moves into `LiveSession`; the model
+        // replay below needs it and the map is not the place to reach for it.
+        let input_for_override = input_tx.clone();
         let live = LiveSession {
             input_tx,
             event_rx: Arc::new(AsyncMutex::new(Some(event_rx))),
@@ -1902,8 +1930,92 @@ impl SessionPool {
         if let Some(old) = sessions.insert(session_id.clone(), live) {
             old.cancel.cancel();
         }
+        // Before this Agent serves anything: the command is queued ahead of
+        // whatever turn follows, so a session rebuilt mid-conversation never
+        // answers one turn on the model the caller replaced.
+        if let Some(model) = self.model_override(&session_id) {
+            let _ = input_for_override.send(InputMessage::System {
+                kind: EngineCommand::UpdateModel,
+                content: model,
+            });
+        }
         info!(%session_id, "session created");
         Ok(session_id)
+    }
+
+    fn model_override(&self, session_id: &str) -> Option<String> {
+        self.model_overrides
+            .lock()
+            .expect("model_overrides mutex is never held across a panic")
+            .get(session_id)
+            .cloned()
+    }
+
+    /// `session.setModel` — what the next API call this session makes should
+    /// ask for.
+    ///
+    /// The engine has been able to do this all along (`EngineCommand::
+    /// UpdateModel`); what it had no way to hear was a client asking. The
+    /// transcript is not touched: this is a change to what answers the next
+    /// message, not a rewrite of the conversation that led to it.
+    ///
+    /// Refused while a turn is running, rather than queued behind it. The
+    /// engine's main loop is inside `process_turn` for the duration and is
+    /// not reading its input channel, so a command accepted here would take
+    /// effect at some unannounced later moment — the caller would have been
+    /// told the model changed and watched the old one answer.
+    pub async fn set_session_model(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<serde_json::Value, SetModelError> {
+        let input_tx = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(live) = sessions.get_mut(session_id) else {
+                return Err(SetModelError::Rpc((
+                    codes::SESSION_NOT_FOUND,
+                    format!("session not found: {session_id}"),
+                )));
+            };
+            if let Some(current_turn_id) = live.current_turn.clone() {
+                return Err(SetModelError::Busy { current_turn_id });
+            }
+            live.last_active = Instant::now();
+            live.input_tx.clone()
+        };
+
+        self.model_overrides
+            .lock()
+            .expect("model_overrides mutex is never held across a panic")
+            .insert(session_id.to_string(), model.to_string());
+
+        if input_tx
+            .send(InputMessage::System {
+                kind: EngineCommand::UpdateModel,
+                content: model.to_string(),
+            })
+            .is_err()
+        {
+            return Err(SetModelError::Rpc((
+                codes::SESSION_NOT_FOUND,
+                format!("session is no longer running: {session_id}"),
+            )));
+        }
+
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "model": model,
+            "applies": "next_turn",
+        }))
+    }
+
+    /// Forget a session's `session.setModel` choice — it is deleted or
+    /// closed, and an id is never reused.
+    fn forget_model_override(&self, session_id: &str) {
+        self.model_overrides
+            .lock()
+            .expect("model_overrides mutex is never held across a panic")
+            .remove(session_id);
     }
 
     /// Record a raised permission ask so late subscribers can be handed it.
@@ -2054,7 +2166,7 @@ impl SessionPool {
             return Ok(false);
         }
         let _ = input_tx.send(InputMessage::System {
-            kind: runtime::agent::EngineCommand::CancelTurn,
+            kind: EngineCommand::CancelTurn,
             content: String::new(),
         });
         Ok(true)
@@ -3032,6 +3144,10 @@ impl SessionPool {
                 info!(%session_id, "session removed");
             }
         }
+        // The runtime entity is gone, so the runtime choice goes with it —
+        // unlike eviction, which destroys the same `Agent` while the session
+        // is still something a client can come back to.
+        self.forget_model_override(session_id);
         self.delete_sidechain_list(session_id, children).await
     }
 
@@ -5185,6 +5301,51 @@ mod multi_scene_tests {
         assert!(
             !chat.tools().is_empty(),
             "chat restricts its tools to a whitelist"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_model_tests {
+    use super::mcp_for_project_tests::test_pool;
+    use super::*;
+
+    /// The engine's main loop is inside `process_turn` while a turn runs and
+    /// is not reading its input channel. A command accepted here would sit in
+    /// the queue and take effect at a moment nobody announced — the caller
+    /// told the model had changed, watching the old one answer.
+    #[tokio::test]
+    async fn a_session_with_a_turn_in_flight_refuses_rather_than_queues() {
+        let (pool, _dir) = test_pool().await;
+        let session_id = pool
+            .create_session(None, ProjectSelector::Default, None)
+            .await
+            .expect("a session")["session_id"]
+            .as_str()
+            .expect("a session id")
+            .to_string();
+
+        {
+            let mut sessions = pool.sessions.lock().await;
+            sessions
+                .get_mut(&session_id)
+                .expect("the session is live")
+                .current_turn = Some("t1".into());
+        }
+
+        match pool.set_session_model(&session_id, "claude-opus-4-6").await {
+            Err(SetModelError::Busy { current_turn_id }) => {
+                assert_eq!(current_turn_id, "t1", "the refusal names the turn holding it")
+            }
+            Err(SetModelError::Rpc((code, message))) => {
+                panic!("expected a busy refusal, got {code}: {message}")
+            }
+            Ok(v) => panic!("a busy session accepted a model change: {v}"),
+        }
+
+        assert!(
+            pool.model_override(&session_id).is_none(),
+            "a refused change must not be recorded — a later rebuild would apply it"
         );
     }
 }

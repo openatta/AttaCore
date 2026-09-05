@@ -616,6 +616,7 @@ impl DaemonServer {
             "session.history" => self.method_session_history(id, req.params).await,
             "session.fork" => self.method_session_fork(id, req.params).await,
             "session.resume" => self.method_session_resume(id, req.params).await,
+            "session.setModel" => self.method_session_set_model(id, req.params).await,
             "scene.list" => RpcResponse::ok(
                 id,
                 serde_json::json!({"scenes": self.pool.list_scenes().await}),
@@ -1182,6 +1183,46 @@ impl DaemonServer {
         match self.pool.subscribe_session(session_id, client).await {
             Ok(v) => RpcResponse::ok(id, v),
             Err((code, message)) => RpcResponse::err(id, code, message),
+        }
+    }
+
+    /// `session.setModel` params: `{"session_id": "...", "model": "..."}`.
+    ///
+    /// The model a session talks to was fixed when the session was built, and
+    /// the only way to change it was to change the configuration and start
+    /// over — which costs the conversation. The engine never had that
+    /// limitation (`EngineCommand::UpdateModel`); the method table did.
+    async fn method_session_set_model(
+        &self,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) else {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing session_id");
+        };
+        let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        if model.trim().is_empty() {
+            return RpcResponse::err(id, codes::INVALID_PARAMS, "missing model");
+        }
+        if let Some(err) = self.scene_mismatch_response(&id, session_id).await {
+            return err;
+        }
+        match self.pool.set_session_model(session_id, model).await {
+            Ok(v) => RpcResponse::ok(id, v),
+            Err(crate::session_pool::SetModelError::Busy { current_turn_id }) => {
+                RpcResponse::err_with_data(
+                    id,
+                    codes::SESSION_BUSY,
+                    "session is busy",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "current_turn_id": current_turn_id,
+                    }),
+                )
+            }
+            Err(crate::session_pool::SetModelError::Rpc((code, message))) => {
+                RpcResponse::err(id, code, message)
+            }
         }
     }
 

@@ -861,6 +861,31 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 取消当前 turn,**保留会话**。没有进行中的 turn 时 `interrupted` 是 `false`,不是
 错误 —— 调用方要的是会话空闲,而它确实空闲。
 
+#### `session.setModel`
+
+```jsonc
+// → params
+{ "session_id": "…", "model": "claude-opus-4-6" }
+// ← result
+{ "session_id": "…", "model": "claude-opus-4-6", "applies": "next_turn" }
+```
+
+换掉这个会话**下一次模型调用**用的模型。transcript 不动 —— 这是换"谁来回答下一
+条",不是改写已经说过的话。所以"这一段用便宜的,接下来换个强的"不再需要新建会话,
+也就不再需要丢掉上下文。
+
+**换的是模型名,不是 provider。** 走的还是这个 daemon 当初建起来的那个 client;
+跨 provider 的切换要配 `providers` / `task_models`(§`config.setProvider`),不是
+这个方法能做的事。
+
+**有 turn 在跑时返回 `SESSION_BUSY`**,不排队。引擎跑 turn 的时候不读输入通道,
+排进去的命令会在某个没人宣布的时刻生效 —— 调用方被告知模型换了,却看着旧模型答完
+这一轮。要换就先 `session.interrupt`,或者等这一轮结束。
+
+**只对内存里的会话有效**,冷会话返回 `SESSION_NOT_FOUND`(先 `session.resume`)。
+选择跟着这个 daemon 活着:会话被驱逐后重建、`config.reload` 之后重建,选的还是这个
+模型;**daemon 重启则回到配置里的模型** —— 重启是看得见的事件,驱逐不是。
+
 #### `session.history`
 
 ```jsonc
