@@ -50,6 +50,10 @@ const WIRING_CHECKS: &[(&str, &str)] = &[
     ("mcp", "set_elicitation_callback"),
     ("script-host", "bind_into"),
     ("script-host", "bind_lenient"),
+    // Not a capability but the same failure: skipping it orphans every
+    // session written under the older layout, and nothing about a daemon
+    // that skipped it looks wrong.
+    ("history", "migrate_layout"),
 ];
 
 /// Functions matching `WIRING_CHECKS`-style naming that are deliberately
