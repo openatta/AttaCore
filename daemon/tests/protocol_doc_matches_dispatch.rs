@@ -1,4 +1,5 @@
-//! The protocol doc and the dispatch table describe the same set of methods.
+//! The protocol doc and the code describe the same set of methods, and the
+//! same set of stream events.
 //!
 //! `docs/daemon_rpc_protocol.md` is what someone writes a client against.
 //! When it drifts, both directions hurt and neither is visible from the
@@ -11,8 +12,16 @@
 //! it recommends for keepalive — and eleven methods were implemented with
 //! no entry in the doc.
 //!
+//! The same drift is possible one level down, in the events: §7's table is a
+//! whitelist of `session.event` kinds, and the whitelist in the code is the
+//! `match` in `run_turn`'s forwarding loop. Nothing compared them, so an
+//! event could be documented and never sent — a client waiting forever for a
+//! frame that does not exist — or sent and never documented. The `compact`
+//! kind was added with nothing checking either direction.
+//!
 //! Source-text scanning: match arms out of `dispatch`, `#### \`name\``
-//! headings out of §6. It cannot check that a documented *shape* is right,
+//! headings out of §6, `AgentEvent` arms out of the forwarding loop, table
+//! rows out of §7. It cannot check that a documented *shape* is right,
 //! only that both sides agree on what exists. That is the failure that kept
 //! happening.
 
@@ -224,6 +233,91 @@ fn every_method_a_client_can_send_is_driven_by_a_test() {
         undriven.is_empty(),
         "these methods are dispatched but no test sends them: {undriven:?}\n\
          A method whose only proof is that it compiles is a method nobody has run."
+    );
+}
+
+/// The `kind` each `AgentEvent` arm of `run_turn`'s forwarding loop emits.
+///
+/// Bounded to the loop rather than scanned over the file: `daemon.event`
+/// frames carry a `kind` of their own and are not part of this whitelist, and
+/// a scan that could not tell them apart would report the wrong drift.
+fn forwarded_event_kinds(pool_rs: &str) -> Vec<String> {
+    const ARM: &str = "Some(AgentEvent::";
+    let start = pool_rs
+        .find(ARM)
+        .expect("run_turn still forwards `AgentEvent` arms");
+    let loop_body = &pool_rs[start..];
+    // The wildcard that ends the forwarding match — everything past it
+    // belongs to some other part of the file.
+    let end = loop_body
+        .find("_ => continue,")
+        .expect("the forwarding match no longer ends in a wildcard");
+    let loop_body = &loop_body[..end];
+
+    let mut out: Vec<String> = loop_body
+        .split(ARM)
+        .skip(1)
+        .filter_map(|arm| {
+            let at = arm.find("\"kind\"")?;
+            let rest = arm[at + "\"kind\"".len()..].trim_start();
+            let rest = rest.strip_prefix(':')?.trim_start();
+            let value = rest.strip_prefix('"')?;
+            Some(value.split('"').next()?.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `kind`s documented in §7's table — the first cell of each row, backticked.
+fn documented_event_kinds(doc: &str) -> Vec<String> {
+    let section = doc
+        .split("## 7. 流式帧")
+        .nth(1)
+        .expect("the doc still has a §7");
+    let table = section
+        .split("\n\n")
+        .find(|block| block.trim_start().starts_with("| `kind`"))
+        .expect("§7 still opens with the kind table");
+
+    let mut out: Vec<String> = table
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1).map(str::to_string))
+        .filter(|kind| kind != "kind")
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// §7's table and the forwarding loop are the same whitelist.
+///
+/// Both directions fail differently. A documented kind with no arm is a
+/// client waiting for a frame the engine will never send; an arm with no row
+/// is a capability nobody knows to handle — and since §7 tells clients to
+/// ignore kinds they do not know, one that every well-behaved client drops.
+#[test]
+fn every_stream_event_is_documented_and_every_documented_one_is_sent() {
+    let root = repo_root();
+    let pool = std::fs::read_to_string(root.join("daemon/src/session_pool.rs")).unwrap();
+    let doc = std::fs::read_to_string(root.join("docs/daemon_rpc_protocol.md")).unwrap();
+
+    let sent = forwarded_event_kinds(&pool);
+    let documented = documented_event_kinds(&doc);
+
+    assert!(
+        sent.len() > 5,
+        "only found {sent:?} — the forwarding scan is broken, not the doc"
+    );
+    let undocumented: Vec<&String> = sent.iter().filter(|k| !documented.contains(k)).collect();
+    let never_sent: Vec<&String> = documented.iter().filter(|k| !sent.contains(k)).collect();
+    assert!(
+        undocumented.is_empty() && never_sent.is_empty(),
+        "§7's table and `run_turn`'s forwarding match disagree.\n\
+         sent but undocumented: {undocumented:?}\n\
+         documented but never sent: {never_sent:?}"
     );
 }
 
