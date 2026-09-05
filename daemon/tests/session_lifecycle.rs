@@ -1873,12 +1873,21 @@ async fn a_projects_own_script_reaches_the_prompt_the_daemon_sends() {
            }"#,
     )
     .unwrap();
+    // `timeout_ms` well above the carrier's 100ms default, because the
+    // subject here is whether a project's script reaches the prompt at all.
+    // The default budget is wall clock, and on a machine running the rest of
+    // this suite beside it even this script can miss it — the engine then
+    // does exactly what it promises, drops the contribution and leaves the
+    // prompt alone, and the case fails for a reason it is not about. The
+    // deadline itself is covered where it belongs, by a script written to
+    // exceed it (`tests/runner/tests/script_boundaries.rs`).
     std::fs::write(
         project.join(".atta").join("settings.json"),
         r#"{
              "memory_enabled": false,
              "scripts": [
-               {"path": ".atta/scripts/house.js", "point": "prompt.assemble", "entry": "onAssemble"}
+               {"path": ".atta/scripts/house.js", "point": "prompt.assemble",
+                "entry": "onAssemble", "timeout_ms": 5000}
              ]
            }"#,
     )
@@ -1946,12 +1955,16 @@ async fn session_get_reports_what_the_scripts_did() {
         "function onAssemble() { throw new Error('nope'); }",
     )
     .unwrap();
+    // Generous on purpose: this case is about a script that *throws* being
+    // reported, and a script that timed out would be reported as failed too
+    // — passing for the wrong reason.
     std::fs::write(
         project.join(".atta").join("settings.json"),
         r#"{
              "memory_enabled": false,
              "scripts": [
-               {"path": ".atta/scripts/broken.js", "point": "prompt.assemble", "entry": "onAssemble"}
+               {"path": ".atta/scripts/broken.js", "point": "prompt.assemble",
+                "entry": "onAssemble", "timeout_ms": 5000}
              ]
            }"#,
     )
@@ -2057,8 +2070,10 @@ async fn one_bad_binding_leaves_the_session_running_with_no_scripts() {
         r#"{
              "memory_enabled": false,
              "scripts": [
-               {"path": ".atta/scripts/house.js", "point": "prompt.assemble", "entry": "onAssemble"},
-               {"path": ".atta/scripts/missing.js", "point": "tool.result", "entry": "onResult"}
+               {"path": ".atta/scripts/house.js", "point": "prompt.assemble",
+                "entry": "onAssemble", "timeout_ms": 5000},
+               {"path": ".atta/scripts/missing.js", "point": "tool.result",
+                "entry": "onResult", "timeout_ms": 5000}
              ]
            }"#,
     )

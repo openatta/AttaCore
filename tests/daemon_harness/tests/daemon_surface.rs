@@ -547,7 +547,15 @@ fn a_project_with_a_script(world: &World) -> anyhow::Result<std::path::PathBuf> 
                 {
                     "path": ".atta/scripts/house.js",
                     "point": "prompt.assemble",
-                    "entry": "onAssemble"
+                    "entry": "onAssemble",
+                    // Far above the carrier's 100ms default. These cases are
+                    // about a script reaching the prompt, and that budget is
+                    // wall clock: on a machine running the rest of the suite
+                    // beside them, even a script this small can miss it, and
+                    // the engine then correctly drops the contribution. The
+                    // deadline has its own case, with a script written to
+                    // exceed it (`tests/runner/tests/script_boundaries.rs`).
+                    "timeout_ms": 5000
                 }
             ]
         }),
@@ -651,7 +659,8 @@ fn a_package_with_a_script(
              \n\
              [[script]]\n\
              point = \"prompt.assemble\"\n\
-             entry = \"annotate.js:onAssemble\"\n"
+             entry = \"annotate.js:onAssemble\"\n\
+             timeout_ms = 5000\n"
         ),
     )?;
     std::fs::write(src.join("annotate.js"), body)?;
