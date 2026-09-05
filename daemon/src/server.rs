@@ -1224,7 +1224,11 @@ impl DaemonServer {
             return err;
         }
 
-        let mut report = match self.pool.subscribe_session(session_id, client.clone()).await {
+        let mut report = match self
+            .pool
+            .subscribe_session(session_id, client.clone())
+            .await
+        {
             Ok(v) => Some(v),
             Err((code, _)) if resume && code == codes::SESSION_NOT_FOUND => {
                 // §3.4 still applies: the mismatch check above ran first, and

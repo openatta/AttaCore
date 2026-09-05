@@ -304,7 +304,12 @@ async fn main() -> anyhow::Result<()> {
     // ── Startup checkpoints ────────────────────────────────────────────
     // Phases the assembly performs in one call; the markers stay because the
     // startup-timing telemetry below is keyed by them.
-    for phase in ["memory_loaded", "skills_scanned", "mcp_connected", "tools_registered"] {
+    for phase in [
+        "memory_loaded",
+        "skills_scanned",
+        "mcp_connected",
+        "tools_registered",
+    ] {
         let elapsed = perf.checkpoint(phase);
         info!(elapsed_ms = elapsed, phase, "startup phase complete");
     }

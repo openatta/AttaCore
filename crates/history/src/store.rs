@@ -2579,20 +2579,23 @@ mod contract_tests {
     // session that has not been written to has no `Meta` line at all. Both
     // answer `None` rather than an inferred value — inferring here is what
     // §3.4's scene check exists to refuse.
-    for_each_store!(facts_a_log_does_not_record_are_absent_not_guessed, |store| {
-        let written = SessionId::new();
-        store.append(written, meta(None)).await.unwrap();
-        let facts = store.session_facts(written).await.unwrap();
-        assert_eq!(facts.scene, None);
-        assert_eq!(facts.project_root, None);
+    for_each_store!(
+        facts_a_log_does_not_record_are_absent_not_guessed,
+        |store| {
+            let written = SessionId::new();
+            store.append(written, meta(None)).await.unwrap();
+            let facts = store.session_facts(written).await.unwrap();
+            assert_eq!(facts.scene, None);
+            assert_eq!(facts.project_root, None);
 
-        let never_written = SessionId::new();
-        assert_eq!(
-            store.session_facts(never_written).await.unwrap(),
-            SessionFacts::default(),
-            "a session with no log is not an error here, it is no facts"
-        );
-    });
+            let never_written = SessionId::new();
+            assert_eq!(
+                store.session_facts(never_written).await.unwrap(),
+                SessionFacts::default(),
+                "a session with no log is not an error here, it is no facts"
+            );
+        }
+    );
 
     for_each_store!(a_session_keeps_the_name_a_person_gave_it, |store| {
         let s = SessionId::new();
@@ -2613,7 +2616,10 @@ mod contract_tests {
             .set_session_title(s, Some("second".into()))
             .await
             .unwrap();
-        assert_eq!(store.session_stats(s).await.unwrap().title.as_deref(), Some("second"));
+        assert_eq!(
+            store.session_stats(s).await.unwrap().title.as_deref(),
+            Some("second")
+        );
 
         store.set_session_title(s, None).await.unwrap();
         assert_eq!(
@@ -2632,7 +2638,10 @@ mod contract_tests {
         store.append(s, user("hello")).await.unwrap();
         let before = store.load(s).await.unwrap().len();
 
-        store.set_session_title(s, Some("named".into())).await.unwrap();
+        store
+            .set_session_title(s, Some("named".into()))
+            .await
+            .unwrap();
 
         assert_eq!(store.load(s).await.unwrap().len(), before);
     });

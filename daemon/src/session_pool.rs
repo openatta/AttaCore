@@ -2028,10 +2028,12 @@ impl SessionPool {
         // session nothing else knows about — a row in every future listing
         // that nobody can open.
         let live = self.sessions.lock().await.contains_key(session_id);
-        if !live && matches!(
-            store.load(sid).await,
-            Err(history::error::HistoryError::SessionNotFound(_))
-        ) {
+        if !live
+            && matches!(
+                store.load(sid).await,
+                Err(history::error::HistoryError::SessionNotFound(_))
+            )
+        {
             return Err((
                 codes::SESSION_NOT_FOUND,
                 format!("session not found: {session_id}"),
@@ -5460,7 +5462,10 @@ mod set_model_tests {
 
         match pool.set_session_model(&session_id, "claude-opus-4-6").await {
             Err(SetModelError::Busy { current_turn_id }) => {
-                assert_eq!(current_turn_id, "t1", "the refusal names the turn holding it")
+                assert_eq!(
+                    current_turn_id, "t1",
+                    "the refusal names the turn holding it"
+                )
             }
             Err(SetModelError::Rpc((code, message))) => {
                 panic!("expected a busy refusal, got {code}: {message}")

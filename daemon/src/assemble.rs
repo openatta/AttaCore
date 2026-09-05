@@ -267,9 +267,12 @@ fn build_task_router(
         .default_provider
         .as_deref()
         .expect("resolve_task_models already validated default_provider is set");
-    let router =
-        crate::model_router::build_task_router(&config.settings.providers, default_provider, resolved)
-            .map_err(|e| anyhow::anyhow!("failed to build multi-provider model router: {e}"))?;
+    let router = crate::model_router::build_task_router(
+        &config.settings.providers,
+        default_provider,
+        resolved,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to build multi-provider model router: {e}"))?;
     Ok(Some(Arc::new(router)))
 }
 

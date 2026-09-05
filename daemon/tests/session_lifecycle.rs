@@ -446,16 +446,16 @@ fn ask_settings_no_memory() -> Settings {
 /// out, and impossible for a session that is only on disk.
 #[tokio::test]
 async fn a_listed_session_says_which_scene_and_project_it_belongs_to() {
-    let (srv, _seen) = start_scripted_server(
-        vec![text_round("answer")],
-        ask_settings(),
-        Duration::ZERO,
-    )
-    .await;
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("answer")], ask_settings(), Duration::ZERO).await;
 
     let sid = run_turn(&srv.sock, None, "hello").await;
 
-    let listed = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":1}"#).await;
+    let listed = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.list","id":1}"#,
+    )
+    .await;
     let entry = listed["result"]["sessions"]
         .as_array()
         .expect("a sessions array")
@@ -531,7 +531,11 @@ async fn a_listed_session_reports_how_often_it_was_compacted() {
     )
     .await;
 
-    let listed = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#).await;
+    let listed = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#,
+    )
+    .await;
     let entry = listed["result"]["sessions"]
         .as_array()
         .unwrap()
@@ -560,12 +564,8 @@ async fn a_listed_session_reports_how_often_it_was_compacted() {
 /// session is called.
 #[tokio::test]
 async fn a_renamed_session_keeps_its_name_after_it_leaves_memory() {
-    let (srv, _seen) = start_scripted_server(
-        vec![text_round("answer")],
-        ask_settings(),
-        Duration::ZERO,
-    )
-    .await;
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("answer")], ask_settings(), Duration::ZERO).await;
 
     let sid = run_turn(&srv.sock, None, "hello").await;
     let renamed = rpc(
@@ -577,7 +577,11 @@ async fn a_renamed_session_keeps_its_name_after_it_leaves_memory() {
     .await;
     assert_eq!(renamed["result"]["name"], "重构 daemon 装配");
 
-    let listed_live = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#).await;
+    let listed_live = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.list","id":2}"#,
+    )
+    .await;
     let live_entry = listed_live["result"]["sessions"]
         .as_array()
         .unwrap()
@@ -596,7 +600,11 @@ async fn a_renamed_session_keeps_its_name_after_it_leaves_memory() {
         ),
     )
     .await;
-    let listed_cold = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":4}"#).await;
+    let listed_cold = rpc(
+        &srv.sock,
+        r#"{"jsonrpc":"2.0","method":"session.list","id":4}"#,
+    )
+    .await;
     let cold_entry = listed_cold["result"]["sessions"]
         .as_array()
         .unwrap()
@@ -628,12 +636,8 @@ async fn a_renamed_session_keeps_its_name_after_it_leaves_memory() {
 
 #[tokio::test]
 async fn a_name_that_would_break_a_list_is_refused() {
-    let (srv, _seen) = start_scripted_server(
-        vec![text_round("answer")],
-        ask_settings(),
-        Duration::ZERO,
-    )
-    .await;
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("answer")], ask_settings(), Duration::ZERO).await;
     let sid = run_turn(&srv.sock, None, "hello").await;
 
     for bad in [r#""  ""#, r#""a\nb""#] {
@@ -645,7 +649,8 @@ async fn a_name_that_would_break_a_list_is_refused() {
         )
         .await;
         assert_eq!(
-            response["error"]["code"], codes::INVALID_PARAMS as i64,
+            response["error"]["code"],
+            codes::INVALID_PARAMS as i64,
             "`{bad}` is not a name: {response}"
         );
     }
@@ -721,12 +726,8 @@ async fn the_automatic_namer_does_not_overwrite_a_name_somebody_typed() {
 /// project) are the ones it is worst placed to know.
 #[tokio::test]
 async fn subscribing_with_resume_opens_a_session_that_left_memory() {
-    let (srv, _seen) = start_scripted_server(
-        vec![text_round("answer")],
-        ask_settings(),
-        Duration::ZERO,
-    )
-    .await;
+    let (srv, _seen) =
+        start_scripted_server(vec![text_round("answer")], ask_settings(), Duration::ZERO).await;
 
     let sid = run_turn(&srv.sock, None, "hello").await;
     let closed = rpc(
@@ -748,7 +749,8 @@ async fn subscribing_with_resume_opens_a_session_that_left_memory() {
     )
     .await;
     assert_eq!(
-        refused["error"]["code"], codes::SESSION_NOT_FOUND as i64,
+        refused["error"]["code"],
+        codes::SESSION_NOT_FOUND as i64,
         "subscribe still refuses a cold session by default: {refused}"
     );
 

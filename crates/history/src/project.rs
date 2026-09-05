@@ -315,8 +315,9 @@ pub async fn set_session_title_in(
     session: SessionId,
     title: Option<String>,
 ) -> Result<(), HistoryError> {
-    let paths = ensure_session_sidecar_in(sessions_root, canonical_cwd, project_history_dir, session)
-        .await?;
+    let paths =
+        ensure_session_sidecar_in(sessions_root, canonical_cwd, project_history_dir, session)
+            .await?;
     let mut metadata = match tokio::fs::read_to_string(&paths.metadata).await {
         Ok(content) => serde_json::from_str::<SessionMetadata>(&content)
             .unwrap_or_else(|_| SessionMetadata::new(canonical_cwd, project_history_dir, session)),

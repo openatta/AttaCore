@@ -127,7 +127,10 @@ async fn run_one_turn(sock: &Path) -> Vec<serde_json::Value> {
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     let created: serde_json::Value = serde_json::from_str(&line).unwrap();
-    let session_id = created["result"]["session_id"].as_str().unwrap().to_string();
+    let session_id = created["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     w.write_all(
         exchange(

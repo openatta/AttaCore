@@ -203,8 +203,7 @@ impl Harness {
                 model_client: Some(client),
                 transcripts: daemon::Transcripts::In(store),
                 permission: Some(if allow_all {
-                    Arc::new(AllowAllPermission)
-                        as Arc<dyn base::interface::permission::Permission>
+                    Arc::new(AllowAllPermission) as Arc<dyn base::interface::permission::Permission>
                 } else {
                     Arc::new(AskEverythingPermission)
                 }),
