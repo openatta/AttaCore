@@ -429,6 +429,12 @@ pub struct SessionInfo {
     pub last_active: String,
     pub status: SessionStatus,
     pub session_kind: history::entry::SessionKind,
+    /// Scene the session was created under, and the project it is bound to.
+    /// Both always present, `null` when the log does not record them (pre-v2
+    /// files) — a client grouping by either can then tell "no project" from
+    /// "not known" without a presence check.
+    pub scene: Option<String>,
+    pub project_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// `false` only for a sidechain that already ran its one-shot task to
@@ -2599,26 +2605,41 @@ impl SessionPool {
     /// primary sessions and still-running/externally-cut-off sidechains are
     /// always `true`. One `load_entries` scan covers both, since listing
     /// every session would otherwise pay for the same disk read twice.
-    async fn session_kind_parent_and_resumable(
+    /// What the log says this session is — scene, project, kind, lineage.
+    ///
+    /// The empty set when there is no store, the id does not parse, or the
+    /// log has no `Meta` line: none of those is a reason to fail a listing,
+    /// and "we do not know" is the honest entry for a session that cannot say.
+    async fn facts_of(&self, session_id: &str) -> history::store::SessionFacts {
+        let Some(ref store) = self.history_store else {
+            return history::store::SessionFacts::default();
+        };
+        let Ok(sid) = base::session::SessionId::parse(session_id) else {
+            return history::store::SessionFacts::default();
+        };
+        store.session_facts(sid).await.unwrap_or_default()
+    }
+
+    async fn session_facts_and_resumable(
         &self,
         session_id: &str,
-    ) -> (history::entry::SessionKind, Option<String>, bool) {
-        let Ok(entries) = self.load_entries(session_id).await else {
-            return (history::entry::SessionKind::Primary, None, true);
-        };
-        let (session_kind, parent_session_id) = match find_meta(&entries) {
-            Some(history::entry::LogEntry::Meta {
-                session_kind,
-                parent_session_id,
-                ..
-            }) => (*session_kind, parent_session_id.clone()),
-            _ => (history::entry::SessionKind::Primary, None),
-        };
-        let has_terminal_marker = matches!(session_kind, history::entry::SessionKind::Sidechain)
-            && entries
-                .iter()
-                .any(|env| matches!(env.entry, history::entry::LogEntry::SessionEnd { .. }));
-        (session_kind, parent_session_id, !has_terminal_marker)
+    ) -> (history::store::SessionFacts, bool) {
+        let facts = self.facts_of(session_id).await;
+        // Only a sidechain can be non-resumable, and only the whole log can
+        // say whether it ended — so only a sidechain pays for reading it.
+        if !matches!(facts.session_kind, history::entry::SessionKind::Sidechain) {
+            return (facts, true);
+        }
+        let ended = self
+            .load_entries(session_id)
+            .await
+            .map(|entries| {
+                entries
+                    .iter()
+                    .any(|env| matches!(env.entry, history::entry::LogEntry::SessionEnd { .. }))
+            })
+            .unwrap_or(false);
+        (facts, !ended)
     }
 
     /// `scene.describe {scene, project_root, include_secrets}` — what this
@@ -2755,8 +2776,10 @@ impl SessionPool {
                 )
             })?;
 
-        let (_, scene) = self.session_kind_and_scene(session_id).await;
-        let scene_active = match &scene {
+        // The entry's own `scene`, not a second lookup: `session.get`
+        // disagreeing with the `session.list` entry for the same session is
+        // the failure this whole assembly is arranged to prevent.
+        let scene_active = match &info.scene {
             Some(id) => self.active_scenes.read().await.contains_key(id),
             None => false,
         };
@@ -2764,7 +2787,6 @@ impl SessionPool {
 
         let mut detail = serde_json::to_value(&info).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = detail.as_object_mut() {
-            obj.insert("scene".into(), serde_json::json!(scene));
             obj.insert("scene_active".into(), serde_json::json!(scene_active));
             // `turn_state` is the pair a client actually acts on: whether to
             // enable its send button, and which turn to interrupt if not.
@@ -2892,8 +2914,7 @@ impl SessionPool {
             for sid in children {
                 let sid_str = sid.to_string();
                 let active = active_ids.contains(&sid_str);
-                let (session_kind, _, resumable) =
-                    self.session_kind_parent_and_resumable(&sid_str).await;
+                let (facts, resumable) = self.session_facts_and_resumable(&sid_str).await;
                 out.push(SessionInfo {
                     session_id: sid_str,
                     name: None,
@@ -2906,7 +2927,9 @@ impl SessionPool {
                     } else {
                         SessionStatus::Inactive
                     },
-                    session_kind,
+                    session_kind: facts.session_kind,
+                    scene: facts.scene,
+                    project_root: facts.project_root,
                     parent_session_id: Some(parent.to_string()),
                     resumable,
                 });
@@ -2937,10 +2960,11 @@ impl SessionPool {
         let mut seen = std::collections::HashSet::new();
 
         for (sid, name, created_at, last_active) in active_snapshot {
-            let (session_kind, parent, resumable) =
-                self.session_kind_parent_and_resumable(&sid).await;
+            let (facts, resumable) = self.session_facts_and_resumable(&sid).await;
             seen.insert(sid.clone());
-            if !include_children && matches!(session_kind, history::entry::SessionKind::Sidechain) {
+            if !include_children
+                && matches!(facts.session_kind, history::entry::SessionKind::Sidechain)
+            {
                 continue;
             }
             out.push(SessionInfo {
@@ -2951,8 +2975,10 @@ impl SessionPool {
                 created_at: format_instant(created_at),
                 last_active: format_instant(last_active),
                 status: SessionStatus::Active,
-                session_kind,
-                parent_session_id: parent,
+                session_kind: facts.session_kind,
+                scene: facts.scene,
+                project_root: facts.project_root,
+                parent_session_id: facts.parent_session_id,
                 resumable,
             });
         }
@@ -2966,10 +2992,9 @@ impl SessionPool {
                     if seen.contains(&sid_str) {
                         continue;
                     }
-                    let (session_kind, parent, resumable) =
-                        self.session_kind_parent_and_resumable(&sid_str).await;
+                    let (facts, resumable) = self.session_facts_and_resumable(&sid_str).await;
                     if !include_children
-                        && matches!(session_kind, history::entry::SessionKind::Sidechain)
+                        && matches!(facts.session_kind, history::entry::SessionKind::Sidechain)
                     {
                         continue;
                     }
@@ -2981,8 +3006,10 @@ impl SessionPool {
                         created_at: String::new(),
                         last_active: String::new(),
                         status: SessionStatus::Inactive,
-                        session_kind,
-                        parent_session_id: parent,
+                        session_kind: facts.session_kind,
+                        scene: facts.scene,
+                        project_root: facts.project_root,
+                        parent_session_id: facts.parent_session_id,
                         resumable,
                     });
                 }
@@ -3075,10 +3102,8 @@ impl SessionPool {
         };
         let mut sidechains = Vec::with_capacity(children.len());
         for child in children {
-            let (kind, _, _) = self
-                .session_kind_parent_and_resumable(&child.to_string())
-                .await;
-            if matches!(kind, history::entry::SessionKind::Sidechain) {
+            let facts = self.facts_of(&child.to_string()).await;
+            if matches!(facts.session_kind, history::entry::SessionKind::Sidechain) {
                 sidechains.push(child);
             }
         }
@@ -3541,7 +3566,7 @@ impl SessionPool {
         {
             let sessions = self.sessions.lock().await;
             for sid in sessions.keys() {
-                if let (_, Some(scene)) = self.session_kind_and_scene(sid).await {
+                if let Some(scene) = self.facts_of(sid).await.scene {
                     *counts.entry(scene).or_insert(0) += 1;
                 }
             }
@@ -3590,7 +3615,7 @@ impl SessionPool {
             let sessions = self.sessions.lock().await;
             let mut out = Vec::new();
             for sid in sessions.keys() {
-                if let (_, Some(scene)) = self.session_kind_and_scene(sid).await {
+                if let Some(scene) = self.facts_of(sid).await.scene {
                     if scene == scene_id {
                         out.push(sid.clone());
                     }
@@ -3615,23 +3640,6 @@ impl SessionPool {
     /// instead of the parent — `list_scenes`/`deactivate_scene`'s shared
     /// lookup. `None` for the scene half covers "no Meta at all" the same
     /// way `session_kind_and_parent` does for kind/parent.
-    async fn session_kind_and_scene(
-        &self,
-        session_id: &str,
-    ) -> (history::entry::SessionKind, Option<String>) {
-        let Ok(entries) = self.load_entries(session_id).await else {
-            return (history::entry::SessionKind::Primary, None);
-        };
-        match find_meta(&entries) {
-            Some(history::entry::LogEntry::Meta {
-                session_kind,
-                scene,
-                ..
-            }) => (*session_kind, scene.clone()),
-            _ => (history::entry::SessionKind::Primary, None),
-        }
-    }
-
     /// Merged settings for `project_root` (global → scene → project tiers),
     /// built once and cached — see the `projects` field doc comment.
     /// `None` is the global no-project tier (docs/ARCHITECTURE.md §3.2):
@@ -3783,14 +3791,7 @@ impl SessionPool {
     /// default scene; only a scene this daemon isn't currently serving at
     /// all counts as a mismatch.
     pub async fn check_scene(&self, session_id: &str) -> SceneCheck {
-        let recorded: Option<String> = match self.load_entries(session_id).await {
-            Ok(entries) => match find_meta(&entries) {
-                Some(history::entry::LogEntry::Meta { scene, .. }) => scene.clone(),
-                _ => None,
-            },
-            Err(_) => None,
-        };
-        match recorded {
+        match self.facts_of(session_id).await.scene {
             None => SceneCheck::Inferred,
             Some(s) if self.active_scenes.read().await.contains_key(&s) => SceneCheck::Matches,
             Some(s) => SceneCheck::Mismatch(s),
@@ -5626,7 +5627,10 @@ mod session_listing_tests {
     }
 
     /// The fields a `SessionSummary` could fill in stay empty for a session
-    /// that is only on disk — clients have always read them that way.
+    /// that is only on disk — clients have always read them that way. The
+    /// identity fields are a different question and answered separately (see
+    /// `SessionFacts`); this seeded session has no `Meta` line at all, so
+    /// they are `null` rather than invented.
     #[tokio::test]
     async fn an_inactive_session_reports_the_same_empty_summary_it_always_has() {
         let store = Arc::new(IndexedStore::new());
@@ -5647,6 +5651,8 @@ mod session_listing_tests {
                 "last_active": "",
                 "status": "inactive",
                 "session_kind": "primary",
+                "scene": null,
+                "project_root": null,
                 "resumable": true,
             })
         );

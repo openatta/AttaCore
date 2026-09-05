@@ -752,14 +752,18 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
   "status": "active",              // active | inactive
   "session_kind": "primary",
   "resumable": true,
-  "scene": "coding", "scene_active": true,
+  "scene": "coding", "project_root": "…",   // null = 无项目会话,或老日志没记
+  "scene_active": true,
   "turn_state": "idle",            // idle | running
   "current_turn_id": null }
 ```
 
-比 `session.list` 的条目多 `scene` / `scene_active` / `turn_state` /
-`current_turn_id` 四项 —— 前两个要读 transcript,后两个只有内存里的池子知道。
-`turn_state` 就是"发送按钮该不该置灰"的依据。
+比 `session.list` 的条目多 `scene_active` / `turn_state` / `current_turn_id` 三项 ——
+第一个要问 daemon 当前激活了哪些场景,后两个只有内存里的池子知道。`turn_state` 就是
+"发送按钮该不该置灰"的依据。
+
+`scene` / `project_root` 与 `session.list` 的条目**同源**(都是那一条 `SessionInfo`),
+所以两个方法对同一个会话不会给出不同的答案。
 
 **`scripts`——这个会话的脚本都干了什么。** 只有绑了脚本的会话才有这个键;没绑的会话
 **没有这个键**,而不是一个空对象——「这儿没有脚本」和「脚本一次都没跑」是两个不同的
@@ -797,17 +801,23 @@ turn 期间的引擎错误不是事件,是**这次调用的错误响应**:`ENGIN
 { "sessions": [
     { "session_id": "…", "name": null, "preview": null,
       "message_count": 0, "created_at": "…", "last_active": "…",
-      "status": "active", "session_kind": "primary", "resumable": true } ] }
+      "status": "active", "session_kind": "primary", "resumable": true,
+      "scene": "coding", "project_root": "…" } ] }
 ```
 
 返回内存中的会话 + 磁盘上的历史会话,合并去重,**不分页、不过滤场景、不过滤项目**。
-没有 `scene` / `project_root` / `status` / `limit` / `cursor` 这些参数 —— 传了会被
-忽略。要按场景分组得自己拿 `session.get` 逐个问,或者靠客户端自己的记录。
+没有 `scene` / `project_root` / `status` / `limit` / `cursor` 这些**参数** —— 传了
+会被忽略;但每个**条目**都带 `scene` 与 `project_root`,按项目或场景分组在客户端一次
+遍历就能做完,不用逐个 `session.get`。
 
-**未激活会话的字段几乎全是空的**:`name` 为 `null`,`created_at` / `last_active`
-是**空字符串**,`message_count` 为 `0`。这是设计如此 —— 列表走的是历史存储的索引,
-不为了填几个摘要字段去逐个读 transcript。活跃会话的 `created_at` / `last_active`
-是真的,`name` 在场景开启自动命名且已经跑过一轮时才有值。
+`scene` / `project_root` 来自会话自己的 `Meta` 行(§3.4 校验的是同一处),所以冷会话
+也答得出来。**两个字段恒出现**,老会话(`Meta` 里没记场景的 pre-v2 文件)是 `null` —— 
+`null` 是"这份日志没写",不是"没有项目"。
+
+**未激活会话的摘要字段几乎全是空的**:`name` 为 `null`,`created_at` / `last_active`
+是**空字符串**,`message_count` 为 `0`。这是设计如此 —— 列表不为了填几个摘要字段去
+逐个读 transcript。活跃会话的 `created_at` / `last_active` 是真的,`name` 在场景开启
+自动命名且已经跑过一轮时才有值。
 
 `parent_session_id` 是**事后**查子 Agent 的路径:它扫的是磁盘上的 `Meta`,daemon
 重启后仍然可用。拿到子会话 id 后用普通 `session.history` 读内容 —— 侧链与主线共用

@@ -8,7 +8,7 @@
 //! cannot interleave into a partial line.
 
 use crate::blob::{BlobRef, BlobStore, PasteStore};
-use crate::entry::{EnvelopedEntry, LogEntry};
+use crate::entry::{EnvelopedEntry, LogEntry, SessionKind};
 use crate::error::HistoryError;
 use crate::path::{
     canonicalize_cwd, project_dir, session_file, session_metadata_file, HistoryRoots,
@@ -38,6 +38,45 @@ pub struct SessionSummary {
     pub total_input_tokens: Option<u64>,
     pub total_output_tokens: Option<u64>,
     pub compact_count: u64,
+}
+
+/// What a session is: the facts fixed when it was created.
+///
+/// Distinct from [`SessionSummary`], which is about the conversation and
+/// changes with every turn. These come from the log's `Meta` entry and never
+/// change, which is why a listing can carry them and why nothing needs to
+/// keep a second copy in step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionFacts {
+    /// Scene the session was created under. `None` on pre-v2 logs.
+    pub scene: Option<String>,
+    /// Absolute project root, or `None` for a no-project session — and also
+    /// `None` on pre-v2 logs, which did not record one. The two cases are not
+    /// distinguished here because nothing acts differently on them.
+    pub project_root: Option<String>,
+    pub session_kind: SessionKind,
+    pub parent_session_id: Option<String>,
+}
+
+impl SessionFacts {
+    /// The facts a `Meta` entry carries, or `None` for any other entry.
+    pub fn of(entry: &LogEntry) -> Option<Self> {
+        match entry {
+            LogEntry::Meta {
+                scene,
+                project_root,
+                session_kind,
+                parent_session_id,
+                ..
+            } => Some(Self {
+                scene: scene.clone(),
+                project_root: project_root.clone(),
+                session_kind: *session_kind,
+                parent_session_id: parent_session_id.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Where a session's log lives between runs.
@@ -103,25 +142,38 @@ pub trait HistoryStore: Send + Sync {
         &DefaultProjection
     }
 
-    /// Which session spawned this one, if any.
+    /// What a session is, as opposed to what was said in it.
     ///
-    /// Split out from [`child_sessions`](Self::child_sessions) so a backend
-    /// can answer it without materializing a whole transcript: the answer sits
-    /// in the log's `Meta` entry, and the default here has to read everything
-    /// to find it. Overriding this alone is enough to make the parent-child
-    /// walk cheap on any backend that can seek.
-    async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+    /// Scene, project and lineage are decided when a session is created and
+    /// never change, and they are all written to the log's `Meta` entry — the
+    /// first line of the file. A backend that can read that line alone
+    /// answers this without materializing a transcript, which is what makes
+    /// it usable from a listing: overriding this one method is enough to make
+    /// both the parent-child walk and `session.list`'s per-entry facts cheap.
+    ///
+    /// Every field is optional in the same sense: a pre-v2 log has no
+    /// `scene`/`project_root`, and the honest answer is `None` rather than a
+    /// guess. Callers that need a scene for a *resume* infer it from the
+    /// request instead (§3.4 of the RPC protocol).
+    async fn session_facts(&self, session: SessionId) -> Result<SessionFacts, HistoryError> {
         let entries = match self.load(session).await {
             Ok(e) => e,
-            Err(HistoryError::SessionNotFound(_)) => return Ok(None),
+            Err(HistoryError::SessionNotFound(_)) => return Ok(SessionFacts::default()),
             Err(e) => return Err(e),
         };
-        Ok(entries.iter().find_map(|env| match &env.entry {
-            LogEntry::Meta {
-                parent_session_id, ..
-            } => parent_session_id.clone(),
-            _ => None,
-        }))
+        Ok(entries
+            .iter()
+            .find_map(|env| SessionFacts::of(&env.entry))
+            .unwrap_or_default())
+    }
+
+    /// Which session spawned this one, if any.
+    ///
+    /// Reads through [`session_facts`](Self::session_facts) so a backend has
+    /// one place to make head-of-file lookups cheap rather than two that can
+    /// disagree about the same line.
+    async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+        Ok(self.session_facts(session).await?.parent_session_id)
     }
 
     /// Every session this one spawned.
@@ -768,12 +820,14 @@ impl HistoryStore for JsonlHistoryStore {
 
     /// Reads only as far as the `Meta` entry, which the engine writes first.
     /// The default would parse — and hydrate every paste of — an entire
-    /// transcript to reach a field on its first line.
-    async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
+    /// transcript to reach the fields on its first line.
+    async fn session_facts(&self, session: SessionId) -> Result<SessionFacts, HistoryError> {
         let path = self.session_file_path(&session);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SessionFacts::default())
+            }
             Err(e) => return Err(HistoryError::Io(e)),
         };
         for (i, line) in content.lines().enumerate() {
@@ -782,14 +836,11 @@ impl HistoryStore for JsonlHistoryStore {
             }
             let env = serde_json::from_str::<EnvelopedEntry>(line)
                 .map_err(|error| HistoryError::Parse { line: i + 1, error })?;
-            if let LogEntry::Meta {
-                parent_session_id, ..
-            } = env.entry
-            {
-                return Ok(parent_session_id);
+            if let Some(facts) = SessionFacts::of(&env.entry) {
+                return Ok(facts);
             }
         }
-        Ok(None)
+        Ok(SessionFacts::default())
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionId>, HistoryError> {
@@ -2152,6 +2203,10 @@ impl HistoryStore for ObservedHistoryStore {
         self.inner.load_messages(session).await
     }
 
+    async fn session_facts(&self, session: SessionId) -> Result<SessionFacts, HistoryError> {
+        self.inner.session_facts(session).await
+    }
+
     async fn session_parent(&self, session: SessionId) -> Result<Option<String>, HistoryError> {
         self.inner.session_parent(session).await
     }
@@ -2230,6 +2285,36 @@ mod contract_tests {
             project_root: None,
             session_kind: SessionKind::Primary,
             schema_version: crate::entry::CURRENT_META_SCHEMA_VERSION,
+        }
+    }
+
+    fn meta_in(scene: &str, project_root: &str) -> LogEntry {
+        match meta(None) {
+            LogEntry::Meta {
+                cwd,
+                started_at,
+                model,
+                permission_mode,
+                engine_version,
+                attacode_version,
+                parent_session_id,
+                session_kind,
+                schema_version,
+                ..
+            } => LogEntry::Meta {
+                cwd,
+                started_at,
+                model,
+                permission_mode,
+                engine_version,
+                attacode_version,
+                parent_session_id,
+                scene: Some(scene.to_string()),
+                project_root: Some(project_root.to_string()),
+                session_kind,
+                schema_version,
+            },
+            other => other,
         }
     }
 
@@ -2339,6 +2424,39 @@ mod contract_tests {
             );
         }
     );
+
+    for_each_store!(
+        the_scene_and_project_a_session_was_created_under_are_readable,
+        |store| {
+            let s = SessionId::new();
+            store.append(s, meta_in("chat", "/repo/a")).await.unwrap();
+            store.append(s, user("hi")).await.unwrap();
+
+            let facts = store.session_facts(s).await.unwrap();
+            assert_eq!(facts.scene.as_deref(), Some("chat"));
+            assert_eq!(facts.project_root.as_deref(), Some("/repo/a"));
+            assert_eq!(facts.session_kind, SessionKind::Primary);
+        }
+    );
+
+    // A pre-v2 log has no `scene`/`project_root` on its `Meta` line, and a
+    // session that has not been written to has no `Meta` line at all. Both
+    // answer `None` rather than an inferred value — inferring here is what
+    // §3.4's scene check exists to refuse.
+    for_each_store!(facts_a_log_does_not_record_are_absent_not_guessed, |store| {
+        let written = SessionId::new();
+        store.append(written, meta(None)).await.unwrap();
+        let facts = store.session_facts(written).await.unwrap();
+        assert_eq!(facts.scene, None);
+        assert_eq!(facts.project_root, None);
+
+        let never_written = SessionId::new();
+        assert_eq!(
+            store.session_facts(never_written).await.unwrap(),
+            SessionFacts::default(),
+            "a session with no log is not an error here, it is no facts"
+        );
+    });
 
     for_each_store!(an_extension_entry_comes_back_exactly_as_written, |store| {
         let s = SessionId::new();

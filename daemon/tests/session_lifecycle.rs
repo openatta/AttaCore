@@ -436,6 +436,55 @@ fn ask_settings_no_memory() -> Settings {
     s
 }
 
+// ── session.list / session.get identity ─────────────────────────────────
+
+/// A list a host can group by. Scene and project come from the session's own
+/// `Meta` line, so an entry answers "which project, which scene" without the
+/// caller asking `session.get` once per row — which was the only way to find
+/// out, and impossible for a session that is only on disk.
+#[tokio::test]
+async fn a_listed_session_says_which_scene_and_project_it_belongs_to() {
+    let (srv, _seen) = start_scripted_server(
+        vec![text_round("answer")],
+        ask_settings(),
+        Duration::ZERO,
+    )
+    .await;
+
+    let sid = run_turn(&srv.sock, None, "hello").await;
+
+    let listed = rpc(&srv.sock, r#"{"jsonrpc":"2.0","method":"session.list","id":1}"#).await;
+    let entry = listed["result"]["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|s| s["session_id"] == sid.as_str())
+        .unwrap_or_else(|| panic!("the session that just ran is not listed: {listed}"))
+        .clone();
+
+    assert_eq!(entry["scene"], "coding");
+    let project_root = entry["project_root"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the entry names no project: {entry}"));
+    assert!(
+        project_root.ends_with("work"),
+        "the entry names the project the session was created in, got {project_root}"
+    );
+
+    // The same two fields, for the same session, out of the same place.
+    let detail = rpc(
+        &srv.sock,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session.get","id":2,"params":{{"session_id":"{sid}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(detail["result"]["scene"], entry["scene"]);
+    assert_eq!(detail["result"]["project_root"], entry["project_root"]);
+
+    srv.stop().await;
+}
+
 // ── session.history ─────────────────────────────────────────────────────
 
 #[tokio::test]
